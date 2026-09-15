@@ -123,7 +123,9 @@ suite('Diff Tracker real Extension Host', () => {
         const blocked = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('bulk-00.txt').fsPath);
         assert.equal(blocked.status, 'conflict');
         assert.match(blocked.reason, /branch|Git/i);
-        assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', workspacePath), true);
+        const [pausedRepository] = (await state()).gitPauses;
+        assert.ok(pausedRepository?.repoRoot, 'paused repository root is exposed for explicit recovery');
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
         await until('Git baseline rebuild', async () => (await state()).gitPauses.length === 0 && (await state()).reviewTokens.length === 0);
     });
 });
