@@ -11,6 +11,7 @@ export interface FileDiff {
     originalContent: string;
     currentContent: string;
     isDeleted: boolean;
+    unavailableReason?: string;
     changes: Diff.Change[];
     timestamp: Date;
 }
@@ -74,13 +75,28 @@ interface PersistedTrackerState {
     baselineExistingFiles: string[];
 }
 
+export interface ActionResult {
+    status: 'success' | 'failed' | 'conflict' | 'cancelled';
+    filePath: string;
+    reason?: string;
+    bufferChanged?: boolean;
+}
+
+export interface BatchActionResult {
+    results: ActionResult[];
+    succeeded: number;
+    failed: number;
+}
+
 type CurrentFileState =
     | { kind: 'text'; content: string }
     | { kind: 'missing' }
-    | { kind: 'unavailable' };
+    | { kind: 'unavailable'; reason: string };
 
 export class DiffTracker {
     private isRecording = false;
+    private pendingWriteFiles = new Set<string>();
+    private activeWriteFiles = new Set<string>();
     private fileSnapshots = new Map<string, string>();
     private baselineExistingFiles = new Set<string>();
     private trackedChanges = new Map<string, FileDiff>();
@@ -216,6 +232,7 @@ export class DiffTracker {
         this.isRecording = true;
         this.clearAutomationSessions();
         this.clearWatcherSuppressionTimers();
+        this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
         this.baselineExistingFiles.clear();
         this.clearTrackedChanges();
@@ -281,6 +298,7 @@ export class DiffTracker {
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
 
+        this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
         this.baselineExistingFiles.clear();
         this.clearTrackedChanges();
@@ -546,6 +564,9 @@ export class DiffTracker {
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
         this.suppressWatcherForVsCodeSave(doc);
+        if (!this.activeWriteFiles.has(doc.uri.fsPath) && this.pendingWriteFiles.delete(doc.uri.fsPath)) {
+            void this.readFileAndUpdate(doc.uri.fsPath, doc.uri);
+        }
     }
 
     private suppressWatcherForVsCodeSave(doc: vscode.TextDocument): void {
@@ -1021,11 +1042,12 @@ export class DiffTracker {
                     if (this.fileSnapshots.has(uri.fsPath)) {
                         return;
                     }
-                    const text = await this.readFileSnapshot(uri);
-                    if (text === null) {
+                    const state = await this.readFileSnapshot(uri);
+                    if (state.kind !== 'text') {
+                        if (state.kind === 'unavailable') { this.markFileUnavailable(uri.fsPath, state.reason); }
                         return;
                     }
-                    this.fileSnapshots.set(uri.fsPath, text);
+                    this.fileSnapshots.set(uri.fsPath, state.content);
                     this.baselineExistingFiles.add(uri.fsPath);
                 });
 
@@ -1046,55 +1068,66 @@ export class DiffTracker {
         this.schedulePersistState();
     }
 
-    private async readFileSnapshot(uri: vscode.Uri): Promise<string | null> {
+    private isFileNotFound(error: unknown): boolean {
+        const code = (error as { code?: string } | undefined)?.code;
+        return code === 'FileNotFound' || code === 'ENOENT';
+    }
+
+    private async readFileSnapshot(uri: vscode.Uri): Promise<CurrentFileState> {
+        const targetError = this.validateActionTarget(uri.fsPath);
+        if (uri.scheme !== 'file' || targetError) {
+            return { kind: 'unavailable', reason: targetError ?? 'Only local file resources are supported' };
+        }
         try {
             const stat = await vscode.workspace.fs.stat(uri);
-            const maxSizeBytes = 5 * 1024 * 1024;
-            if (stat.size > maxSizeBytes) {
-                return null;
+            if (stat.type & vscode.FileType.Directory) {
+                return { kind: 'unavailable', reason: 'Resource is a directory' };
+            }
+            if (stat.size > 5 * 1024 * 1024) {
+                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit' };
             }
             const content = await vscode.workspace.fs.readFile(uri);
-            if (this.isLikelyBinaryContent(content)) {
-                return null;
+            if (content.length > 5 * 1024 * 1024) {
+                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit' };
             }
-            return new TextDecoder('utf-8').decode(content);
-        } catch {
-            return null;
+            if (content[0] === 0xef && content[1] === 0xbb && content[2] === 0xbf) {
+                return { kind: 'unavailable', reason: 'UTF-8 BOM files require encoding preservation and are read-only in this development build' };
+            }
+            if (this.isLikelyBinaryContent(content)) {
+                return { kind: 'unavailable', reason: 'Binary content is unsupported' };
+            }
+            try {
+                return { kind: 'text', content: new TextDecoder('utf-8', { fatal: true }).decode(content) };
+            } catch {
+                return { kind: 'unavailable', reason: 'Unsupported text encoding (expected UTF-8)' };
+            }
+        } catch (error) {
+            return this.isFileNotFound(error)
+                ? { kind: 'missing' }
+                : { kind: 'unavailable', reason: 'File cannot be read (access or provider error)' };
         }
     }
 
     private async readCurrentFileState(filePath: string): Promise<CurrentFileState> {
-        const openDocument = vscode.workspace.textDocuments.find(doc =>
-            doc.uri.scheme === 'file' && doc.uri.fsPath === filePath
-        );
-        if (openDocument) {
-            return {
-                kind: 'text',
-                content: openDocument.getText()
-            };
+        // Existence and read errors come from the resource, never a stale clean editor.
+        const state = await this.readFileSnapshot(vscode.Uri.file(filePath));
+        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath && d.uri.scheme === 'file');
+        if (doc?.isDirty) {
+            return { kind: 'unavailable', reason: 'Unsaved editor changes require review before file actions' };
         }
+        return state;
+    }
 
-        const uri = vscode.Uri.file(filePath);
-
-        try {
-            const stat = await vscode.workspace.fs.stat(uri);
-            const maxSizeBytes = 5 * 1024 * 1024;
-            if (stat.size > maxSizeBytes) {
-                return { kind: 'unavailable' };
-            }
-
-            const content = await vscode.workspace.fs.readFile(uri);
-            if (this.isLikelyBinaryContent(content)) {
-                return { kind: 'unavailable' };
-            }
-
-            return {
-                kind: 'text',
-                content: new TextDecoder('utf-8').decode(content)
-            };
-        } catch {
-            return { kind: 'missing' };
-        }
+    private markFileUnavailable(filePath: string, reason: string): void {
+        const previous = this.trackedChanges.get(filePath);
+        this.setTrackedChange(filePath, {
+            filePath, fileName: displayFileName(filePath),
+            originalContent: this.fileSnapshots.get(filePath) ?? '',
+            currentContent: previous?.currentContent ?? '',
+            isDeleted: previous?.isDeleted ?? false,
+            changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: reason
+        });
+        this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
 
     private async rebuildTrackedChangesFromSnapshots(): Promise<void> {
@@ -1121,7 +1154,9 @@ export class DiffTracker {
             }
 
             if (currentState.kind === 'missing' && this.baselineExistingFiles.has(filePath)) {
-                this.updateTrackedDiff(filePath, '');
+                this.updateTrackedDiff(filePath, '', { currentExists: false });
+            } else if (currentState.kind === 'unavailable') {
+                this.markFileUnavailable(filePath, currentState.reason);
             }
         });
     }
@@ -1257,71 +1292,55 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
-        const text = await this.readFileSnapshot(uri);
-        if (text === null) {
-            this.fileSnapshots.delete(filePath);
-            this.baselineExistingFiles.delete(filePath);
-            this.schedulePersistState();
+        const state = await this.readFileSnapshot(uri);
+        if (state.kind === 'unavailable') {
+            this.markFileUnavailable(filePath, state.reason);
             return;
         }
-        if (!this.fileSnapshots.has(filePath)) {
+        if (!this.fileSnapshots.has(filePath) && !this.trackedChanges.get(filePath)?.unavailableReason) {
             this.fileSnapshots.set(filePath, '');
             this.schedulePersistState();
         }
-        this.updateTrackedDiff(filePath, text);
+        await this.readFileAndUpdate(filePath, uri);
     }
 
     private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
-        if (!this.isRecording || !this.externalWatcherEnabled) {
+        if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' || this.isPathIgnored(uri)) {
             return;
         }
-
-        if (uri.scheme !== 'file') {
-            return;
-        }
-
-        if (this.isPathIgnored(uri)) {
-            return;
-        }
-
-        const filePath = uri.fsPath;
-        const originalContent = this.fileSnapshots.get(filePath);
-        if (originalContent === undefined) {
-            return;
-        }
-
-        this.updateTrackedDiff(filePath, '');
+        // A delete notification may race an atomic replacement; confirm actual state.
+        await this.readFileAndUpdate(uri.fsPath, uri);
     }
 
     private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
-        const text = await this.readFileSnapshot(uri);
-        if (text !== null) {
-            this.updateTrackedDiff(filePath, text);
-        } else {
-            const hadTracked = this.trackedChanges.has(filePath);
-            this.deleteTrackedChange(filePath);
-            this.lineChanges.delete(filePath);
-            this.markLineChangesUpdated(filePath);
-            this.inlineViews.delete(filePath);
-            if (hadTracked) {
-                this.emitTrackChangesEvent({ removedFiles: [filePath] });
-            }
+        if (this.pendingWriteFiles.has(filePath) && !this.activeWriteFiles.has(filePath)) {
+            const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+            if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
+        }
+        const state = await this.readFileSnapshot(uri);
+        if (state.kind === 'unavailable') {
+            this.markFileUnavailable(filePath, state.reason);
+        } else if (state.kind === 'text') {
+            this.updateTrackedDiff(filePath, state.content);
+        } else if (this.fileSnapshots.has(filePath)) {
+            this.updateTrackedDiff(filePath, '', { currentExists: false });
         }
     }
 
     private updateTrackedDiff(
         filePath: string,
         currentContent: string,
-        options?: { baselineChanged?: boolean }
+        options?: { baselineChanged?: boolean; currentExists?: boolean }
     ): void {
+        if (this.pendingWriteFiles.has(filePath)) { return; }
+        const currentExists = options?.currentExists !== false;
         const hadTrackedChange = this.trackedChanges.has(filePath);
         const hadLineChanges = this.lineChanges.has(filePath);
         const hadInlineView = this.inlineViews.has(filePath);
         let originalContent = this.fileSnapshots.get(filePath);
         if (originalContent === undefined) {
-            // Fallback baseline for unknown files
-            this.fileSnapshots.set(filePath, currentContent);
-            this.schedulePersistState();
+            // No before-image: do not silently accept an unknown baseline.
+            this.markFileUnavailable(filePath, 'Baseline is unknown; start a new baseline explicitly');
             return;
         }
 
@@ -1332,7 +1351,7 @@ export class DiffTracker {
             originalModel.lines.every((line, index) => line === currentModel.lines[index]);
 
         // Ignore pure EOL-style / final-EOL toggles and track only logical line changes.
-        if (sameLogicalLines) {
+        if (sameLogicalLines && this.baselineExistingFiles.has(filePath) === currentExists) {
             this.deleteTrackedChange(filePath);
             this.lineChanges.delete(filePath);
             this.markLineChangesUpdated(filePath);
@@ -1357,7 +1376,7 @@ export class DiffTracker {
         );
         const changes = Diff.diffLines(normalizedOriginal, normalizedCurrent);
         const fileName = displayFileName(filePath);
-        const isDeleted = originalContent.length > 0 && currentContent.length === 0;
+        const isDeleted = !currentExists;
 
         this.setTrackedChange(filePath, {
             filePath,
@@ -1376,135 +1395,193 @@ export class DiffTracker {
         });
     }
 
-    public async revertAllChanges(): Promise<number> {
-        const changes = Array.from(this.trackedChanges.values());
-        let revertedCount = 0;
-
-        for (const change of changes) {
-            const restored = await this.restoreFileToContent(
-                change.filePath,
-                change.originalContent,
-                { deleteIfMissingInBaseline: !this.baselineExistingFiles.has(change.filePath) }
-            );
-            if (restored) {
-                revertedCount++;
-            }
+    private validateActionTarget(filePath: string): string | undefined {
+        const uri = vscode.Uri.file(filePath);
+        const folder = vscode.workspace.getWorkspaceFolder(uri);
+        if (!path.isAbsolute(filePath) || !folder || folder.uri.scheme !== 'file') {
+            return 'Resource is outside the current local workspace; action blocked';
         }
-
-        // Clear all tracked changes after reverting
-        this.clearDiffs();
-
-        return revertedCount;
+        const isWithin = (root: string, target: string): boolean => {
+            const relative = path.relative(root, target);
+            return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+        };
+        if (!isWithin(folder.uri.fsPath, filePath)) {
+            return 'Resource is outside the workspace or is its root; action blocked';
+        }
+        try {
+            const realRoot = fs.realpathSync(folder.uri.fsPath);
+            let existing = filePath;
+            while (true) {
+                try {
+                    fs.lstatSync(existing);
+                    break;
+                } catch (error) {
+                    if (!this.isFileNotFound(error)) { throw error; }
+                    const parent = path.dirname(existing);
+                    if (parent === existing) { throw error; }
+                    existing = parent;
+                }
+            }
+            const realExisting = fs.realpathSync(existing);
+            if (realExisting !== realRoot && !isWithin(realRoot, realExisting)) {
+                return 'Symbolic link resolves outside the workspace; action blocked';
+            }
+        } catch {
+            return 'Cannot verify the resource workspace boundary; action blocked';
+        }
+        return undefined;
     }
 
-    public async keepAllChanges(): Promise<number> {
-        const changes = Array.from(this.trackedChanges.values());
-        if (changes.length === 0) {
-            return 0;
-        }
-
-        let acceptedCount = 0;
-        for (const change of changes) {
-            const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.fsPath === change.filePath);
-            const currentContent = doc?.getText() ?? change.currentContent;
-            this.fileSnapshots.set(change.filePath, currentContent);
-            if (change.isDeleted) {
-                this.baselineExistingFiles.delete(change.filePath);
-            } else {
-                this.baselineExistingFiles.add(change.filePath);
-            }
-            acceptedCount++;
-        }
-
-        this.clearTrackedChanges();
-        this.lineChanges.clear();
-        this.resetChangeBlocksCaches();
-        this.inlineViews.clear();
-        this.emitTrackChangesEvent({
-            removedFiles: changes.map(change => change.filePath),
-            baselineChanged: true
-        });
-        this.schedulePersistState();
-        return acceptedCount;
+    private actionResult(filePath: string, status: ActionResult['status'], reason?: string, bufferChanged = false): ActionResult {
+        return { filePath, status, reason, bufferChanged };
     }
 
-    public async revertFile(filePath: string): Promise<boolean> {
-        const change = this.trackedChanges.get(filePath);
-        if (!change) {
-            return false;
-        }
-
-        const restored = await this.restoreFileToContent(
-            change.filePath,
-            change.originalContent,
-            { deleteIfMissingInBaseline: !this.baselineExistingFiles.has(change.filePath) }
-        );
-        if (!restored) {
-            return false;
-        }
-
+    private clearFileReview(filePath: string, baselineChanged = false): void {
         this.deleteTrackedChange(filePath);
         this.lineChanges.delete(filePath);
         this.markLineChangesUpdated(filePath);
         this.inlineViews.delete(filePath);
-        this.emitTrackChangesEvent({ removedFiles: [filePath] });
+        this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
+    }
 
-        return true;
+    private async runFileBatch(action: (filePath: string) => Promise<ActionResult>): Promise<BatchActionResult> {
+        const targets = Array.from(this.trackedChanges.values());
+        const results: ActionResult[] = [];
+        for (const target of targets) {
+            if (this.trackedChanges.get(target.filePath) !== target) {
+                results.push(this.actionResult(target.filePath, 'conflict', 'File review changed during batch; review again'));
+                continue;
+            }
+            try {
+                results.push(await action(target.filePath));
+            } catch {
+                results.push(this.actionResult(target.filePath, 'failed', 'Unexpected file action error; review retained'));
+            }
+        }
+        const succeeded = results.filter(result => result.status === 'success').length;
+        return { results, succeeded, failed: results.length - succeeded };
+    }
+
+    public async revertAllChanges(): Promise<BatchActionResult> {
+        return this.runFileBatch(filePath => this.revertFile(filePath));
+    }
+
+    public async keepAllChanges(): Promise<BatchActionResult> {
+        return this.runFileBatch(filePath => this.keepAllChangesInFile(filePath));
+    }
+
+    public async revertFile(filePath: string): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+        const change = this.trackedChanges.get(filePath);
+        if (!change || !this.fileSnapshots.has(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'No known baseline is available');
+        }
+        const result = await this.restoreFileToContent(filePath, change.originalContent, {
+            deleteIfMissingInBaseline: !this.baselineExistingFiles.has(filePath)
+        });
+        if (result.status !== 'success') { return result; }
+        // Verify persisted state, including existence, before removing this item.
+        const current = await this.readCurrentFileState(filePath);
+        const baselineExists = this.baselineExistingFiles.has(filePath);
+        if ((baselineExists && (current.kind !== 'text' || current.content !== change.originalContent)) ||
+            (!baselineExists && current.kind !== 'missing')) {
+            return this.actionResult(filePath, 'conflict', 'File does not match the baseline after revert; review retained', result.bufferChanged);
+        }
+        this.clearFileReview(filePath);
+        return result;
     }
 
     private async restoreFileToContent(
         filePath: string,
         content: string,
         options?: { deleteIfMissingInBaseline?: boolean }
-    ): Promise<boolean> {
+    ): Promise<ActionResult> {
         const uri = vscode.Uri.file(filePath);
+        const openDoc = vscode.workspace.textDocuments.find(doc => doc.uri.fsPath === filePath && doc.uri.scheme === 'file');
+        if (openDoc?.isDirty) {
+            return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; file skipped');
+        }
+        const state = await this.readCurrentFileState(filePath);
+        if (state.kind === 'unavailable') {
+            this.markFileUnavailable(filePath, state.reason);
+            return this.actionResult(filePath, 'failed', state.reason);
+        }
         if (options?.deleteIfMissingInBaseline) {
             return this.deleteFileForMissingBaseline(uri, filePath);
         }
-
+        let bufferChanged = false;
+        let editedDocument: vscode.TextDocument | undefined;
+        let beforeText: string | undefined;
+        this.pendingWriteFiles.add(filePath);
+        this.activeWriteFiles.add(filePath);
         try {
+            if (state.kind === 'missing') {
+                // Only confirmed absence permits creation. No overwrite fallback after open/save errors.
+                const edit = new vscode.WorkspaceEdit();
+                edit.createFile(uri, { overwrite: false, ignoreIfExists: false, contents: new TextEncoder().encode(content) });
+                const targetError = this.validateActionTarget(filePath);
+                if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+                if (!await vscode.workspace.applyEdit(edit)) {
+                    return this.actionResult(filePath, 'failed', 'File creation was rejected');
+                }
+                return this.actionResult(filePath, 'success');
+            }
             const doc = await vscode.workspace.openTextDocument(uri);
+            if (doc.isDirty) {
+                return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; file skipped');
+            }
+            editedDocument = doc;
+            beforeText = doc.getText();
             const edit = new vscode.WorkspaceEdit();
-            const fullRange = this.getFullDocumentRange(doc);
-
-            edit.replace(uri, fullRange, content);
-            const success = await vscode.workspace.applyEdit(edit);
-            if (!success) {
-                return false;
+            edit.replace(uri, this.getFullDocumentRange(doc), content);
+            const targetError = this.validateActionTarget(filePath);
+            if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+            if (!await vscode.workspace.applyEdit(edit)) {
+                bufferChanged = doc.getText() !== beforeText;
+                return this.actionResult(filePath, 'failed', 'Editor rejected the revert; review retained', bufferChanged);
             }
-
-            await doc.save();
-            this.fileSnapshots.set(filePath, doc.getText());
-            return true;
+            bufferChanged = true;
+            const saveTargetError = this.validateActionTarget(filePath);
+            if (saveTargetError) { return this.actionResult(filePath, 'conflict', saveTargetError, true); }
+            if (!await doc.save()) {
+                this.markFileUnavailable(filePath, 'Editor buffer changed but saving failed; pending review retained');
+                return this.actionResult(filePath, 'failed', 'Editor buffer changed but saving failed; pending review retained', true);
+            }
+            bufferChanged = false;
+            return this.actionResult(filePath, 'success', undefined, true);
         } catch {
-            // File may have been deleted. Recreate it from the snapshot content.
-            try {
-                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(filePath)));
-                await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-                this.fileSnapshots.set(filePath, content);
-                return true;
-            } catch (error) {
-                console.error(`Failed to restore ${filePath}:`, error);
-                return false;
+            if (editedDocument && beforeText !== undefined) {
+                bufferChanged = bufferChanged || editedDocument.getText() !== beforeText;
             }
+            const reason = bufferChanged
+                ? 'Editor buffer changed but saving failed; pending review retained'
+                : 'Revert failed (open, edit or provider error); review retained';
+            if (bufferChanged) { this.markFileUnavailable(filePath, reason); }
+            return this.actionResult(filePath, 'failed', reason, bufferChanged);
+        } finally {
+            this.activeWriteFiles.delete(filePath);
+            // Keep the failed buffer from erasing the disk-level pending entry via document events.
+            if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
         }
     }
 
-    private async deleteFileForMissingBaseline(uri: vscode.Uri, filePath: string): Promise<boolean> {
+    private async deleteFileForMissingBaseline(uri: vscode.Uri, filePath: string): Promise<ActionResult> {
+        const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+        if (doc?.isDirty) {
+            return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; file skipped');
+        }
         try {
             const edit = new vscode.WorkspaceEdit();
             edit.deleteFile(uri, { ignoreIfNotExists: true, recursive: false });
-            const success = await vscode.workspace.applyEdit(edit);
-            if (!success) {
-                return false;
+            const targetError = this.validateActionTarget(filePath);
+            if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+            if (!await vscode.workspace.applyEdit(edit)) {
+                return this.actionResult(filePath, 'failed', 'Editor rejected new-file deletion');
             }
-
-            this.fileSnapshots.set(filePath, '');
-            this.baselineExistingFiles.delete(filePath);
-            return true;
-        } catch (error) {
-            console.error(`Failed to delete new file ${filePath}:`, error);
-            return false;
+            return this.actionResult(filePath, 'success');
+        } catch {
+            return this.actionResult(filePath, 'failed', 'New-file deletion failed; review retained');
         }
     }
 
@@ -1560,22 +1637,34 @@ export class DiffTracker {
     /**
      * Revert a specific change block to its original content
      */
-    public async revertBlock(filePath: string, blockRef: string | number): Promise<boolean> {
+    public async revertBlock(filePath: string, blockRef: string | number): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
         const originalContent = this.fileSnapshots.get(filePath);
 
         if (originalContent === undefined) {
-            return false;
+            return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained');
         }
 
+        if (this.trackedChanges.get(filePath)?.unavailableReason) {
+            return this.actionResult(filePath, 'failed', 'File is unavailable; refresh before block actions');
+        }
         const block = this.resolveBlock(filePath, blockRef);
         if (!block) {
-            return false;
+            return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained');
         }
 
+        let editedDocument: vscode.TextDocument | undefined;
+        let beforeText: string | undefined;
         try {
             const uri = vscode.Uri.file(filePath);
             const doc = await vscode.workspace.openTextDocument(uri);
-            const currentModel = this.toTextLineModel(doc.getText());
+            if (doc.isDirty) {
+                return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; block skipped');
+            }
+            editedDocument = doc;
+            beforeText = doc.getText();
+            const currentModel = this.toTextLineModel(beforeText);
             const originalModel = this.toTextLineModel(originalContent);
             const nextLines = [...currentModel.lines];
             const startIdx = Math.max(0, block.startLine - 1);
@@ -1604,24 +1693,39 @@ export class DiffTracker {
             );
 
             if (nextText === doc.getText()) {
-                return true;
+                return this.actionResult(filePath, 'success');
             }
 
             const edit = new vscode.WorkspaceEdit();
             const fullRange = this.getFullDocumentRange(doc);
             edit.replace(uri, fullRange, nextText);
 
+            const targetError = this.validateActionTarget(filePath);
+            if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+            this.pendingWriteFiles.add(filePath);
+            this.activeWriteFiles.add(filePath);
             const success = await vscode.workspace.applyEdit(edit);
             if (!success) {
-                return false;
+                const bufferChanged = doc.getText() !== beforeText;
+                if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
+                else { this.markFileUnavailable(filePath, 'Block edit failed after changing the editor buffer; review retained'); }
+                return this.actionResult(filePath, 'failed', 'Block edit was rejected; review retained', bufferChanged);
             }
+            this.pendingWriteFiles.delete(filePath);
 
             // Refresh immediately so WebView/CodeLens state does not wait for debounced document-change events.
             this.updateTrackedDiff(filePath, nextText);
-            return true;
-        } catch (error) {
-            console.error(`Failed to revert block in ${filePath}:`, error);
-            return false;
+            return this.actionResult(filePath, 'success', undefined, true);
+        } catch {
+            const bufferChanged = !!editedDocument && beforeText !== undefined && editedDocument.getText() !== beforeText;
+            if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
+            else {
+                this.pendingWriteFiles.add(filePath);
+                this.markFileUnavailable(filePath, 'Block edit failed after changing the editor buffer; review retained');
+            }
+            return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained', bufferChanged);
+        } finally {
+            this.activeWriteFiles.delete(filePath);
         }
     }
 
@@ -1629,17 +1733,26 @@ export class DiffTracker {
      * Keep a specific change block (accept the changes)
      * Updates the snapshot so this block's changes become the new baseline
      */
-    public async keepBlock(filePath: string, blockRef: string | number): Promise<boolean> {
+    public async keepBlock(filePath: string, blockRef: string | number): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+        if (this.trackedChanges.get(filePath)?.unavailableReason) {
+            return this.actionResult(filePath, 'failed', 'File is unavailable; refresh before block actions');
+        }
+        const currentState = await this.readFileSnapshot(vscode.Uri.file(filePath));
+        if (currentState.kind !== 'text' || this.trackedChanges.get(filePath)?.isDeleted) {
+            return this.actionResult(filePath, 'conflict', 'Missing or unavailable files require a file-level review');
+        }
         const block = this.resolveBlock(filePath, blockRef);
         if (!block) {
-            return false;
+            return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained');
         }
         const originalContent = this.fileSnapshots.get(filePath);
         const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
         const currentText = doc?.getText() ?? this.trackedChanges.get(filePath)?.currentContent;
 
         if (originalContent === undefined || currentText === undefined) {
-            return false;
+            return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained');
         }
 
         const originalModel = this.toTextLineModel(originalContent);
@@ -1692,54 +1805,46 @@ export class DiffTracker {
             currentModel.dominantEol
         );
         this.fileSnapshots.set(filePath, newSnapshot);
+        const currentExists = true;
         this.baselineExistingFiles.add(filePath);
         this.schedulePersistState();
 
         // Recompute diff against updated snapshot
-        this.updateTrackedDiff(filePath, currentText, { baselineChanged: true });
-        return true;
+        this.updateTrackedDiff(filePath, currentText, { baselineChanged: true, currentExists });
+        return this.actionResult(filePath, 'success');
     }
 
     /**
      * Keep all changes in a file (accept all changes)
      * Updates the snapshot to match current document content
      */
-    public async keepAllChangesInFile(filePath: string): Promise<boolean> {
+    public async keepAllChangesInFile(filePath: string): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
         const tracked = this.trackedChanges.get(filePath);
-        let currentContent = tracked?.currentContent;
-
-        if (currentContent === undefined) {
-            let doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
-            if (!doc) {
-                try {
-                    doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-                } catch {
-                    return false;
-                }
-            }
-            currentContent = doc.getText();
+        if (!tracked || !this.fileSnapshots.has(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'No known baseline is available');
         }
-
-        // Update snapshot to current content
+        const state = await this.readCurrentFileState(filePath);
+        if (state.kind === 'unavailable') {
+            this.markFileUnavailable(filePath, state.reason);
+            return this.actionResult(filePath, 'conflict', state.reason);
+        }
+        const currentContent = state.kind === 'text' ? state.content : '';
+        if (currentContent !== tracked.currentContent || (state.kind === 'missing') !== tracked.isDeleted) {
+            this.updateTrackedDiff(filePath, currentContent, { currentExists: state.kind === 'text' });
+            return this.actionResult(filePath, 'conflict', 'File changed since review; review again');
+        }
         this.fileSnapshots.set(filePath, currentContent);
-        if (tracked?.isDeleted) {
+        if (state.kind === 'missing') {
             this.baselineExistingFiles.delete(filePath);
         } else {
             this.baselineExistingFiles.add(filePath);
         }
-
-        // Clear tracked changes for this file
-        this.deleteTrackedChange(filePath);
-        this.lineChanges.delete(filePath);
-        this.markLineChangesUpdated(filePath);
-        this.inlineViews.delete(filePath);
-
-        this.emitTrackChangesEvent({
-            removedFiles: [filePath],
-            baselineChanged: true
-        });
+        this.pendingWriteFiles.delete(filePath);
+        this.clearFileReview(filePath, true);
         this.schedulePersistState();
-        return true;
+        return this.actionResult(filePath, 'success');
     }
 
     /**
@@ -2004,18 +2109,8 @@ export class DiffTracker {
         // We do this immediately (before debounce) to avoid autosave overwriting
         // the on-disk content and erasing the true baseline.
         if (!this.fileSnapshots.has(filePath)) {
-            // Defensive fallback: normal path should be covered by start/open snapshot capture.
-            try {
-                const originalContent = fs.readFileSync(filePath, 'utf8');
-                this.fileSnapshots.set(filePath, originalContent);
-                this.baselineExistingFiles.add(filePath);
-                this.schedulePersistState();
-            } catch (error) {
-                // File doesn't exist on disk (truly new file), use empty
-                this.fileSnapshots.set(filePath, '');
-                this.baselineExistingFiles.delete(filePath);
-                this.schedulePersistState();
-            }
+            this.ensureSnapshotForDocument(doc);
+            if (!this.fileSnapshots.has(filePath)) { return; }
         }
 
         const existingTimer = this.documentChangeTimers.get(filePath);
@@ -2049,8 +2144,18 @@ export class DiffTracker {
             return;
         }
 
-        const currentContent = doc.getText();
-        this.updateTrackedDiff(filePath, currentContent);
+        if (this.pendingWriteFiles.has(filePath)) { return; }
+        try {
+            fs.statSync(filePath);
+        } catch (error) {
+            if (this.isFileNotFound(error) && !doc.isDirty) {
+                this.updateTrackedDiff(filePath, '', { currentExists: false });
+            } else {
+                this.markFileUnavailable(filePath, 'Resource is missing or unreadable while editor changes remain');
+            }
+            return;
+        }
+        this.updateTrackedDiff(filePath, doc.getText());
     }
 
     private ensureInlineView(filePath: string): InlineDiffView | undefined {
@@ -2098,8 +2203,36 @@ export class DiffTracker {
             return;
         }
 
-        this.fileSnapshots.set(filePath, doc.getText());
-        this.baselineExistingFiles.add(filePath);
+        if (this.trackedChanges.get(filePath)?.unavailableReason) { return; }
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { this.markFileUnavailable(filePath, targetError); return; }
+
+        try {
+            const stat = fs.statSync(filePath);
+            if (!stat.isFile() || stat.size > 5 * 1024 * 1024) {
+                this.markFileUnavailable(filePath, 'Baseline is unsupported or exceeds the 5 MiB limit');
+                return;
+            }
+            const bytes = fs.readFileSync(filePath);
+            if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+                this.markFileUnavailable(filePath, 'UTF-8 BOM baseline is unsupported in this development build');
+                return;
+            }
+            if (this.isLikelyBinaryContent(bytes)) {
+                this.markFileUnavailable(filePath, 'Binary baseline content is unsupported');
+                return;
+            }
+            const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            this.fileSnapshots.set(filePath, content);
+            this.baselineExistingFiles.add(filePath);
+        } catch (error) {
+            if (!this.isFileNotFound(error)) {
+                this.markFileUnavailable(filePath, 'Baseline cannot be read or decoded');
+                return;
+            }
+            this.fileSnapshots.set(filePath, '');
+            this.baselineExistingFiles.delete(filePath);
+        }
         this.schedulePersistState();
     }
 

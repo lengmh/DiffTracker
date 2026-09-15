@@ -116,11 +116,16 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         const item = new TreeItem(displayName, vscode.TreeItemCollapsibleState.None);
         item.filePath = fileDiff.filePath;
         item.isDeleted = fileDiff.isDeleted;
+        item.description = fileDiff.unavailableReason ? `Unavailable: ${fileDiff.unavailableReason}` : undefined;
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
         item.iconPath = vscode.ThemeIcon.File;
         item.tooltip = fileDiff.isDeleted
             ? `${fileDiff.filePath}\nDeleted from disk`
             : fileDiff.filePath;
+
+        if (fileDiff.unavailableReason) {
+            item.tooltip += `\n${fileDiff.unavailableReason}`;
+        }
 
         // Open with configured default mode
         item.command = {

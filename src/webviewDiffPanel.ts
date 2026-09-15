@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ChangeBlock, DiffTracker, TrackChangesEvent } from './diffTracker';
+import { ActionResult, ChangeBlock, DiffTracker, TrackChangesEvent } from './diffTracker';
 
 type WebviewChangeBlockPayload = {
     blockId: string;
@@ -178,6 +178,9 @@ export class WebviewDiffPanel {
             command: 'updateData',
             filePath: this.filePath,
             fileName,
+            hasFileChange: !!fileChange,
+            isDeleted: fileChange?.isDeleted ?? false,
+            unavailableReason: fileChange?.unavailableReason,
             lang,
             oldContents: logicalOriginalContent,
             newContents: logicalCurrentContent,
@@ -189,61 +192,36 @@ export class WebviewDiffPanel {
     }
 
     private async handleMessage(message: WebviewInboundMessage): Promise<void> {
+        const mutationCommands: Record<string, string> = {
+            revertBlock: 'diffTracker.revertBlock',
+            keepBlock: 'diffTracker.keepBlock',
+            keepAll: 'diffTracker.keepAllBlocksInFile',
+            revertAll: 'diffTracker.revertAllBlocksInFile'
+        };
+        const actionCommand = mutationCommands[message.command];
+        if (Object.prototype.hasOwnProperty.call(mutationCommands, message.command)) {
+            const blockRef = message.changeBlockId ?? message.changeBlockIndex;
+            const isBlock = message.command === 'revertBlock' || message.command === 'keepBlock';
+            if (message.filePath !== this.filePath ||
+                !this.diffTracker.getTrackedChanges().some(change => change.filePath === this.filePath) ||
+                (isBlock && typeof blockRef !== 'string' && typeof blockRef !== 'number')) {
+                this.postActionAck(message.requestId, false, 'Review target is unavailable; reopen the file');
+                return;
+            }
+            try {
+                const result = await vscode.commands.executeCommand<ActionResult>(
+                    actionCommand, this.filePath, ...(isBlock ? [blockRef] : [])
+                );
+                this.postActionAck(message.requestId, result?.status === 'success', result?.reason ?? 'Action did not complete', result);
+            } catch (error) {
+                this.postActionAck(message.requestId, false, error);
+            }
+            // Command events may arrive before their acknowledgement. Send the current
+            // state after the acknowledgement too, so controls can leave their busy state.
+            this.sendDataUpdate();
+            return;
+        }
         switch (message.command) {
-            case 'revertBlock':
-                if (message.filePath && (message.changeBlockId !== undefined || message.changeBlockIndex !== undefined)) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.revertBlock',
-                            message.filePath,
-                            message.changeBlockId ?? message.changeBlockIndex
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'keepBlock':
-                if (message.filePath && (message.changeBlockId !== undefined || message.changeBlockIndex !== undefined)) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.keepBlock',
-                            message.filePath,
-                            message.changeBlockId ?? message.changeBlockIndex
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'keepAll':
-                if (message.filePath) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.keepAllBlocksInFile',
-                            message.filePath
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'revertAll':
-                if (message.filePath) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.revertAllBlocksInFile',
-                            message.filePath
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
             case 'setStyle':
                 if (message.style === 'split' || message.style === 'unified') {
                     this.currentStyle = message.style;
@@ -262,7 +240,7 @@ export class WebviewDiffPanel {
         }
     }
 
-    private postActionAck(requestId: string | undefined, ok: boolean, error?: unknown): void {
+    private postActionAck(requestId: string | undefined, ok: boolean, error?: unknown, result?: ActionResult): void {
         if (!requestId) {
             return;
         }
@@ -271,6 +249,8 @@ export class WebviewDiffPanel {
             command: 'actionAck',
             requestId,
             ok,
+            status: result?.status ?? (ok ? 'success' : 'failed'),
+            bufferChanged: result?.bufferChanged ?? false,
             error: ok ? undefined : (error instanceof Error ? error.message : String(error ?? 'Unknown error'))
         });
     }
@@ -538,6 +518,9 @@ export class WebviewDiffPanel {
         const btnRejectAll = document.getElementById('btn-reject-all');
 
         let filePath = ${serializedFilePath};
+        let hasFileChange = ${!!fileChange};
+        let isDeleted = ${fileChange?.isDeleted ?? false};
+        let unavailableReason = ${this.serializeForInlineScript(fileChange?.unavailableReason ?? '')};
 
         const oldFile = {
             name: ${serializedFileName},
@@ -598,7 +581,7 @@ export class WebviewDiffPanel {
         }
 
         function updateToolbarMutationState() {
-            setToolbarButtonsDisabled(isMutationLocked());
+            setToolbarButtonsDisabled(isMutationLocked() || !!unavailableReason || !hasFileChange);
         }
 
         function setBlockWrapperBusy(wrapper, busy) {
@@ -921,6 +904,25 @@ export class WebviewDiffPanel {
             currentStyle = style;
             container.innerHTML = '';
 
+            if (unavailableReason) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                notice.textContent = 'Review unavailable: ' + unavailableReason;
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
+
+            // File existence is reviewable even when there are no text hunks.
+            if (hasFileChange && oldFile.contents === newFile.contents && changeBlocks.length === 0) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                notice.textContent = isDeleted ? 'Empty file deleted — Keep or Revert this file.' : 'Empty file created — Keep or Revert this file.';
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
+
             // Check for no changes: both content identical AND no change blocks
             const hasContentDiff = oldFile.contents !== newFile.contents;
             const hasBlocks = changeBlocks.length > 0;
@@ -1020,7 +1022,7 @@ export class WebviewDiffPanel {
                     pendingGlobalActionRequestId = null;
                 }
 
-                const ok = message.ok !== false;
+                const ok = message.ok === true;
                 debugActionFlow('ack', {
                     requestId,
                     ok,
@@ -1053,6 +1055,9 @@ export class WebviewDiffPanel {
                     oldFile.lang = message.lang;
                     newFile.lang = message.lang;
                 }
+                hasFileChange = message.hasFileChange === true;
+                isDeleted = message.isDeleted === true;
+                unavailableReason = typeof message.unavailableReason === 'string' ? message.unavailableReason : '';
                 oldFile.contents = message.oldContents;
                 newFile.contents = message.newContents;
                 // Replace array reference atomically to avoid race conditions
