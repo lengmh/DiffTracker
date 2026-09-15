@@ -1,10 +1,21 @@
-const path = require('node:path');
-const Mocha = require('mocha');
+const runExtensionHostScenario = require('./extension.test.cjs');
 
-exports.run = () => new Promise((resolve, reject) => {
-    const mocha = new Mocha({ ui: 'tdd', color: true, timeout: 90_000 });
-    mocha.addFile(path.resolve(__dirname, 'extension.test.cjs'));
-    mocha.run(failures => failures > 0
-        ? reject(new Error(`${failures} Extension Host test(s) failed`))
-        : resolve());
-});
+exports.run = async () => {
+    let timeout;
+    try {
+        await Promise.race([
+            runExtensionHostScenario(),
+            new Promise((_, reject) => {
+                timeout = setTimeout(
+                    () => reject(new Error('Diff Tracker Extension Host scenario timed out')),
+                    90_000
+                );
+            })
+        ]);
+        console.log('PASS Diff Tracker real Extension Host scenario');
+    } finally {
+        if (timeout) {
+            clearTimeout(timeout);
+        }
+    }
+};

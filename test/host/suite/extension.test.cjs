@@ -42,8 +42,7 @@ const missing = async name => {
     catch (error) { return error instanceof vscode.FileSystemError; }
 };
 
-suite('Diff Tracker real Extension Host', () => {
-    test('review, recovery, lifecycle, Git pause and no-tab behavior', async () => {
+module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
         const extension = vscode.extensions.getExtension('lengmh.diff-tracker');
         assert.ok(extension, 'development extension is installed');
@@ -164,5 +163,4 @@ suite('Diff Tracker real Extension Host', () => {
         assert.ok(pausedRepository?.repoRoot, 'paused repository root is exposed for explicit recovery');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
         await until('Git baseline rebuild', async () => (await state()).gitPauses.length === 0 && (await state()).reviewTokens.length === 0);
-    });
-});
+};
