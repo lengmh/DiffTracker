@@ -90,7 +90,10 @@ suite('Diff Tracker real Extension Host', () => {
         assert.equal(await read('deleted.txt'), 'delete baseline\n');
         assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
         assert.equal(await missing('deleted.txt'), true);
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath)).status, 'success');
+        await until('review refresh after deleted-file recovery Undo', async () =>
+            (await pending('deleted.txt'))?.isDeleted === true);
+        const deletedAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);
+        assert.equal(deletedAgain.status, 'success', deletedAgain.reason);
 
         // A batch creates one bounded recovery record for its successful members.
         await write('batch-a.txt', 'batch a changed\n');
