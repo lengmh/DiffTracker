@@ -448,6 +448,15 @@ test('DT-09 Undo Last Revert recreates an unaccepted new file',async()=>{
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
     const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(disk(p),'new content'); assert.ok(pending(p));
 });
+test('DT-09 failed recovery content write retains the record after creating the resource',async()=>{
+    const p=file(); fs.writeFileSync(p,'new content'); await tracker.onExternalFileCreated(Uri.file(p));
+    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    faults.set(p,{write:error('NoPermissions')});
+    const undo=await tracker.undoLastRevert();
+    assert.equal(undo.succeeded,0); assert.equal(undo.failed,1); assert.equal(undo.results[0].bufferChanged,true);
+    assert.equal(fs.existsSync(p),true); assert.equal(disk(p),'');
+    assert.equal(tracker.revertHistory.length,1,'partial recovery remains retryable');
+});
 test('DT-09 Undo Last Revert restores a reviewed deletion after Revert recreated the file',async()=>{
     const p=file(); seed(p,'baseline'); fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p));
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'baseline');

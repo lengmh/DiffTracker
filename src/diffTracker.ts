@@ -2328,22 +2328,17 @@ export class DiffTracker {
                 if (!await vscode.workspace.applyEdit(createEdit)) {
                     return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file creation', true);
                 }
-                const document = await vscode.workspace.openTextDocument(uri);
                 if (!this.isCurrentEpoch(epoch)) {
                     return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery creation', true);
                 }
-                if (item.before.content.length > 0) {
-                    const contentEdit = new vscode.WorkspaceEdit();
-                    contentEdit.insert(uri, new vscode.Position(0, 0), item.before.content);
-                    if (!await vscode.workspace.applyEdit(contentEdit)) {
-                        return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file content', true);
-                    }
+                try {
+                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(item.before.content));
+                } catch {
+                    return this.actionResult(item.filePath, 'failed', 'Recovery file was created but writing its content failed', true);
                 }
-                if (document.getText() !== item.before.content) {
+                const created = await this.readFileSnapshot(uri);
+                if (created.kind !== 'text' || created.content !== item.before.content) {
                     return this.actionResult(item.filePath, 'failed', 'Recovery file content was not applied', true);
-                }
-                if (item.saveMode === 'disk' && !await document.save()) {
-                    return this.actionResult(item.filePath, 'failed', 'Recovery created the buffer but saving failed', true);
                 }
                 bufferChanged = false;
             } finally {
@@ -2464,21 +2459,15 @@ export class DiffTracker {
                 if (!await vscode.workspace.applyEdit(createEdit)) {
                     return this.actionResult(filePath, 'failed', 'File creation was rejected', true);
                 }
-                editedDocument = await vscode.workspace.openTextDocument(uri);
-                beforeText = '';
-                if (content.length > 0) {
-                    const contentEdit = new vscode.WorkspaceEdit();
-                    contentEdit.insert(uri, new vscode.Position(0, 0), content);
-                    if (!await vscode.workspace.applyEdit(contentEdit)) {
-                        return this.actionResult(filePath, 'failed', 'Created file content was rejected', true);
-                    }
+                try {
+                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
+                } catch {
+                    this.markFileUnavailable(filePath, 'File was created but writing its restored content failed; review retained');
+                    return this.actionResult(filePath, 'failed', 'File was created but writing its restored content failed; review retained', true);
                 }
-                if (editedDocument.getText() !== content) {
+                const created = await this.readFileSnapshot(uri);
+                if (created.kind !== 'text' || created.content !== content) {
                     return this.actionResult(filePath, 'failed', 'Created file content was not applied', true);
-                }
-                if (!await editedDocument.save()) {
-                    this.markFileUnavailable(filePath, 'File was created but saving its restored content failed; review retained');
-                    return this.actionResult(filePath, 'failed', 'File was created but saving its restored content failed; review retained', true);
                 }
                 bufferChanged = false;
                 return this.actionResult(filePath, 'success', undefined, true);
