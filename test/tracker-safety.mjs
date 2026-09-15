@@ -962,6 +962,12 @@ test('DT-09 Undo rejects a document refreshed to newer content while opening',as
     document(p).text='new editor content';gate.release();assert.equal((await operation).succeeded,0);
     assert.equal(document(p).getText(),'new editor content');assert.equal(disk(p),'base');assert.equal(tracker.revertHistory.length,1);
 });
+test('DT-08 delayed watcher read cannot erase a newer dirty editor review',async()=>{
+    const p=file();seed(p,'base');const doc=document(p),gate=pause(p,'read');
+    const operation=scan(p);await gate.entered;doc.text='native Undo content';doc.isDirty=true;doc.version++;
+    tracker.processDocumentChange(doc);assert.ok(pending(p));gate.release();await operation;
+    assert.ok(pending(p));assert.equal(doc.getText(),'native Undo content');assert.equal(disk(p),'base');
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
