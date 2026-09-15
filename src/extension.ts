@@ -1,3 +1,4 @@
+import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
 import { DiffTracker, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
@@ -198,7 +199,7 @@ export async function activate(context: vscode.ExtensionContext) {
             const currentUri = vscode.Uri.file(filePath);
             const originalUri = currentUri.with({ scheme: 'diff-tracker-original' });
 
-            const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'file';
+            const fileName = displayFileName(filePath);
 
             await vscode.commands.executeCommand('vscode.diff',
                 originalUri,

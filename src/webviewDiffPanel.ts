@@ -1,3 +1,4 @@
+import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
 import { ChangeBlock, DiffTracker, TrackChangesEvent } from './diffTracker';
 
@@ -142,7 +143,7 @@ export class WebviewDiffPanel {
 
     public update(filePath: string): void {
         this.filePath = filePath;
-        const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(filePath);
         this.panel.title = `Diff: ${fileName}`;
 
         if (this.isInitialized) {
@@ -170,7 +171,7 @@ export class WebviewDiffPanel {
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
         const changeBlocks = this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
-        const fileName = this.filePath.split('/').pop() || this.filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(this.filePath);
         const lang = this.getLangForFileName(fileName);
 
         this.panel.webview.postMessage({
@@ -320,7 +321,7 @@ export class WebviewDiffPanel {
         const currentContent = fileChange?.currentContent ?? originalContent;
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
-        const fileName = this.filePath.split('/').pop() || this.filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(this.filePath);
         const escapedFileName = this.escapeHtml(fileName);
 
         // Get change blocks from diffTracker - this is the source of truth for block indexing

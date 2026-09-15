@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
+import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
 import { DiffTracker, FileDiff } from './diffTracker';
 
 interface DirNode {
@@ -111,7 +111,8 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
     }
 
     private createFileItem(fileDiff: FileDiff): TreeItem {
-        const displayName = fileDiff.isDeleted ? `${fileDiff.fileName} [Deleted]` : fileDiff.fileName;
+        const fileName = displayFileName(fileDiff.filePath);
+        const displayName = fileDiff.isDeleted ? `${fileName} [Deleted]` : fileName;
         const item = new TreeItem(displayName, vscode.TreeItemCollapsibleState.None);
         item.filePath = fileDiff.filePath;
         item.isDeleted = fileDiff.isDeleted;
@@ -134,28 +135,16 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         return item;
     }
 
-    private toWorkspaceRelative(filePath: string): string {
-        const uri = vscode.Uri.file(filePath);
-        const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
-        if (!workspaceFolder) {
-            return path.basename(filePath);
-        }
-
-        const relativePath = path.relative(workspaceFolder.uri.fsPath, filePath);
-        const normalizedRelative = relativePath.split(path.sep).join('/');
-
-        // Avoid collisions across workspace folders in multi-root workspaces.
-        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-        if (workspaceFolders.length > 1) {
-            return `${workspaceFolder.name}/${normalizedRelative}`;
-        }
-
-        return normalizedRelative;
+    private toWorkspaceRelative(filePath: string): string[] {
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+        return workspaceDisplayParts(
+            filePath,
+            workspaceFolder && { fsPath: workspaceFolder.uri.fsPath, name: workspaceFolder.name },
+            (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+        );
     }
 
-    private insertFileIntoTree(rootNode: DirNode, relativePath: string, fileDiff: FileDiff): void {
-        const normalized = relativePath.replace(/\\/g, '/');
-        const parts = normalized.split('/').filter(Boolean);
+    private insertFileIntoTree(rootNode: DirNode, parts: string[], fileDiff: FileDiff): void {
         if (parts.length === 0) {
             rootNode.files.push(fileDiff);
             return;

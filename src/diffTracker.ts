@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { displayFileName } from './utils/displayPath';
 import * as Diff from 'diff';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -1355,7 +1356,7 @@ export class DiffTracker {
             '\n'
         );
         const changes = Diff.diffLines(normalizedOriginal, normalizedCurrent);
-        const fileName = filePath.split('/').pop() || filePath;
+        const fileName = displayFileName(filePath);
         const isDeleted = originalContent.length > 0 && currentContent.length === 0;
 
         this.setTrackedChange(filePath, {
