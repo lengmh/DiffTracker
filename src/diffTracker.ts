@@ -1427,7 +1427,7 @@ export class DiffTracker {
             this.baselineBuilding = false;
             this._onDidChangeBaselineState.fire('ready');
         }
-        this.processPendingExternalChanges();
+        await this.processPendingExternalChanges();
         this.schedulePersistState();
     }
 

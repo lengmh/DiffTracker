@@ -56,6 +56,7 @@ function getDefaultOpenMode(): DefaultOpenMode {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+    const runningExtensionTests = context.extensionMode === vscode.ExtensionMode.Test;
 
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
@@ -238,7 +239,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const reason = event.kind === 'changed'
             ? diffTracker.observeGitContext(event.context)
             : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
-        if (!reason || gitPromptInFlight.has(repoRoot)) { return; }
+        if (!reason || runningExtensionTests || gitPromptInFlight.has(repoRoot)) { return; }
         gitPromptInFlight.add(repoRoot);
         try {
             const answer = await vscode.window.showWarningMessage(
@@ -276,6 +277,35 @@ export async function activate(context: vscode.ExtensionContext) {
             stopRecordingFlow();
         })
     );
+
+    if (runningExtensionTests) {
+        context.subscriptions.push(
+            vscode.commands.registerCommand('diffTracker._testState', () => ({
+                isRecording: diffTracker.getIsRecording(),
+                baselineState: diffTracker.getBaselineState(),
+                reviewTokens: diffTracker.getReviewTokens(),
+                trackedChanges: diffTracker.getTrackedChanges(),
+                gitPauses: diffTracker.getPausedGitRepositories()
+            })),
+            vscode.commands.registerCommand('diffTracker._testRevertFile', (filePath: string) => {
+                const token = diffTracker.getReviewToken(filePath);
+                return token ? diffTracker.revertFile(filePath, token) : undefined;
+            }),
+            vscode.commands.registerCommand('diffTracker._testRevertBlock', (filePath: string) => {
+                const token = diffTracker.getReviewToken(filePath);
+                const block = diffTracker.getChangeBlocks(filePath)[0];
+                return token && block ? diffTracker.revertBlock(filePath, block.blockId, token) : undefined;
+            }),
+            vscode.commands.registerCommand('diffTracker._testRevertAll', () => {
+                return diffTracker.revertAllChanges(diffTracker.getReviewTokens());
+            }),
+            vscode.commands.registerCommand('diffTracker._testUndoLastRevert', () => diffTracker.undoLastRevert()),
+            vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
+                const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
+                return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
+            })
+        );
+    }
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.beginAutomationSession', (target?: unknown) => {
@@ -734,7 +764,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (gitContextAvailable && gitContextMonitor.isReady() &&
         (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete')) {
         diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
-    } else if (!gitContextAvailable) {
+    } else if (!gitContextAvailable && !runningExtensionTests) {
         void vscode.window.showWarningMessage(
             'Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
         );
