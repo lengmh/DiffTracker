@@ -39,6 +39,8 @@ interface GitApiLike {
     onDidChangeState: vscode.Event<'uninitialized' | 'initialized'>;
     onDidOpenRepository: vscode.Event<GitRepositoryLike>;
     onDidCloseRepository: vscode.Event<GitRepositoryLike>;
+    getRepositoryRoot?(uri: vscode.Uri): Promise<vscode.Uri | null>;
+    openRepository?(root: vscode.Uri): Promise<GitRepositoryLike | null>;
 }
 
 interface GitExtensionExportsLike {
@@ -111,6 +113,7 @@ export class GitContextMonitor implements vscode.Disposable {
             const exports = extension.isActive ? extension.exports : await extension.activate();
             if (!exports?.enabled) { return false; }
             this.api = exports.getAPI(1);
+            await this.discoverInitialRepositories();
             this.disposables.push(
                 this.api.onDidOpenRepository(repository => this.attachRepository(repository, true)),
                 this.api.onDidCloseRepository(repository => this.detachRepository(repository.rootUri.fsPath, true)),
@@ -128,6 +131,21 @@ export class GitContextMonitor implements vscode.Disposable {
         } catch {
             this.api = undefined;
             return false;
+        }
+    }
+
+    private async discoverInitialRepositories(): Promise<void> {
+        if (!this.api?.getRepositoryRoot || !this.api.openRepository) { return; }
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+            if (folder.uri.scheme !== 'file') { continue; }
+            try {
+                const root = await this.api.getRepositoryRoot(folder.uri);
+                if (root && !this.api.repositories.some(repository => repository.rootUri.fsPath === root.fsPath)) {
+                    await this.api.openRepository(root);
+                }
+            } catch {
+                // Git discovery is optional. Existing repository events remain active.
+            }
         }
     }
 

@@ -11,7 +11,7 @@ class Emitter {
 }
 class Uri { constructor(fsPath){this.fsPath=fsPath;this.scheme='file';} static file(value){return new Uri(value);} }
 let installedExtension;
-const vscode={Uri,extensions:{getExtension:id=>id==='vscode.git'?installedExtension:undefined}};
+const vscode={Uri,workspace:{workspaceFolders:[{uri:Uri.file('/workspace/repo')}]},extensions:{getExtension:id=>id==='vscode.git'?installedExtension:undefined}};
 const originalLoad=Module._load;
 Module._load=function(id,...args){return id==='vscode'?vscode:originalLoad.call(this,id,...args);};
 let api;
@@ -56,6 +56,22 @@ test('monitor uses vscode.git API v1 and reports repository state changes',async
     repo.state.HEAD={name:'feature',commit:'bbb'}; stateChanged.fire();
     assert.equal(events.at(-1).kind,'changed'); assert.equal(events.at(-1).context.headName,'feature');
     closed.fire(repo); assert.deepEqual(events.at(-1),{kind:'removed',repoRoot:'/workspace/repo'});
+    monitor.dispose();
+});
+test('monitor discovers an existing workspace repository before baseline capture',async()=>{
+    const opened=new Emitter(),closed=new Emitter(),apiState=new Emitter(),stateChanged=new Emitter();
+    const repo={rootUri:Uri.file('/workspace/repo'),kind:'repository',state:{
+        HEAD:{name:'main',commit:'aaa'},rebaseCommit:undefined,mergeChanges:[],onDidChange:stateChanged.event
+    }};
+    const repositories=[];
+    const gitApi={state:'initialized',repositories,onDidChangeState:apiState.event,
+        onDidOpenRepository:opened.event,onDidCloseRepository:closed.event,
+        async getRepositoryRoot(uri){assert.equal(uri.fsPath,'/workspace/repo');return uri;},
+        async openRepository(){repositories.push(repo);return repo;}};
+    installedExtension={isActive:true,exports:{enabled:true,getAPI:()=>gitApi}};
+    const events=[];const monitor=new api.GitContextMonitor(event=>events.push(event));
+    assert.equal(await monitor.start(),true);assert.equal(monitor.isReady(),true);
+    assert.equal(monitor.getSnapshots()[0].headName,'main');assert.deepEqual(events,[]);
     monitor.dispose();
 });
 test('Git missing or disabled degrades without throwing',async()=>{

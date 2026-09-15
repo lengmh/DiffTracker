@@ -36,7 +36,8 @@ suite('Diff Tracker real Extension Host', () => {
         // Whole-file WorkspaceEdit/save participates in native editor Undo/Redo.
         await write('existing.txt', 'whole changed\n');
         await until('whole-file pending review', () => pending('existing.txt'));
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('existing.txt').fsPath)).status, 'success');
+        const wholeRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('existing.txt').fsPath);
+        assert.equal(wholeRevert.status, 'success', wholeRevert.reason);
         assert.equal(await read('existing.txt'), 'base\n');
         const existingDocument = await vscode.workspace.openTextDocument(uri('existing.txt'));
         await vscode.window.showTextDocument(existingDocument);
