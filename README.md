@@ -1,4 +1,30 @@
-# Diff Tracker
+# Diff Tracker — Development fork
+
+
+This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) development fork of
+[TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining its MIT license and upstream attribution.
+Version 0.6.1 is a **development test build**, limited to engineering stages 0–1.
+It is **not a final stable release**: see [the audit and remaining P0 blockers](docs/engineering-audit.md).
+
+The development VSIX uses extension ID `lengmh.diff-tracker`. Disable the upstream
+`TinyTigerPan.diff-tracker` before testing: both register the same commands, views,
+and configuration keys; simultaneous operation is unsupported. The new ID has
+separate VS Code storage, so it does not automatically import an upstream review
+session. Upstream session files are left intact. Preserve your work and review
+session before switching; do not delete either extension's storage to migrate.
+
+Install: disable the upstream extension, install the development VSIX using
+**Extensions → … → Install from VSIX**, then reload VS Code. Test in a disposable
+workspace first. Roll back by disabling/removing `lengmh.diff-tracker`, re-enabling
+the upstream extension, and reloading. Rollback does not undo edits or transfer
+review decisions between their separate storage locations.
+
+Build from this branch with `npm ci`, `npm test`, then
+`npm run package -- --pre-release --out diff-tracker-0.6.1-development.vsix`.
+This build conservatively blocks actions on unreadable, binary, oversized, non-UTF-8
+and UTF-8 BOM files; BOM-preserving editor writes are not yet validated.
+No Marketplace publication is performed. Windows and real Extension Host checks
+remain separate from the mocked VS Code boundary tests.
 
 [中文说明](./README_CN.md)
 

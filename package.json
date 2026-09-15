@@ -1,14 +1,14 @@
 {
   "name": "diff-tracker",
-  "displayName": "Diff Tracker",
+  "displayName": "Diff Tracker (Development)",
   "description": "Visual file diff tracking - record and display changes in real-time",
-  "version": "0.6.0",
-  "publisher": "TinyTigerPan",
+  "version": "0.6.1",
+  "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
   "icon": "resources/marketplace-icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TinyTigerPan/DiffTracker.git"
+    "url": "https://github.com/lengmh/DiffTracker.git"
   },
   "engines": {
     "vscode": "^1.80.0"
@@ -342,7 +342,11 @@
     "test:webview-anchors": "node test/webview-annotation-mapping.mjs",
     "test:similarity-pairing": "node test/similarity-pairing.mjs",
     "lint": "eslint src --ext ts",
-    "package": "vsce package"
+    "package": "vsce package",
+    "test:paths": "node test/path-display.mjs",
+    "test:tracker-safety": "node test/tracker-safety.mjs",
+    "test:review-ui": "node test/review-ui.mjs",
+    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui"
   },
   "devDependencies": {
     "@types/node": "^20.x",

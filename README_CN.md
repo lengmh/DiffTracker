@@ -1,3 +1,9 @@
+> **开发测试分支，非最终稳定版。** 本 fork 为 `lengmh/DiffTracker`，仅实施阶段 0、1；剩余 P0 与验证边界见 [工程审查报告](docs/engineering-audit.md)。
+>
+> 开发包扩展 ID 为 `lengmh.diff-tracker`，请先禁用上游 `TinyTigerPan.diff-tracker`，不能同时启用。二者共享命令/视图/配置名称，但 session 存储隔离；本轮不自动迁移上游待审记录。回滚时禁用或卸载开发扩展，再启用上游扩展并重载；这不会撤销文件编辑或跨扩展转移审阅结果。
+>
+> 本开发版保守拒绝不可读、二进制、超限、非 UTF-8 以及 UTF-8 BOM 文件的写回。Windows/真实 VS Code Extension Host 尚未验证。
+
 # Diff Tracker
 
 Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化，并提供多种差异查看与变更处理方式，适合日常开发、代码审阅，以及 AI / 自动化工具改动后的快速验收。
