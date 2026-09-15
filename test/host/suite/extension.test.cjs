@@ -53,7 +53,7 @@ suite('Diff Tracker real Extension Host', () => {
 
         // Whole-file WorkspaceEdit/save participates in native editor Undo/Redo.
         await write('existing.txt', 'whole changed\n');
-        await until('whole-file pending review', () => pending('existing.txt'));
+        await untilStable('whole-file pending review', () => pending('existing.txt'));
         const wholeRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('existing.txt').fsPath);
         assert.equal(wholeRevert.status, 'success', wholeRevert.reason);
         assert.equal(await read('existing.txt'), 'base\n');
@@ -61,18 +61,18 @@ suite('Diff Tracker real Extension Host', () => {
         await vscode.window.showTextDocument(existingDocument);
         await vscode.commands.executeCommand('undo');
         await until('native whole-file Undo', () => existingDocument.getText() === 'whole changed\n');
-        await until('review refresh after native whole-file Undo', () => pending('existing.txt'));
+        await untilStable('review refresh after native whole-file Undo', () => pending('existing.txt'));
         const recoveryAfterNativeUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
         assert.equal(recoveryAfterNativeUndo.succeeded, 1, 'native Undo is recognized without a second inverse edit');
         assert.equal(existingDocument.getText(), 'whole changed\n');
         await vscode.commands.executeCommand('redo');
         await until('native whole-file Redo', () => existingDocument.getText() === 'base\n');
         await existingDocument.save();
-        await until('clean review after native whole-file Redo', async () => !(await pending('existing.txt')));
+        await untilStable('clean review after native whole-file Redo', async () => !(await pending('existing.txt')));
 
         // Hunk WorkspaceEdit is buffer-only and native Undo/Redo keeps disk untouched until save.
         await write('existing.txt', 'hunk changed\n');
-        await until('hunk pending review', () => pending('existing.txt'));
+        await untilStable('hunk pending review', () => pending('existing.txt'));
         await until('clean editor reload after external write', () => existingDocument.getText() === 'hunk changed\n');
         const hunkResult = await vscode.commands.executeCommand('diffTracker._testRevertBlock', uri('existing.txt').fsPath);
         assert.equal(hunkResult.status, 'success');
@@ -84,18 +84,18 @@ suite('Diff Tracker real Extension Host', () => {
         await vscode.commands.executeCommand('redo');
         await until('native hunk Redo', () => existingDocument.getText() === 'base\n');
         await existingDocument.save();
-        await until('clean review after hunk Redo', async () => !(await pending('existing.txt')));
+        await untilStable('clean review after hunk Redo', async () => !(await pending('existing.txt')));
 
         // Windows-style CRLF bytes survive a real filesystem review/revert round trip.
         await write('crlf.txt', 'one\r\nchanged\r\n');
-        await until('CRLF file pending review', () => pending('crlf.txt'));
+        await untilStable('CRLF file pending review', () => pending('crlf.txt'));
         const crlfRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('crlf.txt').fsPath);
         assert.equal(crlfRevert.status, 'success', crlfRevert.reason);
         assert.equal(await read('crlf.txt'), 'one\r\ntwo\r\n');
 
         // Extension recovery covers file creation/deletion without overwriting later work.
         await write('new-empty.txt', '');
-        await until('empty creation pending', () => pending('new-empty.txt'));
+        await untilStable('empty creation pending', () => pending('new-empty.txt'));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath)).status, 'success');
         assert.equal(await missing('new-empty.txt'), true);
         await untilStable('empty creation review cleared', async () => !(await pending('new-empty.txt')));
@@ -106,8 +106,9 @@ suite('Diff Tracker real Extension Host', () => {
         assert.equal(emptyAgain.status, 'success', emptyAgain.reason);
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));
-        await until('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath)).status, 'success');
+        await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
+        const deletedRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);
+        assert.equal(deletedRevert.status, 'success', deletedRevert.reason);
         assert.equal(await read('deleted.txt'), 'delete baseline\n');
         await untilStable('deleted-file review cleared', async () => !(await pending('deleted.txt')));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
@@ -120,7 +121,7 @@ suite('Diff Tracker real Extension Host', () => {
         // A batch creates one bounded recovery record for its successful members.
         await write('batch-a.txt', 'batch a changed\n');
         await write('batch-b.txt', 'batch b changed\n');
-        await until('batch pending reviews', async () => await pending('batch-a.txt') && await pending('batch-b.txt'));
+        await untilStable('batch pending reviews', async () => await pending('batch-a.txt') && await pending('batch-b.txt'));
         const batch = await vscode.commands.executeCommand('diffTracker._testRevertAll');
         assert.equal(batch.failed, 0);
         assert.equal(batch.succeeded, 2);
