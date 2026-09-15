@@ -1,38 +1,34 @@
-# Diff Tracker — Development fork
+# Diff Tracker
 
+Review workspace changes as they happen, then keep or safely revert them by block,
+file, or batch. Version 0.7.0 adds versioned review actions, durable session recovery,
+bounded **Undo Last Revert**, and Git-context safety.
 
-This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) development fork of
-[TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining its MIT license and upstream attribution.
-Version 0.6.2 is a **development test build**, limited to engineering stages 0–2.
-It is **not a final stable release**: see [stage 2 verification and limits](docs/stage2-verification.md)
-and [the original audit](docs/engineering-audit.md).
+This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) fork of
+[TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining the
+MIT license and upstream attribution. Its Marketplace extension ID is
+`lengmh.diff-tracker`.
 
-The development VSIX uses extension ID `lengmh.diff-tracker`. Disable the upstream
-`TinyTigerPan.diff-tracker` before testing: both register the same commands, views,
-and configuration keys; simultaneous operation is unsupported. The new ID has
-separate VS Code storage, so it does not automatically import an upstream review
-session. Upstream session files are left intact. Preserve your work and review
-session before switching; do not delete either extension's storage to migrate.
+> If `TinyTigerPan.diff-tracker` is installed, disable it before enabling this fork.
+> Both extensions register the same commands, views, and configuration keys and are
+> not supported side by side. Their VS Code storage is separate, so review sessions
+> are not migrated automatically.
 
-Install: disable the upstream extension, install the development VSIX using
-**Extensions → … → Install from VSIX**, then reload VS Code. Test in a disposable
-workspace first. Roll back by disabling/removing `lengmh.diff-tracker`, re-enabling
-the upstream extension, and reloading. Rollback does not undo edits or transfer
-review decisions between their separate storage locations.
+Diff Tracker blocks a review action when the displayed version is stale, a file is
+unsafe to decode or write, or the repository has moved to a different Git context.
+When a Git branch, detached HEAD, worktree, or conflict context changes, existing
+review data remains available but writes pause until you explicitly archive and
+rebuild that repository's baseline. Session data is written atomically and keeps a
+last-known-good copy; corrupt recovery data is reported instead of silently replaced.
 
-Build from this branch with `npm ci`, `npm test`, then
-`npm run package -- --pre-release --out diff-tracker-0.6.2-development.vsix`.
-This build conservatively blocks actions on unreadable, binary, oversized, non-UTF-8
-and UTF-8 BOM files; BOM-preserving editor writes are not yet validated.
-No Marketplace publication is performed. Windows and real Extension Host checks
-remain separate from the mocked VS Code boundary tests.
+Automation-only mode conservatively retains editor changes whose source cannot be
+proven. Saving a document does not silently accept it. Extensions can use the
+existing automation-session API to identify their own edits.
 
-Review buttons carry the version displayed; stale actions require another review.
-Automation-only mode conservatively retains unclassified editor edits alongside
-external edits. Saving alone does not accept them or establish human authorship;
-the uncertainty notice is informational and explicit Keep/Revert remains available.
-Use the existing automation-session API for tagged extension changes. Stage 3
-durability/recovery and stage 4 Git-context protection remain unfinished.
+Unsupported text encodings, binary or oversized files, UTF-8 BOM files, unreadable
+files, paths outside the workspace, and symlink write targets are review-only or
+skipped; Diff Tracker will not decode and write them back speculatively. Pure EOL
+style changes are treated as no logical content change.
 
 [中文说明](./README_CN.md)
 
@@ -103,6 +99,14 @@ When recording starts, Diff Tracker:
 
 ## Installation
 
+### Marketplace
+
+Search for **Diff Tracker** by publisher `lengmh`, or run:
+
+```bash
+code --install-extension lengmh.diff-tracker
+```
+
 ### From VSIX
 1. Download the .vsix file
 2. Open VS Code
@@ -165,6 +169,15 @@ try {
 - If you find a reproducible diff/render edge case, please open an issue with a minimal file sample.
 
 ## Release Notes
+
+### 0.7.0
+
+- Add stale-action rejection and serialized same-file review actions
+- Add atomic session persistence, last-known-good recovery, strict migration, and corruption blocking
+- Add bounded **Undo Last Revert** for file, hunk, creation, deletion, and batch reverts
+- Pause writes across Git branch, detached HEAD, worktree, and conflict-context changes
+- Preserve failed/conflicted batch items and empty-file existence semantics
+- Add Linux and Windows CI, real VS Code Stable Extension Host coverage, and performance measurements
 
 ### 0.1.0
 

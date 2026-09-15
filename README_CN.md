@@ -1,10 +1,16 @@
-> **0.6.2 开发测试分支，非最终稳定版。** 本 fork 为 `lengmh/DiffTracker`，实施范围为阶段 0—2；最新结果见 [阶段 2 验证报告](docs/stage2-verification.md)，原始证据见 [工程审查报告](docs/engineering-audit.md)。
->
-> 开发包扩展 ID 为 `lengmh.diff-tracker`，请先禁用上游 `TinyTigerPan.diff-tracker`，不能同时启用。二者共享命令/视图/配置名称，但 session 存储隔离；本轮不自动迁移上游待审记录。回滚时禁用或卸载开发扩展，再启用上游扩展并重载；这不会撤销文件编辑或跨扩展转移审阅结果。
->
-> 本开发版保守拒绝不可读、二进制、超限、非 UTF-8 以及 UTF-8 BOM 文件的写回。Windows/真实 VS Code Extension Host 尚未验证。
->
-> 审阅按钮携带显示时的版本，版本变化后需要重新审阅。automation-only 模式不把普通文档/保存事件当成人工来源证明：来源未确认的编辑与外部修改一起保留待审，不因保存自动接受。来源提示不阻止用户明确 Keep/Revert。持久化耐故障和 Git 上下文保护仍在后续阶段。
+> 本 fork 的扩展 ID 为 `lengmh.diff-tracker`。如果已经安装上游
+> `TinyTigerPan.diff-tracker`，请先禁用上游版本；二者共享命令、视图和配置
+> 名称，不支持同时启用。两者的 VS Code 存储互相隔离，待审 session 不会
+> 自动迁移。
+
+0.7.0 增加版本化审阅、耐故障 session 恢复、有界的 **Undo Last Revert**
+以及 Git 上下文保护。分支、detached HEAD、worktree 或冲突上下文改变时，
+已有待审数据会保留，但写操作暂停，直到用户明确归档并重建该仓库的基线。
+
+不可读、二进制、超限、非 UTF-8、UTF-8 BOM、工作区外路径和符号链接写入
+目标会被只读处理或跳过，不进行推测性解码写回。纯换行风格变化不作为逻辑
+内容变化。automation-only 模式也不会把普通保存事件当成人工来源证明；
+来源不明的编辑仍保留待审，需要明确 Keep 或 Revert。
 
 # Diff Tracker
 
@@ -34,6 +40,10 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
 
 ## 核心特性
 
+- [0.7.0] 审阅操作携带版本，过期 CodeLens / WebView 请求会被拒绝
+- [0.7.0] session 原子写入、上一有效副本恢复、严格 schema 迁移和损坏阻断
+- [0.7.0] 文件、块、创建、删除和批量 Revert 支持有界恢复
+- [0.7.0] Git 分支、detached HEAD、worktree 和冲突上下文改变时暂停写回
 - [新增🚀] 自动在扩展激活后开始录制文件变化
 - [新增🚀] 待处理、未接受的更改在VS Code重启后仍然保留，并从保存的基线中恢复
 - [新增🚀] 仅适用于AI/智能体或扩展驱动编辑的自动化跟踪模式
@@ -78,6 +88,14 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
 5. 将未接受 / 未回滚的录制结果持久化，在 VS Code 重启后恢复
 
 ## 安装
+
+### 从 Marketplace 安装
+
+在 VS Code 扩展页搜索发布者 `lengmh` 的 **Diff Tracker**，或使用：
+
+```bash
+code --install-extension lengmh.diff-tracker
+```
 
 ### 通过 VSIX 安装
 
@@ -171,7 +189,9 @@ try {
 - `Diff Tracker: Show Diffs`
 - `Diff Tracker: Clear Diffs`
 - `Diff Tracker: Revert All Changes`
+- `Diff Tracker: Undo Last Revert`
 - `Diff Tracker: Accept All Changes`
+- `Diff Tracker: Archive and Rebuild Paused Git Baseline`
 - `Diff Tracker: Select Default Open Mode`
 - `Diff Tracker: Edit Watch Ignores`
 
@@ -181,6 +201,15 @@ try {
 - 如果遇到可复现的 Diff 显示或渲染异常，建议提交最小复现样例以便排查
 
 ## 版本更新摘要
+
+### 0.7.0
+
+- 修复空文件、创建、删除、批量部分失败和读取/保存失败的存在性与错误语义
+- 增加过期动作拒绝、同文件动作串行化和生命周期隔离
+- 增加 session 原子持久化、上一有效副本恢复、严格迁移和损坏阻断
+- 增加文件/块/创建/删除/批量 Revert 的有界恢复
+- Git 上下文变化时保留待审数据、暂停写回并提供显式归档重建
+- 增加 Linux/Windows CI、真实 VS Code Stable Extension Host 与性能验证
 
 ### 0.6.0
 

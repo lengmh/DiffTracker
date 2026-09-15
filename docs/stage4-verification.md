@@ -43,7 +43,7 @@ extension objects.
 
 Commands on Linux (Node 24, Git available):
 
-- `npm run test:git-context`: 7/7 adapter tests passed with only the VS Code Git
+- `npm run test:git-context`: 8/8 adapter tests passed with only the VS Code Git
   extension boundary mocked.
 - `npm run test:git-repositories`: 5/5 real temporary Git-repository scenarios
   passed. No command touched the implementation repository.
@@ -57,6 +57,6 @@ Git context is a safety signal, not authorship detection. Path restore and
 `git reset --hard HEAD` can change files without changing HEAD; existing file
 watchers retain those as pending changes, but Diff Tracker does not claim to name
 their source. Same-branch non-fast-forward movement is likewise not inferred as a
-specific Git operation. No automatic reset is provided. Real VS Code Stable host,
-Windows filesystem locks/UNC paths, real rebase conflict events, and multi-window
-shared-storage behavior remain stage 5 validation items until actually run.
+specific Git operation. No automatic reset is provided. Cross-platform Stable Host
+results and the remaining manual-only boundaries are recorded in
+`stage5-verification.md`.

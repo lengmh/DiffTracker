@@ -1,14 +1,30 @@
 {
   "name": "diff-tracker",
-  "displayName": "Diff Tracker (Development)",
-  "description": "Visual file diff tracking - record and display changes in real-time",
-  "version": "0.6.2",
+  "displayName": "Diff Tracker",
+  "description": "Review, keep, and safely revert workspace file changes in real time",
+  "version": "0.7.0",
   "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
+  "license": "MIT",
   "icon": "resources/marketplace-icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/lengmh/DiffTracker.git"
+  },
+  "homepage": "https://github.com/lengmh/DiffTracker#readme",
+  "bugs": {
+    "url": "https://github.com/lengmh/DiffTracker/issues"
+  },
+  "keywords": [
+    "diff",
+    "review",
+    "changes",
+    "automation",
+    "source-control"
+  ],
+  "galleryBanner": {
+    "color": "#1f2937",
+    "theme": "dark"
   },
   "engines": {
     "vscode": "^1.80.0"
@@ -377,6 +393,7 @@
     "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories"
   },
   "devDependencies": {
+    "@pierre/diffs": "1.0.10",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.x",
     "@types/vscode": "^1.80.0",
@@ -390,7 +407,6 @@
     "typescript": "^5.2.0"
   },
   "dependencies": {
-    "@pierre/diffs": "^1.0.10",
     "diff": "^8.0.3",
     "ignore": "^5.3.2"
   }
