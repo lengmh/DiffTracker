@@ -82,7 +82,9 @@ suite('Diff Tracker real Extension Host', () => {
         assert.equal(await missing('new-empty.txt'), true);
         assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
         assert.equal(await read('new-empty.txt'), '');
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath)).status, 'success');
+        await until('review refresh after empty-file recovery Undo', () => pending('new-empty.txt'));
+        const emptyAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
+        assert.equal(emptyAgain.status, 'success', emptyAgain.reason);
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await until('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
@@ -106,6 +108,8 @@ suite('Diff Tracker real Extension Host', () => {
         assert.equal(batchUndo.succeeded, 2);
         assert.equal(await read('batch-a.txt'), 'batch a changed\n');
         assert.equal(await read('batch-b.txt'), 'batch b changed\n');
+        await until('review refresh after batch recovery Undo', async () =>
+            await pending('batch-a.txt') && await pending('batch-b.txt'));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertAll')).failed, 0);
 
         // Twenty external files update the overview without opening twenty editors.
