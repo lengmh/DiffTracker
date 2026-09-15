@@ -2,6 +2,8 @@
 
 Historical stage 0–1 report. For subsequent stage 2 changes and updated blocker
 status, see [stage2-verification.md](stage2-verification.md).
+Stage 3 recovery evidence is in [stage3-verification.md](stage3-verification.md),
+and stage 4 Git-context evidence is in [stage4-verification.md](stage4-verification.md).
 
 Date: 2026-09-15. Target: `lengmh/DiffTracker`. This change is a **development review build**, not a final stable release. Only stages 0 and 1 of `DiffTracker_0.6.0_Work_Codex_Execution_Prompt_v2.md` are authorized this round. Stages 2–5 remain deferred; the release-blocking findings below are not waived by passing stage 1 tests.
 
@@ -94,7 +96,9 @@ available. See `docs/stage3-verification.md` for the detailed evidence and limit
 DT-06 data-loss paths covered by the new harness are closed. DT-09 has production
 coverage for text/file/create/delete/batch and native-undo recognition, but actual
 VS Code Ctrl+Z/Redo and crash/reload behavior remain stage 5 host tests. DT-07 Git
-context coordination remains open until stage 4.
+context coordination is implemented in stage 4 with conservative per-repository
+pause and explicit archive/rebuild. See the stage 4 report for the exact support
+and NOT RUN matrix.
 
 
 ## Stage 1 delivery addendum

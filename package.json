@@ -168,6 +168,12 @@
         "icon": "$(discard)"
       },
       {
+        "command": "diffTracker.rebuildGitBaseline",
+        "title": "Archive and Rebuild Paused Git Baseline",
+        "category": "Diff Tracker",
+        "icon": "$(repo-pull)"
+      },
+      {
         "command": "diffTracker.revertFile",
         "title": "Revert File",
         "category": "Diff Tracker",
@@ -316,6 +322,11 @@
           "command": "diffTracker.undoLastRevert",
           "when": "view == diffTracker.changesView",
           "group": "navigation"
+        },
+        {
+          "command": "diffTracker.rebuildGitBaseline",
+          "when": "view == diffTracker.changesView",
+          "group": "navigation"
         }
       ],
       "editor/title": [
@@ -357,9 +368,11 @@
     "test:paths": "node test/path-display.mjs",
     "test:tracker-safety": "node test/tracker-safety.mjs",
     "test:review-ui": "node test/review-ui.mjs",
+    "test:git-context": "node test/git-context.mjs",
+    "test:git-repositories": "node test/git-repository-integration.mjs",
     "test:stage2-probes": "node test/known-p0.mjs",
     "test:legacy-manual-policy": "node test/legacy-manual-policy.mjs",
-    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui"
+    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories"
   },
   "devDependencies": {
     "@types/node": "^20.x",

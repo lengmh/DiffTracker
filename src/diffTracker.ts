@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
+import { compareGitContexts, GitContextSnapshot } from './gitContext';
 
 export interface FileDiff {
     sourceNote?: string;
@@ -97,6 +98,7 @@ interface PersistedTrackerState {
     fileSnapshots: Array<[string, string]>;
     baselineExistingFiles: string[];
     revertHistory: PersistedRevertRecord[];
+    gitContexts: GitContextSnapshot[];
 }
 
 export type RestoreOutcome = 'absent' | 'restored' | 'recovered' | 'incomplete' | 'blocked';
@@ -234,6 +236,7 @@ export class DiffTracker {
     private readonly persistedStateFileName = 'session-state.json';
     private readonly persistedStateTempFileName = 'session-state.tmp.json';
     private readonly persistedStateBackupFileName = 'session-state.last-good.json';
+    private readonly persistedStateArchiveFileName = 'session-state.archive.json';
     private readonly maxPersistedSnapshots = 10000;
     private readonly maxPersistedBytes = 50 * 1024 * 1024;
     private readonly maxRevertHistory = 10;
@@ -241,6 +244,8 @@ export class DiffTracker {
     private revertHistory: PersistedRevertRecord[] = [];
     private recoveryBlocked = false;
     private persistenceIssue: string | undefined;
+    private baselineGitContexts = new Map<string, GitContextSnapshot>();
+    private pausedGitRepositories = new Map<string, string>();
     private readonly _onDidChangeRecordingState = new vscode.EventEmitter<boolean>();
     private readonly _onDidTrackChanges = new vscode.EventEmitter<TrackChangesEvent>();
     private readonly _onDidChangeBaselineState = new vscode.EventEmitter<'idle' | 'building' | 'ready'>();
@@ -338,6 +343,8 @@ export class DiffTracker {
         this.fileSnapshots = new Map(state.fileSnapshots);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
         this.revertHistory = state.revertHistory.slice(-this.maxRevertHistory);
+        this.baselineGitContexts = new Map(state.gitContexts.map(context => [context.repoRoot, context]));
+        this.pausedGitRepositories.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -398,6 +405,8 @@ export class DiffTracker {
         this.inlineViews.clear();
         this.pendingExternalChanges.clear();
         this.revertHistory = [];
+        this.baselineGitContexts.clear();
+        this.pausedGitRepositories.clear();
         this.snapshotInitialized = false;
         this.baselineBuilding = true;
         this._onDidChangeBaselineState.fire('building');
@@ -604,7 +613,9 @@ export class DiffTracker {
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             baselineExistingFiles: Array.from(this.baselineExistingFiles.values())
                 .sort((leftPath, rightPath) => leftPath.localeCompare(rightPath)),
-            revertHistory: this.revertHistory.slice(-this.maxRevertHistory)
+            revertHistory: this.revertHistory.slice(-this.maxRevertHistory),
+            gitContexts: [...this.baselineGitContexts.values()]
+                .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot))
         };
     }
 
@@ -756,6 +767,7 @@ export class DiffTracker {
             fileSnapshots?: unknown;
             baselineExistingFiles?: unknown;
             revertHistory?: unknown;
+            gitContexts?: unknown;
         };
 
         if ((candidate.version !== 1 && candidate.version !== 2) || typeof candidate.isRecording !== 'boolean') {
@@ -812,6 +824,9 @@ export class DiffTracker {
         const revertHistory = this.parseRevertHistory(rawHistory, snapshotPaths);
         if (!revertHistory) { return undefined; }
 
+        const gitContexts = this.parseGitContexts(candidate.version === 1 ? [] : (candidate.gitContexts ?? []), normalizedRoots);
+        if (!gitContexts) { return undefined; }
+
         return {
             version: 2,
             isRecording: candidate.isRecording,
@@ -819,8 +834,36 @@ export class DiffTracker {
             workspaceRoots: normalizedRoots,
             fileSnapshots,
             baselineExistingFiles,
-            revertHistory
+            revertHistory,
+            gitContexts
         };
+    }
+
+    private parseGitContexts(raw: unknown, workspaceRoots: string[]): GitContextSnapshot[] | undefined {
+        if (!Array.isArray(raw)) { return undefined; }
+        const contexts: GitContextSnapshot[] = [];
+        const seenRoots = new Set<string>();
+        const overlapsWorkspace = (repoRoot: string): boolean => workspaceRoots.some(workspaceRoot => {
+            const workspaceRelative = path.relative(repoRoot, workspaceRoot);
+            const repoRelative = path.relative(workspaceRoot, repoRoot);
+            const within = (relative: string) => relative === '' ||
+                (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+            return within(workspaceRelative) || within(repoRelative);
+        });
+        for (const candidate of raw) {
+            if (!candidate || typeof candidate !== 'object') { return undefined; }
+            const value = candidate as Partial<GitContextSnapshot>;
+            if (typeof value.repoRoot !== 'string' || !path.isAbsolute(value.repoRoot) || seenRoots.has(value.repoRoot) ||
+                (value.kind !== 'repository' && value.kind !== 'submodule' && value.kind !== 'worktree') ||
+                (value.headName !== undefined && typeof value.headName !== 'string') ||
+                (value.headCommit !== undefined && typeof value.headCommit !== 'string') ||
+                typeof value.detached !== 'boolean' || typeof value.inProgress !== 'boolean' || !overlapsWorkspace(value.repoRoot)) {
+                return undefined;
+            }
+            seenRoots.add(value.repoRoot);
+            contexts.push(value as GitContextSnapshot);
+        }
+        return contexts;
     }
 
     private parseRevertHistory(raw: unknown, snapshotPaths: Set<string>): PersistedRevertRecord[] | undefined {
@@ -1746,7 +1789,197 @@ export class DiffTracker {
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.baselineBuilding || !this.snapshotInitialized) { return 'Baseline is incomplete; rebuild it before review actions'; }
         if (this.disposed || this.workspaceContextChanged) { return 'Session is closed or workspace membership changed; review is paused'; }
+        const gitPauseReason = this.getGitPauseReason(filePath);
+        if (gitPauseReason) { return gitPauseReason; }
         return this.validateResourceTarget(filePath);
+    }
+
+    private pathBelongsToRoot(filePath: string, root: string): boolean {
+        const relative = path.relative(root, filePath);
+        return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    }
+
+    public setBaselineGitContexts(contexts: GitContextSnapshot[]): void {
+        this.baselineGitContexts.clear();
+        this.pausedGitRepositories.clear();
+        for (const context of contexts) {
+            if (context.inProgress) {
+                this.pausedGitRepositories.set(context.repoRoot, 'Git merge or rebase is in progress; review actions are paused');
+            } else {
+                this.baselineGitContexts.set(context.repoRoot, { ...context });
+            }
+        }
+        this.schedulePersistState();
+        this.emitTrackChangesEvent({ fullRefresh: true });
+    }
+
+    public reconcileRestoredGitContexts(contexts: GitContextSnapshot[]): void {
+        if (this.baselineGitContexts.size === 0) {
+            // One-time migration for sessions written before Git contexts existed.
+            this.setBaselineGitContexts(contexts);
+            return;
+        }
+        const currentRoots = new Set(contexts.map(context => context.repoRoot));
+        for (const context of contexts) { this.observeGitContext(context); }
+        for (const root of this.baselineGitContexts.keys()) {
+            if (!currentRoots.has(root)) { this.observeGitRepositoryRemoved(root); }
+        }
+    }
+
+    public observeGitContext(context: GitContextSnapshot): string | undefined {
+        const baseline = this.baselineGitContexts.get(context.repoRoot);
+        if (!baseline) {
+            const reason = 'Git repository appeared after the baseline was created; review actions for it are paused';
+            this.pausedGitRepositories.set(context.repoRoot, reason);
+            this.emitTrackChangesEvent({ fullRefresh: true });
+            this.schedulePersistState();
+            return reason;
+        }
+        if (this.pausedGitRepositories.has(context.repoRoot)) {
+            return undefined;
+        }
+        const comparison = compareGitContexts(baseline, context);
+        if (!comparison.compatible) {
+            const reason = `${comparison.reason ?? 'Git context changed'}; review actions for this repository are paused`;
+            this.pausedGitRepositories.set(context.repoRoot, reason);
+            this.emitTrackChangesEvent({ fullRefresh: true });
+            this.schedulePersistState();
+            return reason;
+        }
+        // Commit movement on the same named branch is informational, not a reset.
+        this.baselineGitContexts.set(context.repoRoot, { ...context });
+        this.schedulePersistState();
+        return undefined;
+    }
+
+    public observeGitRepositoryRemoved(repoRoot: string): string | undefined {
+        if (!this.baselineGitContexts.has(repoRoot)) { return undefined; }
+        const existing = this.pausedGitRepositories.get(repoRoot);
+        if (existing) { return undefined; }
+        const reason = 'Git repository became unavailable or was closed; review actions for it are paused';
+        this.pausedGitRepositories.set(repoRoot, reason);
+        this.emitTrackChangesEvent({ fullRefresh: true });
+        this.schedulePersistState();
+        return reason;
+    }
+
+    public getGitPauseReason(filePath: string): string | undefined {
+        return [...this.pausedGitRepositories.entries()]
+            .filter(([root]) => this.pathBelongsToRoot(filePath, root))
+            .sort(([left], [right]) => right.length - left.length)[0]?.[1];
+    }
+
+    public getPausedGitRepositories(): Array<{ repoRoot: string; reason: string }> {
+        return [...this.pausedGitRepositories.entries()]
+            .map(([repoRoot, reason]) => ({ repoRoot, reason }))
+            .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot));
+    }
+
+    private async archiveCurrentSession(): Promise<boolean> {
+        const targetUri = this.getPersistedStateUri();
+        const archiveUri = this.getPersistedStateUri(this.persistedStateArchiveFileName);
+        if (!targetUri || !archiveUri) {
+            this.reportPersistenceIssue('Cannot archive the Git review because extension storage is unavailable.');
+            return false;
+        }
+        if (!await this.flushPendingPersistence()) { return false; }
+        try {
+            await vscode.workspace.fs.copy(targetUri, archiveUri, { overwrite: true });
+            return true;
+        } catch (error) {
+            this.reportPersistenceIssue('Failed to archive the current Diff Tracker review; repository rebuild was blocked.', error);
+            return false;
+        }
+    }
+
+    public async rebuildRepositoryBaseline(repoRoot: string, context: GitContextSnapshot): Promise<boolean> {
+        if (this.disposed || this.recoveryBlocked || !this.snapshotInitialized || this.baselineBuilding ||
+            context.repoRoot !== repoRoot || context.inProgress || !path.isAbsolute(repoRoot)) {
+            return false;
+        }
+        const overlapsWorkspace = this.getWorkspaceRoots().some(workspaceRoot =>
+            this.pathBelongsToRoot(workspaceRoot, repoRoot) || this.pathBelongsToRoot(repoRoot, workspaceRoot));
+        if (!overlapsWorkspace) { return false; }
+        if (vscode.workspace.textDocuments.some(document =>
+            document.uri.scheme === 'file' && this.pathBelongsToRoot(document.uri.fsPath, repoRoot) && document.isDirty)) {
+            return false;
+        }
+        if (!await this.archiveCurrentSession()) { return false; }
+
+        const previous = {
+            fileSnapshots: new Map(this.fileSnapshots),
+            baselineExistingFiles: new Set(this.baselineExistingFiles),
+            trackedChanges: new Map(this.trackedChanges),
+            lineChanges: new Map(this.lineChanges),
+            inlineViews: new Map(this.inlineViews),
+            revertHistory: [...this.revertHistory],
+            baselineGitContexts: new Map(this.baselineGitContexts),
+            pausedGitRepositories: new Map(this.pausedGitRepositories)
+        };
+        const restorePrevious = async (): Promise<void> => {
+            this.fileSnapshots = previous.fileSnapshots;
+            this.baselineExistingFiles = previous.baselineExistingFiles;
+            this.trackedChanges = previous.trackedChanges;
+            this.lineChanges = previous.lineChanges;
+            this.inlineViews = previous.inlineViews;
+            this.revertHistory = previous.revertHistory;
+            this.baselineGitContexts = previous.baselineGitContexts;
+            this.pausedGitRepositories = previous.pausedGitRepositories;
+            this.resetChangeBlocksCaches();
+            this.trackedChangesVersion++;
+            this.trackedChangesCacheVersion = -1;
+            if (this.isRecording) { await this.startExternalWatchers(); }
+            this.emitTrackChangesEvent({ fullRefresh: true });
+        };
+
+        const epoch = this.advanceEpoch();
+        const previousReviewPaths = [...this.trackedChanges.keys()].filter(filePath => this.pathBelongsToRoot(filePath, repoRoot));
+        try {
+            for (const filePath of [...this.fileSnapshots.keys()]) {
+                if (!this.pathBelongsToRoot(filePath, repoRoot)) { continue; }
+                this.fileSnapshots.delete(filePath);
+                this.baselineExistingFiles.delete(filePath);
+                this.deleteTrackedChange(filePath);
+                this.lineChanges.delete(filePath);
+                this.inlineViews.delete(filePath);
+                this.markLineChangesUpdated(filePath);
+            }
+
+            await this.refreshIgnoreMatchers();
+            const files = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(vscode.Uri.file(repoRoot), '**/*'),
+                new vscode.RelativePattern(vscode.Uri.file(repoRoot), '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+            );
+            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+            await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && !this.isPathIgnored(uri)), 8, async uri => {
+                const state = await this.readFileSnapshot(uri);
+                if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+                if (state.kind !== 'text') {
+                    throw new Error(state.kind === 'unavailable' ? state.reason : `File disappeared during baseline rebuild: ${displayFileName(uri.fsPath)}`);
+                }
+                this.fileSnapshots.set(uri.fsPath, state.content);
+                this.baselineExistingFiles.add(uri.fsPath);
+            });
+
+            this.revertHistory = this.revertHistory.map(record => ({
+                ...record,
+                items: record.items.filter(item => !this.pathBelongsToRoot(item.filePath, repoRoot))
+            })).filter(record => record.items.length > 0);
+            this.baselineGitContexts.set(repoRoot, { ...context });
+            this.pausedGitRepositories.delete(repoRoot);
+            this.resetChangeBlocksCaches();
+            if (this.isRecording) { await this.startExternalWatchers(); }
+            if (!await this.flushPendingPersistence()) {
+                await restorePrevious();
+                return false;
+            }
+            this.emitTrackChangesEvent({ removedFiles: previousReviewPaths, fullRefresh: true, baselineChanged: true });
+            return true;
+        } catch (error) {
+            this.reportPersistenceIssue('Failed to rebuild the repository baseline; the archived review remains preserved.', error);
+            await restorePrevious();
+            return false;
+        }
     }
 
     private validateResourceTarget(filePath: string): string | undefined {

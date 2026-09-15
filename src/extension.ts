@@ -12,6 +12,7 @@ import { SettingsTreeDataProvider } from './settingsTreeView';
 import { WebviewDiffPanel } from './webviewDiffPanel';
 import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
+import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -22,6 +23,7 @@ let codeLensProvider: DiffCodeLensProvider;
 let settingsTreeDataProvider: SettingsTreeDataProvider;
 let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
+let gitContextMonitor: GitContextMonitor | undefined;
 
 type DefaultOpenMode = 'webview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
@@ -115,6 +117,9 @@ export async function activate(context: vscode.ExtensionContext) {
             if (answer !== 'Rebuild Baseline') { return false; }
         }
         diffTracker.startRecording();
+        if (gitContextMonitor?.isReady()) {
+            diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
+        }
         void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', true);
         return diffTracker.getIsRecording();
     };
@@ -188,6 +193,66 @@ export async function activate(context: vscode.ExtensionContext) {
     const missingReview = (filePath: string): ActionResult => reportAction({
         filePath, status: 'conflict', reason: 'Review version is unavailable; reopen or refresh the review before acting'
     });
+
+    const gitPromptInFlight = new Set<string>();
+    const rebuildGitBaseline = async (
+        repoRoot: string,
+        contextSnapshot?: GitContextSnapshot,
+        confirmed = false
+    ): Promise<boolean> => {
+        const snapshot = contextSnapshot ?? gitContextMonitor?.getSnapshot(repoRoot);
+        if (!snapshot) {
+            void vscode.window.showWarningMessage('Diff Tracker: The Git repository is unavailable; its preserved review remains paused.');
+            return false;
+        }
+        if (snapshot.inProgress) {
+            void vscode.window.showWarningMessage('Diff Tracker: Finish or abort the Git merge/rebase before rebuilding this repository baseline.');
+            return false;
+        }
+        if (!confirmed) {
+            const answer = await vscode.window.showWarningMessage(
+                'Archive the current review and rebuild only this repository from disk? Pause automation and save or close dirty editors first.',
+                { modal: true, detail: repoRoot },
+                'Archive and Rebuild'
+            );
+            if (answer !== 'Archive and Rebuild') { return false; }
+        }
+        const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot);
+        if (rebuilt) {
+            refreshReview();
+            void vscode.window.showInformationMessage('Diff Tracker: The repository review was archived and its baseline rebuilt.');
+        } else {
+            void vscode.window.showWarningMessage(
+                'Diff Tracker did not rebuild the repository. Its review remains paused; save dirty editors, wait for Git to become stable, and try again.'
+            );
+        }
+        return rebuilt;
+    };
+
+    const handleGitContextEvent = async (event: GitContextEvent): Promise<void> => {
+        if (event.kind === 'ready') {
+            diffTracker.reconcileRestoredGitContexts(event.contexts);
+            return;
+        }
+        const repoRoot = event.kind === 'changed' ? event.context.repoRoot : event.repoRoot;
+        const reason = event.kind === 'changed'
+            ? diffTracker.observeGitContext(event.context)
+            : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
+        if (!reason || gitPromptInFlight.has(repoRoot)) { return; }
+        gitPromptInFlight.add(repoRoot);
+        try {
+            const answer = await vscode.window.showWarningMessage(
+                `Diff Tracker: ${reason}`,
+                { modal: true, detail: 'The existing review is preserved. Closing this message keeps it paused.' },
+                'Archive and Rebuild'
+            );
+            if (answer === 'Archive and Rebuild') {
+                await rebuildGitBaseline(repoRoot, event.kind === 'changed' ? event.context : undefined, true);
+            }
+        } finally {
+            gitPromptInFlight.delete(repoRoot);
+        }
+    };
 
     // Register commands
     context.subscriptions.push(
@@ -329,6 +394,28 @@ export async function activate(context: vscode.ExtensionContext) {
                 return result;
             }
             return reportBatch('Restored', result);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.rebuildGitBaseline', async () => {
+            const paused = diffTracker.getPausedGitRepositories();
+            if (paused.length === 0) {
+                void vscode.window.showInformationMessage('Diff Tracker: No Git repository review is paused.');
+                return false;
+            }
+            const selected = paused.length === 1
+                ? paused[0]
+                : await vscode.window.showQuickPick(
+                    paused.map(item => ({
+                        label: displayFileName(item.repoRoot),
+                        description: item.reason,
+                        detail: item.repoRoot,
+                        value: item
+                    })),
+                    { placeHolder: 'Choose the paused repository to archive and rebuild' }
+                ).then(item => item?.value);
+            return selected ? rebuildGitBaseline(selected.repoRoot) : false;
         })
     );
 
@@ -641,6 +728,18 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    gitContextMonitor = new GitContextMonitor(event => { void handleGitContextEvent(event); });
+    context.subscriptions.push(gitContextMonitor);
+    const gitContextAvailable = await gitContextMonitor.start();
+    if (gitContextAvailable && gitContextMonitor.isReady() &&
+        (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete')) {
+        diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+    } else if (!gitContextAvailable) {
+        void vscode.window.showWarningMessage(
+            'Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
+        );
+    }
+
     refreshChangesTree();
     await vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', diffTracker.getIsRecording());
 
@@ -663,6 +762,9 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
+    if (gitContextMonitor) {
+        gitContextMonitor.dispose();
+    }
     if (diffTracker) {
         await diffTracker.dispose();
     }

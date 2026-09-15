@@ -410,6 +410,75 @@ test('DT-09 a later file change conflicts instead of being overwritten by recove
     const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,0); assert.equal(undo.failed,1);
     assert.equal(disk(p),'newer work'); assert.deepEqual(counters,before);
 });
+test('DT-07 ordinary commit on the same branch does not pause review actions',async()=>{
+    const repo=path.join(root,'repo-same'); fs.mkdirSync(repo); const p=path.join(repo,'sample.m'); seed(p,'base','changed'); await scan(p);
+    tracker.setBaselineGitContexts([{repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    tracker.observeGitContext({repoRoot:repo,kind:'repository',headName:'main',headCommit:'bbb',detached:false,inProgress:false});
+    assert.equal(tracker.getGitPauseReason(p),undefined); assert.ok(succeeded(await tracker.keepAllChangesInFile(p)));
+});
+test('DT-07 same commit on another branch pauses only that repository',async()=>{
+    const repoA=path.join(root,'repo-a'),repoB=path.join(root,'repo-b'); fs.mkdirSync(repoA);fs.mkdirSync(repoB);
+    const p=path.join(repoA,'a.m'),q=path.join(repoB,'b.m'); for(const f of [p,q]){seed(f,'base','changed');await scan(f);}
+    tracker.setBaselineGitContexts([
+        {repoRoot:repoA,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false},
+        {repoRoot:repoB,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}
+    ]);
+    tracker.observeGitContext({repoRoot:repoA,kind:'repository',headName:'feature',headCommit:'aaa',detached:false,inProgress:false});
+    assert.match(tracker.getGitPauseReason(p)??'',/branch/i); assert.equal(tracker.getGitPauseReason(q),undefined);
+    assert.equal(succeeded(await tracker.revertFile(p)),false); assert.ok(succeeded(await tracker.keepAllChangesInFile(q)));
+});
+test('DT-07 detached HEAD movement and merge conflicts pause the affected repository',async()=>{
+    const repo=path.join(root,'repo-detached'); fs.mkdirSync(repo); const p=path.join(repo,'sample.m'); seed(p,'base','changed'); await scan(p);
+    tracker.setBaselineGitContexts([{repoRoot:repo,kind:'worktree',headName:undefined,headCommit:'aaa',detached:true,inProgress:false}]);
+    tracker.observeGitContext({repoRoot:repo,kind:'worktree',headName:undefined,headCommit:'bbb',detached:true,inProgress:false});
+    assert.match(tracker.getGitPauseReason(p)??'',/detached|commit/i);
+    tracker.setBaselineGitContexts([{repoRoot:repo,kind:'worktree',headName:'main',headCommit:'bbb',detached:false,inProgress:false}]);
+    tracker.observeGitContext({repoRoot:repo,kind:'worktree',headName:'main',headCommit:'bbb',detached:false,inProgress:true});
+    assert.match(tracker.getGitPauseReason(p)??'',/merge|rebase|progress/i);
+});
+test('DT-07 missing Git repository observation pauses persisted repository review',async()=>{
+    const repo=path.join(root,'repo-removed'); fs.mkdirSync(repo); const p=path.join(repo,'sample.m'); seed(p,'base','changed'); await scan(p);
+    tracker.setBaselineGitContexts([{repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    tracker.observeGitRepositoryRemoved(repo); assert.match(tracker.getGitPauseReason(p)??'',/unavailable|closed/i);
+    assert.equal(succeeded(await tracker.revertFile(p)),false);
+});
+test('DT-07 persisted Git identity detects a branch change after reload',async()=>{
+    const repo=path.join(root,'repo-reload');fs.mkdirSync(repo);const p=path.join(repo,'sample.m');seed(p,'base','changed');await scan(p);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    tracker.setBaselineGitContexts([{repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.equal(saved.gitContexts[0].headName,'main');
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    tracker.reconcileRestoredGitContexts([{repoRoot:repo,kind:'repository',headName:'feature',headCommit:'aaa',detached:false,inProgress:false}]);
+    assert.match(tracker.getGitPauseReason(p)??'',/branch/i);assert.equal(succeeded(await tracker.revertFile(p)),false);
+});
+test('DT-07 explicit archive-and-rebuild resets only the changed repository',async()=>{
+    const repoA=path.join(root,'repo-rebuild-a'),repoB=path.join(root,'repo-rebuild-b');fs.mkdirSync(repoA);fs.mkdirSync(repoB);
+    const p=path.join(repoA,'a.m'),q=path.join(repoB,'b.m');for(const f of [p,q]){seed(f,'base','changed');await scan(f);}
+    const originalA={repoRoot:repoA,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const currentA={...originalA,headName:'feature',headCommit:'bbb'};
+    tracker.setBaselineGitContexts([originalA,{repoRoot:repoB,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    tracker.observeGitContext(currentA);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repoA,currentA),true);
+    assert.equal(tracker.getOriginalContent(p),'changed');assert.equal(pending(p),undefined);assert.equal(tracker.getGitPauseReason(p),undefined);
+    assert.equal(tracker.getOriginalContent(q),'base');assert.ok(pending(q));
+    assert.equal(fs.existsSync(path.join(storage,'session-state.archive.json')),true);
+    const archive=JSON.parse(fs.readFileSync(path.join(storage,'session-state.archive.json'),'utf8'));
+    assert.ok(archive.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='base'));
+});
+test('DT-07 dirty buffer or unstable Git state cannot rebuild a paused repository',async()=>{
+    const repo=path.join(root,'repo-rebuild-blocked');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'base','changed');await scan(p);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    tracker.setBaselineGitContexts([base]);tracker.observeGitContext({...base,headName:'feature'});
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);document(p).isDirty=true;
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,{...base,headName:'feature'}),false);
+    assert.equal(tracker.getOriginalContent(p),'base');assert.ok(pending(p));assert.ok(tracker.getGitPauseReason(p));
+    document(p).isDirty=false;
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,{...base,headName:'feature',inProgress:true}),false);
+    assert.equal(tracker.getOriginalContent(p),'base');assert.ok(tracker.getGitPauseReason(p));
+});
 test('existing automation session interface balances overlapping resource sessions',async()=>{
     const p=file(); const first=tracker.beginAutomationSession({filePaths:[p]}); const second=tracker.beginAutomationSession({filePaths:[p]});
     assert.equal(tracker.isAutomationChangeAllowed(p),true); tracker.endAutomationSession(first);
