@@ -2,7 +2,7 @@
   "name": "diff-tracker",
   "displayName": "Diff Tracker (Development)",
   "description": "Visual file diff tracking - record and display changes in real-time",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
   "icon": "resources/marketplace-icon.png",
@@ -116,7 +116,7 @@
         "diffTracker.onlyTrackAutomatedChanges": {
           "type": "boolean",
           "default": false,
-          "description": "Only track automated changes. Manual typing in VS Code is ignored; external tool edits and tagged agent/extension edits are still recorded."
+          "description": "Track external and tagged automation changes. Editor changes without reliable source information remain visible for review; saving does not automatically accept them."
         }
       }
     },
@@ -346,6 +346,8 @@
     "test:paths": "node test/path-display.mjs",
     "test:tracker-safety": "node test/tracker-safety.mjs",
     "test:review-ui": "node test/review-ui.mjs",
+    "test:stage2-probes": "node test/known-p0.mjs",
+    "test:legacy-manual-policy": "node test/legacy-manual-policy.mjs",
     "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui"
   },
   "devDependencies": {

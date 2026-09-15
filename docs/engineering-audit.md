@@ -1,5 +1,8 @@
 # DiffTracker 0.6.0 stage 0 / stage 1 engineering audit
 
+Historical stage 0–1 report. For subsequent stage 2 changes and updated blocker
+status, see [stage2-verification.md](stage2-verification.md).
+
 Date: 2026-09-15. Target: `lengmh/DiffTracker`. This change is a **development review build**, not a final stable release. Only stages 0 and 1 of `DiffTracker_0.6.0_Work_Codex_Execution_Prompt_v2.md` are authorized this round. Stages 2–5 remain deferred; the release-blocking findings below are not waived by passing stage 1 tests.
 
 ## Verified starting point

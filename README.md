@@ -3,8 +3,9 @@
 
 This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) development fork of
 [TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining its MIT license and upstream attribution.
-Version 0.6.1 is a **development test build**, limited to engineering stages 0–1.
-It is **not a final stable release**: see [the audit and remaining P0 blockers](docs/engineering-audit.md).
+Version 0.6.2 is a **development test build**, limited to engineering stages 0–2.
+It is **not a final stable release**: see [stage 2 verification and limits](docs/stage2-verification.md)
+and [the original audit](docs/engineering-audit.md).
 
 The development VSIX uses extension ID `lengmh.diff-tracker`. Disable the upstream
 `TinyTigerPan.diff-tracker` before testing: both register the same commands, views,
@@ -20,11 +21,18 @@ the upstream extension, and reloading. Rollback does not undo edits or transfer
 review decisions between their separate storage locations.
 
 Build from this branch with `npm ci`, `npm test`, then
-`npm run package -- --pre-release --out diff-tracker-0.6.1-development.vsix`.
+`npm run package -- --pre-release --out diff-tracker-0.6.2-development.vsix`.
 This build conservatively blocks actions on unreadable, binary, oversized, non-UTF-8
 and UTF-8 BOM files; BOM-preserving editor writes are not yet validated.
 No Marketplace publication is performed. Windows and real Extension Host checks
 remain separate from the mocked VS Code boundary tests.
+
+Review buttons carry the version displayed; stale actions require another review.
+Automation-only mode conservatively retains unclassified editor edits alongside
+external edits. Saving alone does not accept them or establish human authorship;
+the uncertainty notice is informational and explicit Keep/Revert remains available.
+Use the existing automation-session API for tagged extension changes. Stage 3
+durability/recovery and stage 4 Git-context protection remain unfinished.
 
 [中文说明](./README_CN.md)
 
@@ -125,14 +133,14 @@ This extension provides the following settings:
 | `diffTracker.highlightWordChanges` | `true` | Highlight word-level changes within modified lines |
 | `diffTracker.openWebviewBeside` | `false` | Open Webview diff in a side editor group instead of the current editor group |
 | `diffTracker.watchExclude` | `[]` | Additional watch ignore patterns (`.gitignore` style) |
-| `diffTracker.onlyTrackAutomatedChanges` | `false` | Ignore manual typing in VS Code. External CLI/tool edits are still tracked, and VS Code extension edits can be tracked when they open an automation session first |
+| `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits; retain uncertain editor edits for explicit review without automatic baseline acceptance |
 
 You can toggle display/highlight settings in the sidebar **Settings** panel, and edit watch ignore patterns via **Edit Watch Ignores**.
 
 When `diffTracker.openWebviewBeside` is enabled, Webview diff opens in a side editor group. By default it opens in the current editor group.
 
 When `diffTracker.onlyTrackAutomatedChanges` is enabled:
-- Manual typing in the editor is ignored
+- Editor events without reliable source information remain visible with an uncertainty notice
 - External tools/CLI that modify files on disk are still tracked through file watchers
 - VS Code extensions should call `diffTracker.beginAutomationSession` before applying edits, and `diffTracker.endAutomationSession` after they finish
 

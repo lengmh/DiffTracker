@@ -1,8 +1,10 @@
-> **开发测试分支，非最终稳定版。** 本 fork 为 `lengmh/DiffTracker`，仅实施阶段 0、1；剩余 P0 与验证边界见 [工程审查报告](docs/engineering-audit.md)。
+> **0.6.2 开发测试分支，非最终稳定版。** 本 fork 为 `lengmh/DiffTracker`，实施范围为阶段 0—2；最新结果见 [阶段 2 验证报告](docs/stage2-verification.md)，原始证据见 [工程审查报告](docs/engineering-audit.md)。
 >
 > 开发包扩展 ID 为 `lengmh.diff-tracker`，请先禁用上游 `TinyTigerPan.diff-tracker`，不能同时启用。二者共享命令/视图/配置名称，但 session 存储隔离；本轮不自动迁移上游待审记录。回滚时禁用或卸载开发扩展，再启用上游扩展并重载；这不会撤销文件编辑或跨扩展转移审阅结果。
 >
 > 本开发版保守拒绝不可读、二进制、超限、非 UTF-8 以及 UTF-8 BOM 文件的写回。Windows/真实 VS Code Extension Host 尚未验证。
+>
+> 审阅按钮携带显示时的版本，版本变化后需要重新审阅。automation-only 模式不把普通文档/保存事件当成人工来源证明：来源未确认的编辑与外部修改一起保留待审，不因保存自动接受。来源提示不阻止用户明确 Keep/Revert。持久化耐故障和 Git 上下文保护仍在后续阶段。
 
 # Diff Tracker
 
@@ -124,7 +126,7 @@ npm run package
 | `diffTracker.defaultOpenMode` | `webview` | 点击变更文件时的默认打开方式 |
 | `diffTracker.openWebviewBeside` | `false` | 是否将 WebView Diff 打开到旁边的编辑器分组 |
 | `diffTracker.watchExclude` | `[]` | 额外的监听忽略规则，使用 `.gitignore` 风格 |
-| `diffTracker.onlyTrackAutomatedChanges` | `false` | 只记录自动化产生的改动，忽略手动键入 |
+| `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
 
 你可以在侧边栏的 **Settings** 面板中直接切换大部分显示类设置，也可以通过 `Edit Watch Ignores` 编辑忽略规则。
 
@@ -142,7 +144,7 @@ npm run package
 
 当 `diffTracker.onlyTrackAutomatedChanges` 为 `true` 时：
 
-- 在 VS Code 中手动输入的内容不会被记录
+- 无法可靠确认来源的编辑会保留待审，并显示来源不确定提示
 - 外部 CLI、脚本或其他直接写磁盘的工具仍会通过文件监听被记录
 - 其他 VS Code 扩展可以通过显式开启自动化会话，将自己的编辑纳入记录范围
 
