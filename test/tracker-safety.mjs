@@ -139,7 +139,7 @@ const vscode = {
         fs: {
             async stat(uri) { fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
-            async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
+            async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); await boundary(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
             async delete(uri) { fault(uri.fsPath,'delete'); fs.rmSync(uri.fsPath); },
             async rename(source, target, options) {
@@ -459,7 +459,8 @@ test('DT-09 recovery record persistence failure blocks file Revert before mutati
     const before={...counters}; const result=await tracker.revertFile(p);
     assert.equal(succeeded(result),false); assert.match(result.reason,/recovery record/i);
     assert.equal(disk(p),'changed'); assert.equal(document(p).getText(),'changed');
-    assert.equal(counters.apply,before.apply); assert.equal(counters.save,before.save); assert.equal(counters.write,before.write+1);
+    assert.equal(counters.apply,before.apply); assert.equal(counters.save,before.save);
+    assert.ok(fs.existsSync(path.join(storage,'session-state.unsaved')));
     faults.delete(temp);
 });
 test('DT-09 Undo Last Revert recreates an unaccepted new file',async()=>{
@@ -476,10 +477,13 @@ test('DT-09 failed recovery content write retains the record after creating the 
     assert.equal(fs.existsSync(p),true); assert.equal(disk(p),'');
     assert.equal(tracker.revertHistory.length,1,'partial recovery remains retryable');
 });
-test('DT-09 Undo Last Revert restores a reviewed deletion after Revert recreated the file',async()=>{
+test('DT-09 destructive recovery requires manual deletion and retains its record until verified',async()=>{
     const p=file(); seed(p,'baseline'); fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p));
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'baseline');
-    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(fs.existsSync(p),false); assert.equal(pending(p)?.isDeleted,true);
+    const before={...counters};const undo=await tracker.undoLastRevert();assert.equal(undo.succeeded,0);
+    assert.equal(disk(p),'baseline');assert.deepEqual(counters,before);assert.equal(tracker.revertHistory.length,1);
+    fs.writeFileSync(p,'new external work');assert.equal((await tracker.undoLastRevert()).succeeded,0);assert.equal(disk(p),'new external work');
+    fs.unlinkSync(p);assert.equal((await tracker.undoLastRevert()).succeeded,1);assert.equal(tracker.revertHistory.length,0);
 });
 test('DT-09 block recovery restores only the dirty buffer and never saves it',async()=>{
     const p=file(); seed(p,'base\n','changed\n'); await scan(p); const block=tracker.getChangeBlocks(p)[0];
@@ -967,6 +971,52 @@ test('DT-08 delayed watcher read cannot erase a newer dirty editor review',async
     const operation=scan(p);await gate.entered;doc.text='native Undo content';doc.isDirty=true;doc.version++;
     tracker.processDocumentChange(doc);assert.ok(pending(p));gate.release();await operation;
     assert.ok(pending(p));assert.equal(doc.getText(),'native Undo content');assert.equal(disk(p),'base');
+});
+for(const baselineState of ['ready','building']) test(`DT-06 zero-file ${baselineState} baseline is valid`,async()=>{
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    tracker.baselineBuilding=baselineState==='building';tracker.snapshotInitialized=!tracker.baselineBuilding;
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const restored=new DiffTracker(Uri.file(storage));
+    try {assert.equal(await restored.restorePersistedState(),baselineState==='ready'?'restored':'incomplete');assert.equal(restored.isRecoveryBlocked(),false);}
+    finally {await restored.dispose();}
+    const again=new DiffTracker(Uri.file(storage));
+    try {assert.equal(await again.restorePersistedState(),baselineState==='ready'?'restored':'incomplete');}
+    finally {await again.dispose();}
+});
+for(const via of ['create','document']) test(`DT-06 Ready baseline growth via ${via} exceeding limits blocks actions and restart`,async()=>{
+    const p=file();seed(p,'base');const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    tracker.maxPersistedSnapshots=1;assert.equal(await tracker.flushPendingPersistence(),true);
+    const q=file();fs.writeFileSync(q,'new');
+    if(via==='create') await tracker.onExternalFileCreated(Uri.file(q));else tracker.ensureSnapshotForDocument(document(q));
+    await tracker.flushPendingPersistence();assert.equal(tracker.getBaselineState(),'building');
+    assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),false);assert.equal(disk(q),'new');
+    const restored=new DiffTracker(Uri.file(storage));
+    try {assert.equal(await restored.restorePersistedState(),'blocked');assert.equal(restored.isRecoveryBlocked(),true);}
+    finally {await restored.dispose();}
+    assert.ok(fs.existsSync(path.join(storage,'session-state.unsaved')));
+});
+for(const action of ['file','block']) test(`DT-06 ${action} Keep exceeding byte limit keeps baseline and review`,async()=>{
+    const p=file();seed(p,'base','x'.repeat(5000));await scan(p);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));tracker.maxPersistedBytes=2000;
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const result=action==='file'?await tracker.keepAllChangesInFile(p):await tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId);
+    assert.equal(succeeded(result),false);assert.equal(tracker.getOriginalContent(p),'base');assert.ok(pending(p));
+});
+test('DT-06 new-file review stays blocked until its durable snapshot is written',async()=>{
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    const p=file();fs.writeFileSync(p,'new');const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=tracker.onExternalFileCreated(Uri.file(p));await gate.entered;
+    assert.equal(tracker.getBaselineState(),'building');assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);
+    gate.release();await operation;assert.equal(tracker.getBaselineState(),'ready');assert.ok(pending(p));
+    assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false);
+});
+for(const action of ['file','block']) test(`DT-06 ${action} Keep preserves edits arriving while persistence waits`,async()=>{
+    const p=file();seed(p,'base','reviewed');await scan(p);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=action==='file'?tracker.keepAllChangesInFile(p):tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId);
+    await gate.entered;fs.writeFileSync(p,'newer external');gate.release();assert.equal(succeeded(await operation),true);
+    assert.equal(tracker.getOriginalContent(p),'reviewed');assert.equal(pending(p)?.currentContent,'newer external');
 });
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;

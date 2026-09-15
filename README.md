@@ -4,6 +4,14 @@ Review workspace changes as they happen, then keep or safely revert them by bloc
 file, or batch. Version 0.7.0 adds versioned review actions, durable session recovery,
 bounded **Undo Last Revert**, and Git-context safety.
 
+Undo that would delete a restored file requires manual deletion: inspect and delete
+that file yourself, then retry Undo to acknowledge it. The recovery record remains
+available until then. VS Code does not provide a conditional, version-checked file
+deletion, so this branch never automatically deletes potentially newer work.
+Baseline growth and Keep must persist before review resumes. An interrupted or
+failed session write leaves a recovery marker and blocks automatic restoration;
+preserve the session and workspace before explicitly rebuilding.
+
 This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) fork of
 [TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining the
 MIT license and upstream attribution. Its Marketplace extension ID is

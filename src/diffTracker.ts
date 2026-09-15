@@ -271,6 +271,9 @@ export class DiffTracker {
     private revertHistory: PersistedRevertRecord[] = [];
     private recoveryBlocked = false;
     private persistenceIssue: string | undefined;
+    private persistenceFailed = false;
+    private baselineCompletionVersion = 0;
+    private readonly persistenceFailureFileName = 'session-state.unsaved';
     private baselineGitContexts = new Map<string, GitContextSnapshot>();
     private pausedGitRepositories = new Map<string, string>();
     private readonly _onDidChangeRecordingState = new vscode.EventEmitter<boolean>();
@@ -329,6 +332,23 @@ export class DiffTracker {
 
     public async restorePersistedState(): Promise<RestoreOutcome> {
         const epoch = this.advanceEpoch();
+        const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+        if (failureUri) {
+            try {
+                await vscode.workspace.fs.stat(failureUri);
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                this.recoveryBlocked = true;
+                this.isRecording = false;
+                this.persistenceIssue = 'The previous session could not be saved completely; preserve it before rebuilding.';
+                return 'blocked';
+            } catch (error) {
+                if (!this.isFileNotFound(error)) {
+                    this.recoveryBlocked = true;
+                    this.persistenceIssue = 'Cannot verify whether the previous session was saved completely.';
+                    return 'blocked';
+                }
+            }
+        }
         const loaded = await this.loadPersistedStateWithRecovery();
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (loaded.kind === 'absent') {
@@ -347,17 +367,6 @@ export class DiffTracker {
         this.persistenceIssue = loaded.kind === 'recovered'
             ? 'Recovered the last-good Diff Tracker session because the primary state was unreadable.'
             : undefined;
-
-        if (
-            state.isRecording &&
-            state.fileSnapshots.length === 0 &&
-            state.unresolvedBaselineFiles.length === 0 &&
-            (vscode.workspace.workspaceFolders?.length ?? 0) > 0
-        ) {
-            this.recoveryBlocked = true;
-            this.persistenceIssue = 'Persisted recording state has no baseline snapshots; automatic replacement was blocked.';
-            return 'blocked';
-        }
 
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
@@ -661,7 +670,7 @@ export class DiffTracker {
             return undefined;
         }
 
-        if (!this.isRecording && this.fileSnapshots.size === 0) {
+        if (!this.isRecording && !this.baselineBuilding && this.fileSnapshots.size === 0 && this.unresolvedBaselineFiles.size === 0) {
             return undefined;
         }
 
@@ -715,10 +724,13 @@ export class DiffTracker {
 
     private reportPersistenceIssue(message: string, error?: unknown): void {
         this.persistenceIssue = message;
+        this.persistenceFailed = true;
         console.error(message, error);
     }
 
     private async flushPersistState(completedBaseline = false): Promise<boolean> {
+        // A blocked restore must never erase the evidence during shutdown.
+        if (this.recoveryBlocked) { return false; }
         const storageUri = this.storageUri;
         if (!storageUri) {
             return true;
@@ -728,15 +740,14 @@ export class DiffTracker {
         // Persist the ready candidate while actions remain blocked in memory.
         if (state && completedBaseline) { state.baselineState = 'ready'; }
         let payload: Uint8Array | undefined;
+        let limitError: string | undefined;
         if (state) {
             if (state.fileSnapshots.length > this.maxPersistedSnapshots) {
-                this.reportPersistenceIssue(`Failed to persist Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`);
-                return false;
+                limitError = `Failed to persist Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`;
             }
             payload = new TextEncoder().encode(JSON.stringify(state));
             if (payload.byteLength > this.maxPersistedBytes) {
-                this.reportPersistenceIssue(`Failed to persist Diff Tracker session: state exceeds ${this.maxPersistedBytes} bytes.`);
-                return false;
+                limitError = `Failed to persist Diff Tracker session: state exceeds ${this.maxPersistedBytes} bytes.`;
             }
         }
 
@@ -744,6 +755,7 @@ export class DiffTracker {
             const targetUri = this.getPersistedStateUri();
             const tempUri = this.getPersistedStateUri(this.persistedStateTempFileName);
             const backupUri = this.getPersistedStateUri(this.persistedStateBackupFileName);
+            const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
             if (!targetUri || !tempUri || !backupUri) { return true; }
 
             if (!payload) {
@@ -751,7 +763,9 @@ export class DiffTracker {
                     await this.deletePersistedFile(targetUri);
                     await this.deletePersistedFile(tempUri);
                     await this.deletePersistedFile(backupUri);
+                    if (failureUri) { await this.deletePersistedFile(failureUri); }
                     this.persistenceIssue = undefined;
+                    this.persistenceFailed = false;
                     return true;
                 } catch (error) {
                     this.reportPersistenceIssue('Failed to clear Diff Tracker persisted session state.', error);
@@ -761,10 +775,15 @@ export class DiffTracker {
 
             try {
                 await vscode.workspace.fs.createDirectory(storageUri);
+                // A durable intent survives size-limit failures and interrupted writes.
+                if (failureUri) { await vscode.workspace.fs.writeFile(failureUri, new TextEncoder().encode('Session write incomplete')); }
+                if (limitError) { this.reportPersistenceIssue(limitError); return false; }
                 await vscode.workspace.fs.writeFile(tempUri, payload);
                 await vscode.workspace.fs.rename(tempUri, targetUri, { overwrite: true });
                 await vscode.workspace.fs.copy(targetUri, backupUri, { overwrite: true });
+                if (failureUri) { await this.deletePersistedFile(failureUri); }
                 this.persistenceIssue = undefined;
+                this.persistenceFailed = false;
                 return true;
             } catch (error) {
                 try { await this.deletePersistedFile(tempUri); } catch { /* Retain the primary failure. */ }
@@ -984,11 +1003,12 @@ export class DiffTracker {
             return true;
         }
         try {
-            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName]) {
+            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName, this.persistenceFailureFileName]) {
                 const uri = this.getPersistedStateUri(name);
                 if (uri) { await this.deletePersistedFile(uri); }
             }
             this.recoveryBlocked = false;
+            this.persistenceFailed = false;
             this.persistenceIssue = undefined;
             return true;
         } catch (error) {
@@ -1509,6 +1529,7 @@ export class DiffTracker {
     }
 
     private async completeBaseline(epoch: number): Promise<boolean> {
+        ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
         await this.processPendingExternalChanges();
@@ -1517,7 +1538,11 @@ export class DiffTracker {
             clearTimeout(this.persistTimer);
             this.persistTimer = undefined;
         }
-        if (!await this.flushPersistState(true) || !this.isCurrentEpoch(epoch)) { return false; }
+        let version: number;
+        do {
+            version = this.baselineCompletionVersion;
+            if (!await this.flushPersistState(true) || !this.isCurrentEpoch(epoch)) { return false; }
+        } while (version !== this.baselineCompletionVersion);
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
         return true;
@@ -1797,7 +1822,7 @@ export class DiffTracker {
         // however, resolve entries that were already uncertain during baseline scan.
         if (!this.fileSnapshots.has(filePath) && !this.unresolvedBaselineFiles.has(filePath)) {
             this.fileSnapshots.set(filePath, '');
-            this.schedulePersistState();
+            if (!await this.completeBaseline(epoch)) { return; }
         }
         await this.readFileAndUpdate(filePath, uri);
     }
@@ -1914,6 +1939,7 @@ export class DiffTracker {
     }
 
     private validateActionTarget(filePath: string): string | undefined {
+        if (this.persistenceFailed) { return 'Session persistence failed; review actions are paused until it can be saved'; }
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.baselineBuilding || !this.snapshotInitialized) { return 'Baseline is incomplete; rebuild it before review actions'; }
         return this.validateSnapshotTarget(filePath);
@@ -2442,15 +2468,9 @@ export class DiffTracker {
         const uri = vscode.Uri.file(item.filePath);
         const edit = new vscode.WorkspaceEdit();
         if (!item.before.exists) {
-            edit.deleteFile(uri, { ignoreIfNotExists: false, recursive: false });
-            if (!this.isCurrentEpoch(epoch)) {
-                return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery deletion');
-            }
-            if (!await vscode.workspace.applyEdit(edit)) {
-                return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file deletion');
-            }
-            this.updateTrackedDiff(item.filePath, '', { currentExists: false });
-            return this.actionResult(item.filePath, 'success', undefined, true);
+            // WorkspaceEdit.deleteFile has no expected-content/version condition.
+            // Re-reading cannot protect a replacement while applyEdit is pending.
+            return this.actionResult(item.filePath, 'conflict', 'Recovery would delete a restored file. Inspect and delete it manually, then retry Undo; the recovery record is retained');
         }
         if (!item.after.exists) {
             this.pendingWriteFiles.add(item.filePath);
@@ -2991,13 +3011,25 @@ export class DiffTracker {
         );
         const finalTargetError = this.validateActionTarget(filePath);
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
+        const keepEpoch = this.sessionEpoch;
+        const previousExists = this.baselineExistingFiles.has(filePath);
         this.fileSnapshots.set(filePath, newSnapshot);
-        const currentExists = true;
         this.baselineExistingFiles.add(filePath);
-        this.schedulePersistState();
+        if (!await this.completeBaseline(keepEpoch)) {
+            if (this.isCurrentEpoch(keepEpoch)) {
+                this.fileSnapshots.set(filePath, originalContent);
+                if (!previousExists) { this.baselineExistingFiles.delete(filePath); }
+                this.updateTrackedDiff(filePath, currentText, { baselineChanged: true, currentExists: true });
+            }
+            return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
+        }
 
-        // Recompute diff against updated snapshot
-        this.updateTrackedDiff(filePath, currentText, { baselineChanged: true, currentExists });
+        // Persistence awaits may admit newer editor/disk changes; never clear them
+        // using the content reviewed before the write began.
+        const afterKeep = await this.readCurrentFileState(filePath);
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during Keep'); }
+        if (afterKeep.kind === 'unavailable') { this.markFileUnavailable(filePath, afterKeep.reason); }
+        else { this.updateTrackedDiff(filePath, afterKeep.kind === 'text' ? afterKeep.content : '', { baselineChanged: true, currentExists: afterKeep.kind === 'text' }); }
         return this.actionResult(filePath, 'success');
     }
 
@@ -3029,15 +3061,28 @@ export class DiffTracker {
         }
         const finalTargetError = this.validateActionTarget(filePath);
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
+        const previousContent = this.fileSnapshots.get(filePath)!;
+        const previousExists = this.baselineExistingFiles.has(filePath);
+        const keepEpoch = this.sessionEpoch;
         this.fileSnapshots.set(filePath, currentContent);
         if (state.kind === 'missing') {
             this.baselineExistingFiles.delete(filePath);
         } else {
             this.baselineExistingFiles.add(filePath);
         }
+        if (!await this.completeBaseline(keepEpoch)) {
+            if (this.isCurrentEpoch(keepEpoch)) {
+                this.fileSnapshots.set(filePath, previousContent);
+                if (previousExists) { this.baselineExistingFiles.add(filePath); } else { this.baselineExistingFiles.delete(filePath); }
+                this.updateTrackedDiff(filePath, currentContent, { baselineChanged: true, currentExists: state.kind === 'text' });
+            }
+            return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
+        }
         this.pendingWriteFiles.delete(filePath);
-        this.clearFileReview(filePath, true);
-        this.schedulePersistState();
+        const afterKeep = await this.readCurrentFileState(filePath);
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during Keep'); }
+        if (afterKeep.kind === 'unavailable') { this.markFileUnavailable(filePath, afterKeep.reason); }
+        else { this.updateTrackedDiff(filePath, afterKeep.kind === 'text' ? afterKeep.content : '', { baselineChanged: true, currentExists: afterKeep.kind === 'text' }); }
         return this.actionResult(filePath, 'success');
     }
 
@@ -3433,7 +3478,11 @@ export class DiffTracker {
             this.fileSnapshots.set(filePath, '');
             this.baselineExistingFiles.delete(filePath);
         }
-        this.schedulePersistState();
+        if (this.snapshotInitialized && this.storageUri) {
+            void this.completeBaseline(this.sessionEpoch);
+        } else {
+            this.schedulePersistState();
+        }
     }
 
     private calculateLineChanges(filePath: string) {
