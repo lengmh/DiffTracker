@@ -13,10 +13,12 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     private pendingPrewarmFiles = new Set<string>();
     private disposed = false;
     private readonly prewarmDelayMs = 20;
+    private readonly trackingSubscription: vscode.Disposable;
 
     constructor(private diffTracker: DiffTracker) {
         // Refresh CodeLens when diff changes
-        this.diffTracker.onDidTrackChanges((event: TrackChangesEvent) => {
+        this.trackingSubscription = this.diffTracker.onDidTrackChanges((event: TrackChangesEvent) => {
+            if (this.disposed) { return; }
             if (event.fullRefresh) {
                 this.clearLensCache();
                 this._onDidChangeCodeLenses.fire();
@@ -39,6 +41,8 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     }
 
     public refresh(): void {
+        if (this.disposed) { return; }
+        this.clearLensCache();
         this._onDidChangeCodeLenses.fire();
     }
 
@@ -46,7 +50,7 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
         document: vscode.TextDocument,
         _token: vscode.CancellationToken
     ): vscode.CodeLens[] | Thenable<vscode.CodeLens[]> {
-        if (!this.diffTracker.getIsRecording()) {
+        if (this.disposed || !this.diffTracker.getIsRecording()) {
             return [];
         }
 
@@ -68,6 +72,7 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
 
         const filePath = document.uri.fsPath;
         const blocks = this.diffTracker.getChangeBlocks(filePath);
+        const reviewToken = this.diffTracker.getReviewToken(filePath);
 
         if (blocks.length === 0) {
             this.lensCache.set(cacheKey, []);
@@ -82,14 +87,14 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
         codeLenses.push(new vscode.CodeLens(topRange, {
             title: '↩ Revert All',
             command: 'diffTracker.revertAllBlocksInFile',
-            arguments: [filePath],
+            arguments: [filePath, reviewToken],
             tooltip: 'Revert all changes in this file'
         }));
 
         codeLenses.push(new vscode.CodeLens(topRange, {
             title: '✓ Keep All',
             command: 'diffTracker.keepAllBlocksInFile',
-            arguments: [filePath],
+            arguments: [filePath, reviewToken],
             tooltip: 'Accept all changes in this file'
         }));
 
@@ -109,7 +114,7 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
             codeLenses.push(new vscode.CodeLens(range, {
                 title: '↩ Revert',
                 command: 'diffTracker.revertBlock',
-                arguments: [filePath, block.blockId],
+                arguments: [filePath, block.blockId, reviewToken],
                 tooltip: 'Revert this block to original content'
             }));
 
@@ -117,7 +122,7 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
             codeLenses.push(new vscode.CodeLens(range, {
                 title: '✓ Keep',
                 command: 'diffTracker.keepBlock',
-                arguments: [filePath, block.blockId],
+                arguments: [filePath, block.blockId, reviewToken],
                 tooltip: 'Accept this change and remove from diff'
             }));
 
@@ -160,7 +165,9 @@ export class DiffCodeLensProvider implements vscode.CodeLensProvider {
     }
 
     public dispose(): void {
+        if (this.disposed) { return; }
         this.disposed = true;
+        this.trackingSubscription.dispose();
         if (this.prewarmTimer) {
             clearTimeout(this.prewarmTimer);
             this.prewarmTimer = undefined;

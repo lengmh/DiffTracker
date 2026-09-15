@@ -1,5 +1,5 @@
-// Deliberately outside npm test: desired safety assertions currently expose
-// deferred stage-2 P0s. Exit 1 is evidence of release blockers, not a green gate.
-// Reuses the exact production loader and VS Code boundary from tracker-safety.
+// Focused stage-2 safety probes, also included in normal tracker regressions.
+// Unknown document-event authorship uses the specified conservative policy.
+// Historical stronger author inference remains in legacy-manual-policy.mjs.
 process.env.DT_KNOWN_P0 = '1';
 await import('./tracker-safety.mjs');

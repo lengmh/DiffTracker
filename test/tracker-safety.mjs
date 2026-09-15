@@ -10,7 +10,13 @@ import Module, { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-safety-'));
 const faults = new Map();
+const barriers = new Map();
+function deferred() { let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve}; }
+function pause(p,operation) { const entered=deferred(),release=deferred(); barriers.set(`${p}:${operation}`,{entered,release}); return {entered:entered.promise,release:release.resolve}; }
+async function boundary(p,operation) { const key=`${p}:${operation}`, barrier=barriers.get(key); if(barrier){barriers.delete(key); barrier.entered.resolve(); await barrier.release.promise;} }
 let automationOnly=false;
+let listedFiles=[];
+let workspaceChanged;
 const docs = [];
 const counters = { apply: 0, save: 0, write: 0 };
 const noopEvent = () => ({ dispose() {} });
@@ -57,6 +63,7 @@ function document(p) {
         },
         async save() {
             counters.save++;
+            await boundary(p,'save');
             if (fault(p,'save') === false) return false;
             fs.writeFileSync(p,this.text); this.isDirty = false; return true;
         }
@@ -65,6 +72,7 @@ function document(p) {
 }
 const vscode = {
     EventEmitter: Emitter, Uri, Range, Position, WorkspaceEdit,
+    RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},
     FileType: { File:1, Directory:2, SymbolicLink:64 },
     FileSystemError: { FileNotFound:()=>error('FileNotFound'), NoPermissions:()=>error('NoPermissions') },
     window: { showWarningMessage:async()=>undefined, showErrorMessage:async()=>undefined },
@@ -76,7 +84,10 @@ const vscode = {
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidChangeConfiguration:noopEvent,
-        async openTextDocument(uri) { return document(uri.fsPath); },
+        onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
+        findFiles:async pattern=>pattern.pattern==='**/*'?listedFiles:[],
+        createFileSystemWatcher:()=>({onDidChange:noopEvent,onDidCreate:noopEvent,onDidDelete:noopEvent,dispose(){}}),
+        async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
             counters.apply++;
             for (const op of edit.ops) if (fault(op.uri.fsPath,'apply') === false) return false;
@@ -91,7 +102,7 @@ const vscode = {
         },
         fs: {
             async stat(uri) { fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
-            async readFile(uri) { fault(uri.fsPath,'read'); return new Uint8Array(fs.readFileSync(uri.fsPath)); },
+            async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
             async delete(uri) { fs.rmSync(uri.fsPath); }
@@ -290,23 +301,22 @@ for(const afterApply of [false,error('injected hunk post-mutation failure')]) te
     assert.equal(document(p).getText(),'base\n'); assert.equal(disk(p),'changed\n'); assert.equal(counters.save,beforeSave);
     tracker.processDocumentChange(document(p)); await scan(p); assert.ok(pending(p)); assert.equal(tracker.getOriginalContent(p),'base\n');
 });
-if(process.env.DT_KNOWN_P0==='1') {
-    tests.length=0;
-    test('DT-04 pure insertion Keep Y uses the wrong baseline coordinate',async()=>{
+const stage1Count=tests.length;
+{
+    test('DT-04 pure insertion Keep Y uses its baseline coordinate',async()=>{
         const p=file(); seed(p,'a\nb\nc\nd\ne\n','X\na\nb\nc\nY\nd\ne\n'); await scan(p);
         const working=disk(p); const block=tracker.getChangeBlocks(p).find(b=>b.changes.some(c=>c.newText==='Y'));
         assert.ok(block); await tracker.keepBlock(p,block.blockId);
-        console.log('OBSERVED baseline:',JSON.stringify(tracker.getOriginalContent(p)));
         assert.equal(disk(p),working); assert.equal(tracker.getOriginalContent(p),'a\nb\nc\nY\nd\ne\n');
     });
-    test('DT-04 old block ID survives same-line external text replacement',async()=>{
+    test('DT-04 old block ID is rejected after same-line external replacement',async()=>{
         const p=file(); seed(p,'a\nb\nc\n','a\nB\nc\n'); await scan(p); const old=tracker.getChangeBlocks(p)[0].blockId;
         fs.writeFileSync(p,'a\nZ\nc\n'); await scan(p); const current=tracker.getChangeBlocks(p)[0].blockId;
         const result=await tracker.keepBlock(p,old);
-        console.log('OBSERVED stale ID equal:',old===current,'accepted:',succeeded(result),'baseline:',JSON.stringify(tracker.getOriginalContent(p)));
         assert.equal(succeeded(result),false);
+        assert.notEqual(old,current); assert.equal(tracker.getOriginalContent(p),'a\nb\nc\n');
     });
-    for(const delay of [200,2000]) test(`DT-05 manual save then external write after ${delay}ms`,async()=>{
+    for(const delay of [200,2000]) test(`DT-05 unknown-source save then external write after ${delay}ms`,async()=>{
         automationOnly=true; const p=file(); seed(p,'A=old\nseparator\nB=old\n'); const doc=document(p);
         doc.text='A=manual\nseparator\nB=old\n'; doc.isDirty=true;
         tracker.onDocumentChanged({document:doc,contentChanges:[{text:'A=manual'}]});
@@ -314,20 +324,141 @@ if(process.env.DT_KNOWN_P0==='1') {
         await new Promise(resolve=>setTimeout(resolve,delay));
         fs.writeFileSync(p,'A=manual\nseparator\nB=external\n');
         await tracker.onExternalFileChanged(Uri.file(p)); await new Promise(resolve=>setTimeout(resolve,180));
-        const change=pending(p); console.log('OBSERVED delay:',delay,'pending:',!!change,'baseline:',JSON.stringify(tracker.getOriginalContent(p)),'disk:',JSON.stringify(disk(p)));
+        const change=pending(p);
         assert.ok(change,'external change must be visible');
         assert.ok(change.currentContent.includes('B=external'),'external write must be represented');
-        assert.ok(change.originalContent.includes('A=manual'),'previously untracked manual-only save must not reappear as pending');
+        if(process.env.DT_LEGACY_MANUAL==='1') {
+            assert.ok(change.originalContent.includes('A=manual'),'LEGACY desired attribution: previously untracked manual-only save must not reappear as pending');
+        } else {
+            assert.ok(change.originalContent.includes('A=old'),'unknown document-event authorship must remain conservative, not silently accept text');
+        }
     });
 }
+for(const order of [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]]) {
+    for(const kept of [[],[0],[1],[0,2],[0,1,2]]) test(`DT-04 insertion permutation ${order} Keep ${kept}`,async()=>{
+        const p=file(), base='a\nb\nc\nd\ne\nf\ng\nh\ni\n';
+        const render=ids=>`${ids.includes(0)?'X\n':''}a\nb\nc\n${ids.includes(1)?'Y\n':''}d\ne\nf\n${ids.includes(2)?'Z\n':''}g\nh\ni\n`;
+        seed(p,base,render([0,1,2])); await scan(p);
+        const accepted=[], remaining=[0,1,2];
+        for(const id of order) {
+            const block=tracker.getChangeBlocks(p).find(b=>b.changes.some(c=>c.newText===['X','Y','Z'][id])); assert.ok(block);
+            const before=disk(p);
+            if(kept.includes(id)){assert.ok(succeeded(await tracker.keepBlock(p,block.blockId)));accepted.push(id);assert.equal(disk(p),before);}
+            else {
+                assert.ok(succeeded(await tracker.revertBlock(p,block.blockId)));remaining.splice(remaining.indexOf(id),1);
+                assert.equal(document(p).getText(),render(remaining),'Revert edits the buffer');
+                assert.equal(disk(p),before,'hunk Revert preserves existing unsaved behavior');
+                assert.ok(await document(p).save());await scan(p);
+            }
+            assert.equal(tracker.getOriginalContent(p),render(accepted),'only selected Keep enters baseline');
+            assert.equal(disk(p),render(remaining),'only selected Revert changes working file');
+        }
+        assert.equal(disk(p),render(kept)); assert.equal(pending(p),undefined);
+    });
+}
+for(const action of ['keepAllChangesInFile','revertFile']) {
+    test(`DT-04 ${action} rejects stale explicit file token`,async()=>{
+        const p=file();seed(p,'base','first');await scan(p);const token=tracker.getReviewToken(p);
+        fs.writeFileSync(p,'second');await scan(p);
+        assert.equal(succeeded(await tracker[action](p,token)),false);assert.equal(disk(p),'second');assert.equal(tracker.getOriginalContent(p),'base');
+    });
+    test(`DT-04 ${action} detects external replacement across read await`,async()=>{
+        const p=file();seed(p,'base','first');await scan(p);const token=tracker.getReviewToken(p);
+        const gate=pause(p,'read');const operation=tracker[action](p,token);await gate.entered;
+        fs.writeFileSync(p,'second');gate.release();const result=await operation;
+        assert.equal(succeeded(result),false);assert.equal(disk(p),'second');assert.equal(tracker.getOriginalContent(p),'base');
+    });
+}
+test('DT-04 duplicate queued Keep uses original token and only succeeds once',async()=>{
+    const p=file();seed(p,'base','first');await scan(p);const token=tracker.getReviewToken(p);
+    const gate=pause(p,'read');const first=tracker.keepAllChangesInFile(p,token);await gate.entered;
+    const second=tracker.keepAllChangesInFile(p,token);gate.release();
+    assert.ok(succeeded(await first));assert.equal(succeeded(await second),false);assert.equal(tracker.getOriginalContent(p),'first');
+});
+for(const action of ['keepAllChanges','revertAllChanges']) test(`DT-04 ${action} snapshot excludes new files and changed targets`,async()=>{
+    const p=file(),q=file();seed(p,'base','first');await scan(p);const tokens=tracker.getReviewTokens();
+    fs.writeFileSync(p,'later');await scan(p);seed(q,'qbase','qpending');await scan(q);
+    const result=await tracker[action](tokens);assert.equal(result.succeeded,0);
+    assert.equal(disk(p),'later');assert.equal(disk(q),'qpending');assert.ok(pending(p));assert.ok(pending(q));
+});
+test('DT-05 mixed AI pending plus unknown save never accepts full file',async()=>{
+    automationOnly=true;const p=file();seed(p,'a\nseparator\nb\n','AI\nseparator\nb\n');await scan(p);
+    const doc=document(p);doc.text='AI\nseparator\nmanual\n';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc,contentChanges:[{text:'manual'}]});
+    tracker.onWillSaveDocument({document:doc});await doc.save();tracker.onDidSaveDocument(doc);await scan(p);
+    assert.equal(tracker.getOriginalContent(p),'a\nseparator\nb\n');assert.ok(pending(p));assert.equal(disk(p),doc.text);
+});
+for(const reason of [1,2,undefined]) test(`DT-05 undo/redo/formatter event ${reason} refreshes automation-only review`,async()=>{
+    automationOnly=true;const p=file();seed(p,'base','changed');await scan(p);const doc=document(p);
+    doc.text='base';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc,contentChanges:[{text:'base'}],reason});
+    await new Promise(r=>setTimeout(r,180));assert.equal(pending(p),undefined);
+    doc.text='changed';doc.version++;tracker.onDocumentChanged({document:doc,contentChanges:[{text:'changed'}],reason});
+    await new Promise(r=>setTimeout(r,180));assert.ok(pending(p));assert.equal(tracker.getOriginalContent(p),'base');
+});
+for(const stop of ['stopRecording','dispose']) test(`DT-08 old read cannot publish after ${stop}`,async()=>{
+    const p=file();seed(p,'base','changed');const gate=pause(p,'read');const operation=scan(p);await gate.entered;
+    tracker[stop]();gate.release();await operation;assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),'base');
+});
+test('DT-08 atomic replacement delete event reads actual replacement',async()=>{
+    const p=file();seed(p,'base','replacement');await tracker.onExternalFileDeleted(Uri.file(p));
+    assert.equal(pending(p)?.isDeleted,false);assert.equal(pending(p)?.currentContent,'replacement');
+});
+test('DT-08 parent-only deletion event discovers baseline child deletion',async()=>{
+    const dir=file('directory');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');fs.rmSync(dir,{recursive:true});
+    await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(p)?.isDeleted,true);
+});
+for(const transition of ['startRecording','resetBaselineToCurrentState']) test(`DT-08 old scan cannot publish across ${transition}`,async()=>{
+    const p=file();fs.writeFileSync(p,'old scan');listedFiles=[Uri.file(p)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const gate=pause(p,'read');const old=tracker.initializeWorkspaceSnapshots();await gate.entered;
+    listedFiles=[];await tracker[transition]();tracker.fileSnapshots.set(p,'new baseline');tracker.baselineExistingFiles.add(p);
+    gate.release();await old;assert.equal(tracker.getOriginalContent(p),'new baseline');
+});
+test('DT-08 create during scan has unknown before-image, not silently accepted',async()=>{
+    const p=file();fs.writeFileSync(p,'scanned');listedFiles=[Uri.file(p)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const gate=pause(p,'read');const old=tracker.initializeWorkspaceSnapshots();await gate.entered;
+    fs.writeFileSync(p,'replacement');await tracker.onExternalFileCreated(Uri.file(p));gate.release();await old;
+    assert.ok(pending(p)?.unavailableReason);assert.notEqual(tracker.getOriginalContent(p),'replacement');
+});
+test('DT-08 save completion after stop/start cannot clear new session review',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);const gate=pause(p,'save');const operation=tracker.revertFile(p);await gate.entered;
+    tracker.stopRecording();tracker.startRecording();tracker.fileSnapshots.set(p,'new baseline');tracker.baselineExistingFiles.add(p);
+    tracker.updateTrackedDiff(p,'new pending');gate.release();const result=await operation;
+    assert.equal(succeeded(result),false);assert.equal(tracker.getOriginalContent(p),'new baseline');assert.ok(pending(p));
+});
+test('DT-08 workspace membership event pauses and invalidates captured action',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);const token=tracker.getReviewToken(p);
+    workspaceChanged({added:[],removed:[vscode.workspace.workspaceFolders[0]]});
+    assert.equal(tracker.getIsRecording(),false);assert.equal(succeeded(await tracker.revertFile(p,token)),false);assert.equal(disk(p),'changed');
+});
+for(const action of ['keepBlock','revertBlock']) test(`DT-04 ${action} rejects stale clean editor content`,async()=>{
+    const p=file();seed(p,'base','old edit');document(p);fs.writeFileSync(p,'new edit');await scan(p);
+    const block=tracker.getChangeBlocks(p)[0],token=tracker.getReviewToken(p),before={...counters};
+    assert.equal(succeeded(await tracker[action](p,block.blockId,token)),false);
+    assert.equal(disk(p),'new edit');assert.equal(document(p).getText(),'old edit');assert.equal(tracker.getOriginalContent(p),'base');assert.deepEqual(counters,before);
+});
+test('DT-08 failed old save cannot mark new session pending-write or replace its review',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);const gate=pause(p,'save');faults.set(p,{save:error('old save error')});
+    const operation=tracker.revertFile(p);await gate.entered;tracker.stopRecording();tracker.startRecording();
+    tracker.fileSnapshots.set(p,'new baseline');tracker.baselineExistingFiles.add(p);tracker.updateTrackedDiff(p,'new pending');
+    gate.release();assert.equal(succeeded(await operation),false);
+    assert.equal(tracker.getOriginalContent(p),'new baseline');assert.equal(pending(p)?.currentContent,'new pending');assert.equal(tracker.pendingWriteFiles.has(p),false);
+});
+for(const action of ['keepAllChanges','revertAllChanges']) test(`DT-04 ${action} rechecks later target after earlier await`,async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base','pending');await scan(f);}
+    const tokens=tracker.getReviewTokens(),gate=pause(p,'read');const operation=tracker[action](tokens);await gate.entered;
+    fs.writeFileSync(q,'later external');await scan(q);gate.release();const result=await operation;
+    assert.equal(result.succeeded,1);assert.equal(disk(q),'later external');assert.equal(tracker.getOriginalContent(q),'base');assert.ok(pending(q));
+});
+if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
-    docs.length=0; faults.clear(); automationOnly=false; tracker=new DiffTracker();
+    docs.length=0; faults.clear(); barriers.clear(); automationOnly=false;listedFiles=[]; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }
     finally { tracker.dispose(); }
 }
 fs.rmSync(root,{recursive:true,force:true});
-console.log(`${tests.length-failures}/${tests.length} ${process.env.DT_KNOWN_P0==='1'?'known-P0 desired-behavior probes':'production tracker regressions'} passed (mocked VS Code boundary; not Extension Host).`);
+console.log(`${tests.length-failures}/${tests.length} ${process.env.DT_LEGACY_MANUAL==='1'?'historical authorship-inference diagnostics':process.env.DT_KNOWN_P0==='1'?'known-P0 conservative safety probes':'production tracker regressions'} passed (mocked VS Code boundary; not Extension Host).`);
 process.exitCode=failures?1:0;

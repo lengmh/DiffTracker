@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, BatchActionResult, DiffTracker, TrackChangesEvent } from './diffTracker';
+import { ActionResult, BatchActionResult, DiffTracker, ReviewToken, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
 import { DiffTreeDataProvider } from './diffTreeView';
 import { DiffHoverProvider } from './hoverProvider';
@@ -167,6 +167,10 @@ export async function activate(context: vscode.ExtensionContext) {
         return result;
     };
 
+    const missingReview = (filePath: string): ActionResult => reportAction({
+        filePath, status: 'conflict', reason: 'Review version is unavailable; reopen or refresh the review before acting'
+    });
+
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.toggleRecording', () => {
@@ -261,8 +265,9 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertAllChanges', async () => {
-            const changes = diffTracker.getTrackedChanges();
+        vscode.commands.registerCommand('diffTracker.revertAllChanges', async (reviewTokens?: ReviewToken[]) => {
+            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
+            const changes = tokens;
             if (changes.length === 0) {
                 return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
             }
@@ -276,7 +281,7 @@ export async function activate(context: vscode.ExtensionContext) {
             );
 
             if (answer === 'Revert All') {
-                return reportBatch('Reverted', await diffTracker.revertAllChanges());
+                return reportBatch('Reverted', await diffTracker.revertAllChanges(tokens));
             }
             return {
                 results: changes.map(change => ({ filePath: change.filePath, status: 'cancelled', reason: 'Revert cancelled' })),
@@ -287,18 +292,19 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepAllChanges', async () => {
-            const changes = diffTracker.getTrackedChanges();
+        vscode.commands.registerCommand('diffTracker.keepAllChanges', async (reviewTokens?: ReviewToken[]) => {
+            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
+            const changes = tokens;
             if (changes.length === 0) {
                 return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
             }
 
-            return reportBatch('Accepted', await diffTracker.keepAllChanges());
+            return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertFile', async (filePathOrItem: string | any) => {
+        vscode.commands.registerCommand('diffTracker.revertFile', async (filePathOrItem: string | any, reviewToken?: ReviewToken) => {
             const filePath = typeof filePathOrItem === 'string'
                 ? filePathOrItem
                 : filePathOrItem?.filePath;
@@ -306,6 +312,12 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!filePath) {
                 return;
             }
+
+            // Tree items carry the version shown; direct command invocations capture
+            // their target before opening the modal and never recapture afterward.
+            const token = reviewToken ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getReviewToken(filePath) : filePathOrItem.reviewToken);
+            if (!token) { return missingReview(filePath); }
 
             const answer = await vscode.window.showWarningMessage(
                 `Revert changes for ${displayFileName(filePath)}? Review pending changes and save any dirty editors first.`,
@@ -318,7 +330,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 return { status: 'cancelled', filePath, reason: 'Revert cancelled' } satisfies ActionResult;
             }
 
-            const result = reportAction(await diffTracker.revertFile(filePath));
+            const result = reportAction(await diffTracker.revertFile(filePath, token));
             if (result.status === 'success') {
                 void vscode.window.showInformationMessage('File reverted to original content');
             }
@@ -394,15 +406,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Block-wise revert command
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertBlock', async (filePath: string, blockRef: string | number) => {
-            return reportAction(await diffTracker.revertBlock(filePath, blockRef));
+        vscode.commands.registerCommand('diffTracker.revertBlock', async (filePath: string, blockRef: string | number, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.revertBlock(filePath, blockRef, token));
         })
     );
 
     // Block-wise keep command
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepBlock', async (filePath: string, blockRef: string | number) => {
-            return reportAction(await diffTracker.keepBlock(filePath, blockRef));
+        vscode.commands.registerCommand('diffTracker.keepBlock', async (filePath: string, blockRef: string | number, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.keepBlock(filePath, blockRef, token));
         })
     );
 
@@ -439,15 +453,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Revert all blocks in a file
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertAllBlocksInFile', async (filePath: string) => {
-            return reportAction(await diffTracker.revertFile(filePath));
+        vscode.commands.registerCommand('diffTracker.revertAllBlocksInFile', async (filePath: string, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.revertFile(filePath, token));
         })
     );
 
     // Keep all blocks in a file (accept all changes)
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepAllBlocksInFile', async (filePath: string) => {
-            return reportAction(await diffTracker.keepAllChangesInFile(filePath));
+        vscode.commands.registerCommand('diffTracker.keepAllBlocksInFile', async (filePath: string, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.keepAllChangesInFile(filePath, token));
         })
     );
 
