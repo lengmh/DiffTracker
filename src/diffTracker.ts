@@ -1730,7 +1730,12 @@ export class DiffTracker {
             this.markFileUnavailable(filePath, state.reason);
             return;
         }
-        if (!this.fileSnapshots.has(filePath) && !this.trackedChanges.get(filePath)?.unavailableReason) {
+        // Some watchers (notably Windows) can deliver a change notification before
+        // the matching create notification. That provisional change has no
+        // before-image and is marked unavailable, but the later create event is the
+        // evidence that this path did not exist in the ready baseline. Do not,
+        // however, resolve entries that were already uncertain during baseline scan.
+        if (!this.fileSnapshots.has(filePath) && !this.unresolvedBaselineFiles.has(filePath)) {
             this.fileSnapshots.set(filePath, '');
             this.schedulePersistState();
         }
@@ -2314,20 +2319,25 @@ export class DiffTracker {
             this.activeWriteFiles.add(item.filePath);
             let bufferChanged = false;
             try {
-                edit.createFile(uri, { overwrite: false, ignoreIfExists: false });
-                edit.insert(uri, new vscode.Position(0, 0), item.before.content);
-                // Applying a resource creation and text insertion in one WorkspaceEdit is
-                // supported by VS Code 1.80; createFile(contents) is not.
+                const createEdit = new vscode.WorkspaceEdit();
+                createEdit.createFile(uri, { overwrite: false, ignoreIfExists: false });
                 if (!this.isCurrentEpoch(epoch)) {
                     return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery creation');
                 }
                 bufferChanged = true;
-                if (!await vscode.workspace.applyEdit(edit)) {
+                if (!await vscode.workspace.applyEdit(createEdit)) {
                     return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file creation', true);
                 }
                 const document = await vscode.workspace.openTextDocument(uri);
                 if (!this.isCurrentEpoch(epoch)) {
                     return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery creation', true);
+                }
+                if (item.before.content.length > 0) {
+                    const contentEdit = new vscode.WorkspaceEdit();
+                    contentEdit.insert(uri, new vscode.Position(0, 0), item.before.content);
+                    if (!await vscode.workspace.applyEdit(contentEdit)) {
+                        return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file content', true);
+                    }
                 }
                 if (document.getText() !== item.before.content) {
                     return this.actionResult(item.filePath, 'failed', 'Recovery file content was not applied', true);
@@ -2444,19 +2454,25 @@ export class DiffTracker {
         try {
             if (state.kind === 'missing') {
                 // Only confirmed absence permits creation. No overwrite fallback after open/save errors.
-                const edit = new vscode.WorkspaceEdit();
-                edit.createFile(uri, { overwrite: false, ignoreIfExists: false });
-                edit.insert(uri, new vscode.Position(0, 0), content);
+                const createEdit = new vscode.WorkspaceEdit();
+                createEdit.createFile(uri, { overwrite: false, ignoreIfExists: false });
                 const targetError = this.validateActionTarget(filePath);
                 if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
                 // A failed WorkspaceEdit may have created the resource before rejecting
                 // a later entry, so conservatively retain recovery until disk is verified.
                 bufferChanged = true;
-                if (!await vscode.workspace.applyEdit(edit)) {
+                if (!await vscode.workspace.applyEdit(createEdit)) {
                     return this.actionResult(filePath, 'failed', 'File creation was rejected', true);
                 }
                 editedDocument = await vscode.workspace.openTextDocument(uri);
                 beforeText = '';
+                if (content.length > 0) {
+                    const contentEdit = new vscode.WorkspaceEdit();
+                    contentEdit.insert(uri, new vscode.Position(0, 0), content);
+                    if (!await vscode.workspace.applyEdit(contentEdit)) {
+                        return this.actionResult(filePath, 'failed', 'Created file content was rejected', true);
+                    }
+                }
                 if (editedDocument.getText() !== content) {
                     return this.actionResult(filePath, 'failed', 'Created file content was not applied', true);
                 }

@@ -35,6 +35,14 @@ const untilStable = async (description, predicate, stableMilliseconds = 750, tim
 };
 const state = () => vscode.commands.executeCommand('diffTracker._testState');
 const pending = async name => (await state()).trackedChanges.find(item => item.filePath === uri(name).fsPath);
+const reviewablePending = async name => {
+    const current = await state();
+    const filePath = uri(name).fsPath;
+    const change = current.trackedChanges.find(item => item.filePath === filePath);
+    return change && !change.unavailableReason && current.reviewTokens.some(token => token.filePath === filePath)
+        ? change
+        : undefined;
+};
 const read = async name => new TextDecoder().decode(await vscode.workspace.fs.readFile(uri(name)));
 const write = (name, content) => vscode.workspace.fs.writeFile(uri(name), new TextEncoder().encode(content));
 const missing = async name => {
@@ -94,22 +102,25 @@ module.exports = async function runExtensionHostScenario() {
 
         // Extension recovery covers file creation/deletion without overwriting later work.
         await write('new-empty.txt', '');
-        await untilStable('empty creation pending', () => pending('new-empty.txt'));
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath)).status, 'success');
+        await untilStable('empty creation pending', () => reviewablePending('new-empty.txt'));
+        const emptyRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
+        assert.equal(emptyRevert.status, 'success', emptyRevert.reason);
         assert.equal(await missing('new-empty.txt'), true);
         await untilStable('empty creation review cleared', async () => !(await pending('new-empty.txt')));
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
+        const emptyUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
+        assert.equal(emptyUndo.succeeded, 1, JSON.stringify(emptyUndo.results));
         assert.equal(await read('new-empty.txt'), '');
         await untilStable('review refresh after empty-file recovery Undo', () => pending('new-empty.txt'));
         const emptyAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
         assert.equal(emptyAgain.status, 'success', emptyAgain.reason);
 
         await write('new-nonempty.txt', 'new recovery content\n');
-        await untilStable('nonempty creation pending', () => pending('new-nonempty.txt'));
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-nonempty.txt').fsPath)).status, 'success');
+        await untilStable('nonempty creation pending', () => reviewablePending('new-nonempty.txt'));
+        const nonemptyRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-nonempty.txt').fsPath);
+        assert.equal(nonemptyRevert.status, 'success', nonemptyRevert.reason);
         assert.equal(await missing('new-nonempty.txt'), true);
         const nonemptyUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
-        assert.equal(nonemptyUndo.succeeded, 1);
+        assert.equal(nonemptyUndo.succeeded, 1, JSON.stringify(nonemptyUndo.results));
         assert.equal(await read('new-nonempty.txt'), 'new recovery content\n');
         await untilStable('review refresh after nonempty-file recovery Undo', () => pending('new-nonempty.txt'));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-nonempty.txt').fsPath)).status, 'success');

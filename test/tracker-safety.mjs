@@ -100,6 +100,10 @@ const vscode = {
         async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
             counters.apply++;
+            // Keep the compatibility seam conservative: resource creation and
+            // document text edits must also work on hosts/providers that reject a
+            // mixed WorkspaceEdit even though each operation is supported alone.
+            if (edit.ops.some(op=>op.type==='create') && edit.ops.some(op=>op.type==='replace')) return false;
             for (const op of edit.ops) {
                 await boundary(op.uri.fsPath,'apply');
                 if (fault(op.uri.fsPath,'apply') === false) return false;
@@ -708,6 +712,17 @@ for(const stop of ['stopRecording','dispose']) test(`DT-08 old read cannot publi
 test('DT-08 atomic replacement delete event reads actual replacement',async()=>{
     const p=file();seed(p,'base','replacement');await tracker.onExternalFileDeleted(Uri.file(p));
     assert.equal(pending(p)?.isDeleted,false);assert.equal(pending(p)?.currentContent,'replacement');
+});
+test('DT-08 change-before-create watcher order still recognizes a post-baseline new file',async()=>{
+    const p=file('watcher-race-new.m');fs.writeFileSync(p,'new content');
+    await tracker.onExternalFileChanged(Uri.file(p));await new Promise(resolve=>setTimeout(resolve,180));
+    assert.ok(pending(p)?.unavailableReason,'the early change event has no before-image yet');
+    await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(pending(p)?.unavailableReason,undefined);
+    assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.ok(succeeded(await tracker.revertFile(p)));
+    assert.equal(fs.existsSync(p),false);
 });
 test('DT-08 parent-only deletion event discovers baseline child deletion',async()=>{
     const dir=file('directory');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');fs.rmSync(dir,{recursive:true});
