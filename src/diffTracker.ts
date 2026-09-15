@@ -141,7 +141,13 @@ export class DiffTracker {
     private sessionWorkspaceRoots: string[] = [];
     private latestGitContexts = new Map<string, GitContextSnapshot | undefined>();
     private fileActionQueues = new Map<string, Promise<unknown>>();
-    private undoActionQueue: Promise<void> = Promise.resolve();
+    private recoveryActionQueue: Promise<void> = Promise.resolve();
+
+    private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
+        const operation = this.recoveryActionQueue.then(action);
+        this.recoveryActionQueue = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
     private scanUncertainFiles = new Set<string>();
 
     private isCurrentEpoch(epoch: number): boolean {
@@ -2262,7 +2268,15 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
     }
 
-    public async revertAllChanges(tokens: ReviewToken[] = this.getReviewTokens()): Promise<BatchActionResult> {
+    public revertAllChanges(tokens: ReviewToken[] = this.getReviewTokens()): Promise<BatchActionResult> {
+        const epoch = this.sessionEpoch;
+        const reviewedTokens = [...tokens];
+        return this.queueRecoveryAction(() => this.isCurrentEpoch(epoch)
+            ? this.performRevertAllChanges(reviewedTokens)
+            : Promise.resolve({ results: [], succeeded: 0, failed: 0 }));
+    }
+
+    private async performRevertAllChanges(tokens: ReviewToken[]): Promise<BatchActionResult> {
         if (tokens.length === 0) { return { results: [], succeeded: 0, failed: 0 }; }
         const preparedPaths = new Set<string>();
         const items = tokens.flatMap(token => {
@@ -2301,7 +2315,7 @@ export class DiffTracker {
     }
 
     public revertFile(filePath: string, token = this.getReviewToken(filePath)): Promise<ActionResult> {
-        return this.revertFileQueued(filePath, token);
+        return this.queueRecoveryAction(() => this.revertFileQueued(filePath, token));
     }
 
     private revertFileQueued(
@@ -2470,11 +2484,7 @@ export class DiffTracker {
 
     public undoLastRevert(): Promise<BatchActionResult> {
         const epoch = this.sessionEpoch;
-        const operation = this.undoActionQueue
-            .catch(() => undefined)
-            .then(() => this.performUndoLastRevert(epoch));
-        this.undoActionQueue = operation.then(() => undefined, () => undefined);
-        return operation;
+        return this.queueRecoveryAction(() => this.performUndoLastRevert(epoch));
     }
 
     private async performUndoLastRevert(epoch: number): Promise<BatchActionResult> {
@@ -2694,7 +2704,8 @@ export class DiffTracker {
      * Revert a specific change block to its original content
      */
     public revertBlock(filePath: string, blockRef: string | number, token = this.getReviewToken(filePath)): Promise<ActionResult> {
-        return this.queueFileAction(filePath, token, review => this.revertBlockReviewed(filePath, blockRef, review));
+        return this.queueRecoveryAction(() =>
+            this.queueFileAction(filePath, token, review => this.revertBlockReviewed(filePath, blockRef, review)));
     }
 
     private async revertBlockReviewed(filePath: string, blockRef: string | number, review: ReviewToken): Promise<ActionResult> {
@@ -2932,6 +2943,8 @@ export class DiffTracker {
             },
             currentModel.dominantEol
         );
+        const finalTargetError = this.validateActionTarget(filePath);
+        if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
         this.fileSnapshots.set(filePath, newSnapshot);
         const currentExists = true;
         this.baselineExistingFiles.add(filePath);
@@ -2968,6 +2981,8 @@ export class DiffTracker {
             this.updateTrackedDiff(filePath, currentContent, { currentExists: state.kind === 'text' });
             return this.actionResult(filePath, 'conflict', 'File changed since review; review again');
         }
+        const finalTargetError = this.validateActionTarget(filePath);
+        if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
         this.fileSnapshots.set(filePath, currentContent);
         if (state.kind === 'missing') {
             this.baselineExistingFiles.delete(filePath);

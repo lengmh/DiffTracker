@@ -899,6 +899,25 @@ for(const action of ['keepAllChanges','revertAllChanges']) test(`DT-04 ${action}
     fs.writeFileSync(q,'later external');await scan(q);gate.release();const result=await operation;
     assert.equal(result.succeeded,1);assert.equal(disk(q),'later external');assert.equal(tracker.getOriginalContent(q),'base');assert.ok(pending(q));
 });
+for(const kind of ['file','block']) test(`DT-07 ${kind} Keep rechecks Git pause after its reads`,async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);
+    const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    tracker.setBaselineGitContexts([context]);const token=tracker.getReviewToken(p);const block=tracker.getChangeBlocks(p)[0];
+    // The initial queue verification reads once; pause the following action read.
+    const first=pause(p,'read');const action=kind==='file'?tracker.keepAllChangesInFile(p,token):tracker.keepBlock(p,block.blockId,token);
+    await first.entered;const second=pause(p,'read');first.release();await second.entered;
+    tracker.observeGitContext({...context,headName:'other'});second.release();
+    assert.equal(succeeded(await action),false);assert.equal(tracker.getOriginalContent(p),'base\n');
+});
+test('DT-09 Undo waits for the complete in-flight Revert All',async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base','changed');await scan(f);}
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));
+    const gate=pause(p,'apply');const revert=tracker.revertAllChanges();await gate.entered;
+    let undoCompleted=false;const undo=tracker.undoLastRevert().then(result=>{undoCompleted=true;return result;});
+    await new Promise(resolve=>setTimeout(resolve,30));const premature=undoCompleted;gate.release();
+    assert.equal((await revert).succeeded,2);assert.equal((await undo).succeeded,2);
+    assert.equal(premature,false);assert.equal(disk(p),'changed');assert.equal(disk(q),'changed');
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
