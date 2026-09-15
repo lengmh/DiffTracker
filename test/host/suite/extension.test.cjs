@@ -15,6 +15,24 @@ const until = async (description, predicate, timeout = 30_000) => {
     }
     throw new Error(`Timed out waiting for ${description}`);
 };
+const untilStable = async (description, predicate, stableMilliseconds = 750, timeout = 30_000) => {
+    const deadline = Date.now() + timeout;
+    let stableSince;
+    let stableValue;
+    while (Date.now() < deadline) {
+        const value = await predicate();
+        if (value) {
+            stableValue = value;
+            stableSince ??= Date.now();
+            if (Date.now() - stableSince >= stableMilliseconds) { return stableValue; }
+        } else {
+            stableSince = undefined;
+            stableValue = undefined;
+        }
+        await delay(100);
+    }
+    throw new Error(`Timed out waiting for stable ${description}`);
+};
 const state = () => vscode.commands.executeCommand('diffTracker._testState');
 const pending = async name => (await state()).trackedChanges.find(item => item.filePath === uri(name).fsPath);
 const read = async name => new TextDecoder().decode(await vscode.workspace.fs.readFile(uri(name)));
@@ -80,9 +98,10 @@ suite('Diff Tracker real Extension Host', () => {
         await until('empty creation pending', () => pending('new-empty.txt'));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath)).status, 'success');
         assert.equal(await missing('new-empty.txt'), true);
+        await untilStable('empty creation review cleared', async () => !(await pending('new-empty.txt')));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
         assert.equal(await read('new-empty.txt'), '');
-        await until('review refresh after empty-file recovery Undo', () => pending('new-empty.txt'));
+        await untilStable('review refresh after empty-file recovery Undo', () => pending('new-empty.txt'));
         const emptyAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
         assert.equal(emptyAgain.status, 'success', emptyAgain.reason);
 
@@ -90,9 +109,10 @@ suite('Diff Tracker real Extension Host', () => {
         await until('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath)).status, 'success');
         assert.equal(await read('deleted.txt'), 'delete baseline\n');
+        await untilStable('deleted-file review cleared', async () => !(await pending('deleted.txt')));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testUndoLastRevert')).succeeded, 1);
         assert.equal(await missing('deleted.txt'), true);
-        await until('review refresh after deleted-file recovery Undo', async () =>
+        await untilStable('review refresh after deleted-file recovery Undo', async () =>
             (await pending('deleted.txt'))?.isDeleted === true);
         const deletedAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);
         assert.equal(deletedAgain.status, 'success', deletedAgain.reason);
@@ -104,11 +124,13 @@ suite('Diff Tracker real Extension Host', () => {
         const batch = await vscode.commands.executeCommand('diffTracker._testRevertAll');
         assert.equal(batch.failed, 0);
         assert.equal(batch.succeeded, 2);
+        await untilStable('batch reviews cleared', async () =>
+            !(await pending('batch-a.txt')) && !(await pending('batch-b.txt')));
         const batchUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
         assert.equal(batchUndo.succeeded, 2);
         assert.equal(await read('batch-a.txt'), 'batch a changed\n');
         assert.equal(await read('batch-b.txt'), 'batch b changed\n');
-        await until('review refresh after batch recovery Undo', async () =>
+        await untilStable('review refresh after batch recovery Undo', async () =>
             await pending('batch-a.txt') && await pending('batch-b.txt'));
         assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertAll')).failed, 0);
 
