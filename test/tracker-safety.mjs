@@ -18,8 +18,27 @@ let automationOnly=false;
 let listedFiles=[];
 let workspaceChanged;
 const docs = [];
+const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
 const noopEvent = () => ({ dispose() {} });
+function createWatcher() {
+    const handlers = { change: [], create: [], delete: [] };
+    const watcher = {
+        active: true,
+        onDidChange(handler) { handlers.change.push(handler); return { dispose() {} }; },
+        onDidCreate(handler) { handlers.create.push(handler); return { dispose() {} }; },
+        onDidDelete(handler) { handlers.delete.push(handler); return { dispose() {} }; },
+        emit(kind, uri) { if(this.active) for(const handler of handlers[kind]) handler(uri); },
+        dispose() { this.active=false; }
+    };
+    watcherInstances.push(watcher);
+    return watcher;
+}
+function emitWatcher(kind, uri) { for(const watcher of watcherInstances) watcher.emit(kind,uri); }
+async function waitUntil(predicate, timeoutMs=1000) {
+    const deadline=Date.now()+timeoutMs;
+    while(!predicate()) { if(Date.now()>=deadline) throw new Error('Timed out waiting for test condition'); await new Promise(resolve=>setTimeout(resolve,5)); }
+}
 class Emitter { event = noopEvent; fire() {} dispose() {} }
 class Uri {
     constructor(p) { this.fsPath = p; this.path = p; this.scheme = 'file'; }
@@ -96,7 +115,7 @@ const vscode = {
         onDidChangeConfiguration:noopEvent,
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
         findFiles:async pattern=>pattern.pattern==='**/*'?listedFiles:[],
-        createFileSystemWatcher:()=>({onDidChange:noopEvent,onDidCreate:noopEvent,onDidDelete:noopEvent,dispose(){}}),
+        createFileSystemWatcher:createWatcher,
         async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
             counters.apply++;
@@ -541,6 +560,18 @@ test('DT-07 explicit archive-and-rebuild resets only the changed repository',asy
     const archive=JSON.parse(fs.readFileSync(path.join(storage,'session-state.archive.json'),'utf8'));
     assert.ok(archive.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='base'));
 });
+test('DT-07 repository rebuild watches files already captured while later files are scanning',async()=>{
+    const repo=path.join(root,'repo-rebuild-watcher-gap');fs.mkdirSync(repo);
+    const p=path.join(repo,'first.m'),q=path.join(repo,'blocked.m');seed(p,'old','branch baseline');seed(q,'old','branch baseline');
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p),Uri.file(q)];
+    await tracker.startExternalWatchers();const gate=pause(q,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);
+    await gate.entered;await waitUntil(()=>tracker.getOriginalContent(p)==='branch baseline');
+    fs.writeFileSync(p,'late external');emitWatcher('change',Uri.file(p));gate.release();
+    assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
+    assert.equal(tracker.getOriginalContent(p),'branch baseline');assert.equal(pending(p)?.currentContent,'late external');
+});
 test('DT-07 repository rebuild removes unresolved baseline paths that disappeared',async()=>{
     const repo=path.join(root,'repo-rebuild-unresolved');fs.mkdirSync(repo);
     const unresolved=path.join(repo,'unreadable.m'),stable=path.join(repo,'stable.m');
@@ -737,6 +768,14 @@ test('DT-08 parent-only deletion event discovers baseline child deletion',async(
     const dir=file('directory');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');fs.rmSync(dir,{recursive:true});
     await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(p)?.isDeleted,true);
 });
+test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{
+    const p=file('dirty-reset.m');seed(p,'old baseline','saved disk');const doc=document(p);
+    doc.text='dirty current';doc.isDirty=true;doc.version++;
+    listedFiles=[Uri.file(p)];await tracker.resetBaselineToCurrentState();
+    assert.equal(tracker.getOriginalContent(p),'dirty current');assert.equal(pending(p),undefined);
+    doc.text='later edit';doc.version++;tracker.processDocumentChange(doc);
+    assert.equal(pending(p)?.originalContent,'dirty current');assert.equal(pending(p)?.currentContent,'later edit');
+});
 for(const transition of ['startRecording','resetBaselineToCurrentState']) test(`DT-08 old scan cannot publish across ${transition}`,async()=>{
     const p=file();fs.writeFileSync(p,'old scan');listedFiles=[Uri.file(p)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
     const gate=pause(p,'read');const old=tracker.initializeWorkspaceSnapshots();await gate.entered;
@@ -818,7 +857,7 @@ for(const action of ['keepAllChanges','revertAllChanges']) test(`DT-04 ${action}
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
-    docs.length=0; faults.clear(); barriers.clear(); automationOnly=false;listedFiles=[]; tracker=new DiffTracker();
+    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;listedFiles=[]; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }

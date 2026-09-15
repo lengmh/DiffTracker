@@ -434,7 +434,7 @@ export class DiffTracker {
         this._onDidChangeBaselineState.fire('building');
 
         vscode.workspace.textDocuments.forEach(doc => {
-            this.ensureSnapshotForDocument(doc);
+            this.ensureSnapshotForDocument(doc, true);
         });
 
         void this.startExternalWatchers();
@@ -512,7 +512,7 @@ export class DiffTracker {
         try {
             // Open editors may be ahead of on-disk state; use their in-memory text as baseline.
             vscode.workspace.textDocuments.forEach(doc => {
-                this.ensureSnapshotForDocument(doc);
+                this.ensureSnapshotForDocument(doc, true);
             });
 
             await this.initializeWorkspaceSnapshots();
@@ -530,13 +530,44 @@ export class DiffTracker {
         }
     }
 
+    private createExternalWatchers(epoch: number): vscode.FileSystemWatcher[] {
+        const watchers: vscode.FileSystemWatcher[] = [];
+        try {
+            for (const folder of vscode.workspace.workspaceFolders ?? []) {
+                const pattern = new vscode.RelativePattern(folder, '**/*');
+                const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+                watchers.push(watcher);
+                watcher.onDidChange(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileChanged(uri); } });
+                watcher.onDidCreate(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileCreated(uri); } });
+                watcher.onDidDelete(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileDeleted(uri); } });
+            }
+            return watchers;
+        } catch (error) {
+            watchers.forEach(watcher => watcher.dispose());
+            throw error;
+        }
+    }
+
+    private activateExternalWatchers(watchers: vscode.FileSystemWatcher[]): void {
+        const previousWatchers = this.fileWatchers;
+        this.fileWatchers = watchers;
+        this.externalWatcherEnabled = watchers.length > 0;
+        previousWatchers.forEach(watcher => watcher.dispose());
+    }
+
+    private reportExternalWatcherFailure(error: any): void {
+        const message = error?.code === 'ENOSPC'
+            ? 'Diff Tracker: File watcher limit reached (ENOSPC). Falling back to open files only.'
+            : 'Diff Tracker: File watcher failed. Falling back to open files only.';
+        vscode.window.showWarningMessage(message);
+    }
+
     private async startExternalWatchers(): Promise<void> {
         const epoch = this.sessionEpoch;
-        this.disposeFileWatchers();
-        this.externalWatcherEnabled = false;
-
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
+            this.disposeFileWatchers();
+            this.externalWatcherEnabled = false;
             return;
         }
 
@@ -548,31 +579,11 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch) || !this.isRecording) { return; }
 
         try {
-            const patternGlob = '**/*';
-
-            for (const folder of folders) {
-                const createWatcher = (glob: string) => {
-                    const pattern = new vscode.RelativePattern(folder, glob);
-                    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-
-                    watcher.onDidChange(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileChanged(uri); } });
-                    watcher.onDidCreate(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileCreated(uri); } });
-                    watcher.onDidDelete(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileDeleted(uri); } });
-
-                    this.fileWatchers.push(watcher);
-                };
-
-                createWatcher(patternGlob);
-            }
-
-            this.externalWatcherEnabled = true;
+            this.activateExternalWatchers(this.createExternalWatchers(epoch));
         } catch (error: any) {
             this.externalWatcherEnabled = false;
             this.disposeFileWatchers();
-            const message = error?.code === 'ENOSPC'
-                ? 'Diff Tracker: File watcher limit reached (ENOSPC). Falling back to open files only.'
-                : 'Diff Tracker: File watcher failed. Falling back to open files only.';
-            vscode.window.showWarningMessage(message);
+            this.reportExternalWatcherFailure(error);
         }
     }
 
@@ -1849,6 +1860,11 @@ export class DiffTracker {
     private validateActionTarget(filePath: string): string | undefined {
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.baselineBuilding || !this.snapshotInitialized) { return 'Baseline is incomplete; rebuild it before review actions'; }
+        return this.validateSnapshotTarget(filePath);
+    }
+
+    private validateSnapshotTarget(filePath: string): string | undefined {
+        if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.disposed || this.workspaceContextChanged) { return 'Session is closed or workspace membership changed; review is paused'; }
         const gitPauseReason = this.getGitPauseReason(filePath);
         if (gitPauseReason) { return gitPauseReason; }
@@ -1976,7 +1992,9 @@ export class DiffTracker {
             revertHistory: [...this.revertHistory],
             unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
             baselineGitContexts: new Map(this.baselineGitContexts),
-            pausedGitRepositories: new Map(this.pausedGitRepositories)
+            pausedGitRepositories: new Map(this.pausedGitRepositories),
+            snapshotInitialized: this.snapshotInitialized,
+            baselineBuilding: this.baselineBuilding
         };
         const restorePrevious = async (): Promise<void> => {
             this.fileSnapshots = previous.fileSnapshots;
@@ -1988,15 +2006,40 @@ export class DiffTracker {
             this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
             this.baselineGitContexts = previous.baselineGitContexts;
             this.pausedGitRepositories = previous.pausedGitRepositories;
+            this.snapshotInitialized = previous.snapshotInitialized;
+            this.baselineBuilding = previous.baselineBuilding;
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
-            if (this.isRecording) { await this.startExternalWatchers(); }
+            if (this.isRecording && !this.externalWatcherEnabled) { await this.startExternalWatchers(); }
+            await this.processPendingExternalChanges();
+            this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');
             this.emitTrackChangesEvent({ fullRefresh: true });
         };
 
+        const previousEpoch = this.sessionEpoch;
+        let replacementWatchers: vscode.FileSystemWatcher[] | undefined;
+        if (this.isRecording) {
+            try {
+                // Register the next epoch's watchers while the current epoch's
+                // watchers remain active, then switch them without an await gap.
+                await this.refreshIgnoreMatchers();
+                if (!this.isCurrentEpoch(previousEpoch)) { return false; }
+                replacementWatchers = this.createExternalWatchers(previousEpoch + 1);
+            } catch (error: any) {
+                this.reportExternalWatcherFailure(error);
+                this.reportPersistenceIssue('Failed to prepare file watcher coverage for repository baseline rebuild.', error);
+                return false;
+            }
+        }
+
         const epoch = this.advanceEpoch();
+        // No asynchronous work may occur between the epoch change and handoff.
+        if (replacementWatchers) { this.activateExternalWatchers(replacementWatchers); }
         const previousReviewPaths = [...this.trackedChanges.keys()].filter(filePath => this.pathBelongsToRoot(filePath, repoRoot));
+        this.snapshotInitialized = false;
+        this.baselineBuilding = true;
+        this._onDidChangeBaselineState.fire('building');
         try {
             const repositoryBaselinePaths = new Set([
                 ...this.fileSnapshots.keys(),
@@ -2013,7 +2056,6 @@ export class DiffTracker {
                 this.markLineChangesUpdated(filePath);
             }
 
-            await this.refreshIgnoreMatchers();
             const files = await vscode.workspace.findFiles(
                 new vscode.RelativePattern(repoRoot, '**/*'),
                 new vscode.RelativePattern(repoRoot, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
@@ -2024,6 +2066,10 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
                 if (state.kind !== 'text') {
                     throw new Error(state.kind === 'unavailable' ? state.reason : `File disappeared during baseline rebuild: ${displayFileName(uri.fsPath)}`);
+                }
+                if (this.scanUncertainFiles.has(uri.fsPath)) {
+                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
+                    return;
                 }
                 this.unresolvedBaselineFiles.delete(uri.fsPath);
                 this.fileSnapshots.set(uri.fsPath, state.content);
@@ -2037,7 +2083,10 @@ export class DiffTracker {
             this.baselineGitContexts.set(repoRoot, { ...context });
             this.pausedGitRepositories.delete(repoRoot);
             this.resetChangeBlocksCaches();
-            if (this.isRecording) { await this.startExternalWatchers(); }
+            this.snapshotInitialized = true;
+            this.baselineBuilding = false;
+            this._onDidChangeBaselineState.fire('ready');
+            await this.processPendingExternalChanges();
             if (!await this.flushPendingPersistence()) {
                 await restorePrevious();
                 return false;
@@ -3227,7 +3276,7 @@ export class DiffTracker {
         return doc?.getText();
     }
 
-    private ensureSnapshotForDocument(doc: vscode.TextDocument): void {
+    private ensureSnapshotForDocument(doc: vscode.TextDocument, useDocumentContent = false): void {
         if (!this.isRecording) {
             return;
         }
@@ -3246,7 +3295,7 @@ export class DiffTracker {
         }
 
         if (this.trackedChanges.get(filePath)?.unavailableReason) { return; }
-        const targetError = this.validateActionTarget(filePath);
+        const targetError = this.validateSnapshotTarget(filePath);
         if (targetError) { this.markFileUnavailable(filePath, targetError); return; }
 
         try {
@@ -3264,7 +3313,13 @@ export class DiffTracker {
                 this.markFileUnavailable(filePath, 'Binary baseline content is unsupported');
                 return;
             }
-            const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            const diskContent = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            const content = useDocumentContent ? doc.getText() : diskContent;
+            const contentBytes = useDocumentContent ? new TextEncoder().encode(content) : bytes;
+            if (contentBytes.length > 5 * 1024 * 1024 || this.isLikelyBinaryContent(contentBytes)) {
+                this.markFileUnavailable(filePath, 'Baseline is unsupported or exceeds the 5 MiB limit');
+                return;
+            }
             this.fileSnapshots.set(filePath, content);
             this.baselineExistingFiles.add(filePath);
         } catch (error) {
