@@ -57,7 +57,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
-    const restoredSession = await diffTracker.restorePersistedState();
+    const restoreOutcome = await diffTracker.restorePersistedState();
     decorationManager = new DecorationManager(diffTracker);
     statusBarManager = new StatusBarManager(diffTracker);
     originalContentProvider = new OriginalContentProvider(diffTracker);
@@ -96,9 +96,27 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     };
 
-    const startRecordingFlow = () => {
+    const startRecordingFlow = async (): Promise<boolean> => {
+        if (diffTracker.isRecoveryBlocked()) {
+            const answer = await vscode.window.showErrorMessage(
+                'Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
+                { modal: true },
+                'Discard Saved Session and Rebuild'
+            );
+            if (answer !== 'Discard Saved Session and Rebuild' || !await diffTracker.discardRecoveryState()) {
+                return false;
+            }
+        } else if (!diffTracker.getIsRecording() && diffTracker.getBaselineState() === 'building') {
+            const answer = await vscode.window.showWarningMessage(
+                'Diff Tracker recovered an incomplete or different-workspace baseline. Starting will discard that review and build a new baseline.',
+                { modal: true },
+                'Rebuild Baseline'
+            );
+            if (answer !== 'Rebuild Baseline') { return false; }
+        }
         diffTracker.startRecording();
         void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', true);
+        return diffTracker.getIsRecording();
     };
 
     const stopRecordingFlow = () => {
@@ -177,14 +195,14 @@ export async function activate(context: vscode.ExtensionContext) {
             if (diffTracker.getIsRecording()) {
                 stopRecordingFlow();
             } else {
-                startRecordingFlow();
+                return startRecordingFlow();
             }
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.startRecording', () => {
-            startRecordingFlow();
+            return startRecordingFlow();
         })
     );
 
@@ -300,6 +318,17 @@ export async function activate(context: vscode.ExtensionContext) {
             }
 
             return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.undoLastRevert', async () => {
+            const result = await diffTracker.undoLastRevert();
+            if (result.results.length === 0) {
+                void vscode.window.showInformationMessage('Diff Tracker: No recent Revert is available to undo.');
+                return result;
+            }
+            return reportBatch('Restored', result);
         })
     );
 
@@ -615,10 +644,17 @@ export async function activate(context: vscode.ExtensionContext) {
     refreshChangesTree();
     await vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', diffTracker.getIsRecording());
 
-    if (restoredSession) {
+    if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
         updateVisibleDecorations();
+        if (restoreOutcome === 'recovered') {
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the last-good review session.');
+        } else if (restoreOutcome === 'incomplete') {
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the review in paused mode. Rebuild the baseline before review actions.');
+        }
+    } else if (restoreOutcome === 'blocked') {
+        void startRecordingFlow();
     } else {
-        startRecordingFlow();
+        void startRecordingFlow();
     }
 
     // Register disposables
@@ -626,9 +662,9 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(originalContentProvider);
 }
 
-export function deactivate() {
+export async function deactivate(): Promise<void> {
     if (diffTracker) {
-        diffTracker.dispose();
+        await diffTracker.dispose();
     }
     if (decorationManager) {
         decorationManager.dispose();

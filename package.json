@@ -162,6 +162,12 @@
         "icon": "$(check)"
       },
       {
+        "command": "diffTracker.undoLastRevert",
+        "title": "Undo Last Revert",
+        "category": "Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
         "command": "diffTracker.revertFile",
         "title": "Revert File",
         "category": "Diff Tracker",
@@ -303,6 +309,11 @@
         },
         {
           "command": "diffTracker.clearDiffs",
+          "when": "view == diffTracker.changesView",
+          "group": "navigation"
+        },
+        {
+          "command": "diffTracker.undoLastRevert",
           "when": "view == diffTracker.changesView",
           "group": "navigation"
         }

@@ -105,7 +105,17 @@ const vscode = {
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
-            async delete(uri) { fs.rmSync(uri.fsPath); }
+            async delete(uri) { fault(uri.fsPath,'delete'); fs.rmSync(uri.fsPath); },
+            async rename(source, target, options) {
+                fault(source.fsPath,'rename');
+                if (options?.overwrite) fs.rmSync(target.fsPath,{force:true});
+                fs.renameSync(source.fsPath,target.fsPath);
+            },
+            async copy(source, target, options) {
+                fault(source.fsPath,'copy');
+                if (!options?.overwrite && fs.existsSync(target.fsPath)) throw error('FileExists');
+                fs.copyFileSync(source.fsPath,target.fsPath);
+            }
         }
     }
 };
@@ -248,10 +258,157 @@ test('existing V1 persistence preserves absent versus empty baseline and paused 
     const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage); tracker.isRecording=false;
     await tracker.flushPersistState();
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
-    assert.equal(saved.version,1); assert.equal(saved.isRecording,false);
+    assert.equal(saved.version,2); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
     const loaded=await tracker.loadPersistedState(); assert.equal(loaded.isRecording,false);
     assert.ok(loaded.baselineExistingFiles.includes(empty)); assert.equal(loaded.baselineExistingFiles.includes(absent),false);
     assert.ok(loaded.fileSnapshots.some(([p,t])=>p===absent&&t===''));
+});
+test('DT-06 atomic persistence keeps a last-good state and recovers a corrupted primary',async()=>{
+    const p=file(); seed(p,'baseline','pending'); await scan(p);
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPersistState(),true);
+    const primary=path.join(storage,'session-state.json');
+    const backup=path.join(storage,'session-state.last-good.json');
+    assert.equal(fs.existsSync(backup),true);
+    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,2);
+    fs.writeFileSync(primary,'{"version":2,');
+
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'recovered');
+    assert.equal(tracker.getOriginalContent(p),'baseline'); assert.equal(pending(p)?.currentContent,'pending');
+    assert.match(tracker.getPersistenceIssue()??'',/last-good/i);
+});
+test('DT-06 corrupt primary and backup block automatic replacement',async()=>{
+    const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
+    const primary=path.join(storage,'session-state.json');
+    const backup=path.join(storage,'session-state.last-good.json');
+    fs.writeFileSync(primary,'corrupt primary'); fs.writeFileSync(backup,'corrupt backup');
+    tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.restorePersistedState(),'blocked');
+    assert.equal(tracker.isRecoveryBlocked(),true);
+    tracker.startRecording();
+    assert.equal(tracker.getIsRecording(),false);
+    assert.equal(fs.readFileSync(primary,'utf8'),'corrupt primary');
+});
+test('DT-06 invalid V1 entries reject the whole state instead of opening a partial review',async()=>{
+    const p=file(), outside=path.join(os.tmpdir(),`outside-${index++}.m`);
+    const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
+    fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
+        version:1,isRecording:false,fileSnapshots:[[p,'valid'],[outside,42]],baselineExistingFiles:[p,outside]
+    }));
+    tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.restorePersistedState(),'blocked');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+});
+test('DT-06 partial-scan V2 restores paused and cannot perform review writes',async()=>{
+    const p=file(); fs.writeFileSync(p,'current');
+    const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
+    fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
+        version:2,isRecording:true,baselineState:'building',workspaceRoots:[root],
+        fileSnapshots:[[p,'baseline']],baselineExistingFiles:[p],revertHistory:[]
+    }));
+    tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.restorePersistedState(),'incomplete');
+    assert.equal(tracker.getIsRecording(),false); assert.equal(tracker.getBaselineState(),'building');
+    assert.equal(succeeded(await tracker.revertFile(p)),false); assert.equal(disk(p),'current');
+});
+test('DT-06 failed atomic state write reports failure and preserves the previous valid primary',async()=>{
+    const p=file(); seed(p,'first');
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPersistState(),true);
+    const primary=path.join(storage,'session-state.json'); const before=fs.readFileSync(primary,'utf8');
+    tracker.fileSnapshots.set(p,'second');
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    assert.equal(await tracker.flushPersistState(),false);
+    assert.equal(fs.readFileSync(primary,'utf8'),before); assert.match(tracker.getPersistenceIssue()??'',/persist/i);
+    faults.delete(path.join(storage,'session-state.tmp.json'));
+});
+test('DT-06 awaited dispose flushes a queued state mutation',async()=>{
+    const p=file(); seed(p,'baseline');
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    tracker.schedulePersistState(); await tracker.dispose();
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.ok(saved.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='baseline'));
+});
+test('DT-09 Undo Last Revert restores reviewed file without changing its baseline',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p);
+    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'baseline');
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1);
+    assert.equal(disk(p),'changed'); assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.equal(pending(p)?.currentContent,'changed');
+});
+test('DT-09 Undo Last Revert restores all successful members of a partial batch',async()=>{
+    const p=file(),q=file(); for(const f of [p,q]){seed(f,'base','changed');await scan(f);}
+    faults.set(q,{save:false}); const reverted=await tracker.revertAllChanges(); assert.equal(reverted.succeeded,1);
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1);
+    assert.equal(disk(p),'changed'); assert.equal(disk(q),'changed'); assert.ok(pending(p)); assert.ok(pending(q));
+});
+test('DT-09 native Undo invalidates the recovery record without applying a second inverse edit',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p); assert.ok(succeeded(await tracker.revertFile(p)));
+    const doc=document(p); doc.text='changed'; doc.isDirty=true; doc.version++; tracker.processDocumentChange(doc);
+    const before={...counters}; const undo=await tracker.undoLastRevert();
+    assert.equal(undo.succeeded,1); assert.deepEqual(counters,before); assert.equal(doc.getText(),'changed');
+});
+test('DT-06 valid V1 state migrates in memory and the next durable write is strict V2',async()=>{
+    const p=file(); fs.writeFileSync(p,'changed');
+    const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
+    fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
+        version:1,isRecording:false,fileSnapshots:[[p,'baseline']],baselineExistingFiles:[p]
+    }));
+    tracker.storageUri=Uri.file(storage); assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getOriginalContent(p),'baseline'); assert.ok(pending(p));
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,2);
+});
+test('DT-06 explicit discard is required before a blocked session can start',async()=>{
+    const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
+    const primary=path.join(storage,'session-state.json'); fs.writeFileSync(primary,'corrupt');
+    tracker.storageUri=Uri.file(storage); assert.equal(await tracker.restorePersistedState(),'blocked');
+    tracker.startRecording(); assert.equal(tracker.getIsRecording(),false); assert.equal(fs.existsSync(primary),true);
+    assert.equal(await tracker.discardRecoveryState(),true); tracker.startRecording();
+    assert.equal(tracker.getIsRecording(),true); assert.equal(tracker.isRecoveryBlocked(),false);
+});
+test('DT-09 recovery record persistence failure blocks file Revert before mutation',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p);
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const temp=path.join(storage,'session-state.tmp.json'); faults.set(temp,{write:error('NoPermissions')});
+    const before={...counters}; const result=await tracker.revertFile(p);
+    assert.equal(succeeded(result),false); assert.match(result.reason,/recovery record/i);
+    assert.equal(disk(p),'changed'); assert.equal(document(p).getText(),'changed');
+    assert.equal(counters.apply,before.apply); assert.equal(counters.save,before.save); assert.equal(counters.write,before.write+1);
+    faults.delete(temp);
+});
+test('DT-09 Undo Last Revert recreates an unaccepted new file',async()=>{
+    const p=file(); fs.writeFileSync(p,'new content'); await tracker.onExternalFileCreated(Uri.file(p));
+    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(disk(p),'new content'); assert.ok(pending(p));
+});
+test('DT-09 Undo Last Revert restores a reviewed deletion after Revert recreated the file',async()=>{
+    const p=file(); seed(p,'baseline'); fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p));
+    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'baseline');
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(fs.existsSync(p),false); assert.equal(pending(p)?.isDeleted,true);
+});
+test('DT-09 block recovery restores only the dirty buffer and never saves it',async()=>{
+    const p=file(); seed(p,'base\n','changed\n'); await scan(p); const block=tracker.getChangeBlocks(p)[0];
+    assert.ok(succeeded(await tracker.revertBlock(p,block.blockId))); const doc=document(p);
+    assert.equal(doc.getText(),'base\n'); assert.equal(doc.isDirty,true); assert.equal(disk(p),'changed\n');
+    const beforeSave=counters.save; const undo=await tracker.undoLastRevert();
+    assert.equal(undo.succeeded,1); assert.equal(doc.getText(),'changed\n'); assert.equal(doc.isDirty,true);
+    assert.equal(disk(p),'changed\n'); assert.equal(counters.save,beforeSave);
+});
+test('DT-09 persisted recovery history survives reload and restores the reviewed file',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p);
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    assert.ok(succeeded(await tracker.revertFile(p))); await tracker.flushPendingPersistence();
+    tracker=new DiffTracker(Uri.file(storage)); assert.equal(await tracker.restorePersistedState(),'restored');
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(disk(p),'changed'); assert.ok(pending(p));
+});
+test('DT-09 a later file change conflicts instead of being overwritten by recovery',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p); assert.ok(succeeded(await tracker.revertFile(p)));
+    fs.writeFileSync(p,'newer work'); await scan(p); const before={...counters};
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,0); assert.equal(undo.failed,1);
+    assert.equal(disk(p),'newer work'); assert.deepEqual(counters,before);
 });
 test('existing automation session interface balances overlapping resource sessions',async()=>{
     const p=file(); const first=tracker.beginAutomationSession({filePaths:[p]}); const second=tracker.beginAutomationSession({filePaths:[p]});
@@ -457,7 +614,7 @@ for(const {name,run} of tests) {
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }
-    finally { tracker.dispose(); }
+    finally { await tracker.dispose(); }
 }
 fs.rmSync(root,{recursive:true,force:true});
 console.log(`${tests.length-failures}/${tests.length} ${process.env.DT_LEGACY_MANUAL==='1'?'historical authorship-inference diagnostics':process.env.DT_KNOWN_P0==='1'?'known-P0 conservative safety probes':'production tracker regressions'} passed (mocked VS Code boundary; not Extension Host).`);

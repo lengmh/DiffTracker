@@ -83,6 +83,19 @@ Stage 1 addresses DT-01/02/03 only. Stage 2 must close DT-04/05/08, including st
 
 A development VSIX may be generated through the existing `vsce` build chain with an explicitly forked prerelease identity. It must not masquerade as `TinyTigerPan`'s update or be published automatically. Enable only one DiffTracker extension because command/view/configuration namespaces are shared. A different publisher changes the extension storage namespace: existing upstream storage remains intact but is not automatically migrated. Back up the existing review session and finish/retain its pending work before switching; rollback means disable the development extension and re-enable the original version, whose separate storage was not migrated. No production-stable claim is made while the P0 list above remains open.
 
+## Stage 3 addendum
+
+Stage 3 is implemented on top of stage 2. V2 atomic/last-good persistence,
+strict V1 migration, partial-scan pause, awaited shutdown flush and bounded
+`Undo Last Revert` are covered by production-boundary regressions. Revert now
+requires a durable recovery record before mutation when extension storage is
+available. See `docs/stage3-verification.md` for the detailed evidence and limits.
+
+DT-06 data-loss paths covered by the new harness are closed. DT-09 has production
+coverage for text/file/create/delete/batch and native-undo recognition, but actual
+VS Code Ctrl+Z/Redo and crash/reload behavior remain stage 5 host tests. DT-07 Git
+context coordination remains open until stage 4.
+
 
 ## Stage 1 delivery addendum
 
