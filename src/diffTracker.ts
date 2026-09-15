@@ -718,13 +718,15 @@ export class DiffTracker {
         console.error(message, error);
     }
 
-    private async flushPersistState(): Promise<boolean> {
+    private async flushPersistState(completedBaseline = false): Promise<boolean> {
         const storageUri = this.storageUri;
         if (!storageUri) {
             return true;
         }
 
         const state = this.buildPersistedState();
+        // Persist the ready candidate while actions remain blocked in memory.
+        if (state && completedBaseline) { state.baselineState = 'ready'; }
         let payload: Uint8Array | undefined;
         if (state) {
             if (state.fileSnapshots.length > this.maxPersistedSnapshots) {
@@ -1435,10 +1437,7 @@ export class DiffTracker {
         const epoch = this.sessionEpoch;
         const folders = vscode.workspace.workspaceFolders;
         if (!folders || folders.length === 0) {
-            this.snapshotInitialized = true;
-            this.baselineBuilding = false;
-            this._onDidChangeBaselineState.fire('ready');
-            this.schedulePersistState();
+            await this.completeBaseline(epoch);
             return;
         }
 
@@ -1506,13 +1505,22 @@ export class DiffTracker {
             }
         }
 
+        await this.completeBaseline(epoch);
+    }
+
+    private async completeBaseline(epoch: number): Promise<boolean> {
+        this.baselineBuilding = true;
         this.snapshotInitialized = true;
-        if (this.isRecording && this.baselineBuilding) {
-            this.baselineBuilding = false;
-            this._onDidChangeBaselineState.fire('ready');
-        }
         await this.processPendingExternalChanges();
-        this.schedulePersistState();
+        if (!this.isCurrentEpoch(epoch)) { return false; }
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+        }
+        if (!await this.flushPersistState(true) || !this.isCurrentEpoch(epoch)) { return false; }
+        this.baselineBuilding = false;
+        this._onDidChangeBaselineState.fire('ready');
+        return true;
     }
 
     private isFileNotFound(error: unknown): boolean {
@@ -1690,6 +1698,17 @@ export class DiffTracker {
         }
     }
 
+    private async isUntrackedDirectory(uri: vscode.Uri): Promise<boolean> {
+        // A tracked file replaced with a directory must still report a conflict.
+        if (this.fileSnapshots.has(uri.fsPath)) { return false; }
+        try {
+            return !!((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
+        } catch {
+            // Let the normal reader report missing/unreadable files.
+            return false;
+        }
+    }
+
     private async onExternalFileChanged(uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
@@ -1705,6 +1724,8 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+
+        if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
 
         const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
         if (doc && doc.isDirty) {
@@ -1757,6 +1778,7 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
         if (!this.snapshotInitialized && !this.fileSnapshots.has(filePath)) {
             this.scanUncertainFiles.add(filePath);
             this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
@@ -2122,14 +2144,16 @@ export class DiffTracker {
             this.baselineGitContexts.set(repoRoot, { ...context });
             this.resetChangeBlocksCaches();
             this.snapshotInitialized = true;
-            this.baselineBuilding = false;
-            this._onDidChangeBaselineState.fire('ready');
             await this.processPendingExternalChanges();
             if (!this.isCurrentEpoch(epoch) || !contextStillCurrent()) {
                 await restorePrevious();
                 return false;
             }
-            if (!await this.flushPendingPersistence()) {
+            if (this.persistTimer) {
+                clearTimeout(this.persistTimer);
+                this.persistTimer = undefined;
+            }
+            if (!await this.flushPersistState(true)) {
                 await restorePrevious();
                 return false;
             }
@@ -2138,6 +2162,8 @@ export class DiffTracker {
                 await this.flushPendingPersistence();
                 return false;
             }
+            this.baselineBuilding = false;
+            this._onDidChangeBaselineState.fire('ready');
             this.pausedGitRepositories.delete(repoRoot);
             this.emitTrackChangesEvent({ removedFiles: previousReviewPaths, fullRefresh: true, baselineChanged: true });
             return true;
@@ -2458,6 +2484,16 @@ export class DiffTracker {
         if (item.saveMode === 'disk' && document.isDirty) {
             return this.actionResult(item.filePath, 'conflict', 'Unsaved editor changes appeared after revert; recovery blocked');
         }
+        const canRecover = async (expectedDocument: string): Promise<boolean> => {
+            const disk = item.saveMode === 'disk' ? await this.readFileSnapshot(uri) : undefined;
+            return this.isCurrentEpoch(epoch) && !this.validateActionTarget(item.filePath)
+                && this.revision(this.fileSnapshots.get(item.filePath) ?? '', this.baselineExistingFiles.has(item.filePath)) === item.baselineRevision
+                && document.getText() === expectedDocument
+                && (!disk || (disk.kind === 'text' && disk.content === item.after.content));
+        };
+        if (!await canRecover(item.after.content) || (item.saveMode === 'disk' && document.isDirty)) {
+            return this.actionResult(item.filePath, 'conflict', 'File changed while opening recovery; newer work was preserved');
+        }
         edit.replace(uri, this.getFullDocumentRange(document), item.before.content);
         this.pendingWriteFiles.add(item.filePath);
         this.activeWriteFiles.add(item.filePath);
@@ -2469,6 +2505,9 @@ export class DiffTracker {
                 return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery edit', document.getText() !== item.after.content);
             }
             if (item.saveMode === 'disk') {
+                if (!await canRecover(item.before.content)) {
+                    return this.actionResult(item.filePath, 'conflict', 'File changed before recovery save; buffer changed but disk was preserved', true);
+                }
                 if (!await document.save()) {
                     return this.actionResult(item.filePath, 'failed', 'Recovery changed the buffer but saving failed', true);
                 }

@@ -918,6 +918,50 @@ test('DT-09 Undo waits for the complete in-flight Revert All',async()=>{
     assert.equal((await revert).succeeded,2);assert.equal((await undo).succeeded,2);
     assert.equal(premature,false);assert.equal(disk(p),'changed');assert.equal(disk(q),'changed');
 });
+for(const phase of ['open','apply']) test(`DT-09 Undo preserves disk changed during ${phase}`,async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));
+    assert.equal(succeeded(await tracker.revertFile(p)),true);
+    const gate=pause(p,phase),operation=tracker.undoLastRevert();await gate.entered;
+    fs.writeFileSync(p,'new external work');gate.release();const result=await operation;
+    assert.equal(result.succeeded,0);assert.equal(disk(p),'new external work');assert.equal(tracker.revertHistory.length,1);
+});
+for(const limit of ['maxPersistedSnapshots','maxPersistedBytes']) test(`DT-08 baseline stays blocked when ${limit} is exceeded`,async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));tracker[limit]=0;
+    tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+    await tracker.initializeWorkspaceSnapshots();assert.equal(tracker.getBaselineState(),'building');
+    assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);assert.equal(tracker.getOriginalContent(p),'base');
+});
+for(const building of [false,true]) test(`DT-08 directory watcher events do not create reviews (building=${building})`,async()=>{
+    const dir=file('folder');fs.mkdirSync(dir);tracker.snapshotInitialized=!building;tracker.baselineBuilding=building;
+    await tracker.onExternalFileCreated(Uri.file(dir));await tracker.onExternalFileChanged(Uri.file(dir));
+    await new Promise(resolve=>setTimeout(resolve,150));
+    assert.equal(pending(dir),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(dir),false);
+    fs.rmdirSync(dir);await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(dir),undefined);
+});
+test('DT-08 baseline persistence failure blocks review and a successful retry stores ready',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);
+    const storage=path.join(root,`storage-${index++}`),temp=path.join(storage,'session-state.tmp.json');
+    tracker.storageUri=Uri.file(storage);tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+    faults.set(temp,{write:error('NoPermissions')});await tracker.initializeWorkspaceSnapshots();
+    assert.equal(tracker.getBaselineState(),'building');assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);
+    faults.delete(temp);await tracker.initializeWorkspaceSnapshots();assert.equal(tracker.getBaselineState(),'ready');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).baselineState,'ready');
+});
+test('DT-08 ignoring a directory create still tracks deletion of its baseline children',async()=>{
+    const dir=file('folder');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');
+    await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(pending(dir),undefined);
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));
+    assert.equal(pending(p)?.isDeleted,true);assert.equal(pending(dir),undefined);
+});
+test('DT-09 Undo rejects a document refreshed to newer content while opening',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));await tracker.revertFile(p);
+    const gate=pause(p,'open'),operation=tracker.undoLastRevert();await gate.entered;
+    document(p).text='new editor content';gate.release();assert.equal((await operation).succeeded,0);
+    assert.equal(document(p).getText(),'new editor content');assert.equal(disk(p),'base');assert.equal(tracker.revertHistory.length,1);
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
