@@ -53,6 +53,7 @@ const initRepo = (repoRoot) => {
     git(repoRoot, 'init', '-b', 'main');
     git(repoRoot, 'config', 'user.email', 'diff-tracker@example.invalid');
     git(repoRoot, 'config', 'user.name', 'Diff Tracker Test');
+    git(repoRoot, 'config', 'core.autocrlf', 'false');
     writeFileSync(path.join(repoRoot, 'sample.txt'), 'base\n');
     git(repoRoot, 'add', 'sample.txt');
     git(repoRoot, 'commit', '-m', 'base');

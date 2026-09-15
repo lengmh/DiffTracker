@@ -19,6 +19,7 @@ try {
     mkdirSync(workspacePath, { recursive: true });
     for (const [name, content] of [
         ['existing.txt', 'base\n'],
+        ['crlf.txt', 'one\r\ntwo\r\n'],
         ['deleted.txt', 'delete baseline\n'],
         ['batch-a.txt', 'batch a\n'],
         ['batch-b.txt', 'batch b\n']
@@ -28,6 +29,7 @@ try {
     git('init', '-b', 'main');
     git('config', 'user.email', 'diff-tracker@example.invalid');
     git('config', 'user.name', 'Diff Tracker Host Test');
+    git('config', 'core.autocrlf', 'false');
     git('add', '.');
     git('commit', '-m', 'host baseline');
 

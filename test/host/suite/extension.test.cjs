@@ -68,6 +68,13 @@ suite('Diff Tracker real Extension Host', () => {
         await existingDocument.save();
         await until('clean review after hunk Redo', async () => !(await pending('existing.txt')));
 
+        // Windows-style CRLF bytes survive a real filesystem review/revert round trip.
+        await write('crlf.txt', 'one\r\nchanged\r\n');
+        await until('CRLF file pending review', () => pending('crlf.txt'));
+        const crlfRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('crlf.txt').fsPath);
+        assert.equal(crlfRevert.status, 'success', crlfRevert.reason);
+        assert.equal(await read('crlf.txt'), 'one\r\ntwo\r\n');
+
         // Extension recovery covers file creation/deletion without overwriting later work.
         await write('new-empty.txt', '');
         await until('empty creation pending', () => pending('new-empty.txt'));

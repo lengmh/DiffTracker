@@ -31,6 +31,7 @@ interface GitRepositoryLike {
         onDidChange: vscode.Event<void>;
     };
     onDidCheckout?: vscode.Event<void>;
+    status?(): Promise<void>;
 }
 
 interface GitApiLike {
@@ -135,18 +136,27 @@ export class GitContextMonitor implements vscode.Disposable {
     }
 
     private async discoverInitialRepositories(): Promise<void> {
-        if (!this.api?.getRepositoryRoot || !this.api.openRepository) { return; }
-        for (const folder of vscode.workspace.workspaceFolders ?? []) {
-            if (folder.uri.scheme !== 'file') { continue; }
-            try {
-                const root = await this.api.getRepositoryRoot(folder.uri);
-                if (root && !this.api.repositories.some(repository => repository.rootUri.fsPath === root.fsPath)) {
-                    await this.api.openRepository(root);
+        if (!this.api) { return; }
+        const initialRepositories = new Map(this.api.repositories.map(repository => [repository.rootUri.fsPath, repository]));
+        if (this.api.getRepositoryRoot && this.api.openRepository) {
+            for (const folder of vscode.workspace.workspaceFolders ?? []) {
+                if (folder.uri.scheme !== 'file') { continue; }
+                try {
+                    const root = await this.api.getRepositoryRoot(folder.uri);
+                    if (root && !initialRepositories.has(root.fsPath)) {
+                        const repository = await this.api.openRepository(root);
+                        if (repository) { initialRepositories.set(repository.rootUri.fsPath, repository); }
+                    }
+                } catch {
+                    // Git discovery is optional. Existing repository events remain active.
                 }
-            } catch {
-                // Git discovery is optional. Existing repository events remain active.
             }
         }
+        await Promise.all([...initialRepositories.values()].map(async repository => {
+            try { await repository.status?.(); }
+            catch { /* Later state events can retry context observation. */ }
+            this.attachRepository(repository, false);
+        }));
     }
 
     private refreshRepositories(emit = true): void {

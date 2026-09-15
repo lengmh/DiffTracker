@@ -45,7 +45,7 @@ test('repository snapshot uses public root, kind, HEAD and conflict fields',()=>
 });
 test('monitor uses vscode.git API v1 and reports repository state changes',async()=>{
     const stateChanged=new Emitter(),opened=new Emitter(),closed=new Emitter(),apiState=new Emitter();
-    const repo={rootUri:Uri.file('/workspace/repo'),kind:'repository',state:{
+    const repo={rootUri:Uri.file('/workspace/repo'),kind:'repository',status:async()=>{},state:{
         HEAD:{name:'main',commit:'aaa'},rebaseCommit:undefined,mergeChanges:[],onDidChange:stateChanged.event
     }};
     const gitApi={state:'initialized',repositories:[repo],onDidChangeState:apiState.event,
@@ -61,13 +61,14 @@ test('monitor uses vscode.git API v1 and reports repository state changes',async
 test('monitor discovers an existing workspace repository before baseline capture',async()=>{
     const opened=new Emitter(),closed=new Emitter(),apiState=new Emitter(),stateChanged=new Emitter();
     const repo={rootUri:Uri.file('/workspace/repo'),kind:'repository',state:{
-        HEAD:{name:'main',commit:'aaa'},rebaseCommit:undefined,mergeChanges:[],onDidChange:stateChanged.event
+        HEAD:undefined,rebaseCommit:undefined,mergeChanges:[],onDidChange:stateChanged.event
     }};
     const repositories=[];
     const gitApi={state:'initialized',repositories,onDidChangeState:apiState.event,
         onDidOpenRepository:opened.event,onDidCloseRepository:closed.event,
         async getRepositoryRoot(uri){assert.equal(uri.fsPath,'/workspace/repo');return uri;},
         async openRepository(){repositories.push(repo);return repo;}};
+    repo.status=async()=>{repo.state.HEAD={name:'main',commit:'aaa'};};
     installedExtension={isActive:true,exports:{enabled:true,getAPI:()=>gitApi}};
     const events=[];const monitor=new api.GitContextMonitor(event=>events.push(event));
     assert.equal(await monitor.start(),true);assert.equal(monitor.isReady(),true);
