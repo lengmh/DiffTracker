@@ -43,6 +43,12 @@ test('repository snapshot uses public root, kind, HEAD and conflict fields',()=>
     }};
     assert.deepEqual(api.snapshotGitRepository(repo),context({kind:'worktree',headName:undefined,headCommit:'abc',detached:true,inProgress:true}));
 });
+test('repository snapshot defaults the public vscode.git v1 shape to repository kind',()=>{
+    const repo={rootUri:Uri.file('/workspace/repo'),state:{
+        HEAD:{name:'main',commit:'abc'},rebaseCommit:undefined,mergeChanges:[],onDidChange:()=>({dispose(){}})
+    }};
+    assert.deepEqual(api.snapshotGitRepository(repo),context({headCommit:'abc'}));
+});
 test('monitor uses vscode.git API v1 and reports repository state changes',async()=>{
     const stateChanged=new Emitter(),opened=new Emitter(),closed=new Emitter(),apiState=new Emitter();
     const repo={rootUri:Uri.file('/workspace/repo'),kind:'repository',status:async()=>{},state:{

@@ -90,6 +90,11 @@ interface PersistedRevertRecord {
     items: PersistedRevertItem[];
 }
 
+interface PreparedBatchRevert {
+    record: PersistedRevertRecord;
+    retainPaths: Set<string>;
+}
+
 interface PersistedTrackerState {
     version: 2;
     isRecording: boolean;
@@ -189,7 +194,7 @@ export class DiffTracker {
         const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
         const task = previous.catch(() => undefined).then(async () => {
             if (!token || token.filePath !== filePath || !await this.verifyReview(token)) {
-                if (token && this.isCurrentEpoch(token.epoch)) { await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath)); }
+                if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
                 return this.actionResult(filePath, 'conflict', 'Review is stale or unavailable; refresh and review again');
             }
             return action(token);
@@ -200,6 +205,17 @@ export class DiffTracker {
         }).catch(() => undefined);
         return task;
     }
+    private async refreshRejectedReview(filePath: string): Promise<void> {
+        const document = vscode.workspace.textDocuments.find(value =>
+            value.uri.fsPath === filePath && value.uri.scheme === 'file'
+        );
+        if (document?.isDirty) {
+            this.processDocumentChange(document);
+            return;
+        }
+        await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+    }
+
     private isRecording = false;
     private pendingWriteFiles = new Set<string>();
     private activeWriteFiles = new Set<string>();
@@ -2066,19 +2082,31 @@ export class DiffTracker {
         if (this.revertHistory.length !== previousLength) { await this.flushPendingPersistence(); }
     }
 
-    private async mergeBatchRevertRecords(previousIds: Set<string>): Promise<void> {
-        const batchRecords = this.revertHistory.filter(record => !previousIds.has(record.id));
-        if (batchRecords.length <= 1) { return; }
-        const batchIds = new Set(batchRecords.map(record => record.id));
-        const merged: PersistedRevertRecord = {
-            id: `revert-batch-${Date.now()}-${this.nextRevertRecordId++}`,
-            createdAt: new Date().toISOString(),
-            items: batchRecords.flatMap(record => record.items)
-        };
-        this.revertHistory = [
-            ...this.revertHistory.filter(record => !batchIds.has(record.id)),
-            merged
-        ].slice(-this.maxRevertHistory);
+    private createFileRevertItem(filePath: string): PersistedRevertItem | undefined {
+        const change = this.trackedChanges.get(filePath);
+        if (!change || !this.fileSnapshots.has(filePath)) { return undefined; }
+        return this.createRevertItem(
+            filePath,
+            { exists: !change.isDeleted, content: change.currentContent },
+            { exists: this.baselineExistingFiles.has(filePath), content: change.originalContent },
+            'disk'
+        );
+    }
+
+    private preparedRecordMatchesItem(record: PersistedRevertRecord, expected: PersistedRevertItem): boolean {
+        const item = record.items.find(candidate => candidate.filePath === expected.filePath);
+        return !!item && item.baselineRevision === expected.baselineRevision && item.saveMode === expected.saveMode &&
+            this.fileStateMatches(item.before, expected.before) && this.fileStateMatches(item.after, expected.after);
+    }
+
+    private async finalizeBatchRevertRecord(batch: PreparedBatchRevert): Promise<void> {
+        const current = this.revertHistory.find(candidate => candidate.id === batch.record.id);
+        if (!current) { return; }
+        current.items = current.items.filter(item => batch.retainPaths.has(item.filePath));
+        if (current.items.length === 0) {
+            await this.removeRevertRecord(current);
+            return;
+        }
         await this.flushPendingPersistence();
     }
 
@@ -2091,9 +2119,26 @@ export class DiffTracker {
     }
 
     public async revertAllChanges(tokens: ReviewToken[] = this.getReviewTokens()): Promise<BatchActionResult> {
-        const previousIds = new Set(this.revertHistory.map(record => record.id));
-        const result = await this.runReviewedBatch(tokens, token => this.revertFile(token.filePath, token));
-        await this.mergeBatchRevertRecords(previousIds);
+        if (tokens.length === 0) { return { results: [], succeeded: 0, failed: 0 }; }
+        const preparedPaths = new Set<string>();
+        const items = tokens.flatMap(token => {
+            if (preparedPaths.has(token.filePath)) { return []; }
+            preparedPaths.add(token.filePath);
+            const item = this.createFileRevertItem(token.filePath);
+            return item ? [item] : [];
+        });
+        const record = await this.prepareRevertRecord(items);
+        if (!record) {
+            const results = tokens.map(token => this.actionResult(
+                token.filePath,
+                'failed',
+                'Cannot persist the batch recovery record; Revert All was blocked'
+            ));
+            return { results, succeeded: 0, failed: results.length };
+        }
+        const batch: PreparedBatchRevert = { record, retainPaths: new Set<string>() };
+        const result = await this.runReviewedBatch(tokens, token => this.revertFileQueued(token.filePath, token, batch));
+        await this.finalizeBatchRevertRecord(batch);
         return result;
     }
 
@@ -2112,32 +2157,49 @@ export class DiffTracker {
     }
 
     public revertFile(filePath: string, token = this.getReviewToken(filePath)): Promise<ActionResult> {
-        return this.queueFileAction(filePath, token, review => this.revertFileReviewed(filePath, review));
+        return this.revertFileQueued(filePath, token);
     }
 
-    private async revertFileReviewed(filePath: string, review: ReviewToken): Promise<ActionResult> {
+    private revertFileQueued(
+        filePath: string,
+        token: ReviewToken | undefined,
+        preparedBatch?: PreparedBatchRevert
+    ): Promise<ActionResult> {
+        return this.queueFileAction(
+            filePath,
+            token,
+            review => this.revertFileReviewed(filePath, review, preparedBatch)
+        );
+    }
+
+    private async revertFileReviewed(
+        filePath: string,
+        review: ReviewToken,
+        preparedBatch?: PreparedBatchRevert
+    ): Promise<ActionResult> {
         const targetError = this.validateActionTarget(filePath);
         if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
         const change = this.trackedChanges.get(filePath);
         if (!change || !this.fileSnapshots.has(filePath)) {
             return this.actionResult(filePath, 'conflict', 'No known baseline is available');
         }
-        const revertItem = this.createRevertItem(
-            filePath,
-            { exists: !change.isDeleted, content: change.currentContent },
-            { exists: this.baselineExistingFiles.has(filePath), content: change.originalContent },
-            'disk'
-        );
+        const revertItem = this.createFileRevertItem(filePath);
         if (!revertItem) { return this.actionResult(filePath, 'failed', 'Cannot create a recovery record; revert blocked'); }
-        const recoveryRecord = await this.prepareRevertRecord([revertItem]);
+        if (preparedBatch && !this.preparedRecordMatchesItem(preparedBatch.record, revertItem)) {
+            return this.actionResult(filePath, 'conflict', 'Batch recovery record no longer matches the reviewed file');
+        }
+        const recoveryRecord = preparedBatch?.record ?? await this.prepareRevertRecord([revertItem]);
         if (!recoveryRecord) {
             return this.actionResult(filePath, 'failed', 'Cannot persist a recovery record; revert blocked');
         }
         const result = await this.restoreFileToContent(filePath, change.originalContent, {
             deleteIfMissingInBaseline: !this.baselineExistingFiles.has(filePath), review
         });
+        if (preparedBatch && (result.status === 'success' || result.bufferChanged)) {
+            preparedBatch.retainPaths.add(filePath);
+        }
         if (result.status !== 'success') {
-            await this.removeRevertRecord(recoveryRecord);
+            if (!preparedBatch && !result.bufferChanged) { await this.removeRevertRecord(recoveryRecord); }
             return result;
         }
         // Verify persisted state, including existence, before removing this item.
@@ -2509,24 +2571,35 @@ export class DiffTracker {
             this.activeWriteFiles.add(filePath);
             const success = await vscode.workspace.applyEdit(edit);
             if (!this.matchesReview(review)) {
-                await this.removeRevertRecord(recoveryRecord);
-                recoveryRecord = undefined;
-                return this.actionResult(filePath, 'conflict', 'Session or review changed during block edit', doc.getText() !== beforeText);
+                const bufferChanged = doc.getText() !== beforeText;
+                if (!bufferChanged) {
+                    this.pendingWriteFiles.delete(filePath);
+                    await this.removeRevertRecord(recoveryRecord);
+                    recoveryRecord = undefined;
+                } else {
+                    this.markFileUnavailable(filePath, 'Review changed after the editor buffer was modified; recovery retained');
+                }
+                return this.actionResult(filePath, 'conflict', 'Session or review changed during block edit', bufferChanged);
             }
             if (!success) {
                 const bufferChanged = doc.getText() !== beforeText;
                 if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
                 else { this.markFileUnavailable(filePath, 'Block edit failed after changing the editor buffer; review retained'); }
-                await this.removeRevertRecord(recoveryRecord);
-                recoveryRecord = undefined;
+                if (!bufferChanged) {
+                    await this.removeRevertRecord(recoveryRecord);
+                    recoveryRecord = undefined;
+                }
                 return this.actionResult(filePath, 'failed', 'Block edit was rejected; review retained', bufferChanged);
             }
             this.pendingWriteFiles.delete(filePath);
             if (doc.getText() !== nextText) {
+                const bufferChanged = doc.getText() !== beforeText;
                 this.updateTrackedDiff(filePath, doc.getText());
-                await this.removeRevertRecord(recoveryRecord);
-                recoveryRecord = undefined;
-                return this.actionResult(filePath, 'conflict', 'Document changed during block edit; review again', true);
+                if (!bufferChanged) {
+                    await this.removeRevertRecord(recoveryRecord);
+                    recoveryRecord = undefined;
+                }
+                return this.actionResult(filePath, 'conflict', 'Document changed during block edit; review again', bufferChanged);
             }
 
             // Refresh immediately so WebView/CodeLens state does not wait for debounced document-change events.
@@ -2534,16 +2607,16 @@ export class DiffTracker {
             this.schedulePersistState();
             return this.actionResult(filePath, 'success', undefined, true);
         } catch {
-            if (recoveryRecord) {
-                await this.removeRevertRecord(recoveryRecord);
-                recoveryRecord = undefined;
-            }
             if (!this.isCurrentEpoch(review.epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during block edit'); }
             const bufferChanged = !!editedDocument && beforeText !== undefined && editedDocument.getText() !== beforeText;
             if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
             else {
                 this.pendingWriteFiles.add(filePath);
                 this.markFileUnavailable(filePath, 'Block edit failed after changing the editor buffer; review retained');
+            }
+            if (recoveryRecord && !bufferChanged) {
+                await this.removeRevertRecord(recoveryRecord);
+                recoveryRecord = undefined;
             }
             return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained', bufferChanged);
         } finally {

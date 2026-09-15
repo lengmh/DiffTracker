@@ -203,7 +203,15 @@ for(const save of [false,error('NoPermissions')]) test(`DT-03 save ${save===fals
     assert.equal(succeeded(result),false); assert.equal(result.bufferChanged,true);
     assert.equal(disk(p),'changed\n'); assert.equal(document(p).getText(),'baseline\n'); assert.equal(document(p).isDirty,true);
     assert.equal(counters.write,before); assert.equal(tracker.getOriginalContent(p),'baseline\n'); assert.ok(pending(p));
+    assert.equal(tracker.revertHistory.length,1,'a partial buffer mutation must retain its durable recovery record');
     tracker.processDocumentChange(document(p)); await scan(p); assert.ok(pending(p), 'save failure pending survives buffer and watcher refresh');
+});
+test('DT-09 save failure retains its recovery record in durable session state',async()=>{
+    const p=file(); seed(p,'baseline','changed'); await scan(p); faults.set(p,{save:false});
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    const result=await tracker.revertFile(p); assert.equal(result.bufferChanged,true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.equal(saved.revertHistory.length,1); assert.equal(saved.revertHistory[0].items[0].before.content,'changed');
 });
 test('DT-03 applyEdit false never saves and keeps pending',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); faults.set(p,{apply:false}); const before=counters.save;
@@ -216,7 +224,8 @@ test('DT-03 arbitrary open failure cannot rebuild/overwrite existing file',async
 test('DT-03 dirty document is skipped without apply/save or acceptance',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); const doc=document(p); doc.text='unsaved manual'; doc.isDirty=true;
     const before={...counters}; assert.equal(succeeded(await tracker.revertFile(p)),false); assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);
-    assert.deepEqual(counters,before); assert.equal(doc.text,'unsaved manual'); assert.equal(disk(p),'changed'); assert.ok(pending(p));
+    assert.deepEqual(counters,before); assert.equal(doc.text,'unsaved manual'); assert.equal(disk(p),'changed');
+    assert.equal(pending(p)?.currentContent,'unsaved manual','rejected actions must retain the dirty buffer as the pending review');
 });
 test('DT-03 three-file batch removes only successes, save-false remains pending',async()=>{
     const files=[file('first.m'),file('second.m'),file('third.m')];
@@ -342,6 +351,28 @@ test('DT-09 Undo Last Revert restores all successful members of a partial batch'
     faults.set(q,{save:false}); const reverted=await tracker.revertAllChanges(); assert.equal(reverted.succeeded,1);
     const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1);
     assert.equal(disk(p),'changed'); assert.equal(disk(q),'changed'); assert.ok(pending(p)); assert.ok(pending(q));
+});
+test('DT-09 Revert All larger than the history limit remains one fully recoverable action',async()=>{
+    const files=Array.from({length:12},()=>file('batch.m'));
+    for(const p of files){seed(p,'base','changed');await scan(p);}
+    const reverted=await tracker.revertAllChanges(); assert.equal(reverted.succeeded,files.length);
+    assert.equal(tracker.revertHistory.length,1); assert.equal(tracker.revertHistory[0].items.length,files.length);
+    const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,files.length);
+    for(const p of files){assert.equal(disk(p),'changed');assert.equal(pending(p)?.currentContent,'changed');}
+});
+test('DT-09 large Revert All is durably one complete action before its final mutation',async()=>{
+    const files=Array.from({length:12},()=>file('durable-batch.m'));
+    for(const p of files){seed(p,'base','changed');await scan(p);}
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
+    const hold=pause(files.at(-1),'open'); const batchPromise=tracker.revertAllChanges();
+    await hold.entered;
+    try {
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        assert.equal(saved.revertHistory.length,1);
+        assert.equal(saved.revertHistory[0].items.length,files.length);
+        assert.equal(tracker.parsePersistedState(saved)?.revertHistory[0].items.length,files.length);
+    } finally { hold.release(); }
+    assert.equal((await batchPromise).succeeded,files.length);
 });
 test('DT-09 native Undo invalidates the recovery record without applying a second inverse edit',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); assert.ok(succeeded(await tracker.revertFile(p)));
@@ -521,10 +552,13 @@ test('DT-03 applyEdit throws after text mutation retains failed buffer and pendi
 });
 for(const afterApply of [false,error('injected hunk post-mutation failure')]) test(`DT-03 hunk applyEdit ${afterApply===false?'false':'throws'} after mutation retains pending`,async()=>{
     const p=file(); seed(p,'base\n','changed\n'); await scan(p);
+    const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);
     const block=tracker.getChangeBlocks(p)[0]; faults.set(p,{afterApply});
     const beforeSave=counters.save; const result=await tracker.revertBlock(p,block.blockId);
     assert.equal(succeeded(result),false); assert.equal(result.bufferChanged,true);
     assert.equal(document(p).getText(),'base\n'); assert.equal(disk(p),'changed\n'); assert.equal(counters.save,beforeSave);
+    assert.equal(tracker.revertHistory.length,1,'a partially applied hunk must retain its durable recovery record');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).revertHistory.length,1);
     tracker.processDocumentChange(document(p)); await scan(p); assert.ok(pending(p)); assert.equal(tracker.getOriginalContent(p),'base\n');
 });
 const stage1Count=tests.length;

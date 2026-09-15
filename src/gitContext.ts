@@ -23,7 +23,7 @@ interface GitHeadLike {
 
 interface GitRepositoryLike {
     rootUri: vscode.Uri;
-    kind: GitRepositoryKind;
+    kind?: GitRepositoryKind;
     state: {
         HEAD?: GitHeadLike;
         rebaseCommit?: unknown;
@@ -59,7 +59,7 @@ export function snapshotGitRepository(repository: GitRepositoryLike): GitContext
     const headCommit = repository.state.HEAD?.commit;
     return {
         repoRoot: repository.rootUri.fsPath,
-        kind: repository.kind,
+        kind: repository.kind ?? 'repository',
         headName,
         headCommit,
         detached: !!headCommit && !headName,
