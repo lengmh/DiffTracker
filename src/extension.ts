@@ -218,7 +218,9 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer !== 'Archive and Rebuild') { return false; }
         }
-        const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot);
+        const currentSnapshot = gitContextMonitor?.getSnapshot(repoRoot);
+        if (!currentSnapshot || currentSnapshot.inProgress) { return false; }
+        const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
         if (rebuilt) {
             refreshReview();
             void vscode.window.showInformationMessage('Diff Tracker: The repository review was archived and its baseline rebuilt.');

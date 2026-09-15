@@ -114,7 +114,7 @@ const vscode = {
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidChangeConfiguration:noopEvent,
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
-        findFiles:async pattern=>pattern.pattern==='**/*'?listedFiles:[],
+        findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:[];},
         createFileSystemWatcher:createWatcher,
         async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
@@ -572,6 +572,24 @@ test('DT-07 repository rebuild watches files already captured while later files 
     assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
     assert.equal(tracker.getOriginalContent(p),'branch baseline');assert.equal(pending(p)?.currentContent,'late external');
 });
+test('DT-07 branch change during rebuild keeps the repository paused',async()=>{
+    const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);await gate.entered;
+    tracker.observeGitContext({...base,headName:'third'});gate.release();
+    assert.equal(await rebuild,false);assert.ok(tracker.getGitPauseReason(p));assert.equal(tracker.getOriginalContent(p),'old');
+});
+test('DT-07 stale dialog context cannot rebuild after a second branch change',async()=>{
+    const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const first={...base,headName:'first'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(first);
+    tracker.observeGitContext({...base,headName:'second'});
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,first),false);
+    assert.equal(tracker.getOriginalContent(p),'old');assert.ok(tracker.getGitPauseReason(p));
+});
 test('DT-07 repository rebuild removes unresolved baseline paths that disappeared',async()=>{
     const repo=path.join(root,'repo-rebuild-unresolved');fs.mkdirSync(repo);
     const unresolved=path.join(repo,'unreadable.m'),stable=path.join(repo,'stable.m');
@@ -767,6 +785,33 @@ test('DT-08 change-before-create watcher order still recognizes a post-baseline 
 test('DT-08 parent-only deletion event discovers baseline child deletion',async()=>{
     const dir=file('directory');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');fs.rmSync(dir,{recursive:true});
     await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(p)?.isDeleted,true);
+});
+test('DT-06 removed workspace roots preserve a reloadable paused session',async()=>{
+    const p=file();seed(p,'preserved');tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));
+    await tracker.flushPendingPersistence();const storage=tracker.storageUri;const folders=vscode.workspace.workspaceFolders;
+    try {
+        vscode.workspace.workspaceFolders=[];workspaceChanged({added:[],removed:folders});
+        assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+        tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'incomplete');
+        assert.equal(tracker.getOriginalContent(p),'preserved');
+    } finally { vscode.workspace.workspaceFolders=folders; }
+});
+test('DT-06 reset after reverting a new file remains reloadable',async()=>{
+    const p=file();fs.writeFileSync(p,'new');await tracker.onExternalFileCreated(Uri.file(p));
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));const storage=tracker.storageUri;
+    assert.ok(succeeded(await tracker.revertFile(p)));const stable=file();seed(stable,'stable');listedFiles=[Uri.file(stable)];
+    await tracker.resetBaselineToCurrentState();await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(storage);
+    assert.notEqual(await tracker.restorePersistedState(),'blocked');
+});
+test('DT-08 reset cannot scan ahead of replacement watcher registration',async()=>{
+    const p=file();seed(p,'old','current');listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');const reset=tracker.resetBaselineToCurrentState();await gate.entered;
+    await new Promise(resolve=>setTimeout(resolve,30));
+    const scanned=tracker.getOriginalContent(p)==='current';
+    fs.writeFileSync(p,'external');emitWatcher('change',Uri.file(p));gate.release();await reset;
+    await new Promise(resolve=>setTimeout(resolve,180));
+    assert.ok(!scanned || pending(p)?.currentContent==='external','a scanned file must have live watcher coverage');
 });
 test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{
     const p=file('dirty-reset.m');seed(p,'old baseline','saved disk');const doc=document(p);
