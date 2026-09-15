@@ -37,7 +37,12 @@ class Range {
 class WorkspaceEdit {
     ops = [];
     replace(uri, range, text) { this.ops.push({ type:'replace', uri, range, text }); }
-    createFile(uri, options) { this.ops.push({ type:'create', uri, options }); }
+    createFile(uri, options) {
+        if (options && Object.prototype.hasOwnProperty.call(options,'contents')) {
+            throw new Error('VS Code 1.80 WorkspaceEdit.createFile does not support contents');
+        }
+        this.ops.push({ type:'create', uri, options });
+    }
     deleteFile(uri, options) { this.ops.push({ type:'delete', uri, options }); }
     insert(uri, position, text) { this.ops.push({ type:'replace', uri, text }); }
 }
@@ -72,7 +77,12 @@ function document(p) {
 }
 const vscode = {
     EventEmitter: Emitter, Uri, Range, Position, WorkspaceEdit,
-    RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},
+    RelativePattern:class {
+        constructor(base,pattern){
+            if (base instanceof Uri) throw new Error('VS Code 1.80 RelativePattern does not accept Uri');
+            Object.assign(this,{base,pattern});
+        }
+    },
     FileType: { File:1, Directory:2, SymbolicLink:64 },
     FileSystemError: { FileNotFound:()=>error('FileNotFound'), NoPermissions:()=>error('NoPermissions') },
     window: { showWarningMessage:async()=>undefined, showErrorMessage:async()=>undefined },
@@ -90,7 +100,10 @@ const vscode = {
         async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
             counters.apply++;
-            for (const op of edit.ops) if (fault(op.uri.fsPath,'apply') === false) return false;
+            for (const op of edit.ops) {
+                await boundary(op.uri.fsPath,'apply');
+                if (fault(op.uri.fsPath,'apply') === false) return false;
+            }
             for (const op of edit.ops) {
                 const p=op.uri.fsPath;
                 if (op.type==='delete') fs.rmSync(p,{force:!!op.options?.ignoreIfNotExists});
@@ -380,6 +393,22 @@ test('DT-09 native Undo invalidates the recovery record without applying a secon
     const before={...counters}; const undo=await tracker.undoLastRevert();
     assert.equal(undo.succeeded,1); assert.deepEqual(counters,before); assert.equal(doc.getText(),'changed');
 });
+test('DT-09 concurrent Undo Last Revert consumes one recovery record only once',async()=>{
+    const p=file();seed(p,'baseline','changed');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));
+    const hold=pause(p,'apply');const first=tracker.undoLastRevert();await hold.entered;
+    const second=tracker.undoLastRevert();await new Promise(resolve=>setImmediate(resolve));hold.release();
+    const results=await Promise.all([first,second]);
+    assert.equal(results.reduce((total,result)=>total+result.succeeded,0),1);
+    assert.equal(disk(p),'changed');assert.equal(tracker.revertHistory.length,0);
+});
+test('DT-08 queued Undo calls cannot mutate after the recording session stops',async()=>{
+    const p=file();seed(p,'baseline','changed');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));
+    const hold=pause(p,'read');const first=tracker.undoLastRevert();await hold.entered;
+    const second=tracker.undoLastRevert();tracker.stopRecording();hold.release();
+    const results=await Promise.all([first,second]);
+    assert.equal(results.reduce((total,result)=>total+result.succeeded,0),0);
+    assert.equal(disk(p),'baseline');assert.equal(tracker.revertHistory.length,1);
+});
 test('DT-06 valid V1 state migrates in memory and the next durable write is strict V2',async()=>{
     const p=file(); fs.writeFileSync(p,'changed');
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
@@ -498,6 +527,22 @@ test('DT-07 explicit archive-and-rebuild resets only the changed repository',asy
     assert.equal(fs.existsSync(path.join(storage,'session-state.archive.json')),true);
     const archive=JSON.parse(fs.readFileSync(path.join(storage,'session-state.archive.json'),'utf8'));
     assert.ok(archive.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='base'));
+});
+test('DT-07 repository rebuild removes unresolved baseline paths that disappeared',async()=>{
+    const repo=path.join(root,'repo-rebuild-unresolved');fs.mkdirSync(repo);
+    const unresolved=path.join(repo,'unreadable.m'),stable=path.join(repo,'stable.m');
+    fs.writeFileSync(unresolved,'unknown');fs.writeFileSync(stable,'stable');
+    listedFiles=[Uri.file(unresolved),Uri.file(stable)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    faults.set(unresolved,{read:error('NoPermissions')});await tracker.initializeWorkspaceSnapshots();
+    assert.ok(pending(unresolved)?.unavailableReason);faults.delete(unresolved);fs.unlinkSync(unresolved);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    assert.equal(await tracker.flushPendingPersistence(),true);listedFiles=[Uri.file(stable)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,current),true);
+    assert.equal(pending(unresolved),undefined);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.equal(saved.unresolvedBaselineFiles.some(([savedPath])=>savedPath===unresolved),false);
 });
 test('DT-07 dirty buffer or unstable Git state cannot rebuild a paused repository',async()=>{
     const repo=path.join(root,'repo-rebuild-blocked');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'base','changed');await scan(p);
@@ -679,6 +724,42 @@ test('DT-08 create during scan has unknown before-image, not silently accepted',
     const gate=pause(p,'read');const old=tracker.initializeWorkspaceSnapshots();await gate.entered;
     fs.writeFileSync(p,'replacement');await tracker.onExternalFileCreated(Uri.file(p));gate.release();await old;
     assert.ok(pending(p)?.unavailableReason);assert.notEqual(tracker.getOriginalContent(p),'replacement');
+});
+test('DT-08 unreadable baseline entry remains unavailable after Ready persistence and restart',async()=>{
+    const unavailable=file('unreadable.m'),stable=file('stable.m');
+    fs.writeFileSync(unavailable,'unknown before');fs.writeFileSync(stable,'stable baseline');
+    listedFiles=[Uri.file(unavailable),Uri.file(stable)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    faults.set(unavailable,{read:error('NoPermissions')});await tracker.initializeWorkspaceSnapshots();
+    assert.equal(tracker.getBaselineState(),'ready');assert.ok(pending(unavailable)?.unavailableReason);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.ok(saved.unresolvedBaselineFiles.some(([savedPath])=>savedPath===unavailable));
+    faults.delete(unavailable);tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.ok(pending(unavailable)?.unavailableReason);assert.equal(tracker.getReviewToken(unavailable),undefined);
+    assert.equal(tracker.getOriginalContent(stable),'stable baseline');
+});
+test('DT-08 an all-unresolved baseline restores its review instead of being treated as empty corruption',async()=>{
+    const unavailable=file('only-unreadable.m');fs.writeFileSync(unavailable,'unknown before');
+    listedFiles=[Uri.file(unavailable)];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    faults.set(unavailable,{read:error('NoPermissions')});await tracker.initializeWorkspaceSnapshots();
+    assert.equal(await tracker.flushPendingPersistence(),true);faults.delete(unavailable);
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.ok(pending(unavailable)?.unavailableReason);assert.equal(tracker.isRecoveryBlocked(),false);
+});
+test('DT-08 late change outside scan enumeration persists an unknown baseline across restart',async()=>{
+    const changed=file('late-change.m'),stable=file('late-stable.m');
+    fs.writeFileSync(changed,'appeared during scan');seed(stable,'stable baseline');
+    listedFiles=[];tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    await tracker.onExternalFileChanged(Uri.file(changed));await tracker.initializeWorkspaceSnapshots();
+    assert.ok(pending(changed)?.unavailableReason);assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.ok(saved.unresolvedBaselineFiles.some(([savedPath])=>savedPath===changed));
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.ok(pending(changed)?.unavailableReason);assert.equal(tracker.getReviewToken(changed),undefined);
 });
 test('DT-08 save completion after stop/start cannot clear new session review',async()=>{
     const p=file();seed(p,'base','changed');await scan(p);const gate=pause(p,'save');const operation=tracker.revertFile(p);await gate.entered;

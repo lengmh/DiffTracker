@@ -102,6 +102,7 @@ interface PersistedTrackerState {
     workspaceRoots: string[];
     fileSnapshots: Array<[string, string]>;
     baselineExistingFiles: string[];
+    unresolvedBaselineFiles: Array<[string, string]>;
     revertHistory: PersistedRevertRecord[];
     gitContexts: GitContextSnapshot[];
 }
@@ -138,6 +139,7 @@ export class DiffTracker {
     private disposed = false;
     private workspaceContextChanged = false;
     private fileActionQueues = new Map<string, Promise<unknown>>();
+    private undoActionQueue: Promise<void> = Promise.resolve();
     private scanUncertainFiles = new Set<string>();
 
     private isCurrentEpoch(epoch: number): boolean {
@@ -221,6 +223,7 @@ export class DiffTracker {
     private activeWriteFiles = new Set<string>();
     private fileSnapshots = new Map<string, string>();
     private baselineExistingFiles = new Set<string>();
+    private unresolvedBaselineFiles = new Map<string, string>();
     private trackedChanges = new Map<string, FileDiff>();
     private trackedChangesVersion = 0;
     private trackedChangesCacheVersion = -1;
@@ -339,6 +342,7 @@ export class DiffTracker {
         if (
             state.isRecording &&
             state.fileSnapshots.length === 0 &&
+            state.unresolvedBaselineFiles.length === 0 &&
             (vscode.workspace.workspaceFolders?.length ?? 0) > 0
         ) {
             this.recoveryBlocked = true;
@@ -358,6 +362,7 @@ export class DiffTracker {
         this.isRecording = incomplete ? false : state.isRecording;
         this.fileSnapshots = new Map(state.fileSnapshots);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
+        this.unresolvedBaselineFiles = new Map(state.unresolvedBaselineFiles);
         this.revertHistory = state.revertHistory.slice(-this.maxRevertHistory);
         this.baselineGitContexts = new Map(state.gitContexts.map(context => [context.repoRoot, context]));
         this.pausedGitRepositories.clear();
@@ -415,6 +420,7 @@ export class DiffTracker {
         this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
         this.baselineExistingFiles.clear();
+        this.unresolvedBaselineFiles.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -492,6 +498,7 @@ export class DiffTracker {
         this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
         this.baselineExistingFiles.clear();
+        this.unresolvedBaselineFiles.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -629,6 +636,8 @@ export class DiffTracker {
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             baselineExistingFiles: Array.from(this.baselineExistingFiles.values())
                 .sort((leftPath, rightPath) => leftPath.localeCompare(rightPath)),
+            unresolvedBaselineFiles: Array.from(this.unresolvedBaselineFiles.entries())
+                .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             revertHistory: this.revertHistory.slice(-this.maxRevertHistory),
             gitContexts: [...this.baselineGitContexts.values()]
                 .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot))
@@ -782,6 +791,7 @@ export class DiffTracker {
             workspaceRoots?: unknown;
             fileSnapshots?: unknown;
             baselineExistingFiles?: unknown;
+            unresolvedBaselineFiles?: unknown;
             revertHistory?: unknown;
             gitContexts?: unknown;
         };
@@ -833,6 +843,21 @@ export class DiffTracker {
         });
         if (fileSnapshots.some(([filePath]) => !isWithinRoot(filePath))) { return undefined; }
 
+        const rawUnresolved = candidate.version === 1 ? [] : (candidate.unresolvedBaselineFiles ?? []);
+        if (!Array.isArray(rawUnresolved) || rawUnresolved.length > this.maxPersistedSnapshots) { return undefined; }
+        const unresolvedBaselineFiles: Array<[string, string]> = [];
+        const unresolvedPaths = new Set<string>();
+        for (const entry of rawUnresolved) {
+            if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
+            const [filePath, reason] = entry;
+            if (typeof filePath !== 'string' || typeof reason !== 'string' || reason.length === 0 || reason.length > 1000 ||
+                !path.isAbsolute(filePath) || !isWithinRoot(filePath) || snapshotPaths.has(filePath) || unresolvedPaths.has(filePath)) {
+                return undefined;
+            }
+            unresolvedBaselineFiles.push([filePath, reason]);
+            unresolvedPaths.add(filePath);
+        }
+
         const baselineState = candidate.version === 1 ? 'ready' : candidate.baselineState;
         if (baselineState !== 'building' && baselineState !== 'ready') { return undefined; }
 
@@ -850,6 +875,7 @@ export class DiffTracker {
             workspaceRoots: normalizedRoots,
             fileSnapshots,
             baselineExistingFiles,
+            unresolvedBaselineFiles,
             revertHistory,
             gitContexts
         };
@@ -1418,13 +1444,17 @@ export class DiffTracker {
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     if (this.scanUncertainFiles.has(uri.fsPath)) {
-                        this.markFileUnavailable(uri.fsPath, 'File changed during baseline scan; before-image is unknown');
+                        this.recordUnresolvedBaseline(uri.fsPath, 'File changed during baseline scan; before-image is unknown');
                         return;
                     }
                     if (state.kind !== 'text') {
-                        if (state.kind === 'unavailable') { this.markFileUnavailable(uri.fsPath, state.reason); }
+                        const reason = state.kind === 'unavailable'
+                            ? state.reason
+                            : 'File disappeared during baseline scan; before-image is unknown';
+                        this.recordUnresolvedBaseline(uri.fsPath, reason);
                         return;
                     }
+                    this.unresolvedBaselineFiles.delete(uri.fsPath);
                     this.fileSnapshots.set(uri.fsPath, state.content);
                     this.baselineExistingFiles.add(uri.fsPath);
                 });
@@ -1513,6 +1543,12 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
 
+    private recordUnresolvedBaseline(filePath: string, reason: string): void {
+        this.unresolvedBaselineFiles.set(filePath, reason);
+        this.markFileUnavailable(filePath, reason);
+        this.schedulePersistState();
+    }
+
     private async rebuildTrackedChangesFromSnapshots(): Promise<void> {
         const epoch = this.sessionEpoch;
         this.clearTrackedChanges();
@@ -1521,9 +1557,6 @@ export class DiffTracker {
         this.inlineViews.clear();
 
         const snapshotPaths = Array.from(this.fileSnapshots.keys());
-        if (snapshotPaths.length === 0) {
-            return;
-        }
 
         await this.runWithConcurrency(snapshotPaths, 8, async (filePath) => {
             const uri = vscode.Uri.file(filePath);
@@ -1544,6 +1577,12 @@ export class DiffTracker {
                 this.markFileUnavailable(filePath, currentState.reason);
             }
         });
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+            if (!this.isPathIgnored(vscode.Uri.file(filePath))) {
+                this.markFileUnavailable(filePath, reason);
+            }
+        }
     }
 
     private isLikelyBinaryContent(content: Uint8Array): boolean {
@@ -1638,6 +1677,7 @@ export class DiffTracker {
         if (!this.fileSnapshots.has(filePath) && !this.snapshotInitialized) {
             this.scanUncertainFiles.add(filePath);
             this.pendingExternalChanges.add(filePath);
+            this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
             return;
         }
 
@@ -1681,7 +1721,7 @@ export class DiffTracker {
         const filePath = uri.fsPath;
         if (!this.snapshotInitialized && !this.fileSnapshots.has(filePath)) {
             this.scanUncertainFiles.add(filePath);
-            this.markFileUnavailable(filePath, 'File appeared during baseline scan; before-image is unknown');
+            this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
             return;
         }
         const state = await this.readFileSnapshot(uri);
@@ -1929,6 +1969,7 @@ export class DiffTracker {
             lineChanges: new Map(this.lineChanges),
             inlineViews: new Map(this.inlineViews),
             revertHistory: [...this.revertHistory],
+            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
             baselineGitContexts: new Map(this.baselineGitContexts),
             pausedGitRepositories: new Map(this.pausedGitRepositories)
         };
@@ -1939,6 +1980,7 @@ export class DiffTracker {
             this.lineChanges = previous.lineChanges;
             this.inlineViews = previous.inlineViews;
             this.revertHistory = previous.revertHistory;
+            this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
             this.baselineGitContexts = previous.baselineGitContexts;
             this.pausedGitRepositories = previous.pausedGitRepositories;
             this.resetChangeBlocksCaches();
@@ -1951,10 +1993,15 @@ export class DiffTracker {
         const epoch = this.advanceEpoch();
         const previousReviewPaths = [...this.trackedChanges.keys()].filter(filePath => this.pathBelongsToRoot(filePath, repoRoot));
         try {
-            for (const filePath of [...this.fileSnapshots.keys()]) {
+            const repositoryBaselinePaths = new Set([
+                ...this.fileSnapshots.keys(),
+                ...this.unresolvedBaselineFiles.keys()
+            ]);
+            for (const filePath of repositoryBaselinePaths) {
                 if (!this.pathBelongsToRoot(filePath, repoRoot)) { continue; }
                 this.fileSnapshots.delete(filePath);
                 this.baselineExistingFiles.delete(filePath);
+                this.unresolvedBaselineFiles.delete(filePath);
                 this.deleteTrackedChange(filePath);
                 this.lineChanges.delete(filePath);
                 this.inlineViews.delete(filePath);
@@ -1963,8 +2010,8 @@ export class DiffTracker {
 
             await this.refreshIgnoreMatchers();
             const files = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(vscode.Uri.file(repoRoot), '**/*'),
-                new vscode.RelativePattern(vscode.Uri.file(repoRoot), '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+                new vscode.RelativePattern(repoRoot, '**/*'),
+                new vscode.RelativePattern(repoRoot, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
             );
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && !this.isPathIgnored(uri)), 8, async uri => {
@@ -1973,6 +2020,7 @@ export class DiffTracker {
                 if (state.kind !== 'text') {
                     throw new Error(state.kind === 'unavailable' ? state.reason : `File disappeared during baseline rebuild: ${displayFileName(uri.fsPath)}`);
                 }
+                this.unresolvedBaselineFiles.delete(uri.fsPath);
                 this.fileSnapshots.set(uri.fsPath, state.content);
                 this.baselineExistingFiles.add(uri.fsPath);
             });
@@ -2221,7 +2269,10 @@ export class DiffTracker {
         return this.readCurrentFileState(item.filePath);
     }
 
-    private async applyUndoItem(item: PersistedRevertItem): Promise<ActionResult> {
+    private async applyUndoItem(item: PersistedRevertItem, epoch: number): Promise<ActionResult> {
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery');
+        }
         const targetError = this.validateActionTarget(item.filePath);
         if (targetError) { return this.actionResult(item.filePath, 'conflict', targetError); }
         const baseline = this.fileSnapshots.get(item.filePath);
@@ -2229,6 +2280,9 @@ export class DiffTracker {
             return this.actionResult(item.filePath, 'conflict', 'Baseline changed after the revert; recovery record is stale');
         }
         const current = await this.readUndoCurrentState(item);
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery read');
+        }
         if (current.kind === 'unavailable') { return this.actionResult(item.filePath, 'failed', current.reason); }
         const currentState: PersistedFileState = {
             exists: current.kind === 'text',
@@ -2246,6 +2300,9 @@ export class DiffTracker {
         const edit = new vscode.WorkspaceEdit();
         if (!item.before.exists) {
             edit.deleteFile(uri, { ignoreIfNotExists: false, recursive: false });
+            if (!this.isCurrentEpoch(epoch)) {
+                return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery deletion');
+            }
             if (!await vscode.workspace.applyEdit(edit)) {
                 return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file deletion');
             }
@@ -2253,9 +2310,35 @@ export class DiffTracker {
             return this.actionResult(item.filePath, 'success', undefined, true);
         }
         if (!item.after.exists) {
-            edit.createFile(uri, { overwrite: false, ignoreIfExists: false, contents: new TextEncoder().encode(item.before.content) });
-            if (!await vscode.workspace.applyEdit(edit)) {
-                return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file creation');
+            this.pendingWriteFiles.add(item.filePath);
+            this.activeWriteFiles.add(item.filePath);
+            let bufferChanged = false;
+            try {
+                edit.createFile(uri, { overwrite: false, ignoreIfExists: false });
+                edit.insert(uri, new vscode.Position(0, 0), item.before.content);
+                // Applying a resource creation and text insertion in one WorkspaceEdit is
+                // supported by VS Code 1.80; createFile(contents) is not.
+                if (!this.isCurrentEpoch(epoch)) {
+                    return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery creation');
+                }
+                bufferChanged = true;
+                if (!await vscode.workspace.applyEdit(edit)) {
+                    return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file creation', true);
+                }
+                const document = await vscode.workspace.openTextDocument(uri);
+                if (!this.isCurrentEpoch(epoch)) {
+                    return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery creation', true);
+                }
+                if (document.getText() !== item.before.content) {
+                    return this.actionResult(item.filePath, 'failed', 'Recovery file content was not applied', true);
+                }
+                if (item.saveMode === 'disk' && !await document.save()) {
+                    return this.actionResult(item.filePath, 'failed', 'Recovery created the buffer but saving failed', true);
+                }
+                bufferChanged = false;
+            } finally {
+                this.activeWriteFiles.delete(item.filePath);
+                if (!bufferChanged) { this.pendingWriteFiles.delete(item.filePath); }
             }
             this.updateTrackedDiff(item.filePath, item.before.content, { currentExists: true });
             return this.actionResult(item.filePath, 'success', undefined, true);
@@ -2269,6 +2352,9 @@ export class DiffTracker {
         this.pendingWriteFiles.add(item.filePath);
         this.activeWriteFiles.add(item.filePath);
         try {
+            if (!this.isCurrentEpoch(epoch)) {
+                return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery edit');
+            }
             if (!await vscode.workspace.applyEdit(edit) || document.getText() !== item.before.content) {
                 return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery edit', document.getText() !== item.after.content);
             }
@@ -2286,14 +2372,24 @@ export class DiffTracker {
         }
     }
 
-    public async undoLastRevert(): Promise<BatchActionResult> {
+    public undoLastRevert(): Promise<BatchActionResult> {
+        const epoch = this.sessionEpoch;
+        const operation = this.undoActionQueue
+            .catch(() => undefined)
+            .then(() => this.performUndoLastRevert(epoch));
+        this.undoActionQueue = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
+
+    private async performUndoLastRevert(epoch: number): Promise<BatchActionResult> {
+        if (!this.isCurrentEpoch(epoch)) { return { results: [], succeeded: 0, failed: 0 }; }
         const record = this.revertHistory[this.revertHistory.length - 1];
         if (!record) { return { results: [], succeeded: 0, failed: 0 }; }
         const results: ActionResult[] = [];
         const remaining: PersistedRevertItem[] = [];
         for (const item of [...record.items].reverse()) {
             try {
-                const result = await this.applyUndoItem(item);
+                const result = await this.applyUndoItem(item, epoch);
                 results.push(result);
                 if (result.status !== 'success') { remaining.unshift(item); }
             } catch {
@@ -2301,10 +2397,17 @@ export class DiffTracker {
                 remaining.unshift(item);
             }
         }
-        if (remaining.length === 0) {
-            this.revertHistory.pop();
-        } else {
-            record.items = remaining;
+        const recordIndex = this.isCurrentEpoch(epoch)
+            ? this.revertHistory.findIndex(candidate =>
+                candidate === record && candidate.id === record.id && candidate.createdAt === record.createdAt
+            )
+            : -1;
+        if (recordIndex >= 0) {
+            if (remaining.length === 0) {
+                this.revertHistory.splice(recordIndex, 1);
+            } else {
+                record.items = remaining;
+            }
         }
         await this.flushPendingPersistence();
         const succeeded = results.filter(result => result.status === 'success').length;
@@ -2342,13 +2445,27 @@ export class DiffTracker {
             if (state.kind === 'missing') {
                 // Only confirmed absence permits creation. No overwrite fallback after open/save errors.
                 const edit = new vscode.WorkspaceEdit();
-                edit.createFile(uri, { overwrite: false, ignoreIfExists: false, contents: new TextEncoder().encode(content) });
+                edit.createFile(uri, { overwrite: false, ignoreIfExists: false });
+                edit.insert(uri, new vscode.Position(0, 0), content);
                 const targetError = this.validateActionTarget(filePath);
                 if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+                // A failed WorkspaceEdit may have created the resource before rejecting
+                // a later entry, so conservatively retain recovery until disk is verified.
+                bufferChanged = true;
                 if (!await vscode.workspace.applyEdit(edit)) {
-                    return this.actionResult(filePath, 'failed', 'File creation was rejected');
+                    return this.actionResult(filePath, 'failed', 'File creation was rejected', true);
                 }
-                return this.actionResult(filePath, 'success');
+                editedDocument = await vscode.workspace.openTextDocument(uri);
+                beforeText = '';
+                if (editedDocument.getText() !== content) {
+                    return this.actionResult(filePath, 'failed', 'Created file content was not applied', true);
+                }
+                if (!await editedDocument.save()) {
+                    this.markFileUnavailable(filePath, 'File was created but saving its restored content failed; review retained');
+                    return this.actionResult(filePath, 'failed', 'File was created but saving its restored content failed; review retained', true);
+                }
+                bufferChanged = false;
+                return this.actionResult(filePath, 'success', undefined, true);
             }
             const doc = await vscode.workspace.openTextDocument(uri);
             if (options?.review && !await this.verifyReview(options.review)) {

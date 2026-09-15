@@ -34,7 +34,7 @@ try {
     git('commit', '-m', 'host baseline');
 
     await runTests({
-        version: 'stable',
+        version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
         extensionDevelopmentPath,
         extensionTestsPath,
         extensionTestsEnv: {

@@ -105,6 +105,16 @@ suite('Diff Tracker real Extension Host', () => {
         const emptyAgain = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
         assert.equal(emptyAgain.status, 'success', emptyAgain.reason);
 
+        await write('new-nonempty.txt', 'new recovery content\n');
+        await untilStable('nonempty creation pending', () => pending('new-nonempty.txt'));
+        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-nonempty.txt').fsPath)).status, 'success');
+        assert.equal(await missing('new-nonempty.txt'), true);
+        const nonemptyUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
+        assert.equal(nonemptyUndo.succeeded, 1);
+        assert.equal(await read('new-nonempty.txt'), 'new recovery content\n');
+        await untilStable('review refresh after nonempty-file recovery Undo', () => pending('new-nonempty.txt'));
+        assert.equal((await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-nonempty.txt').fsPath)).status, 'success');
+
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
         const deletedRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);

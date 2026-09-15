@@ -51,9 +51,25 @@ jobs:
         if: runner.os == 'Windows'
         run: npm run test:host
 
+  minimum-extension-host:
+    name: VS Code 1.80 Host (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Extension Host (VS Code 1.80.2)
+        env:
+          DIFF_TRACKER_VSCODE_VERSION: 1.80.2
+        run: xvfb-run -a npm run test:host
+
   package:
     name: VSIX package
-    needs: [quality, extension-host]
+    needs: [quality, extension-host, minimum-extension-host]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
