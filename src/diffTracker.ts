@@ -222,6 +222,7 @@ export class DiffTracker {
         this.scanUncertainFiles.clear();
         this.activeCreations.clear();
         this.pendingImportedDirectoryReconciliation.clear();
+        this.importedDirectoryResumePromise = undefined;
         this.activeWriteFiles.clear();
         this.pendingWriteFiles.clear();
         return ++this.sessionEpoch;
@@ -308,6 +309,7 @@ export class DiffTracker {
     private fileWatchers: vscode.FileSystemWatcher[] = [];
     private importedDirectoryWatchers = new Map<string, ImportedDirectoryWatch>();
     private pendingImportedDirectoryReconciliation = new Set<string>();
+    private importedDirectoryResumePromise?: Promise<void>;
     private ignoreMatchers = new Map<string, Ignore>();
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
@@ -811,6 +813,20 @@ export class DiffTracker {
     }
 
     private async resumeImportedDirectoryWatchers(epoch: number, version: number): Promise<void> {
+        const previous = this.importedDirectoryResumePromise;
+        const operation = (async () => {
+            await previous;
+            if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+            await this.performImportedDirectoryResume(epoch, version);
+        })();
+        // A newer refresh must wait until older physical installation finishes,
+        // then inherit its reconciliation obligation. This queue covers only
+        // watch installation, never the ignore-refresh promise that calls it.
+        this.importedDirectoryResumePromise = operation.catch(() => undefined);
+        await operation;
+    }
+
+    private async performImportedDirectoryResume(epoch: number, version: number): Promise<void> {
         if (!this.isRecording || !this.externalWatcherEnabled) { return; }
         for (const [directory, previous] of Array.from(this.importedDirectoryWatchers)) {
             if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
@@ -818,9 +834,9 @@ export class DiffTracker {
                 this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
             try {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
-                // Rediscover directories created while coverage was suspended.
+                // Register before exposing active watches to overlapping refreshes.
+                this.pendingImportedDirectoryReconciliation.add(directory);
                 await this.watchImportedTree(directory, epoch, previous.provenAbsent);
-                if (this.isCurrentEpoch(epoch) && version === this.ignoreRefreshVersion) { this.pendingImportedDirectoryReconciliation.add(directory); }
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }

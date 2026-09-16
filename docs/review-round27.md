@@ -68,3 +68,12 @@ Independent review of 4d9ca01 reported P2 4029569951.
 - An outdated failure cannot recreate a marker removed by a newer successful reconciliation or fail the completed newer refresh.
 - Two overlapping-refresh regressions (watch traversal failure and file discovery failure) fail on 4d9ca01 and pass after the fix.
 - Local full suite: 525/525; final guard refinements also pass the targeted overlap tests. Compile/lint and whitespace checks pass. Final-head CI and independent review remain the merge gate.
+
+## Independent review follow-up: preserve successful resume obligations
+
+Independent review of 50dd2cb reported P1 4030174315.
+
+- Watch resume passes now share a per-session installation queue. A newer refresh waits for older physical installation to finish, then inherits its pending reconciliation work; it cannot mistake partially resumed coverage for a completed recovery.
+- Reconciliation is registered before installing watches, and session changes detach the old queue and clear old obligations.
+- Added overlapping-success and Stop-during-resume cases. The single-directory coverage-gap reproduction fails on 50dd2cb and passes now; the Stop control passes on both. The prior stale-failure case now drives an actual mocked native error during queued recovery.
+- Local full suite: 527/527. The refined single-directory overlap reproduction also passes separately. Compile, lint and whitespace validation pass. Final-head CI and independent review remain required.
