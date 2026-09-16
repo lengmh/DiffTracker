@@ -40,3 +40,13 @@ Independent review of 8868b6e reported P2 comments 4029240797 and 4029240807.
 - Added six regressions: settings/gitignore capacity reclamation across restart; failed-directory deletion with and without intermediate restore; preservation of scan-time and older unknown provenance. The four reported failure cases all fail on 8868b6e and pass with this fix.
 - Updated the existing directory-scan-failure regression to require the known absent before-image and to verify both Keep and Revert remain blocked while the directory is unavailable.
 - Full local suite: 513/513. Compile, lint and whitespace checks pass. Final-head CI and independent review remain the merge gate.
+
+## Independent review follow-up: resume coverage and asynchronous errors
+
+Independent review of d5aa0c0 reported P2 comments 4029340175 and 4029340183.
+
+- Ignoring a directory closes its native resource while retaining dormant discovery/provenance. Unignoring re-traverses the tree, including directories created while ignored. Failed resume restores prior dormant entries for later retry; ignored deletions remove obsolete entries.
+- Watch entries retain whether a post-baseline creation was observed. Error events and unnamed events use the same absence-aware failure path as synchronous failures. Inactive/ignored callbacks are discarded; scan-time uncertainty remains unresolved.
+- Added eight regressions: settings/gitignore unignore with new subdirectories, asynchronous errors/unnamed events with and without restore, failed-resume retry, and asynchronous scan-time uncertainty. All six reported reproductions fail on d5aa0c0 and pass now.
+- Real Linux native fs.watch verifies both unignore scenarios without injected file events.
+- Full local suite: 521/521. Compile, lint and whitespace validation pass. Final-head CI and independent review remain the merge gate.

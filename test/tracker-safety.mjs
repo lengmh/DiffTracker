@@ -29,7 +29,7 @@ const nativeWatch = fs.watch;
 fs.watch = (directory, options, listener) => {
     fault(root, 'watcher');
     const actual = process.env.DT_REAL_DIRECTORY_WATCH ? nativeWatch(directory, options, listener) : undefined;
-    const watcher = {directory, listener, active:true, close(){this.active=false;actual?.close();}, on(event,handler){actual?.on(event,handler);return this;}};
+    const watcher = {directory, listener, active:true, close(){this.active=false;actual?.close();}, on(event,handler){this[event]=handler;actual?.on(event,handler);return this;}};
     nativeDirectoryWatchers.push(watcher);return watcher;
 };
 const nativeLink = fs.promises.link;
@@ -2128,6 +2128,36 @@ for(const uncertainty of ['scan','older']) test(`ROUND27 failed directory covera
     if(uncertainty==='scan')tracker.snapshotInitialized=false;else tracker.recordUnresolvedBaseline(dir,'pre-existing unknown path');
     await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(tracker.getOriginalContent(dir),undefined);assert.ok(pending(dir)?.unavailableReason);
     fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
+});
+
+
+for(const source of ['setting','gitignore']) test(`ROUND27 unignoring ${source} reinstalls coverage including newly nested directories`,async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('unignore'),sub=path.join(dir,'deep'),p=path.join(sub,'known.txt');fs.mkdirSync(sub,{recursive:true});fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
+    const rule=file('.gitignore');if(source==='setting')watchExclude=[path.basename(dir)+'/'];else{fs.writeFileSync(rule,path.basename(dir)+'/');listedIgnores=[Uri.file(rule)];}
+    await tracker.refreshIgnoreMatchers();assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);
+    const nested=path.join(sub,'created-while-ignored');fs.mkdirSync(nested);
+    if(source==='setting')watchExclude=[];else fs.writeFileSync(rule,'');await tracker.refreshIgnoreMatchers();
+    fs.writeFileSync(p,'after unignore');if(!process.env.DT_REAL_DIRECTORY_WATCH)for(const w of nativeDirectoryWatchers)if(w.active&&w.directory===sub)w.listener('change','known.txt');
+    await waitUntil(()=>pending(p)?.currentContent==='after unignore');assert.equal(tracker.getOriginalContent(p),'base');
+    const q=path.join(nested,'new.txt');fs.writeFileSync(q,'new');if(!process.env.DT_REAL_DIRECTORY_WATCH)for(const w of nativeDirectoryWatchers)if(w.active&&w.directory===nested)w.listener('rename','new.txt');await waitUntil(()=>pending(q)?.currentContent==='new');
+});
+for(const restore of [false,true]) for(const kind of ['error','unnamed']) test(`ROUND27 asynchronous watcher ${kind} records deletable absence (restore=${restore})`,async()=>{
+    tracker.storageUri=Uri.file(file('storage'));const storage=tracker.storageUri;const dir=file('async-watch'),sub=path.join(dir,'deep');fs.mkdirSync(sub,{recursive:true});await tracker.onExternalFileCreated(Uri.file(dir));
+    const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===sub);assert.ok(watcher);if(kind==='error')watcher.error(error('ENOSPC'));else watcher.listener('rename',null);
+    await waitUntil(()=>!!pending(sub)?.unavailableReason);assert.equal(tracker.getOriginalContent(sub),'');
+    if(restore){await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');}
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(sub),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(sub),false);
+});
+
+
+test('ROUND27 failed watch resume retains discovery for a later successful retry',async()=>{
+    const dir=file('retry-unignore'),sub=path.join(dir,'deep');fs.mkdirSync(sub,{recursive:true});await tracker.onExternalFileCreated(Uri.file(dir));watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();
+    tracker.maxImportedDirectoryWatchers=1;watchExclude=[];await tracker.refreshIgnoreMatchers();assert.ok(tracker.importedDirectoryWatchers.has(dir));assert.ok(nativeDirectoryWatchers.filter(w=>w.active).length<=1);
+    tracker.maxImportedDirectoryWatchers=2;await tracker.refreshIgnoreMatchers();for(const p of [dir,sub])assert.ok(nativeDirectoryWatchers.some(w=>w.active&&w.directory===p));
+});
+test('ROUND27 asynchronous failure during scan never certifies absence',async()=>{
+    tracker.snapshotInitialized=false;const dir=file('scan-async');fs.mkdirSync(dir);await tracker.onExternalFileCreated(Uri.file(dir));const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));
+    await waitUntil(()=>!!pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

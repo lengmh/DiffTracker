@@ -96,6 +96,12 @@ interface PreparedBatchRevert {
     retainPaths: Set<string>;
 }
 
+interface ImportedDirectoryWatch {
+    watcher: vscode.Disposable;
+    epoch: number;
+    provenAbsent: boolean;
+}
+
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
@@ -299,7 +305,7 @@ export class DiffTracker {
     private inlineViews = new Map<string, InlineDiffView>();
     private disposables: vscode.Disposable[] = [];
     private fileWatchers: vscode.FileSystemWatcher[] = [];
-    private importedDirectoryWatchers = new Map<string, { watcher: vscode.Disposable; epoch: number }>();
+    private importedDirectoryWatchers = new Map<string, ImportedDirectoryWatch>();
     private ignoreMatchers = new Map<string, Ignore>();
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
@@ -796,12 +802,30 @@ export class DiffTracker {
         for (const [directory, entry] of this.importedDirectoryWatchers) {
             if (this.isPathIgnored(vscode.Uri.file(directory), true)) {
                 entry.watcher.dispose();
-                this.importedDirectoryWatchers.delete(directory);
+                // Retain discovery/provenance, not an active OS resource.
+                entry.epoch = -1;
             }
         }
     }
 
-    private watchImportedDirectory(directory: string, epoch: number): boolean {
+    private async resumeImportedDirectoryWatchers(epoch: number): Promise<void> {
+        if (!this.isRecording || !this.externalWatcherEnabled) { return; }
+        for (const [directory, previous] of Array.from(this.importedDirectoryWatchers)) {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (this.importedDirectoryWatchers.get(directory)?.epoch === epoch ||
+                this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
+            try {
+                if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
+                // Rediscover directories created while coverage was suspended.
+                await this.watchImportedTree(directory, epoch, previous.provenAbsent);
+            } catch (error) {
+                if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
+                else { await this.markCreatedDirectoryUnavailable(directory, 'Imported directory watch coverage could not be restored; rebuild after resolving the watcher failure', !previous.provenAbsent, epoch); }
+            }
+        }
+    }
+
+    private watchImportedDirectory(directory: string, epoch: number, inheritedAbsence = false): boolean {
         this.pruneIgnoredImportedDirectoryWatchers();
         if (this.isPathIgnored(vscode.Uri.file(directory), true)) { return false; }
         const previous = this.importedDirectoryWatchers.get(directory);
@@ -812,10 +836,15 @@ export class DiffTracker {
         // descendants. Watch local directories directly, without that backend.
         const targetError = this.validateResourceTarget(directory);
         if (targetError) { throw new Error(targetError); }
+        const provenAbsent = previous?.provenAbsent ?? (inheritedAbsence || this.hasObservedCreation(directory));
+        const reportFailure = (reason: string): void => {
+            void this.markCreatedDirectoryUnavailable(directory, reason, !provenAbsent, epoch);
+        };
         const native = fs.watch(directory, { persistent: false }, (kind, filename) => {
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!this.isCurrentEpoch(epoch) || this.importedDirectoryWatchers.get(directory)?.epoch !== epoch ||
+                this.isPathIgnored(vscode.Uri.file(directory), true)) { return; }
             if (!filename) {
-                this.markFileUnavailable(directory, 'Directory watcher returned an unnamed event; rebuild the baseline to reconcile');
+                reportFailure('Directory watcher returned an unnamed event; rebuild the baseline to reconcile');
                 return;
             }
             const filePath = path.join(directory, filename.toString());
@@ -823,29 +852,31 @@ export class DiffTracker {
             this.dispatchExternalEvent(vscode.Uri.file(filePath), kind === 'change' ? 'change' : fs.existsSync(filePath) ? 'create' : 'delete', epoch);
         });
         const watcher = { dispose: () => native.close() };
-        this.importedDirectoryWatchers.set(directory, { watcher, epoch });
+        this.importedDirectoryWatchers.set(directory, { watcher, epoch, provenAbsent });
         native.on('error', () => {
             native.close();
-            if (this.isCurrentEpoch(epoch) && this.importedDirectoryWatchers.get(directory)?.watcher === watcher) {
-                this.importedDirectoryWatchers.delete(directory);
-                this.markFileUnavailable(directory, 'Directory watcher failed; rebuild the baseline after resolving the watcher failure');
+            if (this.isCurrentEpoch(epoch) && this.importedDirectoryWatchers.get(directory)?.watcher === watcher &&
+                this.importedDirectoryWatchers.get(directory)?.epoch === epoch) {
+                this.importedDirectoryWatchers.get(directory)!.epoch = -1;
+                reportFailure('Directory watcher failed; rebuild the baseline after resolving the watcher failure');
             }
         });
         previous?.watcher.dispose();
         return true;
     }
 
-    private async watchImportedTree(root: string, epoch: number): Promise<void> {
+    private async watchImportedTree(root: string, epoch: number, inheritedAbsence = false): Promise<void> {
         const pending = [root];
-        const installed = new Map<string, { watcher: vscode.Disposable; epoch: number }>();
+        const installed = new Map<string, { current: ImportedDirectoryWatch; previous?: ImportedDirectoryWatch }>();
         try {
             while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
                 const directory = pending.pop()!;
                 if (this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
                 // Watch before enumeration so later children cannot fall into the
                 // discovery gap. Empty and ignored-file-only directories count too.
-                if (this.watchImportedDirectory(directory, epoch)) {
-                    installed.set(directory, this.importedDirectoryWatchers.get(directory)!);
+                const previous = this.importedDirectoryWatchers.get(directory);
+                if (this.watchImportedDirectory(directory, epoch, inheritedAbsence)) {
+                    installed.set(directory, { current: this.importedDirectoryWatchers.get(directory)!, previous });
                 }
                 const entries = await fs.promises.readdir(directory, { withFileTypes: true });
                 if (!this.isCurrentEpoch(epoch)) { return; }
@@ -860,9 +891,10 @@ export class DiffTracker {
             // Keep pre-existing coverage, but do not leak a partial installation
             // on OS quota, configured bound, or directory enumeration failures.
             for (const [directory, entry] of installed) {
-                if (this.importedDirectoryWatchers.get(directory) === entry) {
-                    entry.watcher.dispose();
-                    this.importedDirectoryWatchers.delete(directory);
+                if (this.importedDirectoryWatchers.get(directory) === entry.current) {
+                    entry.current.watcher.dispose();
+                    if (entry.previous) { this.importedDirectoryWatchers.set(directory, entry.previous); }
+                    else { this.importedDirectoryWatchers.delete(directory); }
                 }
             }
             throw error;
@@ -883,12 +915,13 @@ export class DiffTracker {
         this.fileWatchers = watchers;
         this.externalWatcherEnabled = watchers.length > 0;
         previousWatchers.forEach(watcher => watcher.dispose());
-        for (const directory of this.importedDirectoryWatchers.keys()) {
+        for (const [directory, previous] of this.importedDirectoryWatchers) {
             try {
-                if (!fs.lstatSync(directory).isDirectory()) { throw new Error('Directory no longer exists'); }
+                if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
                 this.watchImportedDirectory(directory, this.sessionEpoch);
-            } catch {
-                this.removeImportedDirectoryWatchers(directory);
+            } catch (error) {
+                if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
+                else { void this.markCreatedDirectoryUnavailable(directory, 'Imported directory watcher could not restart; rebuild after resolving the watcher failure', !previous.provenAbsent, this.sessionEpoch); }
             }
         }
     }
@@ -1589,6 +1622,8 @@ export class DiffTracker {
         this.ignoreMatchers = matchers;
         this.ignoreResultCache.clear();
         this.pruneIgnoredImportedDirectoryWatchers();
+        await this.resumeImportedDirectoryWatchers(epoch);
+        if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
         this.pruneIgnoredTrackedChanges();
         if (!changed || previousMatchers.size === 0 || this.restoringEpoch !== undefined ||
             this.baselineBuilding || !this.snapshotInitialized) { return; }
@@ -2363,11 +2398,12 @@ export class DiffTracker {
     private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' ||
-            this.deferInitialIgnoreEvent(uri, 'delete') || this.isPathIgnored(uri)) {
+            this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
         // Remove watches only for a confirmed missing subtree.
         if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
+        if (this.isPathIgnored(uri)) { return; }
         // A delete notification may race an atomic replacement; confirm actual state.
         const targets = new Set([uri.fsPath, ...[...this.fileSnapshots.keys()].filter(filePath => {
             const relative = path.relative(uri.fsPath, filePath);
