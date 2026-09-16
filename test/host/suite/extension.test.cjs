@@ -182,4 +182,5 @@ module.exports = async function runExtensionHostScenario() {
         assert.ok(pausedRepository?.repoRoot, 'paused repository root is exposed for explicit recovery');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
         await until('Git baseline rebuild', async () => (await state()).gitPauses.length === 0 && (await state()).reviewTokens.length === 0);
+        await require('./audit.test.cjs')(workspacePath);
 };

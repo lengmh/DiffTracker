@@ -98,6 +98,7 @@ interface PreparedBatchRevert {
 
 interface BaselineTransaction {
     epoch: number;
+    valid?: () => boolean;
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
@@ -156,6 +157,11 @@ export class DiffTracker {
     private readonly creationTempRoots = new Set<string>();
     private fileModes = new Map<string, number>();
     private baselineTransaction?: BaselineTransaction;
+    private restoringEpoch?: number;
+    private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
+    // Only same-session post-baseline notifications can be resolved by a later
+    // create event. Restored or scan-time uncertainty still requires a rebuild.
+    private postBaselineUnknownFiles = new Set<string>();
 
     private beginBaselineTransaction(rollback: () => void): BaselineTransaction {
         if (this.baselineTransaction) { throw new Error('Baseline transaction already active'); }
@@ -186,6 +192,9 @@ export class DiffTracker {
 
     private advanceEpoch(): number {
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
+        this.restoringEpoch = undefined;
+        this.restoreEvents.clear();
+        this.postBaselineUnknownFiles.clear();
         this.mayAdoptLegacyGitContexts = false;
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
@@ -364,6 +373,18 @@ export class DiffTracker {
 
     public async restorePersistedState(): Promise<RestoreOutcome> {
         const epoch = this.advanceEpoch();
+        this.restoringEpoch = epoch;
+        try {
+            return await this.restorePersistedStateForEpoch(epoch);
+        } finally {
+            if (epoch === this.sessionEpoch) {
+                this.restoringEpoch = undefined;
+                this.restoreEvents.clear();
+            }
+        }
+    }
+
+    private async restorePersistedStateForEpoch(epoch: number): Promise<RestoreOutcome> {
         const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
         if (failureUri) {
             try {
@@ -435,16 +456,28 @@ export class DiffTracker {
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
 
-        await this.rebuildTrackedChangesFromSnapshots();
-        if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-
+        // Watch before reading snapshots, and replay events after reconciliation
+        // so an older in-flight read cannot erase a newer notification.
         if (this.isRecording) {
             await this.startExternalWatchers();
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         } else {
             this.externalWatcherEnabled = false;
         }
-
+        await this.rebuildTrackedChangesFromSnapshots();
+        if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+        while (this.restoreEvents.size > 0) {
+            const restoreEvents = [...this.restoreEvents.values()];
+            this.restoreEvents.clear();
+            for (const { uri, kind } of restoreEvents) {
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                if (this.isPathIgnored(uri)) { continue; }
+                if (kind === 'create') { await this.onExternalFileCreated(uri); }
+                else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
+                else { await this.readFileAndUpdate(uri.fsPath, uri); }
+            }
+        }
+        if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
             this.persistenceIssue = state.baselineState === 'building'
                 ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
@@ -617,9 +650,16 @@ export class DiffTracker {
                 const pattern = new vscode.RelativePattern(folder, '**/*');
                 const watcher = vscode.workspace.createFileSystemWatcher(pattern);
                 watchers.push(watcher);
-                watcher.onDidChange(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileChanged(uri); } });
-                watcher.onDidCreate(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileCreated(uri); } });
-                watcher.onDidDelete(uri => { if (this.isCurrentEpoch(epoch)) { void this.onExternalFileDeleted(uri); } });
+                const dispatch = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): void => {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (this.restoringEpoch === epoch) { this.restoreEvents.set(uri.fsPath, { uri, kind }); return; }
+                    if (kind === 'create') { void this.onExternalFileCreated(uri); }
+                    else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
+                    else { void this.onExternalFileChanged(uri); }
+                };
+                watcher.onDidChange(uri => dispatch(uri, 'change'));
+                watcher.onDidCreate(uri => dispatch(uri, 'create'));
+                watcher.onDidDelete(uri => dispatch(uri, 'delete'));
             }
             return watchers;
         } catch (error) {
@@ -780,9 +820,11 @@ export class DiffTracker {
     }
 
     private async flushPersistState(completedBaseline = false, transaction?: BaselineTransaction): Promise<boolean> {
+        const epoch = this.sessionEpoch;
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
             await this.baselineTransaction.done;
+            if (epoch !== this.sessionEpoch) { return false; }
             return this.flushPersistState(completedBaseline);
         }
         // A blocked restore must never erase the evidence during shutdown.
@@ -801,6 +843,9 @@ export class DiffTracker {
             if (state.fileSnapshots.length > this.maxPersistedSnapshots) {
                 limitError = `Failed to persist Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`;
             }
+            if (!limitError && !this.parsePersistedState(state)) {
+                limitError = 'Failed to persist Diff Tracker session: state does not satisfy recovery schema and limits.';
+            }
             payload = new TextEncoder().encode(JSON.stringify(state));
             if (payload.byteLength > this.maxPersistedBytes) {
                 limitError = `Failed to persist Diff Tracker session: state exceeds ${this.maxPersistedBytes} bytes.`;
@@ -808,8 +853,8 @@ export class DiffTracker {
         }
 
         const persistTask = async (): Promise<boolean> => {
-            const transactionCurrent = (): boolean => !transaction ||
-                (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch));
+            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && (!transaction ||
+                (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch) && (transaction.valid?.() ?? true)));
             if (!transactionCurrent()) { return false; }
             const targetUri = this.getPersistedStateUri();
             const tempUri = this.getPersistedStateUri(this.persistedStateTempFileName);
@@ -823,21 +868,25 @@ export class DiffTracker {
                     await this.deletePersistedFile(tempUri);
                     await this.deletePersistedFile(backupUri);
                     if (failureUri) { await this.deletePersistedFile(failureUri); }
+                    if (!transactionCurrent()) { return false; }
                     this.persistenceIssue = undefined;
                     this.persistenceFailed = false;
                     return true;
                 } catch (error) {
-                    this.reportPersistenceIssue('Failed to clear Diff Tracker persisted session state.', error);
+                    if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to clear Diff Tracker persisted session state.', error); }
                     return false;
                 }
             }
 
             try {
                 await vscode.workspace.fs.createDirectory(storageUri);
+                if (!transactionCurrent()) { return false; }
                 // A durable intent survives size-limit failures and interrupted writes.
                 if (failureUri) { await vscode.workspace.fs.writeFile(failureUri, new TextEncoder().encode('Session write incomplete')); }
+                if (!transactionCurrent()) { return false; }
                 if (limitError) { this.reportPersistenceIssue(limitError); return false; }
                 await vscode.workspace.fs.writeFile(tempUri, payload);
+                if (!transactionCurrent()) { return false; }
                 await vscode.workspace.fs.rename(tempUri, targetUri, { overwrite: true });
                 if (!transactionCurrent()) { return false; } // Keep the incomplete-write marker.
                 await vscode.workspace.fs.copy(targetUri, backupUri, { overwrite: true });
@@ -852,7 +901,7 @@ export class DiffTracker {
                 return true;
             } catch (error) {
                 try { await this.deletePersistedFile(tempUri); } catch { /* Retain the primary failure. */ }
-                this.reportPersistenceIssue('Failed to persist Diff Tracker session state; the previous valid state was preserved.', error);
+                if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to persist Diff Tracker session state; the previous valid state was preserved.', error); }
                 return false;
             }
         };
@@ -1625,6 +1674,7 @@ export class DiffTracker {
             version = this.baselineCompletionVersion;
             if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) { return false; }
         } while (version !== this.baselineCompletionVersion);
+        if (transaction?.valid && !transaction.valid()) { return false; }
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
         return true;
@@ -1685,6 +1735,15 @@ export class DiffTracker {
     }
 
     private markFileUnavailable(filePath: string, reason: string): void {
+        // Unknown paths must survive restart too. A later create notification may
+        // establish an absent baseline, but unavailable bytes are never accepted.
+        if (!this.fileSnapshots.has(filePath)) {
+            if (!this.unresolvedBaselineFiles.has(filePath) && this.snapshotInitialized && !this.baselineBuilding && this.restoringEpoch === undefined) {
+                this.postBaselineUnknownFiles.add(filePath);
+            }
+            this.unresolvedBaselineFiles.set(filePath, reason.slice(0, 1000));
+            this.schedulePersistState();
+        }
         const previous = this.trackedChanges.get(filePath);
         this.setTrackedChange(filePath, {
             filePath, fileName: displayFileName(filePath),
@@ -1697,6 +1756,7 @@ export class DiffTracker {
     }
 
     private recordUnresolvedBaseline(filePath: string, reason: string): void {
+        this.postBaselineUnknownFiles.delete(filePath);
         this.unresolvedBaselineFiles.set(filePath, reason);
         this.markFileUnavailable(filePath, reason);
         this.schedulePersistState();
@@ -1893,18 +1953,15 @@ export class DiffTracker {
         }
         const state = await this.readFileSnapshot(uri);
         if (!this.isCurrentEpoch(epoch)) { return; }
+        if (!this.fileSnapshots.has(filePath) && (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+            this.unresolvedBaselineFiles.delete(filePath);
+            this.postBaselineUnknownFiles.delete(filePath);
+            this.fileSnapshots.set(filePath, '');
+            if (!await this.completeBaseline(epoch)) { return; }
+        }
         if (state.kind === 'unavailable') {
             this.markFileUnavailable(filePath, state.reason);
             return;
-        }
-        // Some watchers (notably Windows) can deliver a change notification before
-        // the matching create notification. That provisional change has no
-        // before-image and is marked unavailable, but the later create event is the
-        // evidence that this path did not exist in the ready baseline. Do not,
-        // however, resolve entries that were already uncertain during baseline scan.
-        if (!this.fileSnapshots.has(filePath) && !this.unresolvedBaselineFiles.has(filePath)) {
-            this.fileSnapshots.set(filePath, '');
-            if (!await this.completeBaseline(epoch)) { return; }
         }
         await this.readFileAndUpdate(filePath, uri);
     }
@@ -2021,6 +2078,7 @@ export class DiffTracker {
     }
 
     private validateActionTarget(filePath: string): string | undefined {
+        if (this.restoringEpoch !== undefined) { return 'Session restoration is still reconciling changes; review is paused'; }
         if (this.persistenceFailed) { return 'Session persistence failed; review actions are paused until it can be saved'; }
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.baselineBuilding || !this.snapshotInitialized) { return 'Baseline is incomplete; rebuild it before review actions'; }
@@ -2109,9 +2167,17 @@ export class DiffTracker {
     }
 
     public getGitPauseReason(filePath: string): string | undefined {
-        return [...this.pausedGitRepositories.entries()]
-            .filter(([root]) => this.pathBelongsToRoot(filePath, root))
-            .sort(([left], [right]) => right.length - left.length)[0]?.[1];
+        const owner = this.getRepositoryOwner(filePath);
+        return owner ? this.pausedGitRepositories.get(owner) : undefined;
+    }
+
+    private getRepositoryRoots(): string[] {
+        return [...new Set([...this.baselineGitContexts.keys(), ...this.latestGitContexts.keys(), ...this.pausedGitRepositories.keys()])];
+    }
+
+    private getRepositoryOwner(filePath: string): string | undefined {
+        return this.getRepositoryRoots()
+            .filter(root => this.pathBelongsToRoot(filePath, root)).sort((a, b) => b.length - a.length)[0];
     }
 
     public getPausedGitRepositories(): Array<{ repoRoot: string; reason: string }> {
@@ -2145,9 +2211,14 @@ export class DiffTracker {
 
     private async performRepositoryRebuild(repoRoot: string, context: GitContextSnapshot): Promise<boolean> {
         const requestedEpoch = this.sessionEpoch;
+        const ownsPath = (filePath: string): boolean => this.pathBelongsToRoot(filePath, repoRoot) &&
+            (this.getRepositoryOwner(filePath) ?? repoRoot) === repoRoot;
+        const ownershipSignature = (): string => JSON.stringify(this.getRepositoryRoots()
+            .filter(root => this.pathBelongsToRoot(root, repoRoot)).sort());
+        const originalOwnership = ownershipSignature();
         const contextStillCurrent = (): boolean => {
             const latest = this.latestGitContexts.get(repoRoot);
-            return !!latest && compareGitContexts(context, latest).compatible &&
+            return ownershipSignature() === originalOwnership && !!latest && compareGitContexts(context, latest).compatible &&
                 context.headCommit === latest.headCommit && !latest.inProgress;
         };
         if (this.disposed || this.recoveryBlocked || !this.snapshotInitialized || this.baselineBuilding ||
@@ -2158,7 +2229,7 @@ export class DiffTracker {
             this.pathBelongsToRoot(workspaceRoot, repoRoot) || this.pathBelongsToRoot(repoRoot, workspaceRoot));
         if (!overlapsWorkspace) { return false; }
         if (vscode.workspace.textDocuments.some(document =>
-            document.uri.scheme === 'file' && this.pathBelongsToRoot(document.uri.fsPath, repoRoot) && document.isDirty)) {
+            document.uri.scheme === 'file' && ownsPath(document.uri.fsPath) && document.isDirty)) {
             return false;
         }
         if (!await this.archiveCurrentSession()) { return false; }
@@ -2189,7 +2260,9 @@ export class DiffTracker {
             this.revertHistory = previous.revertHistory;
             this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
             this.baselineGitContexts = previous.baselineGitContexts;
-            this.pausedGitRepositories = previous.pausedGitRepositories;
+            // Pauses observed during the transaction belong to the live Git
+            // context and must survive rollback of the baseline candidate.
+            this.pausedGitRepositories = new Map([...previous.pausedGitRepositories, ...this.pausedGitRepositories]);
             this.snapshotInitialized = previous.snapshotInitialized;
             this.baselineBuilding = previous.baselineBuilding;
             this.resetChangeBlocksCaches();
@@ -2226,7 +2299,8 @@ export class DiffTracker {
         // No asynchronous work may occur between the epoch change and handoff.
         if (replacementWatchers) { this.activateExternalWatchers(replacementWatchers); }
         transaction = this.beginBaselineTransaction(restoreMemory);
-        const previousReviewPaths = [...this.trackedChanges.keys()].filter(filePath => this.pathBelongsToRoot(filePath, repoRoot));
+        transaction.valid = contextStillCurrent;
+        const previousReviewPaths = [...this.trackedChanges.keys()].filter(ownsPath);
         this.snapshotInitialized = false;
         this.baselineBuilding = true;
         this._onDidChangeBaselineState.fire('building');
@@ -2236,7 +2310,7 @@ export class DiffTracker {
                 ...this.unresolvedBaselineFiles.keys()
             ]);
             for (const filePath of repositoryBaselinePaths) {
-                if (!this.pathBelongsToRoot(filePath, repoRoot)) { continue; }
+                if (!ownsPath(filePath)) { continue; }
                 this.fileSnapshots.delete(filePath);
                 this.fileModes.delete(filePath);
                 this.baselineExistingFiles.delete(filePath);
@@ -2252,7 +2326,7 @@ export class DiffTracker {
                 new vscode.RelativePattern(repoRoot, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
             );
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
-            await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && !this.isPathIgnored(uri)), 8, async uri => {
+            await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
                 if (state.kind !== 'text') {
@@ -2276,7 +2350,7 @@ export class DiffTracker {
             if (!contextStillCurrent()) { throw new Error('Git context changed during baseline rebuild'); }
             this.revertHistory = this.revertHistory.map(record => ({
                 ...record,
-                items: record.items.filter(item => !this.pathBelongsToRoot(item.filePath, repoRoot))
+                items: record.items.filter(item => !ownsPath(item.filePath))
             })).filter(record => record.items.length > 0);
             this.baselineGitContexts.set(repoRoot, { ...context });
             this.resetChangeBlocksCaches();
@@ -2330,6 +2404,13 @@ export class DiffTracker {
         }
         try {
             const realRoot = fs.realpathSync(folder.uri.fsPath);
+            // Reject aliases even when they stay inside the workspace. Checking
+            // ancestors also covers directory links and dangling target links.
+            for (let component = path.resolve(filePath); isWithin(folder.uri.fsPath, component); component = path.dirname(component)) {
+                try {
+                    if (fs.lstatSync(component).isSymbolicLink()) { return 'Symbolic link target is read-only; action blocked'; }
+                } catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
+            }
             let existing = filePath;
             while (true) {
                 try {
@@ -2379,6 +2460,7 @@ export class DiffTracker {
 
     private async prepareRevertRecord(items: PersistedRevertItem[]): Promise<PersistedRevertRecord | undefined> {
         if (items.length === 0) { return undefined; }
+        const epoch = this.sessionEpoch;
         const previousHistory = [...this.revertHistory];
         const record: PersistedRevertRecord = {
             id: `revert-${Date.now()}-${this.nextRevertRecordId++}`,
@@ -2387,7 +2469,9 @@ export class DiffTracker {
         };
         this.revertHistory.push(record);
         this.revertHistory = this.revertHistory.slice(-this.maxRevertHistory);
-        if (await this.flushPendingPersistence()) { return record; }
+        const saved = await this.flushPendingPersistence();
+        if (!this.isCurrentEpoch(epoch)) { return undefined; }
+        if (saved) { return record; }
         this.revertHistory = previousHistory;
         return undefined;
     }
@@ -2417,7 +2501,7 @@ export class DiffTracker {
     }
 
     private async finalizeBatchRevertRecord(batch: PreparedBatchRevert): Promise<void> {
-        const current = this.revertHistory.find(candidate => candidate.id === batch.record.id);
+        const current = this.revertHistory.find(candidate => candidate === batch.record);
         if (!current) { return; }
         current.items = current.items.filter(item => batch.retainPaths.has(item.filePath));
         if (current.items.length === 0) {
@@ -2560,6 +2644,8 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) {
             return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery read');
         }
+        const afterReadError = this.validateActionTarget(item.filePath);
+        if (afterReadError) { return this.actionResult(item.filePath, 'conflict', afterReadError); }
         if (current.kind === 'unavailable') { return this.actionResult(item.filePath, 'failed', current.reason); }
         const currentState: PersistedFileState = {
             exists: current.kind === 'text',
@@ -2633,6 +2719,15 @@ export class DiffTracker {
                 if (!await document.save()) {
                     return this.actionResult(item.filePath, 'failed', 'Recovery changed the buffer but saving failed', true);
                 }
+            }
+            const savedState = item.saveMode === 'disk' ? await this.readFileSnapshot(uri) : undefined;
+            if (document.getText() !== item.before.content || (savedState &&
+                (savedState.kind !== 'text' || savedState.content !== item.before.content || document.isDirty))) {
+                if (this.isCurrentEpoch(epoch)) {
+                    this.pendingWriteFiles.delete(item.filePath);
+                    this.updateTrackedDiff(item.filePath, document.getText(), { currentExists: true });
+                }
+                return this.actionResult(item.filePath, 'conflict', 'Recovery contents changed during save; recovery retained', true);
             }
             if (!this.isCurrentEpoch(epoch) || this.validateActionTarget(item.filePath)) {
                 return this.actionResult(item.filePath, 'conflict', 'Session or action target changed during recovery; recovery retained', true);
@@ -3069,6 +3164,7 @@ export class DiffTracker {
             this.snapshotInitialized = initialized;
             if (change) { this.updateTrackedDiff(filePath, change.currentContent, { baselineChanged: true, currentExists: !change.isDeleted }); }
         });
+        transaction.valid = () => !this.validateSnapshotTarget(filePath);
         // Remove only this path's obsolete recovery items, retaining other batch members.
         this.revertHistory = history.map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -3087,7 +3183,11 @@ export class DiffTracker {
             if (this.isCurrentEpoch(epoch)) { this.reportPersistenceIssue('Keep transaction failed; prior baseline retained.', error); }
             return false;
         } finally {
+            const invalidTarget = this.isCurrentEpoch(epoch) && transaction.valid && !transaction.valid();
             this.endBaselineTransaction(transaction, committed);
+            // A candidate may already have reached disk before target validation
+            // failed. Publish the rolled-back baseline before returning failure.
+            if (!committed && invalidTarget) { await this.flushPendingPersistence(); }
         }
     }
 

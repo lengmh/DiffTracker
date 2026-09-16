@@ -148,13 +148,15 @@ const vscode = {
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); await boundary(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
-            async delete(uri) { fault(uri.fsPath,'delete'); fs.rmSync(uri.fsPath); },
+            async delete(uri) { await boundary(uri.fsPath,'delete'); fault(uri.fsPath,'delete'); fs.rmSync(uri.fsPath); await boundary(uri.fsPath,'afterDelete'); },
             async rename(source, target, options) {
+                await boundary(source.fsPath,'rename');
                 fault(source.fsPath,'rename');
                 if (options?.overwrite) fs.rmSync(target.fsPath,{force:true});
                 fs.renameSync(source.fsPath,target.fsPath);
             },
             async copy(source, target, options) {
+                await boundary(source.fsPath,'copy');
                 fault(source.fsPath,'copy');
                 if (!options?.overwrite && fs.existsSync(target.fsPath)) throw error('FileExists');
                 fs.copyFileSync(source.fsPath,target.fsPath);
@@ -1277,6 +1279,116 @@ test('DT-06 mode metadata rejects malformed values and accepts legacy omission',
     for(const mode of [-1,0o1000,1.5,'755'])assert.equal(tracker.parsePersistedState({...saved,fileModes:[[p,mode]]}),undefined);
     assert.equal(tracker.parsePersistedState({...saved,fileModes:[[p,0o755],[p,0o644]]}),undefined);
 });
+test('AUDIT-1 writer rejects unresolved entries beyond its reader limit',async()=>{
+    const p=file();seed(p,'base');const storage=file('storage');tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const previous=disk(path.join(storage,'session-state.json'));
+    for(let i=0;i<10001;i++)tracker.unresolvedBaselineFiles.set(path.join(root,`unsupported-${i}`),'unavailable');
+    assert.equal(await tracker.flushPendingPersistence(),false);
+    assert.equal(disk(path.join(storage,'session-state.json')),previous);
+    assert.ok(tracker.parsePersistedState(JSON.parse(previous)));
+});
+test('AUDIT-2 parent rebuild preserves child repository baseline and history',async()=>{
+    const repo=file('repo'),child=path.join(repo,'child');fs.mkdirSync(child,{recursive:true});
+    const p=path.join(repo,'parent.txt'),q=path.join(child,'child.txt');seed(p,'parent base','parent edit');seed(q,'child base','child edit');await scan(p);await scan(q);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const nested={...base,repoRoot:child},next={...base,headName:'next',headCommit:'bbb'};
+    tracker.setBaselineGitContexts([base,nested]);tracker.observeGitContext(next);
+    tracker.storageUri=Uri.file(file('storage'));listedFiles=[Uri.file(p),Uri.file(q)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,next),true);
+    assert.equal(tracker.getOriginalContent(q),'child base');assert.ok(pending(q));
+    tracker.observeGitContext({...next,headName:'third'});assert.equal(tracker.getGitPauseReason(q),undefined);
+});
+for(const block of [false,true]) test(`AUDIT-3 Git pause during Keep rejects acceptance (block=${block})`,async()=>{
+    const p=file();seed(p,'base\n','edit\n');await scan(p);
+    const base={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([base]);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const op=block?tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId):tracker.keepAllChangesInFile(p);
+    await gate.entered;tracker.observeGitContext({...base,headName:'other',headCommit:'bbb'});gate.release();
+    assert.equal(succeeded(await op),false);assert.equal(tracker.getOriginalContent(p),'base\n');assert.ok(pending(p));
+    await tracker.flushPendingPersistence();assert.equal(new Map(JSON.parse(disk(path.join(storage,'session-state.json'))).fileSnapshots).get(p),'base\n');
+});
+test('AUDIT-4 restored watcher covers writes during reconciliation',async()=>{
+    const p=file(),q=file();seed(p,'base');seed(q,'base');const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));const gate=pause(q,'read');const restore=tracker.restorePersistedState();await gate.entered;
+    fs.writeFileSync(p,'external');emitWatcher('change',Uri.file(p));gate.release();assert.equal(await restore,'restored');
+    await new Promise(r=>setTimeout(r,180));assert.equal(pending(p)?.currentContent,'external');
+});
+test('AUDIT-5 unavailable new file remains visible after restart',async()=>{
+    const p=file(),q=file();seed(p,'base');fs.writeFileSync(q,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(q));assert.ok(pending(q)?.unavailableReason);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(pending(q)?.unavailableReason);
+});
+test('AUDIT-6 failed old recovery preparation cannot resurrect old history',async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base','edit');await scan(f);}await tracker.revertFile(q);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const temp=path.join(storage,'session-state.tmp.json'),gate=pause(temp,'write');const op=tracker.revertFile(p);await gate.entered;
+    tracker.stopRecording();tracker.startRecording();faults.set(temp,{rename:error('NoPermissions')});gate.release();await op;faults.clear();
+    assert.equal(tracker.revertHistory.length,0);
+});
+test('AUDIT-7 Undo verifies saved contents and retains recovery on save participant edits',async()=>{
+    const p=file();seed(p,'base','edit');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));
+    const gate=pause(p,'save'),op=tracker.undoLastRevert();await gate.entered;document(p).text='save participant output';document(p).version++;gate.release();
+    const result=await op;assert.equal(result.succeeded,0);assert.equal(tracker.revertHistory.length,1);assert.equal(disk(p),'save participant output');
+});
+test('AUDIT-8 replacement symlink within workspace cannot redirect Revert',async()=>{
+    const p=file(),q=file();seed(p,'base','edit');fs.writeFileSync(q,'edit');await scan(p);fs.unlinkSync(p);fs.symlinkSync(q,p);await scan(p);
+    assert.equal(succeeded(await tracker.revertFile(p)),false);assert.equal(disk(q),'edit');
+});
+for(const entry of ['file','block','batch']) for(const phase of ['rename','copy','afterDelete']) test(`AUDIT-3 Keep ${entry} revalidates Git at ${phase}`,async()=>{
+    const p=file();seed(p,'base\n','edit\n');await scan(p);
+    const base={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([base]);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const target=path.join(storage,phase==='rename'?'session-state.tmp.json':phase==='copy'?'session-state.json':tracker.persistenceFailureFileName);
+    const gate=pause(target,phase);const op=entry==='block'?tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId):entry==='batch'?tracker.keepAllChanges():tracker.keepAllChangesInFile(p);
+    await gate.entered;tracker.observeGitContext({...base,headName:'other'});gate.release();const result=await op;
+    assert.equal(entry==='batch'?result.succeeded>0:succeeded(result),false);assert.equal(tracker.getOriginalContent(p),'base\n');
+    assert.equal(new Map(JSON.parse(disk(path.join(storage,'session-state.json'))).fileSnapshots).get(p),'base\n');assert.ok(pending(p));
+});
+for(const entry of ['block','batch']) test(`AUDIT-6 stale ${entry} recovery preparation leaves new session untouched`,async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base\n','edit\n');await scan(f);}await tracker.revertFile(q);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const temp=path.join(storage,'session-state.tmp.json'),gate=pause(temp,'write');
+    const op=entry==='block'?tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId):tracker.revertAllChanges();await gate.entered;
+    tracker.stopRecording();tracker.startRecording();faults.set(temp,{rename:error('NoPermissions')});gate.release();await op;faults.clear();
+    assert.equal(tracker.revertHistory.length,0);assert.equal(disk(p),'edit\n');
+});
+test('AUDIT-6 old batch finalizer cannot prune a reused record ID',async()=>{
+    const p=file();seed(p,'base','edit');await scan(p);const old=await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);
+    const fresh={...old,items:[...old.items]};tracker.revertHistory=[fresh];await tracker.finalizeBatchRevertRecord({record:old,retainPaths:new Set()});
+    assert.equal(tracker.revertHistory[0],fresh);assert.equal(fresh.items.length,1);
+});
+for(const kind of ['submodule','worktree']) test(`AUDIT-2 parent rebuild leaves dirty ${kind} and recovery history untouched`,async()=>{
+    const repo=file('repo'),child=path.join(repo,'child');fs.mkdirSync(child,{recursive:true});const p=path.join(repo,'p'),q=path.join(child,'q');
+    seed(p,'parent base','parent edit');seed(q,'child base','child edit');await scan(p);await scan(q);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false},nested={...base,repoRoot:child,kind},next={...base,headName:'next'};
+    tracker.setBaselineGitContexts([base,nested]);assert.ok(succeeded(await tracker.revertFile(q)));const history=JSON.stringify(tracker.revertHistory);
+    document(q).text='unsaved child';document(q).isDirty=true;tracker.observeGitContext(next);tracker.storageUri=Uri.file(file('storage'));listedFiles=[Uri.file(p),Uri.file(q)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,next),true);assert.equal(tracker.getOriginalContent(q),'child base');assert.equal(document(q).text,'unsaved child');
+    assert.equal(JSON.stringify(tracker.revertHistory),history);assert.equal(tracker.getGitPauseReason(q),undefined);
+});
+for(const entry of ['block','batch','undo']) for(const directoryLink of [false,true]) test(`AUDIT-8 ${entry} rejects internal ${directoryLink?'directory':'file'} symlink`,async()=>{
+    const dir=file('dir');fs.mkdirSync(dir);const p=path.join(dir,'p'),q=file();seed(p,'base\n','edit\n');fs.writeFileSync(q,'edit\n');await scan(p);
+    if(entry==='undo')assert.ok(succeeded(await tracker.revertFile(p)));
+    const token=tracker.getReviewToken(p),id=tracker.getChangeBlocks(p)[0]?.blockId;
+    if(directoryLink){fs.unlinkSync(p);fs.rmdirSync(dir);const target=file('target-dir');fs.mkdirSync(target);fs.writeFileSync(path.join(target,'p'),entry==='undo'?'base\n':'edit\n');fs.symlinkSync(target,dir,process.platform==='win32'?'junction':'dir');}
+    else {fs.unlinkSync(p);if(entry==='undo')fs.writeFileSync(q,'base\n');fs.symlinkSync(q,p);}
+    const before=disk(p);const result=entry==='block'?await tracker.revertBlock(p,id,token):entry==='batch'?await tracker.revertAllChanges([token]):await tracker.undoLastRevert();
+    assert.equal(entry==='block'?succeeded(result):result.succeeded>0,false);assert.equal(disk(p),before);
+});
+test('AUDIT-5 unknown change is durable and cannot be promoted by create after restart',async()=>{
+    const p=file();fs.writeFileSync(p,'unknown');await scan(p);const storage=file('storage');tracker.storageUri=Uri.file(storage);assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');await tracker.onExternalFileCreated(Uri.file(p));assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getOriginalContent(p),undefined);
+});
+test('AUDIT-4 restoration blocks Undo while ignore rules are loading',async()=>{
+    const p=file();seed(p,'base','edit');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));const gate=pause(root,'ignoreScan');const restore=tracker.restorePersistedState();await gate.entered;
+    const undo=await tracker.undoLastRevert();gate.release();await restore;
+    assert.equal(undo.succeeded,0);assert.equal(disk(p),'base');assert.equal(tracker.revertHistory.length,1);
+});
+if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
