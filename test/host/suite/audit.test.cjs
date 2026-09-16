@@ -156,7 +156,7 @@ module.exports = async function auditHost(workspace) {
         console.log('PASS HOST-GIT-INIT restored Keep/Revert pause until reconciliation completes');
 
         const ignoreDir = path.join(workspace, 'audit-ignore');
-        const ignoredFile = path.join(ignoreDir, 'existing.txt');
+        const ignoredFile = vscode.Uri.file(path.join(ignoreDir, 'existing.txt')).fsPath;
         const ignoreFile = path.join(ignoreDir, '.gitignore');
         fs.mkdirSync(ignoreDir, { recursive: true });
         fs.writeFileSync(ignoreFile, 'existing.txt\n');

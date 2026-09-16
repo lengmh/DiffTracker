@@ -2145,7 +2145,14 @@ export class DiffTracker {
 
         const filePath = uri.fsPath;
         const scanEvent = this.markScanEvent(filePath);
-        if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
+        const directory = await this.isUntrackedDirectory(uri);
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        if (directory) {
+            // Native watchers may report only the parent when a populated
+            // directory appears; its nested .gitignore events are not guaranteed.
+            await this.refreshIgnoreMatchers().catch(() => undefined);
+            return;
+        }
         if (scanEvent) {
             this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
             return;

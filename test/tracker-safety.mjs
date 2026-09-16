@@ -1939,6 +1939,13 @@ test('AUDIT-25 live gitignore edits rediscover newly included files',async()=>{
     fs.writeFileSync(original,'');emitWatcher('change',Uri.file(original));await waitUntil(()=>!!pending(q)?.unavailableReason);
     assert.equal(tracker.fileSnapshots.has(q),false);fs.unlinkSync(original);
 });
+test('AUDIT-25 directory-only create notification discovers nested ignore rules',async()=>{
+    tracker.snapshotInitialized=false;await tracker.initializeWorkspaceSnapshots();assert.ok(tracker.scanCoverage);
+    const dir=file('directory'),p=path.join(dir,'existing.txt'),ignorePath=path.join(dir,'.gitignore');fs.mkdirSync(dir);fs.writeFileSync(p,'existing');fs.writeFileSync(ignorePath,'existing.txt\n');
+    listedIgnores=[Uri.file(ignorePath)];listedFiles=[Uri.file(p),Uri.file(ignorePath)];
+    await tracker.onExternalFileCreated(Uri.file(dir));
+    assert.equal(tracker.isPathIgnored(Uri.file(p)),true);assert.equal(tracker.scanCoverage,undefined);assert.equal(pending(p),undefined);assert.equal(pending(dir),undefined);
+});
 for(const partial of [false,true]) test(`AUDIT-25 bounded history commits only when Revert mutates (partial=${partial})`,async()=>{
     const p=file(),q=file(),storage=file('storage');seed(p,'base','changed');seed(q,'base','changed');await scan(p);await scan(q);
     const item=tracker.createFileRevertItem(p);tracker.revertHistory=Array.from({length:10},(_,i)=>({id:`old-${i}`,createdAt:new Date().toISOString(),items:[{...item}]}));tracker.storageUri=Uri.file(storage);

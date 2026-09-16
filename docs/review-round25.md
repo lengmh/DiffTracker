@@ -54,8 +54,8 @@
 
 ## 验证
 
-- `npm test`：**457/457**，包括 tracker **374/374**、Git adapter **27/27**。
-  新增 tracker 21 项、Git 4 项，共 25 项；其余既有测试继续通过。
+- `npm test`：**458/458**，包括 tracker **375/375**、Git adapter **27/27**。
+  新增 tracker 22 项、Git 4 项，共 26 项；其余既有测试继续通过。
 - compile、lint、`git diff --check` 通过。
 - 核心失败复现：输入代码上文件/块/批量失败历史三项、最终 Git 读回两项、
   新 P2、实时取消忽略均失败；扫描删除对照项原本通过。首次打开、三种配置、
@@ -70,6 +70,11 @@
 - 新增原生 Host：完整扫描时忽略一个已有文件，关闭 tracker 后移除该规则，
   恢复必须保留未知基线并拒绝 Revert；实际磁盘字节保持不变。
   Windows/Ubuntu Stable 和 1.80 Host 结果在推送后写入 PR。
+- 初次 CI [35119331983](https://github.com/lengmh/DiffTracker/actions/runs/35119331983)
+  的 Host 失败进一步暴露 R25-2 的原生边界：Linux 创建带内容的目录可能只报告
+  父目录创建，不逐个报告其中的 .gitignore。现于目录创建时重新发现规则，新增
+  目录唯一通知的回归在修复前失败。Windows 用例同时修正为使用 URI 规范化的
+  路径比较；没有重试失败操作或放宽未知基线断言。最终 CI 结果记录于 PR。
 - 实现者二次检查覆盖本次新增字段的读取/写入/回滚、异步规则替换、旧会话、
   三种 Revert 历史处理和 Git 生命周期。**没有声称独立 reviewer 已批准。**
 
@@ -143,4 +148,3 @@
 [stage4](stage4-verification.md)、[stage5](stage5-verification.md)；
 第 16 轮八项内部发现见 [review-round16](review-round16.md)。这些报告中的历史
 “未运行”或历史测试计数属于当时提交；当前结果以本报告与本轮 PR CI 为准。
-
