@@ -1814,6 +1814,46 @@ for (const kind of ['Created','Changed']) {
         assert.equal(tracker.scanUncertainFiles.has(p),false);assert.equal(pending(p),undefined);
     });
 }
+for(const action of ['keepAllChangesInFile','revertFile','keepBlock','revertBlock','keepAllChanges','revertAllChanges','undoLastRevert','resetBaselineToCurrentState']) test(`GIT-INIT blocks ${action} and preserves restored data`,async()=>{
+    const p=file(),storage=file('storage');seed(p,'base\n','changed\n');await scan(p);
+    if(action==='undoLastRevert')assert.ok(succeeded(await tracker.revertFile(p)));
+    // Fill recovery history to expose even a transient rejected batch pruning it.
+    if(action==='revertAllChanges'){
+        const item=tracker.createFileRevertItem(p);
+        tracker.revertHistory=Array.from({length:10},(_,i)=>({id:`prior-${i}`,createdAt:new Date().toISOString(),items:[{...item}]}));
+    }
+    tracker.storageUri=Uri.file(storage);await tracker.dispose();docs.length=0;
+    tracker=new DiffTracker(Uri.file(storage));tracker.setGitContextPending?.(true);
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    const beforeDisk=disk(p),beforeOriginal=tracker.getOriginalContent(p),beforeHistory=JSON.stringify(tracker.revertHistory);
+    const beforeCounters={...counters},block=tracker.getChangeBlocks(p)[0];
+    const result=action.endsWith('Block')?await tracker[action](p,block.blockId):
+        ['keepAllChangesInFile','revertFile'].includes(action)?await tracker[action](p):await tracker[action]();
+    assert.equal(result===true||result?.status==='success'||result?.succeeded>0,false);
+    assert.equal(disk(p),beforeDisk);assert.equal(tracker.getOriginalContent(p),beforeOriginal);
+    assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
+    assert.equal(counters.apply,beforeCounters.apply);assert.equal(counters.save,beforeCounters.save);
+    if(action!=='undoLastRevert')assert.ok(pending(p));
+});
+for(const outcome of ['same','branch','worktree','removed','appeared']) test(`GIT-INIT reconciliation ${outcome} releases only compatible reviews`,async()=>{
+    const p=file(),storage=file('storage'),base={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    seed(p,'base','changed');await scan(p);tracker.setBaselineGitContexts(outcome==='appeared'?[]:[base]);
+    tracker.storageUri=Uri.file(storage);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    tracker.setGitContextPending(true);assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.match(tracker.getGitPauseReason(p),/initialization/);
+    const current={...base,...(outcome==='branch'?{headName:'feature'}:outcome==='worktree'?{kind:'worktree'}:{})};
+    tracker.reconcileRestoredGitContexts(outcome==='removed'?[]:[current]);
+    // Per-repository events must not release the global gate ahead of ready.
+    assert.match(tracker.getGitPauseReason(p),/initialization/);tracker.setGitContextPending(false);
+    assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),outcome==='same');
+    assert.equal(disk(p),'changed');if(outcome!=='same')assert.ok(pending(p));
+});
+test('GIT-INIT stop does not bypass the gate; disposed tracker cannot be released',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);tracker.setGitContextPending(true);tracker.stopRecording();
+    assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);
+    assert.equal(await tracker.resetBaselineToCurrentState(),false);
+    await tracker.dispose();tracker.setGitContextPending(false);assert.match(tracker.getGitPauseReason(p),/initialization/);
+});
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }

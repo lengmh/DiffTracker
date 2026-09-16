@@ -65,6 +65,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
+    // Commands and restored review views must never precede Git reconciliation.
+    diffTracker.setGitContextPending(true);
     const restoreOutcome = await diffTracker.restorePersistedState();
     decorationManager = new DecorationManager(diffTracker);
     statusBarManager = new StatusBarManager(diffTracker);
@@ -249,6 +251,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (diffTracker.getIsRecording() || restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
                 diffTracker.reconcileRestoredGitContexts(event.contexts);
             }
+            diffTracker.setGitContextPending(false);
             return;
         }
         const repoRoot = event.kind === 'changed' ? event.context.repoRoot : event.repoRoot;
@@ -783,10 +786,15 @@ export async function activate(context: vscode.ExtensionContext) {
     gitContextMonitor = new GitContextMonitor(event => { void handleGitContextEvent(event); });
     context.subscriptions.push(gitContextMonitor);
     const gitContextAvailable = await gitContextMonitor.start();
-    if (gitContextAvailable && gitContextMonitor.isReady() &&
-        (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete')) {
-        diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
-    } else if (!gitContextAvailable && !runningExtensionTests) {
+    if (gitContextAvailable && gitContextMonitor.isReady()) {
+        if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
+            diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+        }
+        diffTracker.setGitContextPending(false);
+    } else if (!gitContextAvailable) {
+        diffTracker.setGitContextPending(false);
+    }
+    if (!gitContextAvailable && !runningExtensionTests) {
         void vscode.window.showWarningMessage(
             'Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
         );

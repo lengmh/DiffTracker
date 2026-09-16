@@ -117,6 +117,7 @@ module.exports = async function auditHost(workspace) {
         fs.writeFileSync(offline, 'created while tracker was disposed\n');
         fs.writeFileSync(offlineEmpty, '');
         tracker = new DiffTracker(vscode.Uri.file(storage));
+        tracker.setGitContextPending(true);
         const read = tracker.readCurrentFileState.bind(tracker);
         const gate = new Promise(resolve => { releaseRead = resolve; });
         let entered = false;
@@ -142,6 +143,18 @@ module.exports = async function auditHost(workspace) {
             assert.equal(tracker.baselineExistingFiles.has(filePath), false);
         }
         console.log('PASS HOST-RESTORE offline text and empty additions retain absent baselines');
+
+        await stableReview(tracker, q);
+        const preservedBaseline = tracker.getOriginalContent(q);
+        assert.equal((await tracker.keepAllChangesInFile(q)).status, 'conflict');
+        assert.equal((await tracker.revertFile(q)).status, 'conflict');
+        assert.equal(tracker.getOriginalContent(q), preservedBaseline);
+        assert.equal(fs.readFileSync(q, 'utf8'), 'external during restore\n');
+        tracker.reconcileRestoredGitContexts([]);
+        tracker.setGitContextPending(false);
+        assert.equal((await tracker.keepAllChangesInFile(q)).status, 'success');
+        console.log('PASS HOST-GIT-INIT restored Keep/Revert pause until reconciliation completes');
+
 
         tracker.stopRecording();
         assert.equal(await tracker.resetBaselineToCurrentState(), true);

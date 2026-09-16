@@ -141,14 +141,49 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
     const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
         diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',
             startRecording:()=>{recording=true;calls.push('start');},stopRecording:()=>{recording=false;calls.push('stop');},
-            setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile')},
+            setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
+            setGitContextPending:()=>calls.push('release')},
         gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},
         vscode:{commands:{executeCommand:async()=>{}}}};
     vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
     if(scenario==='stopped')sandbox.flows.stopRecordingFlow();
     await sandbox.flows.handleGitContextEvent({kind:'ready',contexts:[context()]});release(true);if(start)await start;
-    assert.deepEqual(calls,scenario==='fresh'?['start','capture']:scenario==='stopped'?['stop']:['reconcile']);
+    assert.deepEqual(calls,scenario==='fresh'?['release','start','capture']:scenario==='stopped'?['stop','release']:['reconcile','release']);
+});
+for(const scenario of ['delayed','immediate','unavailable','recovered','incomplete','stopped']) test(`production activation gates restored actions (${scenario})`,async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const activation=source.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='activate');
+    const statements=activation.body.statements;
+    const restoreEnd=statements.findIndex(node=>node.getText(source).includes('const restoreOutcome ='));
+    const servicesStart=statements.findIndex(node=>node.getText(source).startsWith('diffTracker = new DiffTracker'));
+    const monitorStart=statements.findIndex(node=>node.getText(source).startsWith('gitContextMonitor = new GitContextMonitor'));
+    const monitorEnd=statements.findIndex((node,i)=>i>monitorStart&&node.getText(source)==='refreshChangesTree();');
+    const handler=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='handleGitContextEvent')handler.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    const calls=[];let callback,pending=false,releaseStart;const starting=new Promise(resolve=>{releaseStart=resolve;});
+    const restored=scenario==='recovered'||scenario==='incomplete'?scenario:'restored';
+    const sandbox={context:{subscriptions:[],storageUri:undefined},runningExtensionTests:true,
+        DiffTracker:class {
+            setGitContextPending(value){pending=value;calls.push(value?'pause':'release');}
+            async restorePersistedState(){assert.equal(pending,true);return restored;}
+            getIsRecording(){return scenario!=='stopped';}
+            reconcileRestoredGitContexts(){assert.equal(pending,true);calls.push('reconcile');}
+        },
+        GitContextMonitor:class {
+            constructor(cb){callback=cb;}
+            async start(){await starting;return scenario!=='unavailable';}
+            isReady(){return scenario==='immediate';}
+            getSnapshots(){return [];}
+        }};
+    const code=`(async()=>{let diffTracker,gitContextMonitor;${statements.slice(servicesStart,restoreEnd+1).map(n=>n.getText(source)).join('\n')}
+${handler.join('\n')}
+${statements.slice(monitorStart,monitorEnd).map(n=>n.getText(source)).join('\n')}})()`;
+    vm.createContext(sandbox);const running=vm.runInContext(ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    await Promise.resolve();await Promise.resolve();assert.equal(pending,true);releaseStart();await running;
+    if(scenario==='immediate'){assert.deepEqual(calls,['pause','reconcile','release']);}
+    else if(scenario==='unavailable'){assert.deepEqual(calls,['pause','release']);}
+    else {assert.equal(pending,true);callback({kind:'ready',contexts:[]});assert.deepEqual(calls,['pause','reconcile','release']);}
+    assert.equal(pending,false);
 });
 let failures=0;
 for(const {name,run} of tests){try{await run();console.log(`PASS ${name}`);}catch(error){failures++;console.error(`FAIL ${name}\n${error.stack}`);}}

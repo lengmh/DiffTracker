@@ -188,6 +188,7 @@ export class DiffTracker {
         transaction.finish();
     }
     private mayAdoptLegacyGitContexts = false;
+    private gitContextPending = false;
 
     private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
         const operation = this.recoveryActionQueue.then(action);
@@ -614,7 +615,7 @@ export class DiffTracker {
 
     public resetBaselineToCurrentState(): Promise<boolean> {
         const epoch = this.sessionEpoch;
-        return this.queueRecoveryAction(() => this.isCurrentEpoch(epoch)
+        return this.queueRecoveryAction(() => this.isCurrentEpoch(epoch) && !this.gitContextPending
             ? this.performBaselineReset() : Promise.resolve(false));
     }
 
@@ -2275,6 +2276,12 @@ export class DiffTracker {
         return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
     }
 
+    public setGitContextPending(pending: boolean): void {
+        if (this.disposed || this.gitContextPending === pending) { return; }
+        this.gitContextPending = pending;
+        this.emitTrackChangesEvent({ fullRefresh: true });
+    }
+
     public setBaselineGitContexts(contexts: GitContextSnapshot[]): void {
         this.latestGitContexts = new Map(contexts.map(context => [context.repoRoot, { ...context }]));
         this.baselineGitContexts.clear();
@@ -2344,6 +2351,7 @@ export class DiffTracker {
     }
 
     public getGitPauseReason(filePath: string): string | undefined {
+        if (this.gitContextPending) { return 'Git initialization and context reconciliation are pending; review actions are paused'; }
         const owner = this.getRepositoryOwner(filePath);
         return owner ? this.pausedGitRepositories.get(owner) : undefined;
     }
@@ -2398,7 +2406,7 @@ export class DiffTracker {
             return ownershipSignature() === originalOwnership && !!latest && compareGitContexts(context, latest).compatible &&
                 context.headCommit === latest.headCommit && !latest.inProgress;
         };
-        if (this.disposed || this.recoveryBlocked || !this.snapshotInitialized || this.baselineBuilding ||
+        if (this.disposed || this.gitContextPending || this.recoveryBlocked || !this.snapshotInitialized || this.baselineBuilding ||
             context.repoRoot !== repoRoot || context.inProgress || !path.isAbsolute(repoRoot)) {
             return false;
         }
@@ -2712,6 +2720,10 @@ export class DiffTracker {
 
     private async performRevertAllChanges(tokens: ReviewToken[]): Promise<BatchActionResult> {
         if (tokens.length === 0) { return { results: [], succeeded: 0, failed: 0 }; }
+        if (this.gitContextPending) {
+            const results = tokens.map(token => this.actionResult(token.filePath, 'conflict', this.getGitPauseReason(token.filePath)));
+            return { results, succeeded: 0, failed: results.length };
+        }
         const preparedPaths = new Set<string>();
         const items = tokens.flatMap(token => {
             if (preparedPaths.has(token.filePath)) { return []; }
