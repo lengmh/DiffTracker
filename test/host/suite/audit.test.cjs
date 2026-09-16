@@ -25,9 +25,9 @@ async function stableReview(tracker, filePath) {
     });
 }
 module.exports = async function auditHost(workspace) {
-    const p = path.join(workspace, 'audit-source.txt');
-    const q = path.join(workspace, 'audit-target.txt');
-    const recoveryPath = path.join(workspace, 'audit-recovery.txt');
+    const p = vscode.Uri.file(path.join(workspace, 'audit-source.txt')).fsPath;
+    const q = vscode.Uri.file(path.join(workspace, 'audit-target.txt')).fsPath;
+    const recoveryPath = vscode.Uri.file(path.join(workspace, 'audit-recovery.txt')).fsPath;
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-audit-host-'));
     let tracker;
     let participant;
@@ -36,6 +36,7 @@ module.exports = async function auditHost(workspace) {
         fs.writeFileSync(p, 'base\n'); fs.writeFileSync(q, 'edit\n'); fs.writeFileSync(recoveryPath, 'base\n');
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
+        await delay(500); // Allow the native watcher backend to register.
         fs.writeFileSync(p, 'edit\n');
         await stableReview(tracker, p);
         const token = tracker.getReviewToken(p);
