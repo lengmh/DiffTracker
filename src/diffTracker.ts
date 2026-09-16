@@ -299,7 +299,7 @@ export class DiffTracker {
     private inlineViews = new Map<string, InlineDiffView>();
     private disposables: vscode.Disposable[] = [];
     private fileWatchers: vscode.FileSystemWatcher[] = [];
-    private importedDirectoryWatchers = new Map<string, { watcher: vscode.FileSystemWatcher; epoch: number }>();
+    private importedDirectoryWatchers = new Map<string, { watcher: vscode.Disposable; epoch: number }>();
     private ignoreMatchers = new Map<string, Ignore>();
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
@@ -762,42 +762,60 @@ export class DiffTracker {
 
     private createPathWatcher(pattern: vscode.RelativePattern, epoch: number): vscode.FileSystemWatcher {
         const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-        const dispatch = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): void => {
-            if (!this.isCurrentEpoch(epoch)) { return; }
-            if (path.basename(uri.fsPath) === '.gitignore') {
-                this.scanCoverage = undefined;
-                this.schedulePersistState();
-                void this.refreshIgnoreMatchers().catch(() => undefined);
-            }
-            if (this.restoringEpoch === epoch) {
-                // A change does not invalidate the evidence that a path
-                // was created. Delete replaces it; a later create starts
-                // a new incarnation and establishes absence again.
-                const previous = this.restoreEvents.get(uri.fsPath);
-                if (kind !== 'change' || previous?.kind !== 'create') {
-                    this.restoreEvents.set(uri.fsPath, { uri, kind });
-                }
-                return;
-            }
-            if (kind === 'create') { void this.onExternalFileCreated(uri); }
-            else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
-            else { void this.onExternalFileChanged(uri); }
-        };
-        watcher.onDidChange(uri => dispatch(uri, 'change'));
-        watcher.onDidCreate(uri => dispatch(uri, 'create'));
-        watcher.onDidDelete(uri => dispatch(uri, 'delete'));
+        watcher.onDidChange(uri => this.dispatchExternalEvent(uri, 'change', epoch));
+        watcher.onDidCreate(uri => this.dispatchExternalEvent(uri, 'create', epoch));
+        watcher.onDidDelete(uri => this.dispatchExternalEvent(uri, 'delete', epoch));
         return watcher;
+    }
+
+    private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        if (path.basename(uri.fsPath) === '.gitignore') {
+            this.scanCoverage = undefined;
+            this.schedulePersistState();
+            void this.refreshIgnoreMatchers().catch(() => undefined);
+        }
+        if (this.restoringEpoch === epoch) {
+            // A change does not invalidate the evidence that a path
+            // was created. Delete replaces it; a later create starts
+            // a new incarnation and establishes absence again.
+            const previous = this.restoreEvents.get(uri.fsPath);
+            if (kind !== 'change' || previous?.kind !== 'create') {
+                this.restoreEvents.set(uri.fsPath, { uri, kind });
+            }
+            return;
+        }
+        if (kind === 'create') { void this.onExternalFileCreated(uri); }
+        else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
+        else { void this.onExternalFileChanged(uri); }
     }
 
     private watchImportedDirectory(directory: string, epoch: number): boolean {
         const previous = this.importedDirectoryWatchers.get(directory);
         if (previous?.epoch === epoch) { return false; }
-        // Non-recursive watches cover moved-in trees whose descendants may be
-        // absent from the host's existing recursive watcher on Linux.
+        // The host may reuse a recursive watcher that never adopted moved-in
+        // descendants. Watch local directories directly, without that backend.
         const targetError = this.validateResourceTarget(directory);
         if (targetError) { throw new Error(targetError); }
-        const watcher = this.createPathWatcher(new vscode.RelativePattern(directory, '*'), epoch);
+        const native = fs.watch(directory, { persistent: false }, (kind, filename) => {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!filename) {
+                this.markFileUnavailable(directory, 'Directory watcher returned an unnamed event; rebuild the baseline to reconcile');
+                return;
+            }
+            const filePath = path.join(directory, filename.toString());
+            if (!this.pathBelongsToRoot(filePath, directory)) { return; }
+            this.dispatchExternalEvent(vscode.Uri.file(filePath), kind === 'change' ? 'change' : fs.existsSync(filePath) ? 'create' : 'delete', epoch);
+        });
+        const watcher = { dispose: () => native.close() };
         this.importedDirectoryWatchers.set(directory, { watcher, epoch });
+        native.on('error', () => {
+            native.close();
+            if (this.isCurrentEpoch(epoch) && this.importedDirectoryWatchers.get(directory)?.watcher === watcher) {
+                this.importedDirectoryWatchers.delete(directory);
+                this.markFileUnavailable(directory, 'Directory watcher failed; rebuild the baseline after resolving the watcher failure');
+            }
+        });
         previous?.watcher.dispose();
         return true;
     }

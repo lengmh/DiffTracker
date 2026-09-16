@@ -24,6 +24,14 @@ let workspaceChanged;
 const docs = [];
 const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
+const nativeDirectoryWatchers = [];
+const nativeWatch = fs.watch;
+fs.watch = (directory, options, listener) => {
+    fault(root, 'watcher');
+    const actual = process.env.DT_REAL_DIRECTORY_WATCH ? nativeWatch(directory, options, listener) : undefined;
+    const watcher = {directory, listener, active:true, close(){this.active=false;actual?.close();}, on(event,handler){actual?.on(event,handler);return this;}};
+    nativeDirectoryWatchers.push(watcher);return watcher;
+};
 const nativeLink = fs.promises.link;
 fs.promises.link = async (source, destination) => {
     await boundary(destination,'publish');fault(destination,'publish');
@@ -2040,10 +2048,10 @@ test('ROUND26 repository info excludes have lower precedence than nested rules',
 });
 test('ROUND26 imported descendants remain watched after Keep and Stop/restart',async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('watched-import'),p=path.join(dir,'deep','child.txt');fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
-    const notify=()=>{for(const watcher of watcherInstances){if(watcher.pattern?.pattern==='*'&&watcher.pattern.base===path.dirname(p))watcher.emit('change',Uri.file(p));}};
-    fs.writeFileSync(p,'after Keep');notify();await waitUntil(()=>pending(p)?.currentContent==='after Keep');assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
-    tracker.stopRecording();assert.equal(watcherInstances.filter(w=>w.pattern?.pattern==='*'&&w.active).length,0);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');fs.writeFileSync(p,'after restart');notify();await waitUntil(()=>pending(p)?.currentContent==='after restart');
-    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(watcherInstances.filter(w=>w.pattern?.pattern==='*'&&w.active).length,0);assert.equal(pending(p)?.isDeleted,true);
+    const notify=()=>{for(const watcher of nativeDirectoryWatchers){if(watcher.active&&watcher.directory===path.dirname(p))watcher.listener('change',path.basename(p));}};
+    fs.writeFileSync(p,'after Keep');if(!process.env.DT_REAL_DIRECTORY_WATCH)notify();await waitUntil(()=>pending(p)?.currentContent==='after Keep');assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
+    tracker.stopRecording();assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');fs.writeFileSync(p,'after restart');if(!process.env.DT_REAL_DIRECTORY_WATCH)notify();await waitUntil(()=>pending(p)?.currentContent==='after restart');
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(pending(p)?.isDeleted,true);
 });
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
@@ -2051,7 +2059,7 @@ if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.star
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
-    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[];listedIgnores=[];vscodeExcludes={}; tracker=new DiffTracker();
+    docs.length=0; watcherInstances.length=0; nativeDirectoryWatchers.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[];listedIgnores=[];vscodeExcludes={}; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }

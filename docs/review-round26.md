@@ -51,9 +51,13 @@ Windows Stable、Ubuntu Stable、Ubuntu VS Code 1.80.2 的结果记录于 PR。
 Windows Host 与两项质量检查通过；Linux Stable/1.80 的目录导入及 Keep 已通过，
 后续修改未重新出现。诊断提交的 [CI 35123973732](https://github.com/lengmh/DiffTracker/actions/runs/35123973732)
 确认两个 Linux 环境没有收到导入子文件的 change 回调，活动写入/待写集合均为空。
-因此为导入目录及其子目录添加非递归 `*` 监听，不依赖已有递归监听器补齐移动
-进来的 inode；监听建立后再次枚举以覆盖发现期间的变化。Stop 关闭监听，重启
+随后 [CI 35124766167](https://github.com/lengmh/DiffTracker/actions/runs/35124766167)
+确认新增 VS Code `RelativePattern('*')` 监听仍没有收到该修改回调。因此改为
+直接使用本地 `fs.watch` 监听导入目录及其子目录，绕开宿主复用的递归监听后端；
+监听建立后再次枚举以覆盖发现期间的变化。Stop 关闭监听，重启
 按新 epoch 重新绑定，删除目录时清理，dispose 清空。相应回归修复前失败。
+本地以 `DT_REAL_DIRECTORY_WATCH=1` 运行相同回归，使用真实 Linux fs.watch，
+不手动触发修改通知；Keep 后及 Stop/重启后的修改均重新进入待审列表。
 未重试失败的业务操作，也未延后外部写入或放宽验收断言；最终结果写入 PR。
 
 ## 检查结论与边界
