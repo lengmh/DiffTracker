@@ -2160,6 +2160,18 @@ test('ROUND27 asynchronous failure during scan never certifies absence',async()=
     await waitUntil(()=>!!pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
 });
 
+
+for(const failScan of [false,true]) test(`ROUND27 same-fingerprint watch retry reconciles gap and clears durable marker (scanRetry=${failScan})`,async()=>{
+    tracker.storageUri=Uri.file(file('storage'));const storage=tracker.storageUri;tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
+    const dir=file('gap'),sub=path.join(dir,'deep'),p=path.join(sub,'known.txt'),deleted=path.join(sub,'deleted.txt');fs.mkdirSync(sub,{recursive:true});for(const f of [p,deleted])fs.writeFileSync(f,'base');listedFiles=[p,deleted].map(Uri.file);await tracker.onExternalFileCreated(Uri.file(dir));for(const f of [p,deleted])assert.equal((await tracker.keepAllChangesInFile(f)).status,'success');
+    watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();watchExclude=[];tracker.maxImportedDirectoryWatchers=0;await tracker.refreshIgnoreMatchers();assert.ok(pending(dir)?.unavailableReason);
+    fs.writeFileSync(p,'gap edit');fs.unlinkSync(deleted);const q=path.join(sub,'gap-new.txt');fs.writeFileSync(q,'gap new');listedFiles=[p,q].map(Uri.file);const fingerprint=tracker.ignoreFingerprint;tracker.maxImportedDirectoryWatchers=256;
+    const find=vscode.workspace.findFiles;
+    if(failScan){vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*')throw error('scan failed');return find(pattern);};try{await assert.rejects(tracker.refreshIgnoreMatchers());}finally{vscode.workspace.findFiles=find;}assert.ok(pending(dir)?.unavailableReason);}
+    await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint);assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason,'unobserved gap creation keeps unknown before-image');assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);
+    await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(dir),undefined);assert.equal(pending(p)?.currentContent,'gap edit');assert.ok(pending(q)?.unavailableReason);
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }

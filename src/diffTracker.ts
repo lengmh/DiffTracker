@@ -221,6 +221,7 @@ export class DiffTracker {
         this.clearDocumentChangeTimers();
         this.scanUncertainFiles.clear();
         this.activeCreations.clear();
+        this.pendingImportedDirectoryReconciliation.clear();
         this.activeWriteFiles.clear();
         this.pendingWriteFiles.clear();
         return ++this.sessionEpoch;
@@ -306,6 +307,7 @@ export class DiffTracker {
     private disposables: vscode.Disposable[] = [];
     private fileWatchers: vscode.FileSystemWatcher[] = [];
     private importedDirectoryWatchers = new Map<string, ImportedDirectoryWatch>();
+    private pendingImportedDirectoryReconciliation = new Set<string>();
     private ignoreMatchers = new Map<string, Ignore>();
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
@@ -818,6 +820,7 @@ export class DiffTracker {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
                 // Rediscover directories created while coverage was suspended.
                 await this.watchImportedTree(directory, epoch, previous.provenAbsent);
+                if (this.isCurrentEpoch(epoch)) { this.pendingImportedDirectoryReconciliation.add(directory); }
             } catch (error) {
                 if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
                 else { await this.markCreatedDirectoryUnavailable(directory, 'Imported directory watch coverage could not be restored; rebuild after resolving the watcher failure', !previous.provenAbsent, epoch); }
@@ -1625,15 +1628,43 @@ export class DiffTracker {
         await this.resumeImportedDirectoryWatchers(epoch);
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
         this.pruneIgnoredTrackedChanges();
-        if (!changed || previousMatchers.size === 0 || this.restoringEpoch !== undefined ||
-            this.baselineBuilding || !this.snapshotInitialized) { return; }
-        // Revive known reviews and discover newly included paths conservatively.
-        await this.discoverRestoredFiles(epoch);
-        for (const filePath of [...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys()]) {
-            if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
-            const uri = vscode.Uri.file(filePath);
-            if (!this.isPathIgnored(uri)) { await this.readFileAndUpdate(filePath, uri); }
+        if ((!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
+            this.restoringEpoch !== undefined || this.baselineBuilding || !this.snapshotInitialized) { return; }
+        const restored = [...this.pendingImportedDirectoryReconciliation];
+        const restoredMarkers = new Set([...this.importedDirectoryWatchers].filter(([directory, entry]) =>
+            entry.epoch === epoch && entry.provenAbsent && this.fileSnapshots.get(directory) === '' &&
+            !this.baselineExistingFiles.has(directory) && restored.some(root => this.pathBelongsToRoot(directory, root))
+        ).map(([directory]) => directory));
+        try {
+            // A same-fingerprint retry must reconcile the gap too. Retain this
+            // obligation if discovery fails, even though OS watches now exist.
+            await this.discoverRestoredFiles(epoch);
+            for (const filePath of [...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys()]) {
+                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+                if (restoredMarkers.has(filePath)) { continue; }
+                const uri = vscode.Uri.file(filePath);
+                if (!this.isPathIgnored(uri)) { await this.readFileAndUpdate(filePath, uri); }
+            }
+        } catch (error) {
+            for (const directory of restored) {
+                const entry = this.importedDirectoryWatchers.get(directory);
+                await this.markCreatedDirectoryUnavailable(directory, 'Restored directory coverage could not be reconciled; refresh or rebuild after resolving the scan failure', !entry?.provenAbsent, epoch);
+            }
+            throw error;
         }
+        if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+        for (const directory of restoredMarkers) {
+            const entry = this.importedDirectoryWatchers.get(directory);
+            if (entry?.epoch !== epoch || this.validateResourceTarget(directory)) { continue; }
+            try { if (!fs.lstatSync(directory).isDirectory()) { continue; } } catch { continue; }
+            this.fileSnapshots.delete(directory);
+            this.fileModes.delete(directory);
+            this.unresolvedBaselineFiles.delete(directory);
+            this.postBaselineUnknownFiles.delete(directory);
+            this.clearFileReview(directory, true);
+            this.schedulePersistState();
+        }
+        restored.forEach(directory => this.pendingImportedDirectoryReconciliation.delete(directory));
     }
 
     private getDefaultExcludePatterns(): string[] {

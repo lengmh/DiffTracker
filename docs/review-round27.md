@@ -50,3 +50,12 @@ Independent review of d5aa0c0 reported P2 comments 4029340175 and 4029340183.
 - Added eight regressions: settings/gitignore unignore with new subdirectories, asynchronous errors/unnamed events with and without restore, failed-resume retry, and asynchronous scan-time uncertainty. All six reported reproductions fail on d5aa0c0 and pass now.
 - Real Linux native fs.watch verifies both unignore scenarios without injected file events.
 - Full local suite: 521/521. Compile, lint and whitespace validation pass. Final-head CI and independent review remain the merge gate.
+
+## Independent review follow-up: reconcile the coverage gap
+
+Independent review of 1c08636 reported P1 4029464703 and P2 4029464716.
+
+- Successfully resumed coverage now records a pending file-reconciliation obligation. Ignore refresh performs discovery and re-reads known paths even when the rule fingerprint is unchanged. A failed scan retains that obligation for a later retry.
+- After successful reconciliation, proven-absent directory failure markers and their synthetic file snapshots are removed and persisted. Older unknown before-images remain protected. Epoch/version guards prevent stale reconciliation from clearing newer state.
+- Two end-to-end regressions cover retry with unchanged rules, modified/deleted/new files during the gap, scan failure followed by retry, and restoration without stale directory markers. Both fail on 1c08636 and pass after the fix.
+- Full local suite: 523/523. Compile, lint and whitespace checks pass. Final-head CI and independent review remain required before merge.
