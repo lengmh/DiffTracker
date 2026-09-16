@@ -1,5 +1,11 @@
 # Diff Tracker
 
+Restored discoveries are classified as new files only when a completed baseline
+scan recorded matching ignore rules. Files newly exposed by changed ignore rules,
+or discovered from older sessions without scan provenance, remain pending with an
+unknown baseline until an explicit rebuild. Existing known baselines are retained.
+
+
 Review workspace changes as they happen, then keep or safely revert them by block,
 file, or batch. Version 0.7.0 adds versioned review actions, durable session recovery,
 bounded **Undo Last Revert**, and Git-context safety.

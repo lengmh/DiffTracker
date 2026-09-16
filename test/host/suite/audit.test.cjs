@@ -155,6 +155,29 @@ module.exports = async function auditHost(workspace) {
         assert.equal((await tracker.keepAllChangesInFile(q)).status, 'success');
         console.log('PASS HOST-GIT-INIT restored Keep/Revert pause until reconciliation completes');
 
+        const ignoreDir = path.join(workspace, 'audit-ignore');
+        const ignoredFile = path.join(ignoreDir, 'existing.txt');
+        const ignoreFile = path.join(ignoreDir, '.gitignore');
+        fs.mkdirSync(ignoreDir, { recursive: true });
+        fs.writeFileSync(ignoreFile, 'existing.txt\n');
+        fs.writeFileSync(ignoredFile, 'existed before the baseline\n');
+        await until(() => tracker.isPathIgnored(vscode.Uri.file(ignoredFile)));
+        await delay(750);
+        assert.equal(await tracker.resetBaselineToCurrentState(), true);
+        assert.equal(tracker.getOriginalContent(ignoredFile), undefined);
+        const covered = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+        assert.match(covered.scanCoverage, /^[a-f0-9]{64}$/);
+        await tracker.dispose();
+        fs.writeFileSync(ignoreFile, '');
+        tracker = new DiffTracker(vscode.Uri.file(storage));
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(tracker.getOriginalContent(ignoredFile), undefined);
+        assert.ok(tracker.getTrackedChanges().find(change => change.filePath === ignoredFile)?.unavailableReason);
+        assert.equal((await tracker.revertFile(ignoredFile)).status, 'conflict');
+        assert.equal(fs.readFileSync(ignoredFile, 'utf8'), 'existed before the baseline\n');
+        console.log('PASS HOST-IGNORE offline rule removal retains unknown before-image');
+
+
 
         tracker.stopRecording();
         assert.equal(await tracker.resetBaselineToCurrentState(), true);

@@ -185,6 +185,23 @@ ${statements.slice(monitorStart,monitorEnd).map(n=>n.getText(source)).join('\n')
     else {assert.equal(pending,true);callback({kind:'ready',contexts:[]});assert.deepEqual(calls,['pause','reconcile','release']);}
     assert.equal(pending,false);
 });
+test('AUDIT-25 disposed Git monitor cannot finish activation or install listeners',async()=>{
+    const opened=new Emitter(),closed=new Emitter(),state=new Emitter();let release;
+    const gate=new Promise(resolve=>{release=resolve;});
+    const gitApi={state:'initialized',repositories:[],onDidOpenRepository:opened.event,onDidCloseRepository:closed.event,onDidChangeState:state.event};
+    const monitor=new api.GitContextMonitor(()=>{},()=>({isActive:false,activate:async()=>{await gate;return {enabled:true,getAPI:()=>gitApi};}}));
+    const starting=monitor.start();monitor.dispose();release();assert.equal(await starting,false);
+    assert.equal(monitor.isReady(),false);assert.equal(opened.handlers.length+closed.handlers.length+state.handlers.length,0);
+});
+for(const outcome of ['ready','unavailable','dispose']) test(`AUDIT-25 readiness waits for extension activation (${outcome})`,async()=>{
+    const opened=new Emitter(),closed=new Emitter(),state=new Emitter();let release;
+    const gate=new Promise(resolve=>{release=resolve;});
+    const gitApi={state:'initialized',repositories:[],onDidOpenRepository:opened.event,onDidCloseRepository:closed.event,onDidChangeState:state.event};
+    const monitor=new api.GitContextMonitor(()=>{},()=>({isActive:false,activate:async()=>{await gate;return {enabled:outcome!=='unavailable',getAPI:()=>gitApi};}}));
+    const starting=monitor.start();let finished=false;const ready=monitor.whenReady().then(result=>{finished=true;return result;});await Promise.resolve();assert.equal(finished,false);
+    if(outcome==='dispose'){monitor.dispose();assert.equal(await ready,false);}release();await starting;
+    assert.equal(await ready,outcome!=='dispose');monitor.dispose();
+});
 let failures=0;
 for(const {name,run} of tests){try{await run();console.log(`PASS ${name}`);}catch(error){failures++;console.error(`FAIL ${name}\n${error.stack}`);}}
 console.log(`${tests.length-failures}/${tests.length} production Git-context adapter tests passed (VS Code Git API boundary mocked).`);

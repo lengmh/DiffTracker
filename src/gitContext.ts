@@ -126,7 +126,7 @@ export class GitContextMonitor implements vscode.Disposable {
 
     public whenReady(): Promise<boolean> {
         if (this.disposed) { return Promise.resolve(false); }
-        if (!this.api || this.ready) { return Promise.resolve(true); }
+        if ((!this.api && !this.starting) || this.ready) { return Promise.resolve(true); }
         return new Promise(resolve => this.readyWaiters.push(resolve));
     }
     private readonly disposables: vscode.Disposable[] = [];
@@ -135,6 +135,7 @@ export class GitContextMonitor implements vscode.Disposable {
     private api: GitApiLike | undefined;
     private disposed = false;
     private ready = false;
+    private starting = false;
 
     constructor(
         private readonly onContextEvent: (event: GitContextEvent) => void,
@@ -144,13 +145,15 @@ export class GitContextMonitor implements vscode.Disposable {
 
     public async start(): Promise<boolean> {
         if (this.disposed) { return false; }
-        const extension = this.extensionProvider();
-        if (!extension) { return false; }
+        this.starting = true;
         try {
+            const extension = this.extensionProvider();
+            if (!extension) { return false; }
             const exports = extension.isActive ? extension.exports : await extension.activate();
-            if (!exports?.enabled) { return false; }
+            if (this.disposed || !exports?.enabled) { return false; }
             this.api = exports.getAPI(1);
             await this.discoverInitialRepositories();
+            if (this.disposed) { return false; }
             this.disposables.push(
                 this.api.onDidOpenRepository(repository => this.attachRepository(repository, true)),
                 this.api.onDidCloseRepository(repository => this.detachRepository(repository.rootUri.fsPath, true)),
@@ -169,19 +172,28 @@ export class GitContextMonitor implements vscode.Disposable {
         } catch {
             this.api = undefined;
             return false;
+        } finally {
+            this.starting = false;
+            if (!this.api || this.ready || this.disposed) {
+                this.readyWaiters.splice(0).forEach(resolve => resolve(!this.disposed));
+            }
         }
     }
 
     private async discoverInitialRepositories(): Promise<void> {
-        if (!this.api) { return; }
-        const initialRepositories = new Map(this.api.repositories.map(repository => [repository.rootUri.fsPath, repository]));
-        if (this.api.getRepositoryRoot && this.api.openRepository) {
+        if (!this.api || this.disposed) { return; }
+        const api = this.api;
+        const initialRepositories = new Map(api.repositories.map(repository => [repository.rootUri.fsPath, repository]));
+        if (api.getRepositoryRoot && api.openRepository) {
             for (const folder of vscode.workspace.workspaceFolders ?? []) {
                 if (folder.uri.scheme !== 'file') { continue; }
                 try {
-                    const root = await this.api.getRepositoryRoot(folder.uri);
+                    if (this.disposed) { return; }
+                    const root = await api.getRepositoryRoot(folder.uri);
+                    if (this.disposed) { return; }
                     if (root && !initialRepositories.has(root.fsPath)) {
-                        const repository = await this.api.openRepository(root);
+                        const repository = await api.openRepository(root);
+                        if (this.disposed) { return; }
                         if (repository) { initialRepositories.set(repository.rootUri.fsPath, repository); }
                     }
                 } catch {

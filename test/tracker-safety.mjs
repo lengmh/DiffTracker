@@ -17,6 +17,8 @@ async function boundary(p,operation) { const key=`${p}:${operation}`, barrier=ba
 let automationOnly=false;
 let watchExclude=[];
 let listedFiles=[];
+let listedIgnores=[];
+let vscodeExcludes={};
 let workspaceChanged;
 const docs = [];
 const watcherInstances = [];
@@ -122,12 +124,12 @@ const vscode = {
             return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
                 ? { uri:Uri.file(root), name:'test' } : undefined;
         },
-        getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:key==='watchExclude'?watchExclude:fallback }),
+        getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:key==='watchExclude'?watchExclude:key in vscodeExcludes?vscodeExcludes[key]:fallback }),
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidChangeConfiguration:noopEvent,
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
-        findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:[];},
+        findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:pattern.pattern==='**/.gitignore'?listedIgnores:[];},
         createFileSystemWatcher:createWatcher,
         async openTextDocument(uri) { await boundary(uri.fsPath,'open'); return document(uri.fsPath); },
         async applyEdit(edit) {
@@ -1046,7 +1048,7 @@ for(const baselineState of ['ready','building']) test(`DT-06 zero-file ${baselin
 });
 for(const via of ['create','document']) test(`DT-06 Ready baseline growth via ${via} exceeding limits blocks actions and restart`,async()=>{
     const p=file();seed(p,'base');const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
-    tracker.maxPersistedSnapshots=1;assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.initializeWorkspaceSnapshots();tracker.maxPersistedSnapshots=1;assert.equal(await tracker.flushPendingPersistence(),true);
     const q=file();fs.writeFileSync(q,'new');
     if(via==='create') await tracker.onExternalFileCreated(Uri.file(q));else tracker.ensureSnapshotForDocument(document(q));
     await tracker.flushPendingPersistence();assert.equal(tracker.getBaselineState(),'building');
@@ -1152,7 +1154,7 @@ test('AUDIT-18 deleting an open document parent during ignore discovery cannot a
 });
 test('AUDIT-18 refreshing ignore rules retains exclusions until replacement is ready',async()=>{
     const p=path.join(root,'node_modules',`${index++}.txt`);fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'ignored');
-    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');tracker.gitignoreCache.clear();
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
     const gate=pause(root,'ignoreScan'),refresh=tracker.refreshIgnoreMatchers();await gate.entered;
     tracker.onDocumentOpened(document(p));emitWatcher('create',Uri.file(p));gate.release();await refresh;
     assert.equal(tracker.getOriginalContent(p),undefined);assert.equal(pending(p),undefined);
@@ -1697,7 +1699,7 @@ for(const interruption of ['stop','symlink','permission']) test(`PARENT recovery
 
 for(const content of ['', 'offline addition\n']) test(`RESTORE-OFFLINE discovers ${content?'text':'empty'} additions and persists absence`,async()=>{
     const p=file(),q=file(),storage=file('storage');seed(p,'old','changed');tracker.storageUri=Uri.file(storage);
-    await tracker.dispose();fs.writeFileSync(q,content);listedFiles=[Uri.file(p),Uri.file(q)];
+    await tracker.initializeWorkspaceSnapshots();await tracker.dispose();fs.writeFileSync(q,content);listedFiles=[Uri.file(p),Uri.file(q)];
     tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
     assert.equal(tracker.getOriginalContent(p),'old');assert.equal(pending(p)?.currentContent,'changed');
     assert.equal(tracker.getOriginalContent(q),'');assert.equal(tracker.baselineExistingFiles.has(q),false);assert.ok(pending(q));
@@ -1708,7 +1710,7 @@ for(const content of ['', 'offline addition\n']) test(`RESTORE-OFFLINE discovers
     assert.equal((await tracker.keepAllChangesInFile(q)).status,'success');assert.equal(tracker.baselineExistingFiles.has(q),true);
 });
 for(const kind of ['dirty','binary','unreadable']) test(`RESTORE-OFFLINE ${kind} addition stays protected`,async()=>{
-    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.initializeWorkspaceSnapshots();await tracker.dispose();
     fs.writeFileSync(q,kind==='binary'?Buffer.from([0,1,2]):'disk');listedFiles=[Uri.file(q)];
     if(kind==='dirty'){const doc=document(q);doc.text='unsaved';doc.isDirty=true;}
     if(kind==='unreadable')faults.set(q,{read:error('EACCES')});
@@ -1755,7 +1757,7 @@ for(const action of ['stop','scan-error','persist-error']) test(`RESTORE-OFFLINE
 });
 
 for(const event of ['change','delete','recreate']) test(`RESTORE-OFFLINE replays ${event} during discovery`,async()=>{
-    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.initializeWorkspaceSnapshots();await tracker.dispose();
     fs.writeFileSync(q,'first');listedFiles=[Uri.file(q)];tracker=new DiffTracker(Uri.file(storage));
     const gate=pause(q,'stat'),restoring=tracker.restorePersistedState();await gate.entered;
     if(event!=='change'){fs.unlinkSync(q);emitWatcher('delete',Uri.file(q));}
@@ -1854,13 +1856,104 @@ test('GIT-INIT stop does not bypass the gate; disposed tracker cannot be release
     assert.equal(await tracker.resetBaselineToCurrentState(),false);
     await tracker.dispose();tracker.setGitContextPending(false);assert.match(tracker.getGitPauseReason(p),/initialization/);
 });
+for(const mode of ['file','batch','block']) test(`AUDIT-25 rejected ${mode} Revert preserves all bounded recovery history`,async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);
+    const item=tracker.createFileRevertItem(p);
+    tracker.revertHistory=Array.from({length:10},(_,i)=>({id:`old-${i}`,createdAt:new Date().toISOString(),items:[{...item}]}));
+    const before=JSON.stringify(tracker.revertHistory);
+    faults.set(p,{apply:false});
+    const result=mode==='batch'?await tracker.revertAllChanges():mode==='block'?await tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId):await tracker.revertFile(p);
+    assert.equal(mode==='batch'?result.succeeded:succeeded(result),mode==='batch'?0:false);
+    assert.equal(JSON.stringify(tracker.revertHistory),before);assert.equal(disk(p),'changed\n');
+});
+test('AUDIT-25 scan deletion cannot disappear behind a pending baseline read',async()=>{
+    const p=file();fs.writeFileSync(p,'old');listedFiles=[Uri.file(p)];tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+    const gate=pause(p,'read'),scanTask=tracker.initializeWorkspaceSnapshots();await gate.entered;
+    fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));gate.release();await scanTask;
+    assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.fileSnapshots.has(p),false);
+});
+for(const mode of ['file','batch']) test(`AUDIT-25 ${mode} final read Git pause cannot report success`,async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);
+    const base={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([base]);
+    const read=tracker.readCurrentFileState.bind(tracker);let paused=false;
+    tracker.readCurrentFileState=async f=>{const value=await read(f);if(f===p&&disk(p)==='base'&&!tracker.activeWriteFiles.has(p)&&!paused){paused=true;tracker.observeGitContext({...base,headName:'feature'});}return value;};
+    const result=mode==='file'?await tracker.revertFile(p):await tracker.revertAllChanges();
+    assert.equal(paused,true);assert.equal(mode==='file'?succeeded(result):result.succeeded,mode==='file'?false:0);
+    assert.ok(pending(p));assert.equal(tracker.revertHistory.length,1);
+});
+test('AUDIT-25 offline ignore removal is unknown rather than an absent baseline',async()=>{
+    const p=file(),q=file(),storage=file('storage');fs.writeFileSync(p,'base');fs.writeFileSync(q,'pre-existing ignored');
+    watchExclude=[path.basename(q)];listedFiles=[Uri.file(p),Uri.file(q)];tracker.storageUri=Uri.file(storage);tracker.snapshotInitialized=false;
+    await tracker.initializeWorkspaceSnapshots();await tracker.dispose();watchExclude=[];
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.fileSnapshots.has(q),false);assert.ok(pending(q)?.unavailableReason);
+    tracker.onDocumentOpened(document(q));assert.equal(tracker.fileSnapshots.has(q),false);
+});
+test('AUDIT-25 ignore refresh restores previously hidden pending reviews',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);watchExclude=[path.basename(p)];await tracker.refreshIgnoreMatchers();assert.equal(pending(p),undefined);
+    watchExclude=[];await tracker.refreshIgnoreMatchers();assert.equal(pending(p)?.currentContent,'changed');
+});
+for(const rule of ['files.exclude','files.watcherExclude','search.exclude','gitignore','deleted-gitignore']) test(`AUDIT-25 offline ${rule} removal preserves unknown before-image`,async()=>{
+    const p=file(),q=file(),storage=file('storage'),ignorePath=file('.gitignore');
+    fs.writeFileSync(p,'base');fs.writeFileSync(q,'pre-existing');listedFiles=[Uri.file(p),Uri.file(q)];
+    if(rule.includes('gitignore')){fs.writeFileSync(ignorePath,path.basename(q));listedIgnores=[Uri.file(ignorePath)];}
+    else vscodeExcludes[rule]={[path.basename(q)]:true};
+    tracker.storageUri=Uri.file(storage);tracker.snapshotInitialized=false;await tracker.initializeWorkspaceSnapshots();
+    assert.equal(tracker.fileSnapshots.has(q),false);await tracker.dispose();
+    if(rule==='deleted-gitignore'){fs.unlinkSync(ignorePath);listedIgnores=[];}else if(rule==='gitignore')fs.writeFileSync(ignorePath,'');else vscodeExcludes={};
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.fileSnapshots.has(q),false);assert.ok(pending(q)?.unavailableReason);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(pending(q)?.unavailableReason);
+});
+test('AUDIT-25 legacy state without scan provenance cannot prove absence',async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'base');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    fs.writeFileSync(q,'may predate scan');listedFiles=[Uri.file(q)];tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.fileSnapshots.has(q),false);assert.ok(pending(q)?.unavailableReason);
+});
+test('AUDIT-25 opening a genuinely new file after a complete scan cannot accept its bytes',async()=>{
+    const p=file(),q=file();fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];tracker.snapshotInitialized=false;await tracker.initializeWorkspaceSnapshots();
+    fs.writeFileSync(q,'new');tracker.onDocumentOpened(document(q));assert.equal(tracker.getOriginalContent(q),'');assert.ok(pending(q));
+});
+test('AUDIT-25 unreadable ignore rules cannot establish complete scan coverage',async()=>{
+    const p=file(),ignorePath=file('.gitignore');fs.writeFileSync(p,'base');fs.writeFileSync(ignorePath,'*.m');
+    listedFiles=[Uri.file(p)];listedIgnores=[Uri.file(ignorePath)];tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+    faults.set(ignorePath,{read:error('EACCES')});await assert.rejects(tracker.initializeWorkspaceSnapshots());
+    assert.equal(tracker.scanCoverage,undefined);assert.equal(tracker.getBaselineState(),'building');
+});
+test('AUDIT-25 earlier ignore refresh cannot replace later rules',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);await tracker.refreshIgnoreMatchers();
+    watchExclude=[path.basename(p)];const gate=pause(root,'ignoreScan'),first=tracker.refreshIgnoreMatchers();await gate.entered;
+    watchExclude=[];await tracker.refreshIgnoreMatchers();gate.release();await first;
+    assert.equal(tracker.isPathIgnored(Uri.file(p)),false);assert.equal(pending(p)?.currentContent,'changed');
+});
+test('AUDIT-25 changing rules during a scan cannot certify offline absence',async()=>{
+    const p=file();fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+    const gate=pause(p,'read'),scanning=tracker.initializeWorkspaceSnapshots();await gate.entered;
+    watchExclude=['old-rule'];await tracker.refreshIgnoreMatchers();watchExclude=[];await tracker.refreshIgnoreMatchers();
+    gate.release();await scanning;assert.equal(tracker.scanCoverage,undefined);
+});
+test('AUDIT-25 live gitignore edits rediscover newly included files',async()=>{
+    const p=file(),q=file();fs.writeFileSync(p,'base');fs.writeFileSync(q,'previously ignored');
+    const original=path.join(root,'.gitignore');fs.writeFileSync(original,path.basename(q));listedIgnores=[Uri.file(original)];listedFiles=[Uri.file(p),Uri.file(q)];
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.fileSnapshots.has(q),false);
+    fs.writeFileSync(original,'');emitWatcher('change',Uri.file(original));await waitUntil(()=>!!pending(q)?.unavailableReason);
+    assert.equal(tracker.fileSnapshots.has(q),false);fs.unlinkSync(original);
+});
+for(const partial of [false,true]) test(`AUDIT-25 bounded history commits only when Revert mutates (partial=${partial})`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'base','changed');seed(q,'base','changed');await scan(p);await scan(q);
+    const item=tracker.createFileRevertItem(p);tracker.revertHistory=Array.from({length:10},(_,i)=>({id:`old-${i}`,createdAt:new Date().toISOString(),items:[{...item}]}));tracker.storageUri=Uri.file(storage);
+    faults.set(p,{apply:false});if(!partial)faults.set(q,{apply:false});const result=await tracker.revertAllChanges();assert.equal(result.succeeded,partial?1:0);
+    assert.equal(tracker.revertHistory.length,10);assert.equal(tracker.revertHistory[0].id,partial?'old-1':'old-0');
+    if(partial)assert.deepEqual(tracker.revertHistory.at(-1).items.map(i=>i.filePath),[q]);
+    const history=JSON.stringify(tracker.revertHistory);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(JSON.stringify(tracker.revertHistory),history);
+});
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
-    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[]; tracker=new DiffTracker();
+    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[];listedIgnores=[];vscodeExcludes={}; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }
