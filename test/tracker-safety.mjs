@@ -817,6 +817,48 @@ test('DT-06 removed workspace roots preserve a reloadable paused session',async(
         assert.equal(tracker.getOriginalContent(p),'preserved');
     } finally { vscode.workspace.workspaceFolders=folders; }
 });
+test('AUDIT-21 stopped clear persists empty baseline and history without resuming recording',async()=>{
+    const p=file(),q=file();seed(p,'before','current');seed(q,'q before','q current');await scan(p);await scan(q);assert.ok(succeeded(await tracker.revertFile(q)));
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();await tracker.flushPendingPersistence();
+    await tracker.resetBaselineToCurrentState();await tracker.flushPendingPersistence();
+    assert.equal(tracker.getIsRecording(),false);assert.equal(disk(p),'current');assert.equal(disk(q),'q before');assert.equal(tracker.getOriginalContent(p),undefined);
+    const saved=JSON.parse(disk(path.join(storage,'session-state.json')));
+    assert.equal(saved.fileSnapshots.length,0);assert.equal(saved.baselineExistingFiles.length,0);assert.equal(saved.revertHistory.length,0);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getIsRecording(),false);assert.equal(tracker.getTrackedChanges().length,0);assert.equal((await tracker.undoLastRevert()).succeeded,0);
+});
+for(const phase of ['write','rename','copy'])test(`AUDIT-21 failed stopped clear at ${phase} retains review and reloadable history`,async()=>{
+    const p=file(),q=file();seed(p,'before','current');seed(q,'q before','q current');await scan(p);await scan(q);assert.ok(succeeded(await tracker.revertFile(q)));
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();await tracker.flushPendingPersistence();
+    const oldHistory=JSON.stringify(tracker.revertHistory),target=path.join(storage,phase==='copy'?'session-state.json':'session-state.tmp.json');faults.set(target,{[phase]:error('NoPermissions')});
+    assert.equal(await tracker.resetBaselineToCurrentState(),false);assert.equal(tracker.getOriginalContent(p),'before');assert.ok(pending(p));assert.equal(JSON.stringify(tracker.revertHistory),oldHistory);
+    faults.clear();assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(pending(p));assert.equal((await tracker.undoLastRevert()).succeeded,1);assert.equal(disk(q),'q current');
+});
+for(const transition of ['stop','restart','dispose'])test(`AUDIT-21 ${transition} cancels pending stopped clear without stale rollback`,async()=>{
+    const p=file();seed(p,'before','current');await scan(p);const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();await tracker.flushPendingPersistence();
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write'),op=tracker.resetBaselineToCurrentState();await gate.entered;
+    let ending;
+    if(transition==='dispose')ending=tracker.dispose();else {tracker.stopRecording();if(transition==='restart'){listedFiles=[Uri.file(p)];tracker.startRecording();}}
+    gate.release();assert.equal(await op,false);await ending;
+    if(transition==='restart'){await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),'current');}
+    else {assert.equal(tracker.getOriginalContent(p),'before');assert.ok(pending(p));}
+    await tracker.flushPendingPersistence();const saved=JSON.parse(disk(path.join(storage,'session-state.json')));
+    assert.equal(new Map(saved.fileSnapshots).get(p),transition==='restart'?'current':'before');
+});
+test('AUDIT-21 stopped clear handles empty, missing, unknown and dirty resources without disk mutation',async()=>{
+    const empty=file(),deleted=file(),dirty=file(),unknown=file();seed(empty,'');seed(deleted,'gone');seed(dirty,'before','saved');
+    fs.unlinkSync(deleted);await tracker.onExternalFileDeleted(Uri.file(deleted));const doc=document(dirty);doc.text='unsaved';doc.isDirty=true;tracker.processDocumentChange(doc);
+    fs.writeFileSync(unknown,Buffer.from([0,1]));await tracker.onExternalFileCreated(Uri.file(unknown));assert.ok(pending(unknown)?.unavailableReason);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(disk(empty),'');assert.equal(fs.existsSync(deleted),false);assert.equal(disk(dirty),'saved');assert.equal(doc.getText(),'unsaved');assert.equal(doc.isDirty,true);
+    const saved=JSON.parse(disk(path.join(storage,'session-state.json')));assert.equal(saved.unresolvedBaselineFiles.length,0);assert.equal(saved.fileSnapshots.length,0);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.getTrackedChanges().length,0);
+});
+test('AUDIT-21 blocked recovery cannot be cleared by the ordinary reset command',async()=>{
+    const p=file();seed(p,'before','current');await scan(p);tracker.stopRecording();tracker.recoveryBlocked=true;
+    assert.equal(await tracker.resetBaselineToCurrentState(),false);assert.equal(tracker.getOriginalContent(p),'before');assert.ok(pending(p));
+});
 test('DT-06 reset after reverting a new file remains reloadable',async()=>{
     const p=file();fs.writeFileSync(p,'new');await tracker.onExternalFileCreated(Uri.file(p));
     tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));const storage=tracker.storageUri;

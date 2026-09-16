@@ -91,7 +91,7 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
    - Original File
    - Split: Original | Webview
 6. 在 WebView Diff 中，可对每个变更块执行 `Undo / Keep`，或在文件级执行 `Keep All / Reject All`。
-7. 如需清空当前基线并以当前工作区状态重新开始，可使用 `Diff Tracker: Clear Diffs`。
+7. `Diff Tracker: Clear Diffs` 在录制中会以当前工作区状态重建基线；停止录制后会清除已保存的基线和 Undo 历史，重载后仍保持停止。该命令不会修改工作区文件或未保存的缓冲区。
 
 ## 工作原理
 

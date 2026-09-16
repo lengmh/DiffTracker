@@ -55,6 +55,11 @@ function getDefaultOpenMode(): DefaultOpenMode {
     return 'webview';
 }
 
+function isDeletedReview(filePath: string, filePathOrItem: string | any): boolean {
+    const tracked = diffTracker.getTrackedChanges().find(change => change.filePath === filePath);
+    return tracked ? tracked.isDeleted === true : extractIsDeleted(filePathOrItem) === true;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
     const runningExtensionTests = context.extensionMode === vscode.ExtensionMode.Test;
 
@@ -517,12 +522,10 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const deletedFromItem = extractIsDeleted(filePathOrItem);
-            const deletedFromTracked = diffTracker.getTrackedChanges().find(change => change.filePath === filePath)?.isDeleted === true;
-            const isDeleted = deletedFromItem ?? deletedFromTracked;
+            const isDeleted = isDeletedReview(filePath, filePathOrItem);
             const defaultMode = getDefaultOpenMode();
 
-            if (isDeleted && defaultMode === 'original') {
+            if (isDeleted && (defaultMode === 'original' || defaultMode === 'splitOriginalWebview')) {
                 await vscode.commands.executeCommand('diffTracker.showWebviewDiff', filePath);
                 return;
             }
@@ -550,14 +553,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.clearDiffs', async () => {
-            if (diffTracker.getIsRecording()) {
-                await diffTracker.resetBaselineToCurrentState();
-            } else {
-                diffTracker.clearDiffs();
+            const wasRecording = diffTracker.getIsRecording();
+            if (!await diffTracker.resetBaselineToCurrentState()) {
+                vscode.window.showWarningMessage('Diff Tracker: Baseline reset did not complete. Check the current review and any persistence warnings.');
+                return false;
             }
             refreshChangesTree();
             decorationManager.clearAllDecorations();
-            vscode.window.showInformationMessage('Diff Tracker: Baseline reset to current workspace state');
+            vscode.window.showInformationMessage(wasRecording
+                ? 'Diff Tracker: Baseline reset to current workspace state'
+                : 'Diff Tracker: Saved baseline and recovery history cleared; recording remains stopped');
+            return true;
         })
     );
 
@@ -652,6 +658,11 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.showOriginalAndWebviewSplit', async (filePathOrItem: string | any) => {
             const filePath = extractFilePath(filePathOrItem);
             if (!filePath) {
+                return;
+            }
+
+            if (isDeletedReview(filePath, filePathOrItem)) {
+                await vscode.commands.executeCommand('diffTracker.showWebviewDiff', filePath);
                 return;
             }
 

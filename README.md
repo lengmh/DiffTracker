@@ -109,6 +109,10 @@ Diff Tracker is a VS Code extension that records file changes and provides three
 7. Use **Revert File** / **Revert All Changes** as needed.
 8. Stop recording when done.
 
+**Clear Diffs** resets the baseline to the current workspace while recording.
+When stopped, it clears the saved baseline and Undo history and remains stopped,
+including after reload. It does not change workspace files or dirty buffers.
+
 ## How It Works
 
 When recording starts, Diff Tracker:

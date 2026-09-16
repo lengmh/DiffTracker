@@ -127,6 +127,13 @@ module.exports = async function runExtensionHostScenario() {
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
+        await vscode.commands.executeCommand('diffTracker.showOriginalAndWebviewSplit', uri('deleted.txt').fsPath);
+        const deletedReviewTab = vscode.window.tabGroups.all.flatMap(group => group.tabs)
+            .find(tab => tab.input instanceof vscode.TabInputWebview);
+        assert.ok(deletedReviewTab, 'Deleted-file split entry must open a review panel');
+        assert.equal(await missing('deleted.txt'), true);
+        await vscode.window.tabGroups.close(deletedReviewTab);
+        console.log('PASS HOST-REVIEW deleted-file split opens Webview without recreating file');
         const deletedRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);
         assert.equal(deletedRevert.status, 'success', deletedRevert.reason);
         assert.equal(await read('deleted.txt'), 'delete baseline\n');
@@ -182,5 +189,14 @@ module.exports = async function runExtensionHostScenario() {
         assert.ok(pausedRepository?.repoRoot, 'paused repository root is exposed for explicit recovery');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
         await until('Git baseline rebuild', async () => (await state()).gitPauses.length === 0 && (await state()).reviewTokens.length === 0);
+        await write('batch-a.txt', 'stopped clear preserves disk\n');
+        await untilStable('stopped clear pending', () => pending('batch-a.txt'));
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        assert.equal(await vscode.commands.executeCommand('diffTracker.clearDiffs'), true);
+        assert.equal((await state()).isRecording, false);
+        assert.equal((await state()).trackedChanges.length, 0);
+        assert.equal((await state()).reviewTokens.length, 0);
+        assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
+        console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
         await require('./audit.test.cjs')(workspacePath);
 };

@@ -287,4 +287,42 @@ await test('detached old annotation button sends its captured old review token',
     wrapper.children[1].listeners.click({stopPropagation(){}});
     assert.equal(ui.sent[0].reviewToken.currentRevision,'current');assert.equal(ui.sent[0].changeBlockId,'old-block');
 });
+function commandHarness(options={}) {
+    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],...options};
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
+    const helpers=[],callbacks=[];
+    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs']);
+    function visit(node){
+        if(ts.isFunctionDeclaration(node)&&['extractFilePath','extractIsDeleted','getDefaultOpenMode','isDeletedReview'].includes(node.name?.text))helpers.push(node.getText(source));
+        if(ts.isCallExpression(node)&&node.expression.getText(source)==='vscode.commands.registerCommand'&&names.has(node.arguments[0]?.text))callbacks.push(`${JSON.stringify(node.arguments[0].text)}:${node.arguments[1].getText(source)}`);
+        ts.forEachChild(node,visit);
+    }
+    visit(source);
+    class Uri {constructor(fsPath){this.fsPath=fsPath;}static file(p){return new Uri(p);}}
+    let sandbox;
+    const vscode={Uri,ViewColumn:{One:1,Two:2},
+        workspace:{getConfiguration:()=>({get:()=>state.mode}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
+        window:{showTextDocument:async()=>{},showInformationMessage:m=>state.info.push(m),showWarningMessage:m=>state.warnings.push(m)},
+        commands:{executeCommand:async(name,...args)=>sandbox.callbacks[name](...args)}};
+    const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
+        resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;}};
+    sandbox={vscode,diffTracker:tracker,context:{extensionUri:{}},WebviewDiffPanel:{createOrShow:()=>state.panels++},
+        refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},console};
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`${helpers.join('\n')}globalThis.callbacks={${callbacks.join(',')}};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    return {state,run:(name,...args)=>sandbox.callbacks[name](...args)};
+}
+for(const command of ['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit'])await test(`deleted-file ${command} opens a panel without opening a missing resource`,async()=>{
+    const h=commandHarness();await h.run(command,filePath);assert.equal(h.state.opened,0);assert.equal(h.state.panels,1);
+});
+await test('current deleted review overrides a stale non-deleted tree item',async()=>{
+    const h=commandHarness();await h.run('diffTracker.openDiffDefault',{filePath,isDeleted:false});assert.equal(h.state.opened,0);assert.equal(h.state.panels,1);
+});
+await test('existing file split still opens its editor and panel',async()=>{
+    const h=commandHarness({deleted:false});await h.run('diffTracker.showOriginalAndWebviewSplit',filePath);assert.equal(h.state.opened,1);assert.equal(h.state.panels,1);
+});
+for(const recording of [false,true])for(const success of [false,true])await test(`clear command awaits durable result (recording=${recording}, success=${success})`,async()=>{
+    const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
+    assert.equal(h.state.info.length,success?1:0);assert.equal(h.state.warnings.length,success?0:1);
+});
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);

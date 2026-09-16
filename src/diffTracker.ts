@@ -587,27 +587,32 @@ export class DiffTracker {
         });
     }
 
-    public async resetBaselineToCurrentState(): Promise<void> {
-        if (this.recoveryBlocked) { return; }
+    public resetBaselineToCurrentState(): Promise<boolean> {
+        const epoch = this.sessionEpoch;
+        return this.queueRecoveryAction(() => this.isCurrentEpoch(epoch)
+            ? this.performBaselineReset() : Promise.resolve(false));
+    }
+
+    private async performBaselineReset(): Promise<boolean> {
+        if (this.recoveryBlocked) { return false; }
         const previousEpoch = this.sessionEpoch;
         let watchers: vscode.FileSystemWatcher[] | undefined;
         if (this.isRecording) {
             try {
                 await this.refreshIgnoreMatchers();
-                if (!this.isCurrentEpoch(previousEpoch)) { return; }
+                if (!this.isCurrentEpoch(previousEpoch)) { return false; }
                 watchers = this.createExternalWatchers(previousEpoch + 1);
             } catch (error) {
                 this.reportExternalWatcherFailure(error);
-                return;
+                return false;
             }
         }
         const epoch = this.advanceEpoch();
         if (watchers) { this.activateExternalWatchers(watchers); }
-        this.workspaceContextChanged = false;
         if (!this.isRecording) {
-            this.clearDiffs();
-            return;
+            return this.clearStoppedBaseline(epoch);
         }
+        this.workspaceContextChanged = false;
 
         const removedFiles = Array.from(this.trackedChanges.keys());
 
@@ -638,7 +643,7 @@ export class DiffTracker {
         } catch (error) {
             console.error('Failed to reset baseline to current state:', error);
         } finally {
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!this.isCurrentEpoch(epoch)) { return false; }
             // A failed/partial scan remains Building; only the scanner can publish Ready.
             this.emitTrackChangesEvent({
                 removedFiles,
@@ -646,6 +651,46 @@ export class DiffTracker {
                 baselineChanged: true
             });
             this.schedulePersistState();
+        }
+        return this.snapshotInitialized && !this.baselineBuilding;
+    }
+
+    private async clearStoppedBaseline(epoch: number): Promise<boolean> {
+        const previous = {
+            fileSnapshots: this.fileSnapshots, fileModes: this.fileModes,
+            baselineExistingFiles: this.baselineExistingFiles, unresolvedBaselineFiles: this.unresolvedBaselineFiles,
+            revertHistory: this.revertHistory, baselineGitContexts: this.baselineGitContexts,
+            pausedGitRepositories: this.pausedGitRepositories, sessionWorkspaceRoots: this.sessionWorkspaceRoots,
+            snapshotInitialized: this.snapshotInitialized, baselineBuilding: this.baselineBuilding,
+            workspaceContextChanged: this.workspaceContextChanged
+        };
+        const transaction = this.beginBaselineTransaction(() => { Object.assign(this, previous); });
+        this.fileSnapshots = new Map();
+        this.fileModes = new Map();
+        this.baselineExistingFiles = new Set();
+        this.unresolvedBaselineFiles = new Map();
+        this.revertHistory = [];
+        this.baselineGitContexts = new Map();
+        this.pausedGitRepositories = new Map();
+        this.sessionWorkspaceRoots = this.getWorkspaceRoots();
+        this.workspaceContextChanged = false;
+        this.snapshotInitialized = true;
+        this.baselineBuilding = true;
+        let committed = false;
+        try {
+            // Persist an explicit empty, stopped session through the same durable
+            // writer as Keep. Deleting several state files cannot be atomic.
+            committed = await this.flushPersistState(true, transaction) && this.isCurrentEpoch(epoch);
+            if (!committed) { return false; }
+            this.endBaselineTransaction(transaction, true);
+            this.baselineBuilding = false;
+            this.pendingExternalChanges.clear();
+            this.clearDiffs();
+            return true;
+        } finally {
+            this.endBaselineTransaction(transaction, committed);
+            if (!committed && this.isCurrentEpoch(epoch)) { await this.flushPendingPersistence(); }
+            if (this.isCurrentEpoch(epoch)) { this._onDidChangeBaselineState.fire(this.getBaselineState()); }
         }
     }
 
@@ -775,7 +820,7 @@ export class DiffTracker {
             return undefined;
         }
 
-        if (!this.isRecording && !this.baselineBuilding && this.fileSnapshots.size === 0 && this.unresolvedBaselineFiles.size === 0) {
+        if (!this.isRecording && !this.baselineBuilding && !this.snapshotInitialized && this.fileSnapshots.size === 0 && this.unresolvedBaselineFiles.size === 0) {
             return undefined;
         }
 

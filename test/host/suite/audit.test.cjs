@@ -132,6 +132,17 @@ module.exports = async function auditHost(workspace) {
         assert.equal(await restoring, 'restored');
         await until(() => tracker.getTrackedChanges().some(change => change.filePath === q && change.currentContent === 'external during restore\n'));
         console.log('PASS HOST-AUDIT real watcher replays write over stale restore read');
+        tracker.stopRecording();
+        assert.equal(await tracker.resetBaselineToCurrentState(), true);
+        await tracker.dispose();
+        tracker = new DiffTracker(vscode.Uri.file(storage));
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(tracker.getIsRecording(), false);
+        assert.equal(tracker.getTrackedChanges().length, 0);
+        assert.equal(tracker.getOriginalContent(q), undefined);
+        assert.equal(tracker.revertHistory.length, 0);
+        assert.equal(fs.readFileSync(q, 'utf8'), 'external during restore\n');
+        console.log('PASS HOST-AUDIT stopped clear survives tracker disposal and restore');
     } finally {
         releaseRead?.(); participant?.dispose(); await tracker?.dispose();
         fs.rmSync(storage, { recursive: true, force: true });
