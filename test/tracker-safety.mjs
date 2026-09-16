@@ -116,7 +116,12 @@ const vscode = {
     workspace: {
         textDocuments: docs,
         workspaceFolders:[{ uri:Uri.file(root), name:'test' }],
-        getWorkspaceFolder:uri => uri.fsPath.startsWith(root) ? { uri:Uri.file(root), name:'test' } : undefined,
+        getWorkspaceFolder:uri => {
+            // Native path.relative preserves Windows case-insensitive membership.
+            const relative=path.relative(root,uri.fsPath);
+            return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+                ? { uri:Uri.file(root), name:'test' } : undefined;
+        },
         getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:key==='watchExclude'?watchExclude:fallback }),
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,

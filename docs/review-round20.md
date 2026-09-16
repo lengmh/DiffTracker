@@ -47,5 +47,12 @@ interval does not claim to cover arbitrarily delayed provider notifications.
 - The implementer reread active/finally/dispose paths, session handoff, permission
   scope and Windows matching. This is not a separate reviewer approval; the
   code-review skill is not installed in this environment.
+- Initial CI `35094889528` passed Ubuntu quality and both Ubuntu Host versions,
+  but Windows quality failed three expiry assertions. The exclusions had expired;
+  the mock workspace lookup used a case-sensitive string prefix and incorrectly
+  rejected normalized Windows paths as outside the workspace. The mock now uses
+  native path-relative membership, and the real Windows Host explicitly checks
+  equivalent-case URI lookup. The expiry assertions remain intact. Final CI is
+  run on the follow-up commit; this failed run is not counted as passing.
 
 The PR remains unmerged; no Marketplace publication in this round.

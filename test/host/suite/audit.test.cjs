@@ -46,6 +46,10 @@ module.exports = async function auditHost(workspace) {
         // Fixtures predate host startup. Creating them here queues native Windows
         // create events into the scan, correctly producing unknown baselines.
         assert.equal(fs.readFileSync(p, 'utf8'), 'base\n');
+        if (process.platform === 'win32') {
+            assert.ok(vscode.workspace.getWorkspaceFolder(vscode.Uri.file(p.toUpperCase())), 'Windows workspace membership must ignore path casing');
+            console.log('PASS HOST-AUDIT Windows workspace lookup accepts equivalent path casing');
+        }
         assert.equal(fs.readFileSync(recoveryPath, 'utf8'), 'base\n');
         const ignoredPaths = ['node_modules', 'out'].map(dir => vscode.Uri.file(path.join(workspace, dir, 'audit-ignored.txt')).fsPath);
         for (const ignored of ignoredPaths) { await vscode.workspace.openTextDocument(vscode.Uri.file(ignored)); }
