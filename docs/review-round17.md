@@ -37,6 +37,11 @@ remain; this is not an OS-level directory-handle transaction.
   recovery record. The two new Reverts correctly added two records. The assertion
   now checks that the complete history is unchanged after conflicting Undo,
   preserving its original safety intent without a fixed global record count.
+- Follow-up CI `35084390180` passed Windows and Ubuntu Stable Host but VS Code
+  1.80 timed out waiting for a parent deletion event. File and batch fixtures now
+  use independent directories seeded before host startup, avoiding immediately
+  deleting the just-recreated directory a second time. Baseline/deletion diagnostics
+  are explicit; recovery actions are not retried and native events remain required.
 - The implementer performed a second read-through of creation, failure cleanup,
   session validation and shared callers. This is not a separate reviewer approval.
 

@@ -26,7 +26,8 @@ try {
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
         ['audit-recovery.txt', 'base\n'],
-        ['audit-parent/nested/child.txt', 'parent baseline\n']
+        ['audit-parent-file/nested/child.txt', 'parent baseline\n'],
+        ['audit-parent-batch/nested/child.txt', 'parent baseline\n']
     ]) {
         mkdirSync(path.dirname(path.join(workspacePath, name)), { recursive: true });
         writeFileSync(path.join(workspacePath, name), content);

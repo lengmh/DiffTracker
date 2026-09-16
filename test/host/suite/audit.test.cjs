@@ -50,15 +50,23 @@ module.exports = async function auditHost(workspace) {
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
         await delay(500); // Allow the native watcher backend to register.
-        const parent = vscode.Uri.file(path.join(workspace, 'audit-parent')).fsPath;
-        const child = path.join(parent, 'nested', 'child.txt');
         for (const batch of [false, true]) {
+            const parent = vscode.Uri.file(path.join(workspace, batch ? 'audit-parent-batch' : 'audit-parent-file')).fsPath;
+            const child = path.join(parent, 'nested', 'child.txt');
+            assert.equal(tracker.getOriginalContent(child), 'parent baseline\n', 'Parent recovery fixture must have a known baseline');
             fs.rmSync(parent, { recursive: true });
-            await until(() => tracker.getTrackedChanges().some(change => change.filePath === child && change.isDeleted));
+            try {
+                await until(() => tracker.getTrackedChanges().some(change => change.filePath === child && change.isDeleted));
+            } catch (error) {
+                console.error('HOST-PARENT deletion diagnostics', JSON.stringify({batch,child,exists:fs.existsSync(child),
+                    baseline:tracker.getOriginalContent(child),changes:tracker.getTrackedChanges().filter(change=>change.filePath.startsWith(parent))}));
+                throw error;
+            }
             await stableReview(tracker, child);
             const result = batch ? await tracker.revertAllChanges([tracker.getReviewToken(child)]) : await tracker.revertFile(child);
             assert.equal(batch ? result.succeeded === 1 : result.status === 'success', true, JSON.stringify(result));
             assert.equal(fs.readFileSync(child, 'utf8'), 'parent baseline\n');
+            console.log(`PASS HOST-PARENT ${batch ? 'batch' : 'file'} recovery`);
         }
         console.log('PASS HOST-AUDIT file and batch recovery recreate deleted parent hierarchy');
         fs.writeFileSync(p, 'edit\n');
