@@ -14,6 +14,10 @@ reports that item as a conflict while continuing with other files.
 Restoring a deleted file publishes fully written content with an exclusive hard
 link. If the destination appears concurrently or the filesystem does not support
 hard links, the action reports a conflict without overwriting the destination.
+New snapshots and recovery records preserve POSIX permission bits, including
+executability. Older sessions without mode metadata use the normal creation mode
+filtered by the process umask; original permissions cannot be inferred retroactively.
+Fresh recording waits for an available Git API to initialize before taking its baseline.
 Baseline growth and Keep must persist before review resumes. An interrupted or
 failed session write leaves a recovery marker and blocks automatic restoration;
 preserve the session and workspace before explicitly rebuilding.

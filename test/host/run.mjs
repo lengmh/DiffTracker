@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,7 @@ try {
         ['batch-b.txt', 'batch b\n']
     ]) {
         writeFileSync(path.join(workspacePath, name), content);
+        if (name === 'deleted.txt' && process.platform !== 'win32') { chmodSync(path.join(workspacePath, name), 0o755); }
     }
     git('init', '-b', 'main');
     git('config', 'user.email', 'diff-tracker@example.invalid');

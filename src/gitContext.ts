@@ -122,6 +122,13 @@ export function compareGitContexts(baseline: GitContextSnapshot, current: GitCon
 }
 
 export class GitContextMonitor implements vscode.Disposable {
+    private readyWaiters: Array<(ready: boolean) => void> = [];
+
+    public whenReady(): Promise<boolean> {
+        if (this.disposed) { return Promise.resolve(false); }
+        if (!this.api || this.ready) { return Promise.resolve(true); }
+        return new Promise(resolve => this.readyWaiters.push(resolve));
+    }
     private readonly disposables: vscode.Disposable[] = [];
     private readonly repositoryDisposables = new Map<string, vscode.Disposable[]>();
     private readonly repositories = new Map<string, GitRepositoryLike>();
@@ -152,6 +159,7 @@ export class GitContextMonitor implements vscode.Disposable {
                     if (state === 'initialized' && !this.ready) {
                         this.ready = true;
                         this.onContextEvent({ kind: 'ready', contexts: this.getSnapshots() });
+                        this.readyWaiters.splice(0).forEach(resolve => resolve(true));
                     }
                 })
             );
@@ -244,6 +252,7 @@ export class GitContextMonitor implements vscode.Disposable {
     }
 
     public dispose(): void {
+        this.readyWaiters.splice(0).forEach(resolve => resolve(false));
         if (this.disposed) { return; }
         this.disposed = true;
         this.disposables.forEach(disposable => disposable.dispose());

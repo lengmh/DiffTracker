@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import ts from 'typescript';
 const repoRoot=mkdtempSync(path.join(os.tmpdir(),'difftracker-adapter-'));
 mkdirSync(path.join(repoRoot,'.git'));
 import Module, { createRequire } from 'node:module';
@@ -119,6 +122,33 @@ test('invalid or unavailable git metadata fails closed',()=>{
     assert.equal(api.snapshotGitRepository(repo).inProgress,true);
     writeFileSync(path.join(root,'.git'),'invalid');assert.equal(api.snapshotGitRepository(repo).inProgress,true);
     writeFileSync(path.join(root,'.git'),'gitdir: ../missing\n');assert.equal(api.snapshotGitRepository(repo).inProgress,true);
+});
+for(const dispose of [false,true]) test(`delayed Git readiness releases fresh-start waiters safely (dispose=${dispose})`,async()=>{
+    const opened=new Emitter(),closed=new Emitter(),apiState=new Emitter();
+    const gitApi={state:'uninitialized',repositories:[],onDidChangeState:apiState.event,onDidOpenRepository:opened.event,onDidCloseRepository:closed.event};
+    installedExtension={isActive:true,exports:{enabled:true,getAPI:()=>gitApi}};
+    const monitor=new api.GitContextMonitor(()=>{});assert.equal(await monitor.start(),true);
+    let completed=false;const waiter=monitor.whenReady().then(value=>{completed=true;return value;});await Promise.resolve();assert.equal(completed,false);
+    if(dispose)monitor.dispose();else{gitApi.state='initialized';apiState.fire('initialized');}
+    assert.equal(await waiter,!dispose);monitor.dispose();
+});
+for(const scenario of ['fresh','stopped','restored']) test(`production activation coordinates late Git readiness (${scenario})`,async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const names=new Set(['startRecordingFlow','stopRecordingFlow','handleGitContextEvent']),declarations=[];
+    const visit=node=>{if(ts.isVariableDeclaration(node)&&names.has(node.name.getText(source)))declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,3);
+    let release;const ready=new Promise(resolve=>{release=resolve;});const calls=[];let recording=scenario==='restored';
+    const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
+        diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',
+            startRecording:()=>{recording=true;calls.push('start');},stopRecording:()=>{recording=false;calls.push('stop');},
+            setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile')},
+        gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},
+        vscode:{commands:{executeCommand:async()=>{}}}};
+    vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
+    if(scenario==='stopped')sandbox.flows.stopRecordingFlow();
+    await sandbox.flows.handleGitContextEvent({kind:'ready',contexts:[context()]});release(true);if(start)await start;
+    assert.deepEqual(calls,scenario==='fresh'?['start','capture']:scenario==='stopped'?['stop']:['reconcile']);
 });
 let failures=0;
 for(const {name,run} of tests){try{await run();console.log(`PASS ${name}`);}catch(error){failures++;console.error(`FAIL ${name}\n${error.stack}`);}}

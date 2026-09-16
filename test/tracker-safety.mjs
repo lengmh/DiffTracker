@@ -1214,6 +1214,69 @@ for(const undo of [false,true]) for(const replacement of ['file','symlink']) tes
     assert.equal(result.status,'conflict');assert.equal(disk(p),'external bytes');assert.equal(disk(target),'external bytes');
     if(undo)assert.equal(tracker.revertHistory.length,1);else assert.ok(pending(p));
 });
+for(const block of [false,true]) for(const transition of ['stop','dispose','restart']) test(`DT-06 Keep rollback survives ${transition} (block=${block})`,async()=>{
+    const p=file();seed(p,'base\n','pending\n');await scan(p);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const action=block?tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId):tracker.keepAllChangesInFile(p);
+    await gate.entered;let ending;
+    if(transition==='dispose')ending=tracker.dispose();else {tracker.stopRecording();if(transition==='restart')tracker.startRecording();}
+    if(transition!=='restart')assert.equal(tracker.getOriginalContent(p),'base\n','rollback precedes transition persistence');
+    gate.release();assert.equal(succeeded(await action),false);if(ending)await ending;
+    if(transition!=='dispose')await tracker.flushPendingPersistence();
+    if(transition==='restart'){assert.notEqual(tracker.getOriginalContent(p),'base\n','old action must not overwrite fresh baseline');return;}
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getOriginalContent(p),'base\n');assert.ok(pending(p));
+});
+for(const fail of [false,true]) for(const block of [false,true]) test(`DT-09 Keep prunes history transactionally (block=${block}, fail=${fail})`,async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base\n','edit\n');await scan(f);}
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    await tracker.revertFile(q);await tracker.revertFile(p);
+    fs.writeFileSync(p,'accepted\n');document(p).text='accepted\n';await scan(p);
+    const oldHistory=JSON.stringify(tracker.revertHistory);
+    if(fail)faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    const result=block?await tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId):await tracker.keepAllChangesInFile(p);
+    if(fail){assert.equal(result.status,'failed');assert.equal(JSON.stringify(tracker.revertHistory),oldHistory);faults.clear();return;}
+    assert.equal(result.status,'success');assert.equal(tracker.revertHistory.some(r=>r.items.some(i=>i.filePath===p)),false);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal((await tracker.undoLastRevert()).succeeded,1);assert.equal(disk(q),'edit\n');
+});
+for(const stop of [false,true]) test(`DT-07 failed long rebuild never persists a partial candidate (stop=${stop})`,async()=>{
+    const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'text'),binary=path.join(repo,'image');seed(p,'old','new');fs.writeFileSync(binary,Buffer.from([0,1]));await scan(p);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false},next={...base,headName:'next'};
+    tracker.setBaselineGitContexts([base]);tracker.observeGitContext(next);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    listedFiles=[Uri.file(binary),Uri.file(p)];const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,next);await gate.entered;
+    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.ok(saved.fileSnapshots.some(([f,c])=>f===p&&c==='old'));assert.equal(saved.baselineState,'ready');
+    if(stop)tracker.stopRecording();else tracker.observeGitContext({...base,headName:'third'});
+    gate.release();assert.equal(await rebuild,false);await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.getOriginalContent(p),'old');assert.ok(pending(p));
+});
+for(const mode of [0o644,0o755]) for(const undo of [false,true]) test(`DT-09 POSIX mode round-trip ${mode.toString(8)} (undo=${undo})`,async()=>{
+    if(process.platform==='win32')return;
+    const p=file();fs.writeFileSync(p,'baseline');fs.chmodSync(p,mode);listedFiles=[Uri.file(p)];
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);await tracker.initializeWorkspaceSnapshots();
+    if(undo){fs.writeFileSync(p,'before revert');await scan(p);const item=tracker.createFileRevertItem(p);item.after={exists:false,content:''};await tracker.prepareRevertRecord([item]);}
+    fs.unlinkSync(p);await scan(p);await tracker.flushPendingPersistence();await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    const result=undo?(await tracker.undoLastRevert()).results[0]:await tracker.revertFile(p);
+    assert.equal(result.status,'success',result.reason);assert.equal(fs.statSync(p).mode&0o777,mode);
+});
+test('DT-09 Keep preserves other members of a batch recovery record',async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'base\n','edit\n');await scan(f);}
+    assert.equal((await tracker.revertAllChanges()).succeeded,2);assert.equal(tracker.revertHistory.length,1);
+    fs.writeFileSync(p,'accepted\n');document(p).text='accepted\n';await scan(p);assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),true);
+    assert.deepEqual(tracker.revertHistory[0].items.map(i=>i.filePath),[q]);assert.equal((await tracker.undoLastRevert()).succeeded,1);
+    assert.equal(disk(p),'accepted\n');assert.equal(disk(q),'edit\n');
+});
+test('DT-06 mode metadata rejects malformed values and accepts legacy omission',async()=>{
+    const p=file();seed(p,'base');tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));
+    const saved=tracker.buildPersistedState();delete saved.fileModes;assert.ok(tracker.parsePersistedState(saved));
+    for(const mode of [-1,0o1000,1.5,'755'])assert.equal(tracker.parsePersistedState({...saved,fileModes:[[p,mode]]}),undefined);
+    assert.equal(tracker.parsePersistedState({...saved,fileModes:[[p,0o755],[p,0o644]]}),undefined);
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {

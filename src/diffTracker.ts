@@ -74,6 +74,7 @@ interface AutomationSession {
 interface PersistedFileState {
     exists: boolean;
     content: string;
+    mode?: number;
 }
 
 interface PersistedRevertItem {
@@ -95,6 +96,13 @@ interface PreparedBatchRevert {
     retainPaths: Set<string>;
 }
 
+interface BaselineTransaction {
+    epoch: number;
+    rollback: () => void;
+    done: Promise<void>;
+    finish: () => void;
+}
+
 interface PersistedTrackerState {
     version: 2;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
@@ -103,6 +111,7 @@ interface PersistedTrackerState {
     baselineState: 'building' | 'ready';
     workspaceRoots: string[];
     fileSnapshots: Array<[string, string]>;
+    fileModes: Array<[string, number]>;
     baselineExistingFiles: string[];
     unresolvedBaselineFiles: Array<[string, string]>;
     revertHistory: PersistedRevertRecord[];
@@ -132,7 +141,7 @@ export interface ReviewToken {
 }
 
 type CurrentFileState =
-    | { kind: 'text'; content: string }
+    | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
     | { kind: 'unavailable'; reason: string };
 
@@ -145,6 +154,23 @@ export class DiffTracker {
     private fileActionQueues = new Map<string, Promise<unknown>>();
     private recoveryActionQueue: Promise<void> = Promise.resolve();
     private readonly creationTempRoots = new Set<string>();
+    private fileModes = new Map<string, number>();
+    private baselineTransaction?: BaselineTransaction;
+
+    private beginBaselineTransaction(rollback: () => void): BaselineTransaction {
+        if (this.baselineTransaction) { throw new Error('Baseline transaction already active'); }
+        if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
+        let finish!: () => void;
+        const done = new Promise<void>(resolve => { finish = resolve; });
+        return this.baselineTransaction = { epoch: this.sessionEpoch, rollback, done, finish };
+    }
+
+    private endBaselineTransaction(transaction: BaselineTransaction, commit: boolean): void {
+        if (this.baselineTransaction !== transaction) { return; }
+        if (!commit) { transaction.rollback(); }
+        this.baselineTransaction = undefined;
+        transaction.finish();
+    }
     private mayAdoptLegacyGitContexts = false;
 
     private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
@@ -159,6 +185,7 @@ export class DiffTracker {
     }
 
     private advanceEpoch(): number {
+        if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
         this.mayAdoptLegacyGitContexts = false;
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
@@ -386,6 +413,7 @@ export class DiffTracker {
         const incomplete = state.baselineState === 'building' || !rootsMatch;
         this.isRecording = incomplete ? false : state.isRecording;
         this.fileSnapshots = new Map(state.fileSnapshots);
+        this.fileModes = new Map(state.fileModes);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
         this.unresolvedBaselineFiles = new Map(state.unresolvedBaselineFiles);
         this.revertHistory = state.revertHistory.slice(-this.maxRevertHistory);
@@ -445,6 +473,7 @@ export class DiffTracker {
         this.clearWatcherSuppressionTimers();
         this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
+        this.fileModes.clear();
         this.baselineExistingFiles.clear();
         this.unresolvedBaselineFiles.clear();
         this.clearTrackedChanges();
@@ -548,6 +577,7 @@ export class DiffTracker {
 
         this.pendingWriteFiles.clear();
         this.fileSnapshots.clear();
+        this.fileModes.clear();
         this.baselineExistingFiles.clear();
         this.unresolvedBaselineFiles.clear();
         this.clearTrackedChanges();
@@ -701,6 +731,7 @@ export class DiffTracker {
             workspaceRoots: [...this.sessionWorkspaceRoots],
             fileSnapshots: Array.from(this.fileSnapshots.entries())
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
+            fileModes: [...this.fileModes].filter(([filePath]) => this.fileSnapshots.has(filePath)),
             baselineExistingFiles: Array.from(this.baselineExistingFiles.values())
                 .sort((leftPath, rightPath) => leftPath.localeCompare(rightPath)),
             unresolvedBaselineFiles: Array.from(this.unresolvedBaselineFiles.entries())
@@ -712,7 +743,7 @@ export class DiffTracker {
     }
 
     private schedulePersistState(): void {
-        if (!this.storageUri) {
+        if (!this.storageUri || this.baselineTransaction) {
             return;
         }
 
@@ -748,7 +779,12 @@ export class DiffTracker {
         console.error(message, error);
     }
 
-    private async flushPersistState(completedBaseline = false): Promise<boolean> {
+    private async flushPersistState(completedBaseline = false, transaction?: BaselineTransaction): Promise<boolean> {
+        if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
+        if (this.baselineTransaction && !transaction) {
+            await this.baselineTransaction.done;
+            return this.flushPersistState(completedBaseline);
+        }
         // A blocked restore must never erase the evidence during shutdown.
         if (this.recoveryBlocked) { return false; }
         const storageUri = this.storageUri;
@@ -772,6 +808,9 @@ export class DiffTracker {
         }
 
         const persistTask = async (): Promise<boolean> => {
+            const transactionCurrent = (): boolean => !transaction ||
+                (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch));
+            if (!transactionCurrent()) { return false; }
             const targetUri = this.getPersistedStateUri();
             const tempUri = this.getPersistedStateUri(this.persistedStateTempFileName);
             const backupUri = this.getPersistedStateUri(this.persistedStateBackupFileName);
@@ -800,8 +839,14 @@ export class DiffTracker {
                 if (limitError) { this.reportPersistenceIssue(limitError); return false; }
                 await vscode.workspace.fs.writeFile(tempUri, payload);
                 await vscode.workspace.fs.rename(tempUri, targetUri, { overwrite: true });
+                if (!transactionCurrent()) { return false; } // Keep the incomplete-write marker.
                 await vscode.workspace.fs.copy(targetUri, backupUri, { overwrite: true });
+                if (!transactionCurrent()) { return false; }
                 if (failureUri) { await this.deletePersistedFile(failureUri); }
+                if (!transactionCurrent()) {
+                    if (failureUri) { await vscode.workspace.fs.writeFile(failureUri, new TextEncoder().encode('Session write interrupted')); }
+                    return false;
+                }
                 this.persistenceIssue = undefined;
                 this.persistenceFailed = false;
                 return true;
@@ -869,6 +914,7 @@ export class DiffTracker {
             baselineState?: unknown;
             workspaceRoots?: unknown;
             fileSnapshots?: unknown;
+            fileModes?: unknown;
             baselineExistingFiles?: unknown;
             unresolvedBaselineFiles?: unknown;
             revertHistory?: unknown;
@@ -941,6 +987,15 @@ export class DiffTracker {
         if (baselineState !== 'building' && baselineState !== 'ready') { return undefined; }
 
         const rawHistory = candidate.version === 1 ? [] : candidate.revertHistory;
+        const rawModes = candidate.fileModes ?? [];
+        if (!Array.isArray(rawModes)) { return undefined; }
+        const fileModes: Array<[string, number]> = [];
+        const modePaths = new Set<string>();
+        for (const entry of rawModes) {
+            if (!Array.isArray(entry) || entry.length !== 2 || !snapshotPaths.has(entry[0]) || modePaths.has(entry[0]) ||
+                !Number.isInteger(entry[1]) || entry[1] < 0 || entry[1] > 0o777) { return undefined; }
+            fileModes.push([entry[0], entry[1]]); modePaths.add(entry[0]);
+        }
         const revertHistory = this.parseRevertHistory(rawHistory, snapshotPaths);
         if (!revertHistory) { return undefined; }
 
@@ -954,6 +1009,7 @@ export class DiffTracker {
             baselineState,
             workspaceRoots: normalizedRoots,
             fileSnapshots,
+            fileModes,
             baselineExistingFiles,
             unresolvedBaselineFiles,
             revertHistory,
@@ -1002,7 +1058,9 @@ export class DiffTracker {
                 if (!rawItem || typeof rawItem !== 'object') { return undefined; }
                 const item = rawItem as Partial<PersistedRevertItem>;
                 const validState = (state: unknown): state is PersistedFileState => !!state && typeof state === 'object' &&
-                    typeof (state as PersistedFileState).exists === 'boolean' && typeof (state as PersistedFileState).content === 'string';
+                    typeof (state as PersistedFileState).exists === 'boolean' && typeof (state as PersistedFileState).content === 'string' &&
+                    ((state as PersistedFileState).mode === undefined || (Number.isInteger((state as PersistedFileState).mode) &&
+                        (state as PersistedFileState).mode! >= 0 && (state as PersistedFileState).mode! <= 0o777));
                 if (typeof item.filePath !== 'string' || !snapshotPaths.has(item.filePath) ||
                     typeof item.baselineRevision !== 'string' || !validState(item.before) || !validState(item.after) ||
                     (item.saveMode !== 'disk' && item.saveMode !== 'buffer')) { return undefined; }
@@ -1536,6 +1594,7 @@ export class DiffTracker {
                     }
                     this.unresolvedBaselineFiles.delete(uri.fsPath);
                     this.fileSnapshots.set(uri.fsPath, state.content);
+                    if (state.mode !== undefined) { this.fileModes.set(uri.fsPath, state.mode); }
                     this.baselineExistingFiles.add(uri.fsPath);
                 });
 
@@ -1551,7 +1610,7 @@ export class DiffTracker {
         await this.completeBaseline(epoch);
     }
 
-    private async completeBaseline(epoch: number): Promise<boolean> {
+    private async completeBaseline(epoch: number, transaction?: BaselineTransaction): Promise<boolean> {
         ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
@@ -1564,7 +1623,7 @@ export class DiffTracker {
         let version: number;
         do {
             version = this.baselineCompletionVersion;
-            if (!await this.flushPersistState(true) || !this.isCurrentEpoch(epoch)) { return false; }
+            if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) { return false; }
         } while (version !== this.baselineCompletionVersion);
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
@@ -1604,7 +1663,7 @@ export class DiffTracker {
                 return { kind: 'unavailable', reason: 'Binary content is unsupported' };
             }
             try {
-                return { kind: 'text', content: new TextDecoder('utf-8', { fatal: true }).decode(content) };
+                return { kind: 'text', content: new TextDecoder('utf-8', { fatal: true }).decode(content), mode: fs.statSync(uri.fsPath).mode & 0o777 };
             } catch {
                 return { kind: 'unavailable', reason: 'Unsupported text encoding (expected UTF-8)' };
             }
@@ -2079,6 +2138,12 @@ export class DiffTracker {
     }
 
     public async rebuildRepositoryBaseline(repoRoot: string, context: GitContextSnapshot): Promise<boolean> {
+        const epoch = this.sessionEpoch;
+        return this.queueRecoveryAction(() => this.isCurrentEpoch(epoch)
+            ? this.performRepositoryRebuild(repoRoot, context) : Promise.resolve(false));
+    }
+
+    private async performRepositoryRebuild(repoRoot: string, context: GitContextSnapshot): Promise<boolean> {
         const requestedEpoch = this.sessionEpoch;
         const contextStillCurrent = (): boolean => {
             const latest = this.latestGitContexts.get(repoRoot);
@@ -2101,6 +2166,7 @@ export class DiffTracker {
 
         const previous = {
             fileSnapshots: new Map(this.fileSnapshots),
+            fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
             trackedChanges: new Map(this.trackedChanges),
             lineChanges: new Map(this.lineChanges),
@@ -2112,9 +2178,10 @@ export class DiffTracker {
             snapshotInitialized: this.snapshotInitialized,
             baselineBuilding: this.baselineBuilding
         };
-        const restorePrevious = async (): Promise<void> => {
-            if (!this.isCurrentEpoch(epoch)) { return; }
+        let transaction: BaselineTransaction;
+        const restoreMemory = (): void => {
             this.fileSnapshots = previous.fileSnapshots;
+            this.fileModes = previous.fileModes;
             this.baselineExistingFiles = previous.baselineExistingFiles;
             this.trackedChanges = previous.trackedChanges;
             this.lineChanges = previous.lineChanges;
@@ -2128,8 +2195,13 @@ export class DiffTracker {
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
+        };
+        const restorePrevious = async (): Promise<void> => {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            this.endBaselineTransaction(transaction, false);
             if (this.isRecording && !this.externalWatcherEnabled) { await this.startExternalWatchers(); }
             await this.processPendingExternalChanges();
+            await this.flushPendingPersistence();
             this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');
             this.emitTrackChangesEvent({ fullRefresh: true });
         };
@@ -2153,6 +2225,7 @@ export class DiffTracker {
         const epoch = this.advanceEpoch();
         // No asynchronous work may occur between the epoch change and handoff.
         if (replacementWatchers) { this.activateExternalWatchers(replacementWatchers); }
+        transaction = this.beginBaselineTransaction(restoreMemory);
         const previousReviewPaths = [...this.trackedChanges.keys()].filter(filePath => this.pathBelongsToRoot(filePath, repoRoot));
         this.snapshotInitialized = false;
         this.baselineBuilding = true;
@@ -2165,6 +2238,7 @@ export class DiffTracker {
             for (const filePath of repositoryBaselinePaths) {
                 if (!this.pathBelongsToRoot(filePath, repoRoot)) { continue; }
                 this.fileSnapshots.delete(filePath);
+                this.fileModes.delete(filePath);
                 this.baselineExistingFiles.delete(filePath);
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.deleteTrackedChange(filePath);
@@ -2195,6 +2269,7 @@ export class DiffTracker {
                 }
                 this.unresolvedBaselineFiles.delete(uri.fsPath);
                 this.fileSnapshots.set(uri.fsPath, state.content);
+                if (state.mode !== undefined) { this.fileModes.set(uri.fsPath, state.mode); }
                 this.baselineExistingFiles.add(uri.fsPath);
             });
 
@@ -2215,7 +2290,7 @@ export class DiffTracker {
                 clearTimeout(this.persistTimer);
                 this.persistTimer = undefined;
             }
-            if (!await this.flushPersistState(true)) {
+            if (!await this.flushPersistState(true, transaction)) {
                 await restorePrevious();
                 return false;
             }
@@ -2225,12 +2300,15 @@ export class DiffTracker {
                 return false;
             }
             this.baselineBuilding = false;
+            this.endBaselineTransaction(transaction, true);
             this._onDidChangeBaselineState.fire('ready');
             this.pausedGitRepositories.delete(repoRoot);
             this.emitTrackChangesEvent({ removedFiles: previousReviewPaths, fullRefresh: true, baselineChanged: true });
             return true;
         } catch (error) {
-            this.reportPersistenceIssue('Failed to rebuild the repository baseline; the archived review remains preserved.', error);
+            if (this.isCurrentEpoch(epoch)) {
+                this.reportPersistenceIssue('Failed to rebuild the repository baseline; the archived review remains preserved.', error);
+            }
             await restorePrevious();
             return false;
         }
@@ -2293,8 +2371,8 @@ export class DiffTracker {
         return {
             filePath,
             baselineRevision: this.revision(baseline, this.baselineExistingFiles.has(filePath)),
-            before,
-            after,
+            before: { ...before, mode: before.mode ?? (before.exists ? this.readFileMode(filePath) : undefined) },
+            after: { ...after, mode: after.mode ?? this.fileModes.get(filePath) },
             saveMode
         };
     }
@@ -2507,7 +2585,7 @@ export class DiffTracker {
             this.activeWriteFiles.add(item.filePath);
             let bufferChanged = false;
             try {
-                const result = await this.createFileExclusively(item.filePath, item.before.content, epoch);
+                const result = await this.createFileExclusively(item.filePath, item.before.content, epoch, item.before.mode);
                 bufferChanged = !!result.bufferChanged;
                 if (result.status !== 'success') { return result; }
                 bufferChanged = false;
@@ -2611,7 +2689,11 @@ export class DiffTracker {
         return { results, succeeded, failed: results.length - succeeded };
     }
 
-    private async createFileExclusively(filePath: string, content: string, epoch: number): Promise<ActionResult> {
+    private readFileMode(filePath: string): number | undefined {
+        try { return fs.statSync(filePath).mode & 0o777; } catch { return undefined; }
+    }
+
+    private async createFileExclusively(filePath: string, content: string, epoch: number, mode?: number): Promise<ActionResult> {
         let staging: string | undefined;
         let published = false;
         try {
@@ -2620,6 +2702,7 @@ export class DiffTracker {
             this.creationTempRoots.add(staging);
             const payload = path.join(staging, 'content');
             await fs.promises.writeFile(payload, content, { flag: 'wx', mode: 0o600 });
+            await fs.promises.chmod(payload, mode ?? (0o666 & ~process.umask()));
             if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed before file creation'); }
             const error = this.validateActionTarget(filePath);
             if (error) { return this.actionResult(filePath, 'conflict', error); }
@@ -2673,7 +2756,7 @@ export class DiffTracker {
         this.activeWriteFiles.add(filePath);
         try {
             if (state.kind === 'missing') {
-                const result = await this.createFileExclusively(filePath, content, epoch);
+                const result = await this.createFileExclusively(filePath, content, epoch, this.fileModes.get(filePath));
                 bufferChanged = !!result.bufferChanged;
                 return result;
             }
@@ -2969,6 +3052,45 @@ export class DiffTracker {
         return this.queueRecoveryAction(() => this.queueFileAction(filePath, token, review => this.keepBlockReviewed(filePath, blockRef, review)));
     }
 
+    private beginKeepTransaction(filePath: string): BaselineTransaction {
+        const content = this.fileSnapshots.get(filePath)!;
+        const mode = this.fileModes.get(filePath);
+        const exists = this.baselineExistingFiles.has(filePath);
+        const history = this.revertHistory;
+        const building = this.baselineBuilding;
+        const initialized = this.snapshotInitialized;
+        const change = this.trackedChanges.get(filePath);
+        const transaction = this.beginBaselineTransaction(() => {
+            this.fileSnapshots.set(filePath, content);
+            if (mode === undefined) { this.fileModes.delete(filePath); } else { this.fileModes.set(filePath, mode); }
+            if (exists) { this.baselineExistingFiles.add(filePath); } else { this.baselineExistingFiles.delete(filePath); }
+            this.revertHistory = history;
+            this.baselineBuilding = building;
+            this.snapshotInitialized = initialized;
+            if (change) { this.updateTrackedDiff(filePath, change.currentContent, { baselineChanged: true, currentExists: !change.isDeleted }); }
+        });
+        // Remove only this path's obsolete recovery items, retaining other batch members.
+        this.revertHistory = history.map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
+            .filter(record => record.items.length > 0);
+        const currentMode = this.readFileMode(filePath);
+        if (currentMode !== undefined) { this.fileModes.set(filePath, currentMode); }
+        return transaction;
+    }
+
+    private async commitKeepTransaction(epoch: number, transaction: BaselineTransaction): Promise<boolean> {
+        let committed = false;
+        try {
+            committed = await this.completeBaseline(epoch, transaction) &&
+                this.baselineTransaction === transaction && this.isCurrentEpoch(epoch);
+            return committed;
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) { this.reportPersistenceIssue('Keep transaction failed; prior baseline retained.', error); }
+            return false;
+        } finally {
+            this.endBaselineTransaction(transaction, committed);
+        }
+    }
+
     private async keepBlockReviewed(filePath: string, blockRef: string | number, review: ReviewToken): Promise<ActionResult> {
         const targetError = this.validateActionTarget(filePath);
         if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
@@ -3059,22 +3181,18 @@ export class DiffTracker {
         const finalTargetError = this.validateActionTarget(filePath);
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
         const keepEpoch = this.sessionEpoch;
-        const previousExists = this.baselineExistingFiles.has(filePath);
+        const transaction = this.beginKeepTransaction(filePath);
         this.fileSnapshots.set(filePath, newSnapshot);
         this.baselineExistingFiles.add(filePath);
-        if (!await this.completeBaseline(keepEpoch)) {
-            if (this.isCurrentEpoch(keepEpoch)) {
-                this.fileSnapshots.set(filePath, originalContent);
-                if (!previousExists) { this.baselineExistingFiles.delete(filePath); }
-                this.updateTrackedDiff(filePath, currentText, { baselineChanged: true, currentExists: true });
-            }
+        if (!await this.commitKeepTransaction(keepEpoch, transaction)) {
             return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
         }
 
         // Persistence awaits may admit newer editor/disk changes; never clear them
         // using the content reviewed before the write began.
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'success', 'Keep saved before the session changed'); }
         const afterKeep = await this.readCurrentFileState(filePath);
-        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during Keep'); }
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'success', 'Keep saved before the session changed'); }
         if (afterKeep.kind === 'unavailable') { this.markFileUnavailable(filePath, afterKeep.reason); }
         else { this.updateTrackedDiff(filePath, afterKeep.kind === 'text' ? afterKeep.content : '', { baselineChanged: true, currentExists: afterKeep.kind === 'text' }); }
         return this.actionResult(filePath, 'success');
@@ -3108,26 +3226,21 @@ export class DiffTracker {
         }
         const finalTargetError = this.validateActionTarget(filePath);
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
-        const previousContent = this.fileSnapshots.get(filePath)!;
-        const previousExists = this.baselineExistingFiles.has(filePath);
         const keepEpoch = this.sessionEpoch;
+        const transaction = this.beginKeepTransaction(filePath);
         this.fileSnapshots.set(filePath, currentContent);
         if (state.kind === 'missing') {
             this.baselineExistingFiles.delete(filePath);
         } else {
             this.baselineExistingFiles.add(filePath);
         }
-        if (!await this.completeBaseline(keepEpoch)) {
-            if (this.isCurrentEpoch(keepEpoch)) {
-                this.fileSnapshots.set(filePath, previousContent);
-                if (previousExists) { this.baselineExistingFiles.add(filePath); } else { this.baselineExistingFiles.delete(filePath); }
-                this.updateTrackedDiff(filePath, currentContent, { baselineChanged: true, currentExists: state.kind === 'text' });
-            }
+        if (!await this.commitKeepTransaction(keepEpoch, transaction)) {
             return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
         }
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'success', 'Keep saved before the session changed'); }
         this.pendingWriteFiles.delete(filePath);
         const afterKeep = await this.readCurrentFileState(filePath);
-        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during Keep'); }
+        if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'success', 'Keep saved before the session changed'); }
         if (afterKeep.kind === 'unavailable') { this.markFileUnavailable(filePath, afterKeep.reason); }
         else { this.updateTrackedDiff(filePath, afterKeep.kind === 'text' ? afterKeep.content : '', { baselineChanged: true, currentExists: afterKeep.kind === 'text' }); }
         return this.actionResult(filePath, 'success');
@@ -3516,6 +3629,7 @@ export class DiffTracker {
                 return;
             }
             this.fileSnapshots.set(filePath, content);
+            this.fileModes.set(filePath, stat.mode & 0o777);
             this.baselineExistingFiles.add(filePath);
         } catch (error) {
             if (!this.isFileNotFound(error)) {

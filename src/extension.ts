@@ -99,7 +99,13 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     };
 
+    let recordingRequest = 0;
     const startRecordingFlow = async (): Promise<boolean> => {
+        const request = ++recordingRequest;
+        // Establish Git identity before capturing a fresh baseline; never adopt
+        // a late context onto snapshots that might predate a checkout.
+        if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
+        if (request !== recordingRequest) { return false; }
         if (diffTracker.isRecoveryBlocked()) {
             const answer = await vscode.window.showErrorMessage(
                 'Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
@@ -126,6 +132,7 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     const stopRecordingFlow = () => {
+        ++recordingRequest;
         diffTracker.stopRecording();
         void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', false);
     };
@@ -234,7 +241,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const handleGitContextEvent = async (event: GitContextEvent): Promise<void> => {
         if (event.kind === 'ready') {
-            diffTracker.reconcileRestoredGitContexts(event.contexts);
+            if (diffTracker.getIsRecording() || restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
+                diffTracker.reconcileRestoredGitContexts(event.contexts);
+            }
             return;
         }
         const repoRoot = event.kind === 'changed' ? event.context.repoRoot : event.repoRoot;

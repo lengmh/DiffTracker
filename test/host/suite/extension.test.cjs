@@ -130,6 +130,9 @@ module.exports = async function runExtensionHostScenario() {
         const deletedRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('deleted.txt').fsPath);
         assert.equal(deletedRevert.status, 'success', deletedRevert.reason);
         assert.equal(await read('deleted.txt'), 'delete baseline\n');
+        if (process.platform !== 'win32') {
+            assert.equal(require('node:fs').statSync(uri('deleted.txt').fsPath).mode & 0o777, 0o755);
+        }
         await untilStable('deleted-file review cleared', async () => !(await pending('deleted.txt')));
         const destructiveUndo = await vscode.commands.executeCommand('diffTracker._testUndoLastRevert');
         assert.equal(destructiveUndo.succeeded, 0);
