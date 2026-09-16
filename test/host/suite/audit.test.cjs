@@ -78,10 +78,11 @@ module.exports = async function auditHost(workspace) {
             const range = new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length));
             event.waitUntil(Promise.resolve([vscode.TextEdit.replace(range, 'save participant output\n')]));
         });
+        const historyBeforeUndo = JSON.stringify(tracker.revertHistory);
         const undo = await tracker.undoLastRevert();
         assert.equal(undo.succeeded, 0);
         assert.equal(fs.readFileSync(recoveryPath, 'utf8'), 'save participant output\n');
-        assert.equal(tracker.revertHistory.length, 1);
+        assert.equal(JSON.stringify(tracker.revertHistory), historyBeforeUndo, 'Conflicting Undo must retain all recovery records');
         console.log('PASS HOST-AUDIT real save participant retains conflicting Undo recovery');
         participant.dispose(); participant = undefined;
         await tracker.flushPendingPersistence(); await tracker.dispose();

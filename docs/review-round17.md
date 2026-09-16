@@ -32,6 +32,11 @@ remain; this is not an OS-level directory-handle transaction.
 - Added native Extension Host assertions for file and batch Revert after deleting
   the entire multi-level parent hierarchy. Fixtures are created before host startup.
   Exact-commit Windows/Ubuntu/VS Code 1.80 results are recorded in PR #1 after CI.
+- Initial CI `35084157824` passed the native parent-restoration assertions but
+  exposed an old test assumption that the later Undo scenario had exactly one
+  recovery record. The two new Reverts correctly added two records. The assertion
+  now checks that the complete history is unchanged after conflicting Undo,
+  preserving its original safety intent without a fixed global record count.
 - The implementer performed a second read-through of creation, failure cleanup,
   session validation and shared callers. This is not a separate reviewer approval.
 
