@@ -47,8 +47,17 @@ module.exports = async function auditHost(workspace) {
         // create events into the scan, correctly producing unknown baselines.
         assert.equal(fs.readFileSync(p, 'utf8'), 'base\n');
         assert.equal(fs.readFileSync(recoveryPath, 'utf8'), 'base\n');
+        const ignoredPaths = ['node_modules', 'out'].map(dir => vscode.Uri.file(path.join(workspace, dir, 'audit-ignored.txt')).fsPath);
+        for (const ignored of ignoredPaths) { await vscode.workspace.openTextDocument(vscode.Uri.file(ignored)); }
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
+        const initialState = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+        for (const ignored of ignoredPaths) {
+            assert.equal(tracker.getOriginalContent(ignored), undefined);
+            assert.equal(initialState.fileSnapshots.some(([filePath]) => filePath === ignored), false);
+            assert.equal(initialState.unresolvedBaselineFiles.some(([filePath]) => filePath === ignored), false);
+        }
+        console.log('PASS HOST-AUDIT ignored open documents never enter persisted baseline');
         await delay(500); // Allow the native watcher backend to register.
         for (const batch of [false, true]) {
             const parent = vscode.Uri.file(path.join(workspace, batch ? 'audit-parent-batch' : 'audit-parent-file')).fsPath;

@@ -26,6 +26,8 @@ try {
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
         ['audit-recovery.txt', 'base\n'],
+        ['node_modules/audit-ignored.txt', 'ignored dependency\n'],
+        ['out/audit-ignored.txt', 'ignored output\n'],
         ['audit-parent-file/nested/child.txt', 'parent baseline\n'],
         ['audit-parent-batch/nested/child.txt', 'parent baseline\n']
     ]) {

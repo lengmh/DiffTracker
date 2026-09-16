@@ -158,6 +158,8 @@ export class DiffTracker {
     private fileModes = new Map<string, number>();
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
+    private initialIgnoreEpoch?: number;
+    private initialIgnoreEvents = new Map<string, vscode.Uri>();
     private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
     // Only same-session post-baseline notifications can be resolved by a later
     // create event. Restored or scan-time uncertainty still requires a rebuild.
@@ -193,6 +195,8 @@ export class DiffTracker {
     private advanceEpoch(): number {
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
         this.restoringEpoch = undefined;
+        this.initialIgnoreEpoch = undefined;
+        this.initialIgnoreEvents.clear();
         this.restoreEvents.clear();
         this.postBaselineUnknownFiles.clear();
         this.mayAdoptLegacyGitContexts = false;
@@ -522,12 +526,10 @@ export class DiffTracker {
         this._onDidChangeBaselineState.fire('building');
 
         try {
-            // Register coverage synchronously before capturing even open documents.
-            // Ignore discovery belongs to the subsequent scan, not this handoff.
+            // Watch immediately, but classify paths and capture documents only
+            // after ignore discovery. Startup events cannot establish a before-image.
+            this.initialIgnoreEpoch = epoch;
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
-            vscode.workspace.textDocuments.forEach(doc => {
-                this.ensureSnapshotForDocument(doc, true);
-            });
             void this.initializeWorkspaceSnapshots().catch(() => {
                 if (this.isCurrentEpoch(epoch) && this.baselineBuilding) {
                     vscode.window.showWarningMessage('Diff Tracker: Baseline scan did not complete; review remains incomplete.');
@@ -623,11 +625,7 @@ export class DiffTracker {
         this._onDidChangeBaselineState.fire('building');
 
         try {
-            // Open editors may be ahead of on-disk state; use their in-memory text as baseline.
-            vscode.workspace.textDocuments.forEach(doc => {
-                this.ensureSnapshotForDocument(doc, true);
-            });
-
+            this.initialIgnoreEpoch = epoch;
             await this.initializeWorkspaceSnapshots();
         } catch (error) {
             console.error('Failed to reset baseline to current state:', error);
@@ -1343,8 +1341,7 @@ export class DiffTracker {
 
     private async refreshIgnoreMatchers(): Promise<void> {
         const epoch = this.sessionEpoch;
-        this.ignoreMatchers.clear();
-        this.ignoreResultCache.clear();
+        const matchers = new Map<string, Ignore>();
         const folders = this.getSupportedWorkspaceFolders();
         if (!folders) {
             return;
@@ -1353,9 +1350,13 @@ export class DiffTracker {
         for (const folder of folders) {
             const matcher = await this.buildIgnoreMatcher(folder);
             if (!this.isCurrentEpoch(epoch)) { return; }
-            this.ignoreMatchers.set(folder.uri.fsPath, matcher);
+            matchers.set(folder.uri.fsPath, matcher);
         }
 
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        // Keep the previous complete rules active while their replacement loads.
+        this.ignoreMatchers = matchers;
+        this.ignoreResultCache.clear();
         this.pruneIgnoredTrackedChanges();
     }
 
@@ -1595,13 +1596,30 @@ export class DiffTracker {
     private async initializeWorkspaceSnapshots(): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
-        if (!folders || folders.length === 0) {
-            await this.completeBaseline(epoch);
-            return;
-        }
-
         await this.refreshIgnoreMatchers();
         if (!this.isCurrentEpoch(epoch)) { return; }
+
+        if (this.initialIgnoreEpoch === epoch) {
+            while (this.initialIgnoreEvents.size > 0) {
+                const events = [...this.initialIgnoreEvents.values()];
+                this.initialIgnoreEvents.clear();
+                for (const uri of events) {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (this.isPathIgnored(uri)) { continue; }
+                    const directory = await this.isUntrackedDirectory(uri);
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    this.scanUncertainFiles.add(uri.fsPath);
+                    // Directory notifications also invalidate unscanned children,
+                    // but directories themselves are not reviewable file entries.
+                    if (directory) { continue; }
+                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during ignore discovery; before-image is unknown');
+                    this.pendingExternalChanges.add(uri.fsPath);
+                }
+            }
+            this.initialIgnoreEpoch = undefined;
+            // Unchanged editors may be ahead of disk. Changed paths stay unknown.
+            vscode.workspace.textDocuments.forEach(doc => this.ensureSnapshotForDocument(doc, true));
+        }
 
         for (const folder of folders) {
             if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
@@ -1639,7 +1657,7 @@ export class DiffTracker {
                     }
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    if (this.scanUncertainFiles.has(uri.fsPath)) {
+                    if (this.hasScanUncertainty(uri.fsPath)) {
                         this.recordUnresolvedBaseline(uri.fsPath, 'File changed during baseline scan; before-image is unknown');
                         return;
                     }
@@ -1895,6 +1913,7 @@ export class DiffTracker {
             return;
         }
 
+        if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -1949,6 +1968,7 @@ export class DiffTracker {
             return;
         }
 
+        if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -1977,7 +1997,8 @@ export class DiffTracker {
 
     private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
-        if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' || this.isPathIgnored(uri)) {
+        if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' ||
+            this.deferInitialIgnoreEvent(uri) || this.isPathIgnored(uri)) {
             return;
         }
         // A delete notification may race an atomic replacement; confirm actual state.
@@ -2346,7 +2367,7 @@ export class DiffTracker {
                         : 'File disappeared during baseline rebuild; before-image is unknown');
                     return;
                 }
-                if (this.scanUncertainFiles.has(uri.fsPath)) {
+                if (this.hasScanUncertainty(uri.fsPath)) {
                     this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
                     return;
                 }
@@ -2471,6 +2492,10 @@ export class DiffTracker {
         if (items.length === 0) { return undefined; }
         const epoch = this.sessionEpoch;
         const previousHistory = [...this.revertHistory];
+        // Session transitions roll this back synchronously, before Stop/dispose
+        // can capture a persistence payload. The shared action queue serializes
+        // preparation with Keep, Undo and other Reverts.
+        const transaction = this.beginBaselineTransaction(() => { this.revertHistory = previousHistory; });
         const record: PersistedRevertRecord = {
             id: `revert-${Date.now()}-${this.nextRevertRecordId++}`,
             createdAt: new Date().toISOString(),
@@ -2478,11 +2503,13 @@ export class DiffTracker {
         };
         this.revertHistory.push(record);
         this.revertHistory = this.revertHistory.slice(-this.maxRevertHistory);
-        const saved = await this.flushPendingPersistence();
-        if (!this.isCurrentEpoch(epoch)) { return undefined; }
-        if (saved) { return record; }
-        this.revertHistory = previousHistory;
-        return undefined;
+        let committed = false;
+        try {
+            committed = await this.flushPersistState(false, transaction) && this.isCurrentEpoch(epoch);
+            return committed ? record : undefined;
+        } finally {
+            this.endBaselineTransaction(transaction, committed);
+        }
     }
 
     private async removeRevertRecord(record: PersistedRevertRecord): Promise<void> {
@@ -3644,6 +3671,7 @@ export class DiffTracker {
 
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
+        if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -3687,6 +3715,7 @@ export class DiffTracker {
 
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
+        if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -3732,8 +3761,21 @@ export class DiffTracker {
         return doc?.getText();
     }
 
+    private deferInitialIgnoreEvent(uri: vscode.Uri): boolean {
+        if (this.initialIgnoreEpoch !== this.sessionEpoch) { return false; }
+        this.initialIgnoreEvents.set(uri.fsPath, uri);
+        return true;
+    }
+
+    private hasScanUncertainty(filePath: string): boolean {
+        for (let current = filePath; ; current = path.dirname(current)) {
+            if (this.scanUncertainFiles.has(current)) { return true; }
+            if (path.dirname(current) === current) { return false; }
+        }
+    }
+
     private ensureSnapshotForDocument(doc: vscode.TextDocument, useDocumentContent = false): void {
-        if (!this.isRecording) {
+        if (!this.isRecording || this.initialIgnoreEpoch === this.sessionEpoch) {
             return;
         }
 
@@ -3750,6 +3792,10 @@ export class DiffTracker {
             return;
         }
 
+        if (this.hasScanUncertainty(filePath)) {
+            this.recordUnresolvedBaseline(filePath, 'File or parent changed during baseline scan; before-image is unknown');
+            return;
+        }
         if (this.trackedChanges.get(filePath)?.unavailableReason) { return; }
         const targetError = this.validateSnapshotTarget(filePath);
         if (targetError) { this.markFileUnavailable(filePath, targetError); return; }

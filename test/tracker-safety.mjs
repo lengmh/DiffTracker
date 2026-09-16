@@ -15,6 +15,7 @@ function deferred() { let resolve; const promise=new Promise(r=>{resolve=r;}); r
 function pause(p,operation) { const entered=deferred(),release=deferred(); barriers.set(`${p}:${operation}`,{entered,release}); return {entered:entered.promise,release:release.resolve}; }
 async function boundary(p,operation) { const key=`${p}:${operation}`, barrier=barriers.get(key); if(barrier){barriers.delete(key); barrier.entered.resolve(); await barrier.release.promise;} }
 let automationOnly=false;
+let watchExclude=[];
 let listedFiles=[];
 let workspaceChanged;
 const docs = [];
@@ -116,7 +117,7 @@ const vscode = {
         textDocuments: docs,
         workspaceFolders:[{ uri:Uri.file(root), name:'test' }],
         getWorkspaceFolder:uri => uri.fsPath.startsWith(root) ? { uri:Uri.file(root), name:'test' } : undefined,
-        getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:fallback }),
+        getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:key==='watchExclude'?watchExclude:fallback }),
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidChangeConfiguration:noopEvent,
@@ -1030,18 +1031,89 @@ for(const action of ['file','block']) test(`DT-06 ${action} Keep preserves edits
     await gate.entered;fs.writeFileSync(p,'newer external');gate.release();assert.equal(succeeded(await operation),true);
     assert.equal(tracker.getOriginalContent(p),'reviewed');assert.equal(pending(p)?.currentContent,'newer external');
 });
-test('DT-08 fresh Start watches open-document changes while ignore discovery waits',async()=>{
+test('DT-08 fresh Start retains startup change evidence while deferring document capture',async()=>{
     const p=file();fs.writeFileSync(p,'before');document(p);listedFiles=[Uri.file(p)];
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
-    assert.ok(watcherInstances.some(w=>w.active));assert.equal(tracker.getOriginalContent(p),'before');
+    assert.ok(watcherInstances.some(w=>w.active));
     fs.writeFileSync(p,'external during startup');emitWatcher('change',Uri.file(p));gate.release();
-    await waitUntil(()=>tracker.getBaselineState()==='ready');await waitUntil(()=>pending(p)?.currentContent==='external during startup');
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+    assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);assert.equal(disk(p),'external during startup');
+});
+test('AUDIT-18 fresh Start excludes open documents and startup events after ignore discovery',async()=>{
+    watchExclude=['custom-excluded/**'];
+    const ignored=['.git','node_modules','out','custom-excluded'].map(dir=>path.join(root,dir,`${index++}.txt`));
+    for(const p of ignored){fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'ignored');document(p);}
+    const allowed=file();fs.writeFileSync(allowed,'included');document(allowed);listedFiles=[...ignored,allowed].map(Uri.file);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    assert.ok(watcherInstances.some(w=>w.active));
+    for(const p of ignored){emitWatcher('change',Uri.file(p));tracker.onDocumentChanged({document:document(p)});tracker.onDidSaveDocument(document(p));}
+    // A path not present in the open-document list must not become unresolved.
+    const created=path.join(root,'node_modules',`${index++}.txt`);fs.writeFileSync(created,'dependency');emitWatcher('create',Uri.file(created));
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');await tracker.flushPendingPersistence();
+    assert.equal(tracker.getOriginalContent(allowed),'included');
+    const state=JSON.parse(disk(path.join(storage,'session-state.json')));
+    for(const p of [...ignored,created]){
+        assert.equal(tracker.getOriginalContent(p),undefined);assert.equal(pending(p),undefined);
+        assert.equal(state.fileSnapshots.some(([name])=>name===p),false);
+        assert.equal(state.unresolvedBaselineFiles.some(([name])=>name===p),false);
+    }
 });
 test('DT-08 fresh Start watcher failure keeps baseline incomplete',async()=>{
     const p=file();fs.writeFileSync(p,'before');document(p);listedFiles=[Uri.file(p)];faults.set(root,{watcher:error('ENOSPC')});
     tracker.startRecording();await new Promise(resolve=>setTimeout(resolve,150));
     assert.equal(tracker.getBaselineState(),'building');assert.equal(tracker.getOriginalContent(p),undefined);
     assert.equal(watcherInstances.some(w=>w.active),false);
+});
+for(const kind of ['create','change','delete','document','save']) test(`AUDIT-18 included ${kind} during ignore discovery stays unknown after reload`,async()=>{
+    const p=file();fs.writeFileSync(p,'before');const doc=document(p);listedFiles=[Uri.file(p)];
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    if(kind==='delete')fs.unlinkSync(p);else fs.writeFileSync(p,'later');
+    if(kind==='document'||kind==='save'){
+        doc.text='later';doc.version++;doc.isDirty=kind==='document';
+        if(kind==='document')tracker.onDocumentChanged({document:doc});else tracker.onDidSaveDocument(doc);
+    }else emitWatcher(kind,Uri.file(p));
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+    await tracker.flushPendingPersistence();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+});
+test('AUDIT-18 ignored startup churn cannot exhaust persistent baseline capacity',async()=>{
+    const ignored=path.join(root,'node_modules',`${index++}.txt`);fs.mkdirSync(path.dirname(ignored),{recursive:true});fs.writeFileSync(ignored,'x'.repeat(20000));document(ignored);
+    const p=file();fs.writeFileSync(p,'included');listedFiles=[Uri.file(p)];
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.maxPersistedBytes=10000;
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    for(let i=0;i<200;i++)emitWatcher('change',Uri.file(path.join(root,'node_modules',`${index++}.txt`)));
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.getOriginalContent(p),'included');
+});
+test('AUDIT-18 cancelled ignore discovery cannot replay paths into a fresh session',async()=>{
+    const p=file();fs.writeFileSync(p,'old');document(p);listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    emitWatcher('change',Uri.file(p));tracker.stopRecording();fs.writeFileSync(p,'new');document(p).text='new';
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');gate.release();await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(tracker.getOriginalContent(p),'new');assert.equal(pending(p),undefined);
+});
+test('AUDIT-18 deleting an open document parent during ignore discovery cannot accept absence',async()=>{
+    const dir=file('parent'),p=path.join(dir,'child');fs.mkdirSync(dir);fs.writeFileSync(p,'before');document(p);listedFiles=[];
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.rmSync(dir,{recursive:true});emitWatcher('delete',Uri.file(dir));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+});
+test('AUDIT-18 refreshing ignore rules retains exclusions until replacement is ready',async()=>{
+    const p=path.join(root,'node_modules',`${index++}.txt`);fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'ignored');
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');tracker.gitignoreCache.clear();
+    const gate=pause(root,'ignoreScan'),refresh=tracker.refreshIgnoreMatchers();await gate.entered;
+    tracker.onDocumentOpened(document(p));emitWatcher('create',Uri.file(p));gate.release();await refresh;
+    assert.equal(tracker.getOriginalContent(p),undefined);assert.equal(pending(p),undefined);
+});
+test('AUDIT-18 directory creation during ignore discovery cannot accept its children',async()=>{
+    const dir=file('new-parent'),p=path.join(dir,'child');listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.mkdirSync(dir);fs.writeFileSync(p,'new child');emitWatcher('create',Uri.file(dir));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
 });
 test('DT-08 Stop during initial ignore discovery prevents late watcher or Ready publication',async()=>{
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;tracker.stopRecording();gate.release();
@@ -1327,6 +1399,27 @@ test('AUDIT-6 failed old recovery preparation cannot resurrect old history',asyn
     tracker.stopRecording();tracker.startRecording();faults.set(temp,{rename:error('NoPermissions')});gate.release();await op;faults.clear();
     assert.equal(tracker.revertHistory.length,0);
 });
+for(const [entry,transition,phase] of [
+    ['file','stop','write'],['block','stop','write'],['batch','stop','write'],
+    ['file','dispose','rename'],['block','dispose','copy'],['batch','stop','afterDelete']
+]) test(`AUDIT-18 ${transition} during ${entry} recovery ${phase} preserves all ten valid Undo records`,async()=>{
+    const oldFiles=[];
+    for(let i=0;i<10;i++){const p=file();oldFiles.push(p);seed(p,'base\n','edit\n');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));}
+    const p=file();seed(p,'base\n','edit\n');await scan(p);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const before=JSON.parse(disk(path.join(storage,'session-state.json'))).revertHistory;
+    const target=phase==='copy'?'session-state.json':phase==='afterDelete'?'session-state.unsaved':'session-state.tmp.json';
+    const gate=pause(path.join(storage,target),phase);
+    const operation=entry==='file'?tracker.revertFile(p):entry==='block'?tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId):tracker.revertAllChanges();
+    await gate.entered;const ending=transition==='dispose'?tracker.dispose():tracker.stopRecording();
+    // Capture the stopped state while the cancelled writer is still blocked.
+    const persisted=tracker.flushPendingPersistence();gate.release();await operation;await ending;assert.equal(await persisted,true);
+    assert.equal(disk(p),'edit\n');
+    assert.deepEqual(JSON.parse(disk(path.join(storage,'session-state.json'))).revertHistory,before);
+    assert.deepEqual(JSON.parse(disk(path.join(storage,'session-state.last-good.json'))).revertHistory,before);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    for(const old of [...oldFiles].reverse()){assert.equal((await tracker.undoLastRevert()).succeeded,1);assert.equal(disk(old),'edit\n');}
+});
 test('AUDIT-7 Undo verifies saved contents and retains recovery on save participant edits',async()=>{
     const p=file();seed(p,'base','edit');await scan(p);assert.ok(succeeded(await tracker.revertFile(p)));
     const gate=pause(p,'save'),op=tracker.undoLastRevert();await gate.entered;document(p).text='save participant output';document(p).version++;gate.release();
@@ -1431,7 +1524,7 @@ if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.star
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
-    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;listedFiles=[]; tracker=new DiffTracker();
+    docs.length=0; watcherInstances.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[]; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
     catch(e) { failures++; console.error(`FAIL ${name}\n${e.stack}`); }
