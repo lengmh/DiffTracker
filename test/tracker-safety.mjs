@@ -2172,6 +2172,18 @@ for(const failScan of [false,true]) test(`ROUND27 same-fingerprint watch retry r
     await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(dir),undefined);assert.equal(pending(p)?.currentContent,'gap edit');assert.ok(pending(q)?.unavailableReason);
 });
 
+
+for(const failResume of [false,true]) test(`ROUND27 stale failed ${failResume?'watch resume':'reconciliation'} cannot overwrite a newer success`,async()=>{
+    tracker.storageUri=Uri.file(file('storage'));tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('stale-reconcile'),p=path.join(dir,'known.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));await tracker.keepAllChangesInFile(p);
+    const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));await waitUntil(()=>!!pending(dir)?.unavailableReason);
+    const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,read=fs.promises.readdir;let first=true;
+    if(failResume)fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return read(directory,...args);};
+    else vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*'&&first){first=false;entered.resolve();await release.promise;throw error('old scan');}return find(pattern);};
+    const old=tracker.refreshIgnoreMatchers();const oldResult=old.then(()=>null,e=>e);
+    try{await entered.promise;if(failResume){nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir).error(error('ENOSPC'));}fs.writeFileSync(p,'latest');await tracker.refreshIgnoreMatchers();assert.equal(pending(p)?.currentContent,'latest');assert.equal(pending(dir),undefined);release.resolve();assert.equal(await oldResult,null);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);}
+    finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.readdir=read;}
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }

@@ -810,20 +810,21 @@ export class DiffTracker {
         }
     }
 
-    private async resumeImportedDirectoryWatchers(epoch: number): Promise<void> {
+    private async resumeImportedDirectoryWatchers(epoch: number, version: number): Promise<void> {
         if (!this.isRecording || !this.externalWatcherEnabled) { return; }
         for (const [directory, previous] of Array.from(this.importedDirectoryWatchers)) {
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             if (this.importedDirectoryWatchers.get(directory)?.epoch === epoch ||
                 this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
             try {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
                 // Rediscover directories created while coverage was suspended.
                 await this.watchImportedTree(directory, epoch, previous.provenAbsent);
-                if (this.isCurrentEpoch(epoch)) { this.pendingImportedDirectoryReconciliation.add(directory); }
+                if (this.isCurrentEpoch(epoch) && version === this.ignoreRefreshVersion) { this.pendingImportedDirectoryReconciliation.add(directory); }
             } catch (error) {
+                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
-                else { await this.markCreatedDirectoryUnavailable(directory, 'Imported directory watch coverage could not be restored; rebuild after resolving the watcher failure', !previous.provenAbsent, epoch); }
+                else { await this.markCreatedDirectoryUnavailable(directory, 'Imported directory watch coverage could not be restored; rebuild after resolving the watcher failure', !previous.provenAbsent, epoch, version); }
             }
         }
     }
@@ -1625,7 +1626,7 @@ export class DiffTracker {
         this.ignoreMatchers = matchers;
         this.ignoreResultCache.clear();
         this.pruneIgnoredImportedDirectoryWatchers();
-        await this.resumeImportedDirectoryWatchers(epoch);
+        await this.resumeImportedDirectoryWatchers(epoch, version);
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
         this.pruneIgnoredTrackedChanges();
         if ((!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
@@ -1646,11 +1647,14 @@ export class DiffTracker {
                 if (!this.isPathIgnored(uri)) { await this.readFileAndUpdate(filePath, uri); }
             }
         } catch (error) {
+            if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             for (const directory of restored) {
+                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 const entry = this.importedDirectoryWatchers.get(directory);
-                await this.markCreatedDirectoryUnavailable(directory, 'Restored directory coverage could not be reconciled; refresh or rebuild after resolving the scan failure', !entry?.provenAbsent, epoch);
+                await this.markCreatedDirectoryUnavailable(directory, 'Restored directory coverage could not be reconciled; refresh or rebuild after resolving the scan failure', !entry?.provenAbsent, epoch, version);
             }
-            throw error;
+            if (this.isCurrentEpoch(epoch) && version === this.ignoreRefreshVersion) { throw error; }
+            return;
         }
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
         for (const directory of restoredMarkers) {
@@ -2330,8 +2334,9 @@ export class DiffTracker {
         this.ensureSnapshotForDocument(doc);
     }
 
-    private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number): Promise<void> {
-        if (!this.isCurrentEpoch(epoch)) { return; }
+    private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number, refreshVersion?: number): Promise<void> {
+        const isCurrent = () => this.isCurrentEpoch(epoch) && (refreshVersion === undefined || refreshVersion === this.ignoreRefreshVersion);
+        if (!isCurrent()) { return; }
         if (!duringScan && !this.fileSnapshots.has(filePath) &&
             (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
             // Persist proven absence, so deleting this new tree clears its
@@ -2342,7 +2347,7 @@ export class DiffTracker {
             this.fileSnapshots.set(filePath, '');
             await this.completeBaseline(epoch);
         }
-        if (this.isCurrentEpoch(epoch)) { this.markFileUnavailable(filePath, reason); }
+        if (isCurrent()) { this.markFileUnavailable(filePath, reason); }
     }
 
     private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {

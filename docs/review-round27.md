@@ -59,3 +59,12 @@ Independent review of 1c08636 reported P1 4029464703 and P2 4029464716.
 - After successful reconciliation, proven-absent directory failure markers and their synthetic file snapshots are removed and persisted. Older unknown before-images remain protected. Epoch/version guards prevent stale reconciliation from clearing newer state.
 - Two end-to-end regressions cover retry with unchanged rules, modified/deleted/new files during the gap, scan failure followed by retry, and restoration without stale directory markers. Both fail on 1c08636 and pass after the fix.
 - Full local suite: 523/523. Compile, lint and whitespace checks pass. Final-head CI and independent review remain required before merge.
+
+## Independent review follow-up: discard stale refresh failures
+
+Independent review of 4d9ca01 reported P2 4029569951.
+
+- Watch-resume and reconciliation failure paths now check both session epoch and ignore-refresh version before applying failure state. The absence-aware helper rechecks after persistence awaits too.
+- An outdated failure cannot recreate a marker removed by a newer successful reconciliation or fail the completed newer refresh.
+- Two overlapping-refresh regressions (watch traversal failure and file discovery failure) fail on 4d9ca01 and pass after the fix.
+- Local full suite: 525/525; final guard refinements also pass the targeted overlap tests. Compile/lint and whitespace checks pass. Final-head CI and independent review remain the merge gate.
