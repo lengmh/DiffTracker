@@ -299,6 +299,7 @@ export class DiffTracker {
     private inlineViews = new Map<string, InlineDiffView>();
     private disposables: vscode.Disposable[] = [];
     private fileWatchers: vscode.FileSystemWatcher[] = [];
+    private importedDirectoryWatchers = new Map<string, { watcher: vscode.FileSystemWatcher; epoch: number }>();
     private ignoreMatchers = new Map<string, Ignore>();
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
@@ -750,32 +751,7 @@ export class DiffTracker {
         try {
             for (const folder of this.getSupportedWorkspaceFolders()) {
                 const pattern = new vscode.RelativePattern(folder, '**/*');
-                const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-                watchers.push(watcher);
-                const dispatch = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): void => {
-                    if (!this.isCurrentEpoch(epoch)) { return; }
-                    if (path.basename(uri.fsPath) === '.gitignore') {
-                        this.scanCoverage = undefined;
-                        this.schedulePersistState();
-                        void this.refreshIgnoreMatchers().catch(() => undefined);
-                    }
-                    if (this.restoringEpoch === epoch) {
-                        // A change does not invalidate the evidence that a path
-                        // was created. Delete replaces it; a later create starts
-                        // a new incarnation and establishes absence again.
-                        const previous = this.restoreEvents.get(uri.fsPath);
-                        if (kind !== 'change' || previous?.kind !== 'create') {
-                            this.restoreEvents.set(uri.fsPath, { uri, kind });
-                        }
-                        return;
-                    }
-                    if (kind === 'create') { void this.onExternalFileCreated(uri); }
-                    else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
-                    else { void this.onExternalFileChanged(uri); }
-                };
-                watcher.onDidChange(uri => dispatch(uri, 'change'));
-                watcher.onDidCreate(uri => dispatch(uri, 'create'));
-                watcher.onDidDelete(uri => dispatch(uri, 'delete'));
+                watchers.push(this.createPathWatcher(pattern, epoch));
             }
             return watchers;
         } catch (error) {
@@ -784,11 +760,70 @@ export class DiffTracker {
         }
     }
 
+    private createPathWatcher(pattern: vscode.RelativePattern, epoch: number): vscode.FileSystemWatcher {
+        const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+        const dispatch = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): void => {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (path.basename(uri.fsPath) === '.gitignore') {
+                this.scanCoverage = undefined;
+                this.schedulePersistState();
+                void this.refreshIgnoreMatchers().catch(() => undefined);
+            }
+            if (this.restoringEpoch === epoch) {
+                // A change does not invalidate the evidence that a path
+                // was created. Delete replaces it; a later create starts
+                // a new incarnation and establishes absence again.
+                const previous = this.restoreEvents.get(uri.fsPath);
+                if (kind !== 'change' || previous?.kind !== 'create') {
+                    this.restoreEvents.set(uri.fsPath, { uri, kind });
+                }
+                return;
+            }
+            if (kind === 'create') { void this.onExternalFileCreated(uri); }
+            else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
+            else { void this.onExternalFileChanged(uri); }
+        };
+        watcher.onDidChange(uri => dispatch(uri, 'change'));
+        watcher.onDidCreate(uri => dispatch(uri, 'create'));
+        watcher.onDidDelete(uri => dispatch(uri, 'delete'));
+        return watcher;
+    }
+
+    private watchImportedDirectory(directory: string, epoch: number): boolean {
+        const previous = this.importedDirectoryWatchers.get(directory);
+        if (previous?.epoch === epoch) { return false; }
+        // Non-recursive watches cover moved-in trees whose descendants may be
+        // absent from the host's existing recursive watcher on Linux.
+        const targetError = this.validateResourceTarget(directory);
+        if (targetError) { throw new Error(targetError); }
+        const watcher = this.createPathWatcher(new vscode.RelativePattern(directory, '*'), epoch);
+        this.importedDirectoryWatchers.set(directory, { watcher, epoch });
+        previous?.watcher.dispose();
+        return true;
+    }
+
+    private removeImportedDirectoryWatchers(root: string): void {
+        for (const [directory, entry] of this.importedDirectoryWatchers) {
+            if (this.pathBelongsToRoot(directory, root)) {
+                entry.watcher.dispose();
+                this.importedDirectoryWatchers.delete(directory);
+            }
+        }
+    }
+
     private activateExternalWatchers(watchers: vscode.FileSystemWatcher[]): void {
         const previousWatchers = this.fileWatchers;
         this.fileWatchers = watchers;
         this.externalWatcherEnabled = watchers.length > 0;
         previousWatchers.forEach(watcher => watcher.dispose());
+        for (const directory of this.importedDirectoryWatchers.keys()) {
+            try {
+                if (!fs.lstatSync(directory).isDirectory()) { throw new Error('Directory no longer exists'); }
+                this.watchImportedDirectory(directory, this.sessionEpoch);
+            } catch {
+                this.removeImportedDirectoryWatchers(directory);
+            }
+        }
     }
 
     private reportExternalWatcherFailure(error: any): void {
@@ -826,6 +861,7 @@ export class DiffTracker {
     private disposeFileWatchers() {
         this.fileWatchers.forEach(w => w.dispose());
         this.fileWatchers = [];
+        for (const entry of this.importedDirectoryWatchers.values()) { entry.watcher.dispose(); entry.epoch = -1; }
     }
 
     private clearExternalChangeTimers(): void {
@@ -2190,10 +2226,25 @@ export class DiffTracker {
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    const children = await vscode.workspace.findFiles(
-                        new vscode.RelativePattern(filePath, '**/*'),
-                        new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-                    );
+                    this.watchImportedDirectory(filePath, epoch);
+                    let children: vscode.Uri[];
+                    let addedWatcher: boolean;
+                    do {
+                        children = await vscode.workspace.findFiles(
+                            new vscode.RelativePattern(filePath, '**/*'),
+                            new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+                        );
+                        if (!this.isCurrentEpoch(epoch)) { return; }
+                        addedWatcher = false;
+                        for (const child of children) {
+                            if (!this.pathBelongsToRoot(child.fsPath, filePath) || this.isPathIgnored(child)) { continue; }
+                            for (let directory = path.dirname(child.fsPath); directory !== filePath && this.pathBelongsToRoot(directory, filePath); directory = path.dirname(directory)) {
+                                addedWatcher = this.watchImportedDirectory(directory, epoch) || addedWatcher;
+                            }
+                        }
+                        // Enumerate once more after installing child watches to
+                        // close changes that raced the first discovery.
+                    } while (addedWatcher);
                     for (const child of children) {
                         if (!this.isCurrentEpoch(epoch)) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
@@ -2235,6 +2286,8 @@ export class DiffTracker {
             this.deferInitialIgnoreEvent(uri, 'delete') || this.isPathIgnored(uri)) {
             return;
         }
+        // Remove watches only for a confirmed missing subtree.
+        if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
         // A delete notification may race an atomic replacement; confirm actual state.
         const targets = new Set([uri.fsPath, ...[...this.fileSnapshots.keys()].filter(filePath => {
             const relative = path.relative(uri.fsPath, filePath);
@@ -5066,6 +5119,7 @@ export class DiffTracker {
         this.clearWatcherSuppressionTimers();
         this.clearAutomationSessions();
         this.disposeFileWatchers();
+        this.importedDirectoryWatchers.clear();
         this.disposables.forEach(d => d.dispose());
         this._onDidChangeRecordingState.dispose();
         this._onDidTrackChanges.dispose();

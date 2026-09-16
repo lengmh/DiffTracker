@@ -31,11 +31,11 @@ fs.promises.link = async (source, destination) => {
     await boundary(destination,'afterPublish');
 };
 const noopEvent = () => ({ dispose() {} });
-function createWatcher() {
+function createWatcher(pattern) {
     fault(root,'watcher');
     const handlers = { change: [], create: [], delete: [] };
     const watcher = {
-        active: true,
+        active: true, pattern,
         onDidChange(handler) { handlers.change.push(handler); return { dispose() {} }; },
         onDidCreate(handler) { handlers.create.push(handler); return { dispose() {} }; },
         onDidDelete(handler) { handlers.delete.push(handler); return { dispose() {} }; },
@@ -2037,6 +2037,13 @@ test('ROUND26 repository info excludes have lower precedence than nested rules',
     const dir=file('precedence'),sub=path.join(dir,'sub');fs.mkdirSync(sub,{recursive:true});assert.equal(spawnSync('git',['init','-q',dir]).status,0);const info=path.join(dir,'.git','info','exclude'),rule=path.join(sub,'.gitignore'),p=path.join(sub,'keep.cfg');fs.writeFileSync(info,'*.cfg\n');fs.writeFileSync(rule,'!keep.cfg\n');fs.writeFileSync(p,'source');
     const folders=vscode.workspace.workspaceFolders;vscode.workspace.workspaceFolders=[{uri:Uri.file(dir),name:'repository'}];const folderFor=vscode.workspace.getWorkspaceFolder;vscode.workspace.getWorkspaceFolder=uri=>uri.fsPath.startsWith(dir+path.sep)?vscode.workspace.workspaceFolders[0]:undefined;
     listedIgnores=[Uri.file(rule)];listedFiles=[Uri.file(p)];try{tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(spawnSync('git',['check-ignore','--no-index','-q','--','sub/keep.cfg'],{cwd:dir}).status,1);assert.equal(tracker.getOriginalContent(p),'source');}finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getWorkspaceFolder=folderFor;}
+});
+test('ROUND26 imported descendants remain watched after Keep and Stop/restart',async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('watched-import'),p=path.join(dir,'deep','child.txt');fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
+    const notify=()=>{for(const watcher of watcherInstances){if(watcher.pattern?.pattern==='*'&&watcher.pattern.base===path.dirname(p))watcher.emit('change',Uri.file(p));}};
+    fs.writeFileSync(p,'after Keep');notify();await waitUntil(()=>pending(p)?.currentContent==='after Keep');assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');
+    tracker.stopRecording();assert.equal(watcherInstances.filter(w=>w.pattern?.pattern==='*'&&w.active).length,0);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');fs.writeFileSync(p,'after restart');notify();await waitUntil(()=>pending(p)?.currentContent==='after restart');
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(watcherInstances.filter(w=>w.pattern?.pattern==='*'&&w.active).length,0);assert.equal(pending(p)?.isDeleted,true);
 });
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
