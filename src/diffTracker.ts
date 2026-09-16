@@ -790,9 +790,13 @@ export class DiffTracker {
         else { void this.onExternalFileChanged(uri); }
     }
 
+    private readonly maxImportedDirectoryWatchers = 256;
+
     private watchImportedDirectory(directory: string, epoch: number): boolean {
         const previous = this.importedDirectoryWatchers.get(directory);
         if (previous?.epoch === epoch) { return false; }
+        const activeCount = Array.from(this.importedDirectoryWatchers.values()).filter(entry => entry.epoch === epoch).length;
+        if (activeCount >= this.maxImportedDirectoryWatchers) { throw new Error('Imported directory watcher limit reached'); }
         // The host may reuse a recursive watcher that never adopted moved-in
         // descendants. Watch local directories directly, without that backend.
         const targetError = this.validateResourceTarget(directory);
@@ -822,20 +826,35 @@ export class DiffTracker {
 
     private async watchImportedTree(root: string, epoch: number): Promise<void> {
         const pending = [root];
-        while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
-            const directory = pending.pop()!;
-            if (this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
-            // Watch before enumeration so later children cannot fall into the
-            // discovery gap. Empty and ignored-file-only directories count too.
-            this.watchImportedDirectory(directory, epoch);
-            const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-            if (!this.isCurrentEpoch(epoch)) { return; }
-            for (const entry of entries) {
-                // Never follow symlink directories outside the validated tree.
-                if (entry.isDirectory() && !entry.isSymbolicLink()) {
-                    pending.push(path.join(directory, entry.name));
+        const installed = new Map<string, { watcher: vscode.Disposable; epoch: number }>();
+        try {
+            while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
+                const directory = pending.pop()!;
+                if (this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
+                // Watch before enumeration so later children cannot fall into the
+                // discovery gap. Empty and ignored-file-only directories count too.
+                if (this.watchImportedDirectory(directory, epoch)) {
+                    installed.set(directory, this.importedDirectoryWatchers.get(directory)!);
+                }
+                const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+                if (!this.isCurrentEpoch(epoch)) { return; }
+                for (const entry of entries) {
+                    // Never follow symlink directories outside the validated tree.
+                    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                        pending.push(path.join(directory, entry.name));
+                    }
                 }
             }
+        } catch (error) {
+            // Keep pre-existing coverage, but do not leak a partial installation
+            // on OS quota, configured bound, or directory enumeration failures.
+            for (const [directory, entry] of installed) {
+                if (this.importedDirectoryWatchers.get(directory) === entry) {
+                    entry.watcher.dispose();
+                    this.importedDirectoryWatchers.delete(directory);
+                }
+            }
+            throw error;
         }
     }
 
@@ -2267,7 +2286,9 @@ export class DiffTracker {
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    await this.watchImportedTree(filePath, epoch);
+                    let watchFailed = false;
+                    try { await this.watchImportedTree(filePath, epoch); }
+                    catch { watchFailed = true; }
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     const children = await vscode.workspace.findFiles(
                         new vscode.RelativePattern(filePath, '**/*'),
@@ -2279,6 +2300,9 @@ export class DiffTracker {
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
                             await this.onExternalFileCreated(child, scanEvent);
                         }
+                    }
+                    if (watchFailed && this.isCurrentEpoch(epoch)) {
+                        this.markFileUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit');
                     }
                 } catch {
                     if (this.isCurrentEpoch(epoch)) {

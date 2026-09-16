@@ -20,3 +20,13 @@ Base: 7ed11f487a621bf6cd324af309a14a27a1f20d84.
 ## Merge gate
 
 Final-head CI must pass and independent review must complete. This implementation report is not an independent review approval. No Marketplace publication is part of this change.
+
+## Independent review follow-up: watcher quotas
+
+Independent review of 05797be reported P2 comment 4029158634: native watches were unbounded and partial traversal failure skipped file discovery while retaining watches.
+
+- Bound supplemental imported-directory watches to 256 per tracker.
+- On OS quota, bound, or directory traversal failure, dispose only watches installed by that traversal; retain existing coverage.
+- Continue discovering current files, and leave a visible unavailable root explaining incomplete ongoing coverage and the need to reduce directories / resolve the watcher limit and rebuild. This fallback does not claim full ongoing coverage.
+- Added three regressions (bound, ENOSPC, directory read failure), each with repeated import attempts and a pre-existing watch. All three fail on 05797be and pass after the fix.
+- Final local full suite: 507/507. Compile, lint and whitespace checks pass. A new final-head CI and independent review are required before merge.

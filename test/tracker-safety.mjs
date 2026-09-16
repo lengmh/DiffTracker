@@ -2087,6 +2087,24 @@ for(const block of [false,true]) for(const failure of ['write','git']) for(const
     if(failure==='git')assert.ok(tracker.getGitPauseReason(p));
 });
 
+
+for(const failure of ['limit','quota','read']) test(`ROUND27 watcher ${failure} cleans partial coverage and still discovers files`,async()=>{
+    const existing=file('watched-existing');fs.mkdirSync(existing);tracker.watchImportedDirectory(existing,tracker.sessionEpoch);
+    const dir=file('watch-limit'),child=path.join(dir,'deep'),p=path.join(child,'file.txt');fs.mkdirSync(child,{recursive:true});fs.writeFileSync(p,'imported');listedFiles=[Uri.file(p)];
+    const originalWatch=fs.watch,originalRead=fs.promises.readdir;
+    if(failure==='limit')tracker.maxImportedDirectoryWatchers=2;
+    if(failure==='quota')fs.watch=(directory,...args)=>{if(directory===child)throw error('ENOSPC');return originalWatch(directory,...args);};
+    if(failure==='read')fs.promises.readdir=async(directory,...args)=>{if(directory===child)throw error('EACCES');return originalRead(directory,...args);};
+    try{
+        for(let attempt=0;attempt<2;attempt++){
+            await tracker.onExternalFileCreated(Uri.file(dir));
+            assert.equal(pending(p)?.currentContent,'imported');assert.equal(pending(p)?.unavailableReason,undefined);
+            assert.match(pending(dir)?.unavailableReason??'',/watch coverage is incomplete/);
+            assert.deepEqual(nativeDirectoryWatchers.filter(w=>w.active).map(w=>w.directory),[existing]);
+        }
+    }finally{fs.watch=originalWatch;fs.promises.readdir=originalRead;}
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
