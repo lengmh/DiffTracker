@@ -27,7 +27,7 @@ async function stableReview(tracker, filePath) {
     } catch (error) {
         console.error('HOST-AUDIT diagnostics', JSON.stringify({filePath,
             baselineState:tracker.getBaselineState(),recording:tracker.getIsRecording(),watching:tracker.externalWatcherEnabled,
-            roots:tracker.sessionWorkspaceRoots,ignored:tracker.isPathIgnored(vscode.Uri.file(filePath)),
+            watcherEvents:tracker.hostWatcherEvents,activeWrites:[...tracker.activeWriteFiles],pendingWrites:[...tracker.pendingWriteFiles],roots:tracker.sessionWorkspaceRoots,ignored:tracker.isPathIgnored(vscode.Uri.file(filePath)),
             snapshots:[...tracker.fileSnapshots].filter(([p])=>p.includes('audit-')),
             changes:tracker.getTrackedChanges().filter(c=>c.filePath.includes('audit-')),
             disk:await tracker.readFileSnapshot(vscode.Uri.file(filePath))}));
@@ -186,6 +186,14 @@ module.exports = async function auditHost(workspace) {
         assert.equal(fs.readFileSync(ignoredFile, 'utf8'), 'existed before the baseline\n');
         console.log('PASS HOST-IGNORE offline rule removal retains unknown before-image');
 
+        tracker.hostWatcherEvents = [];
+        for (const method of ['onExternalFileCreated', 'onExternalFileChanged', 'onExternalFileDeleted']) {
+            const original = tracker[method].bind(tracker);
+            tracker[method] = async (...args) => {
+                if (args[0].fsPath.includes('audit-import')) { tracker.hostWatcherEvents.push({ method, path: args[0].fsPath, time: Date.now() }); }
+                return original(...args);
+            };
+        }
         // Import complete trees from outside the watched workspace. Linux may
         // deliver only a directory create; Windows may deliver child events too.
         for (const withRules of [false, true]) {
