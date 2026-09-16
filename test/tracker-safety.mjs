@@ -2035,7 +2035,7 @@ test('ROUND26 directory event observed during scan remains unknown after scan co
 });
 test('ROUND26 directory scan failure is visible and never accepts its children',async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('failed-dir');fs.mkdirSync(dir);const find=vscode.workspace.findFiles;vscode.workspace.findFiles=async pattern=>{if(pattern.base===dir)throw error('EACCES');return find(pattern);};
-    try{await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);}finally{vscode.workspace.findFiles=find;}
+    try{await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),'');assert.equal(succeeded(await tracker.keepAllChangesInFile(dir)),false);assert.equal(succeeded(await tracker.revertFile(dir)),false);}finally{vscode.workspace.findFiles=find;}
 });
 test('ROUND26 overlapping ignore refresh retains directory creation evidence before stat completes',async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('racing-dir'),p=path.join(dir,'child.txt'),rule=path.join(dir,'.gitignore');fs.mkdirSync(dir);fs.writeFileSync(p,'new');fs.writeFileSync(rule,'*.log');listedFiles=[Uri.file(p)];listedIgnores=[Uri.file(rule)];
@@ -2103,6 +2103,31 @@ for(const failure of ['limit','quota','read']) test(`ROUND27 watcher ${failure} 
             assert.deepEqual(nativeDirectoryWatchers.filter(w=>w.active).map(w=>w.directory),[existing]);
         }
     }finally{fs.watch=originalWatch;fs.promises.readdir=originalRead;}
+});
+
+
+for(const source of ['setting','gitignore']) test(`ROUND27 ${source} changes reclaim imported watch capacity across restart`,async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');tracker.maxImportedDirectoryWatchers=2;
+    const dir=file('reclaim'),sub=path.join(dir,'deep');fs.mkdirSync(sub,{recursive:true});await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,2);
+    if(source==='setting')watchExclude=[path.basename(dir)+'/'];else{const rule=file('.gitignore');fs.writeFileSync(rule,path.basename(dir)+'/');listedIgnores=[Uri.file(rule)];}
+    await tracker.refreshIgnoreMatchers();assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);
+    tracker.stopRecording();tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);
+    const next=file('next-import'),p=path.join(next,'later.txt');fs.mkdirSync(next);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(next));assert.equal(pending(next),undefined);assert.equal(pending(p)?.currentContent,'new');
+});
+for(const restore of [false,true]) test(`ROUND27 deleting a failed-watch tree clears its persisted marker (restore=${restore})`,async()=>{
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.maxImportedDirectoryWatchers=0;
+    const dir=file('failed-watch-delete'),p=path.join(dir,'child.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);
+    if(restore){await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');}
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(dir),false);
+    await tracker.flushPendingPersistence();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));listedFiles=[];assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);
+});
+
+
+for(const uncertainty of ['scan','older']) test(`ROUND27 failed directory coverage preserves ${uncertainty} uncertainty`,async()=>{
+    const dir=file('unknown-watch');fs.mkdirSync(dir);tracker.maxImportedDirectoryWatchers=0;
+    if(uncertainty==='scan')tracker.snapshotInitialized=false;else tracker.recordUnresolvedBaseline(dir,'pre-existing unknown path');
+    await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(tracker.getOriginalContent(dir),undefined);assert.ok(pending(dir)?.unavailableReason);
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

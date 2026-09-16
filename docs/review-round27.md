@@ -30,3 +30,13 @@ Independent review of 05797be reported P2 comment 4029158634: native watches wer
 - Continue discovering current files, and leave a visible unavailable root explaining incomplete ongoing coverage and the need to reduce directories / resolve the watcher limit and rebuild. This fallback does not claim full ongoing coverage.
 - Added three regressions (bound, ENOSPC, directory read failure), each with repeated import attempts and a pre-existing watch. All three fail on 05797be and pass after the fix.
 - Final local full suite: 507/507. Compile, lint and whitespace checks pass. A new final-head CI and independent review are required before merge.
+
+## Independent review follow-up: reclaim ignored watches and deleted markers
+
+Independent review of 8868b6e reported P2 comments 4029240797 and 4029240807.
+
+- Refreshing ignore rules now disposes imported-directory watches that became ignored. Watch creation also prunes ignored entries before applying the cap and rejects ignored targets, covering Stop/Start and rebuild reuse.
+- A failed newly created directory with proven post-baseline absence now persists that absent baseline, allowing its unavailable marker to disappear when the directory is confirmed missing, including after restoring a session. Scan-time or older unknown baselines remain unresolved.
+- Added six regressions: settings/gitignore capacity reclamation across restart; failed-directory deletion with and without intermediate restore; preservation of scan-time and older unknown provenance. The four reported failure cases all fail on 8868b6e and pass with this fix.
+- Updated the existing directory-scan-failure regression to require the known absent before-image and to verify both Keep and Revert remain blocked while the directory is unavailable.
+- Full local suite: 513/513. Compile, lint and whitespace checks pass. Final-head CI and independent review remain the merge gate.

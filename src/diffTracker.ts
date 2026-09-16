@@ -792,7 +792,18 @@ export class DiffTracker {
 
     private readonly maxImportedDirectoryWatchers = 256;
 
+    private pruneIgnoredImportedDirectoryWatchers(): void {
+        for (const [directory, entry] of this.importedDirectoryWatchers) {
+            if (this.isPathIgnored(vscode.Uri.file(directory), true)) {
+                entry.watcher.dispose();
+                this.importedDirectoryWatchers.delete(directory);
+            }
+        }
+    }
+
     private watchImportedDirectory(directory: string, epoch: number): boolean {
+        this.pruneIgnoredImportedDirectoryWatchers();
+        if (this.isPathIgnored(vscode.Uri.file(directory), true)) { return false; }
         const previous = this.importedDirectoryWatchers.get(directory);
         if (previous?.epoch === epoch) { return false; }
         const activeCount = Array.from(this.importedDirectoryWatchers.values()).filter(entry => entry.epoch === epoch).length;
@@ -1577,6 +1588,7 @@ export class DiffTracker {
         }
         this.ignoreMatchers = matchers;
         this.ignoreResultCache.clear();
+        this.pruneIgnoredImportedDirectoryWatchers();
         this.pruneIgnoredTrackedChanges();
         if (!changed || previousMatchers.size === 0 || this.restoringEpoch !== undefined ||
             this.baselineBuilding || !this.snapshotInitialized) { return; }
@@ -2252,6 +2264,21 @@ export class DiffTracker {
         this.ensureSnapshotForDocument(doc);
     }
 
+    private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number): Promise<void> {
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        if (!duringScan && !this.fileSnapshots.has(filePath) &&
+            (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+            // Persist proven absence, so deleting this new tree clears its
+            // unavailable marker even after restoring the session. Scan-time
+            // and older unknown paths must retain their uncertainty.
+            this.unresolvedBaselineFiles.delete(filePath);
+            this.postBaselineUnknownFiles.delete(filePath);
+            this.fileSnapshots.set(filePath, '');
+            await this.completeBaseline(epoch);
+        }
+        if (this.isCurrentEpoch(epoch)) { this.markFileUnavailable(filePath, reason); }
+    }
+
     private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
@@ -2302,11 +2329,11 @@ export class DiffTracker {
                         }
                     }
                     if (watchFailed && this.isCurrentEpoch(epoch)) {
-                        this.markFileUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit');
+                        await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
                     }
                 } catch {
                     if (this.isCurrentEpoch(epoch)) {
-                        this.markFileUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure');
+                        await this.markCreatedDirectoryUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure', scanEvent, epoch);
                     }
                 }
                 return;
