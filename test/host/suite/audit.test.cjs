@@ -17,12 +17,22 @@ async function until(predicate) {
 async function stableReview(tracker, filePath) {
     let previous;
     let since = Date.now();
-    await until(() => {
-        const token = tracker.getReviewToken(filePath);
-        const key = token && JSON.stringify(token);
-        if (!key || key !== previous) { previous = key; since = Date.now(); }
-        return key && Date.now() - since >= 750 && tracker.getBaselineState() === 'ready';
-    });
+    try {
+        await until(() => {
+            const token = tracker.getReviewToken(filePath);
+            const key = token && JSON.stringify(token);
+            if (!key || key !== previous) { previous = key; since = Date.now(); }
+            return key && Date.now() - since >= 750 && tracker.getBaselineState() === 'ready';
+        });
+    } catch (error) {
+        console.error('HOST-AUDIT diagnostics', JSON.stringify({filePath,
+            baselineState:tracker.getBaselineState(),recording:tracker.getIsRecording(),watching:tracker.externalWatcherEnabled,
+            roots:tracker.sessionWorkspaceRoots,ignored:tracker.isPathIgnored(vscode.Uri.file(filePath)),
+            snapshots:[...tracker.fileSnapshots].filter(([p])=>p.includes('audit-')),
+            changes:tracker.getTrackedChanges().filter(c=>c.filePath.includes('audit-')),
+            disk:await tracker.readFileSnapshot(vscode.Uri.file(filePath))}));
+        throw error;
+    }
 }
 module.exports = async function auditHost(workspace) {
     const p = vscode.Uri.file(path.join(workspace, 'audit-source.txt')).fsPath;
