@@ -40,6 +40,12 @@ precedence over stale tree-item flags. Existing-file split behavior is unchanged
   in-process tracker reload in a real Host, not a VS Code process crash test.
   Host tests are not run locally; exact-commit CI results are recorded in PR #1
   after push, including Windows Stable, Ubuntu Stable, VS Code 1.80 and packaging.
+- Initial CI `35098691466` failed the new Host tab assertion: the test queried
+  the tab model immediately after panel creation, before the workbench event
+  reached the extension host. The follow-up waits for the tab model to report
+  the Webview before asserting and closing it. The command executes once;
+  panel-presence and missing-file assertions remain required. Final CI verifies
+  this correction; the initial run is not counted as passing.
 - The implementer inspected the persistence writer, rollback identity checks,
   session invalidation, command routing and messages a second time. This is not
   independent reviewer approval; no code-review skill is installed here.

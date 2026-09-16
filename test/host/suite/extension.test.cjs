@@ -128,6 +128,10 @@ module.exports = async function runExtensionHostScenario() {
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
         await vscode.commands.executeCommand('diffTracker.showOriginalAndWebviewSplit', uri('deleted.txt').fsPath);
+        // Panel creation crosses the workbench boundary; command completion does
+        // not imply the tab model has received the corresponding event yet.
+        await until('deleted-file review tab', () => vscode.window.tabGroups.all
+            .some(group => group.tabs.some(tab => tab.input instanceof vscode.TabInputWebview)));
         const deletedReviewTab = vscode.window.tabGroups.all.flatMap(group => group.tabs)
             .find(tab => tab.input instanceof vscode.TabInputWebview);
         assert.ok(deletedReviewTab, 'Deleted-file split entry must open a review panel');
