@@ -97,6 +97,8 @@ interface PreparedBatchRevert {
 
 interface PersistedTrackerState {
     version: 2;
+    /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
+    migratedFromV1?: boolean;
     isRecording: boolean;
     baselineState: 'building' | 'ready';
     workspaceRoots: string[];
@@ -142,6 +144,7 @@ export class DiffTracker {
     private latestGitContexts = new Map<string, GitContextSnapshot | undefined>();
     private fileActionQueues = new Map<string, Promise<unknown>>();
     private recoveryActionQueue: Promise<void> = Promise.resolve();
+    private mayAdoptLegacyGitContexts = false;
 
     private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
         const operation = this.recoveryActionQueue.then(action);
@@ -155,6 +158,7 @@ export class DiffTracker {
     }
 
     private advanceEpoch(): number {
+        this.mayAdoptLegacyGitContexts = false;
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
         this.scanUncertainFiles.clear();
@@ -363,6 +367,7 @@ export class DiffTracker {
             return 'blocked';
         }
         const state = loaded.state;
+        this.mayAdoptLegacyGitContexts = state.migratedFromV1 === true;
         this.recoveryBlocked = false;
         this.persistenceIssue = loaded.kind === 'recovered'
             ? 'Recovered the last-good Diff Tracker session because the primary state was unreadable.'
@@ -938,6 +943,7 @@ export class DiffTracker {
         return {
             version: 2,
             isRecording: candidate.isRecording,
+            migratedFromV1: candidate.version === 1,
             baselineState,
             workspaceRoots: normalizedRoots,
             fileSnapshots,
@@ -1982,7 +1988,8 @@ export class DiffTracker {
     }
 
     public reconcileRestoredGitContexts(contexts: GitContextSnapshot[]): void {
-        if (this.baselineGitContexts.size === 0) {
+        if (this.mayAdoptLegacyGitContexts) {
+            this.mayAdoptLegacyGitContexts = false;
             // One-time migration for sessions written before Git contexts existed.
             this.setBaselineGitContexts(contexts);
             return;
@@ -2498,19 +2505,26 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) {
                     return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery creation', true);
                 }
+                const beforeWriteError = this.validateActionTarget(item.filePath);
+                if (beforeWriteError) { return this.actionResult(item.filePath, 'conflict', beforeWriteError, true); }
                 try {
                     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(item.before.content));
                 } catch {
                     return this.actionResult(item.filePath, 'failed', 'Recovery file was created but writing its content failed', true);
                 }
                 const created = await this.readFileSnapshot(uri);
+                if (!this.isCurrentEpoch(epoch) || this.validateActionTarget(item.filePath)) {
+                    return this.actionResult(item.filePath, 'conflict', 'Context changed during recovery creation; recovery retained', true);
+                }
                 if (created.kind !== 'text' || created.content !== item.before.content) {
                     return this.actionResult(item.filePath, 'failed', 'Recovery file content was not applied', true);
                 }
                 bufferChanged = false;
             } finally {
-                this.activeWriteFiles.delete(item.filePath);
-                if (!bufferChanged) { this.pendingWriteFiles.delete(item.filePath); }
+                if (this.isCurrentEpoch(epoch)) {
+                    this.activeWriteFiles.delete(item.filePath);
+                    if (!bufferChanged) { this.pendingWriteFiles.delete(item.filePath); }
+                }
             }
             this.updateTrackedDiff(item.filePath, item.before.content, { currentExists: true });
             return this.actionResult(item.filePath, 'success', undefined, true);
@@ -2646,13 +2660,20 @@ export class DiffTracker {
                 if (!await vscode.workspace.applyEdit(createEdit)) {
                     return this.actionResult(filePath, 'failed', 'File creation was rejected', true);
                 }
+                if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during file creation', true); }
+                const beforeWriteError = this.validateActionTarget(filePath);
+                if (beforeWriteError) { return this.actionResult(filePath, 'conflict', beforeWriteError, true); }
                 try {
                     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
                 } catch {
+                    if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during creation write', true); }
                     this.markFileUnavailable(filePath, 'File was created but writing its restored content failed; review retained');
                     return this.actionResult(filePath, 'failed', 'File was created but writing its restored content failed; review retained', true);
                 }
                 const created = await this.readFileSnapshot(uri);
+                if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during creation write', true); }
+                const afterWriteError = this.validateActionTarget(filePath);
+                if (afterWriteError) { return this.actionResult(filePath, 'conflict', afterWriteError, true); }
                 if (created.kind !== 'text' || created.content !== content) {
                     return this.actionResult(filePath, 'failed', 'Created file content was not applied', true);
                 }
@@ -2689,6 +2710,8 @@ export class DiffTracker {
             if (saveTargetError) { return this.actionResult(filePath, 'conflict', saveTargetError, true); }
             const saved = await doc.save();
             if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during save', true); }
+            const afterSaveError = this.validateActionTarget(filePath);
+            if (afterSaveError) { return this.actionResult(filePath, 'conflict', afterSaveError, true); }
             if (!saved) {
                 this.markFileUnavailable(filePath, 'Editor buffer changed but saving failed; pending review retained');
                 return this.actionResult(filePath, 'failed', 'Editor buffer changed but saving failed; pending review retained', true);

@@ -1090,6 +1090,36 @@ test('DT-09 old recovery cleanup cannot remove a new-session record with the sam
     const old=tracker.revertHistory[0],replacement={...old,items:[...old.items]};tracker.advanceEpoch();tracker.revertHistory=[replacement];
     await tracker.removeRevertRecord(old);assert.equal(tracker.revertHistory[0],replacement);
 });
+for(const phase of ['save','apply','write']) for(const change of ['branch','operation']) test(`DT-07 file Revert retains review on ${change} during ${phase}`,async()=>{
+    const p=file();seed(p,'base','changed');if(phase!=='save')fs.unlinkSync(p);await scan(p);
+    const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([context]);
+    const gate=pause(p,phase),operation=tracker.revertFile(p);await gate.entered;
+    tracker.observeGitContext({...context,...(change==='branch'?{headName:'other'}:{inProgress:true})});gate.release();const result=await operation;
+    assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);assert.ok(pending(p));
+    if(phase==='apply')assert.equal(disk(p),'','must not populate the file after pause');
+});
+for(const version of [1,2]) test(`DT-07 only actual V1 restoration adopts initial Git context (V${version})`,async()=>{
+    const p=file();seed(p,'base','changed');const storage=path.join(root,`storage-${index++}`);fs.mkdirSync(storage);
+    fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({version,isRecording:true,baselineState:'ready',workspaceRoots:[root],fileSnapshots:[[p,'base']],baselineExistingFiles:[p],unresolvedBaselineFiles:[],revertHistory:[],gitContexts:[]}));
+    tracker.storageUri=Uri.file(storage);assert.equal(await tracker.restorePersistedState(),'restored');
+    tracker.reconcileRestoredGitContexts([{repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    assert.equal(!!tracker.getGitPauseReason(p),version===2);assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),version===1);
+});
+for(const phase of ['apply','write']) test(`DT-07 Undo recreation retains recovery on Git pause during ${phase}`,async()=>{
+    const p=file();fs.writeFileSync(p,'reviewed');await tracker.onExternalFileCreated(Uri.file(p));
+    await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
+    const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([context]);
+    const gate=pause(p,phase),operation=tracker.undoLastRevert();await gate.entered;tracker.observeGitContext({...context,headName:'other'});gate.release();
+    const result=(await operation).results[0];assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);
+    if(phase==='apply')assert.equal(disk(p),'');
+});
+test('DT-07 V1 migration adoption cannot be reused for a later appearing repository',async()=>{
+    const p=file(),storage=path.join(root,`storage-${index++}`);seed(p,'base');fs.mkdirSync(storage);
+    fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({version:1,isRecording:true,fileSnapshots:[[p,'base']],baselineExistingFiles:[p]}));
+    tracker.storageUri=Uri.file(storage);await tracker.restorePersistedState();tracker.reconcileRestoredGitContexts([]);
+    tracker.reconcileRestoredGitContexts([{repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
+    assert.ok(tracker.getGitPauseReason(p));
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
