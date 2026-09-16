@@ -1,0 +1,87 @@
+name: Verification
+
+on:
+  push:
+    branches:
+      - main
+      - fix/difftracker-060-review-safety
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+
+  extension-host:
+    name: VS Code Stable Host (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Extension Host (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:host
+      - name: Extension Host (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:host
+
+  minimum-extension-host:
+    name: VS Code 1.80 Host (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Extension Host (VS Code 1.80.2)
+        env:
+          DIFF_TRACKER_VSCODE_VERSION: 1.80.2
+        run: xvfb-run -a npm run test:host
+
+  package:
+    name: VSIX package
+    needs: [quality, extension-host, minimum-extension-host]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run package -- --out diff-tracker.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diff-tracker-vsix
+          path: diff-tracker.vsix
+          if-no-files-found: error

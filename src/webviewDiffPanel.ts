@@ -1,5 +1,6 @@
+import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ChangeBlock, DiffTracker, TrackChangesEvent } from './diffTracker';
+import { ActionResult, ChangeBlock, DiffTracker, ReviewToken, TrackChangesEvent } from './diffTracker';
 
 type WebviewChangeBlockPayload = {
     blockId: string;
@@ -17,6 +18,8 @@ type WebviewInboundMessage = {
     command: string;
     requestId?: string;
     filePath?: string;
+    reviewToken?: ReviewToken;
+    viewGeneration?: number;
     blockIndex?: number;
     lineNumber?: number;
     hunkIndex?: number;
@@ -40,6 +43,10 @@ export class WebviewDiffPanel {
     private currentWrap: boolean = false;
     private currentExpandAll: boolean = false;
     private isInitialized: boolean = false;
+    private disposed = false;
+    private viewGeneration = 0;
+    private seenRequests = new Set<string>();
+    private activeRequest: string | undefined;
 
     private constructor(
         panel: vscode.WebviewPanel,
@@ -141,8 +148,14 @@ export class WebviewDiffPanel {
     }
 
     public update(filePath: string): void {
+        if (this.disposed) { return; }
+        if (filePath !== this.filePath) {
+            this.viewGeneration++;
+            this.seenRequests.clear();
+            this.activeRequest = undefined;
+        }
         this.filePath = filePath;
-        const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(filePath);
         this.panel.title = `Diff: ${fileName}`;
 
         if (this.isInitialized) {
@@ -155,6 +168,7 @@ export class WebviewDiffPanel {
     }
 
     private sendDataUpdate(): void {
+        if (this.disposed) { return; }
         const trackedChanges = this.diffTracker.getTrackedChanges();
         const fileChange = trackedChanges.find(c => c.filePath === this.filePath);
         const originalContent =
@@ -170,13 +184,20 @@ export class WebviewDiffPanel {
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
         const changeBlocks = this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
-        const fileName = this.filePath.split('/').pop() || this.filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(this.filePath);
         const lang = this.getLangForFileName(fileName);
 
         this.panel.webview.postMessage({
             command: 'updateData',
             filePath: this.filePath,
+            viewGeneration: this.viewGeneration,
+            reviewToken: this.diffTracker.getReviewToken(this.filePath),
+            mutationBusy: !!this.activeRequest,
             fileName,
+            hasFileChange: !!fileChange,
+            isDeleted: fileChange?.isDeleted ?? false,
+            unavailableReason: fileChange?.unavailableReason,
+            sourceNote: fileChange?.sourceNote,
             lang,
             oldContents: logicalOriginalContent,
             newContents: logicalCurrentContent,
@@ -188,61 +209,55 @@ export class WebviewDiffPanel {
     }
 
     private async handleMessage(message: WebviewInboundMessage): Promise<void> {
+        if (this.disposed) { return; }
+        const mutationCommands: Record<string, string> = {
+            revertBlock: 'diffTracker.revertBlock',
+            keepBlock: 'diffTracker.keepBlock',
+            keepAll: 'diffTracker.keepAllBlocksInFile',
+            revertAll: 'diffTracker.revertAllBlocksInFile'
+        };
+        const actionCommand = mutationCommands[message.command];
+        if (Object.prototype.hasOwnProperty.call(mutationCommands, message.command)) {
+            const generation = this.viewGeneration;
+            // Scope request IDs to the view. They identify delivery only, never the
+            // reviewed contents. The tracker validates the independent review token.
+            if (message.viewGeneration !== generation || message.filePath !== this.filePath) { return; }
+            if (!message.requestId || this.seenRequests.has(message.requestId)) { return; }
+            this.seenRequests.add(message.requestId);
+            if (this.activeRequest) {
+                this.postActionAck(message.requestId, false, 'Another review action is in progress');
+                return;
+            }
+            const blockRef = message.changeBlockId ?? message.changeBlockIndex;
+            const isBlock = message.command === 'revertBlock' || message.command === 'keepBlock';
+            if (!message.reviewToken ||
+                !this.diffTracker.getTrackedChanges().some(change => change.filePath === this.filePath) ||
+                (isBlock && typeof blockRef !== 'string' && typeof blockRef !== 'number')) {
+                this.postActionAck(message.requestId, false, 'Review target is unavailable; reopen the file');
+                this.sendDataUpdate();
+                return;
+            }
+            this.activeRequest = message.requestId;
+            try {
+                const result = await vscode.commands.executeCommand<ActionResult>(
+                    actionCommand, this.filePath, ...(isBlock ? [blockRef] : []), message.reviewToken
+                );
+                if (this.disposed || generation !== this.viewGeneration) { return; }
+                this.postActionAck(message.requestId, result?.status === 'success', result?.reason ?? 'Action did not complete', result);
+            } catch (error) {
+                if (this.disposed || generation !== this.viewGeneration) { return; }
+                this.postActionAck(message.requestId, false, error);
+            } finally {
+                if (!this.disposed && generation === this.viewGeneration) {
+                    this.activeRequest = undefined;
+                    this.sendDataUpdate();
+                }
+            }
+            // Command events may arrive before their acknowledgement. Send the current
+            // state after the acknowledgement too, so controls can leave their busy state.
+            return;
+        }
         switch (message.command) {
-            case 'revertBlock':
-                if (message.filePath && (message.changeBlockId !== undefined || message.changeBlockIndex !== undefined)) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.revertBlock',
-                            message.filePath,
-                            message.changeBlockId ?? message.changeBlockIndex
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'keepBlock':
-                if (message.filePath && (message.changeBlockId !== undefined || message.changeBlockIndex !== undefined)) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.keepBlock',
-                            message.filePath,
-                            message.changeBlockId ?? message.changeBlockIndex
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'keepAll':
-                if (message.filePath) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.keepAllBlocksInFile',
-                            message.filePath
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
-            case 'revertAll':
-                if (message.filePath) {
-                    try {
-                        const success = await vscode.commands.executeCommand<boolean>(
-                            'diffTracker.revertAllBlocksInFile',
-                            message.filePath
-                        );
-                        this.postActionAck(message.requestId, success !== false);
-                    } catch (error) {
-                        this.postActionAck(message.requestId, false, error);
-                    }
-                }
-                break;
             case 'setStyle':
                 if (message.style === 'split' || message.style === 'unified') {
                     this.currentStyle = message.style;
@@ -261,20 +276,25 @@ export class WebviewDiffPanel {
         }
     }
 
-    private postActionAck(requestId: string | undefined, ok: boolean, error?: unknown): void {
-        if (!requestId) {
+    private postActionAck(requestId: string | undefined, ok: boolean, error?: unknown, result?: ActionResult): void {
+        if (!requestId || this.disposed) {
             return;
         }
 
         this.panel.webview.postMessage({
             command: 'actionAck',
             requestId,
+            filePath: this.filePath,
+            viewGeneration: this.viewGeneration,
             ok,
+            status: result?.status ?? (ok ? 'success' : 'failed'),
+            bufferChanged: result?.bufferChanged ?? false,
             error: ok ? undefined : (error instanceof Error ? error.message : String(error ?? 'Unknown error'))
         });
     }
 
     private updateTheme(): void {
+        if (this.disposed) { return; }
         const themeKind = vscode.window.activeColorTheme.kind;
         const themeType = themeKind === vscode.ColorThemeKind.Light ? 'light' : 'dark';
         this.panel.webview.postMessage({ command: 'setTheme', themeType });
@@ -320,7 +340,7 @@ export class WebviewDiffPanel {
         const currentContent = fileChange?.currentContent ?? originalContent;
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
-        const fileName = this.filePath.split('/').pop() || this.filePath.split('\\').pop() || 'file';
+        const fileName = displayFileName(this.filePath);
         const escapedFileName = this.escapeHtml(fileName);
 
         // Get change blocks from diffTracker - this is the source of truth for block indexing
@@ -516,6 +536,7 @@ export class WebviewDiffPanel {
         <button id="btn-keep-all" class="btn-keep-all">Keep All</button>
         <button id="btn-reject-all" class="btn-reject-all">Reject All</button>
     </div>
+    <div id="source-note" role="status" style="padding: 4px 12px;"></div>
     <div id="diff-container">
         <div class="loading">Loading diff...</div>
     </div>
@@ -537,6 +558,12 @@ export class WebviewDiffPanel {
         const btnRejectAll = document.getElementById('btn-reject-all');
 
         let filePath = ${serializedFilePath};
+        let viewGeneration = ${this.viewGeneration};
+        let reviewToken = ${this.serializeForInlineScript(this.diffTracker.getReviewToken(this.filePath) ?? null)};
+        let hasFileChange = ${!!fileChange};
+        let isDeleted = ${fileChange?.isDeleted ?? false};
+        let unavailableReason = ${this.serializeForInlineScript(fileChange?.unavailableReason ?? '')};
+        let sourceNote = ${this.serializeForInlineScript(fileChange?.sourceNote ?? '')};
 
         const oldFile = {
             name: ${serializedFileName},
@@ -561,6 +588,7 @@ export class WebviewDiffPanel {
         let pendingMutationRequestId = null;
         let pendingGlobalActionRequestId = null;
         let waitingForRefresh = false;
+        let serverMutationBusy = false;
         let requestSequence = 0;
         const pendingBlockActions = new Set();
         const pendingRequests = new Map();
@@ -588,7 +616,7 @@ export class WebviewDiffPanel {
         }
 
         function isMutationLocked() {
-            return pendingMutationRequestId !== null || waitingForRefresh;
+            return pendingMutationRequestId !== null || waitingForRefresh || serverMutationBusy;
         }
 
         function setToolbarButtonsDisabled(disabled) {
@@ -597,7 +625,7 @@ export class WebviewDiffPanel {
         }
 
         function updateToolbarMutationState() {
-            setToolbarButtonsDisabled(isMutationLocked());
+            setToolbarButtonsDisabled(isMutationLocked() || !!unavailableReason || !hasFileChange);
         }
 
         function setBlockWrapperBusy(wrapper, busy) {
@@ -854,8 +882,8 @@ export class WebviewDiffPanel {
             return annotations;
         }
 
-        function sendBlockMutation(command, blockId, wrapper) {
-            if (!blockId || isMutationLocked()) {
+        function sendBlockMutation(command, blockId, wrapper, reviewed) {
+            if (!blockId || isMutationLocked() || reviewed.filePath !== filePath || reviewed.viewGeneration !== viewGeneration) {
                 return;
             }
 
@@ -865,7 +893,9 @@ export class WebviewDiffPanel {
 
             vscode.postMessage({
                 command,
-                filePath: filePath,
+                filePath: reviewed.filePath,
+                viewGeneration: reviewed.viewGeneration,
+                reviewToken: reviewed.reviewToken,
                 changeBlockId: blockId,
                 requestId
             });
@@ -882,11 +912,13 @@ export class WebviewDiffPanel {
             vscode.postMessage({
                 command,
                 filePath: filePath,
+                viewGeneration,
+                reviewToken,
                 requestId
             });
         }
 
-        function createHunkActionButtons(blockId, blockIndex) {
+        function createHunkActionButtons(blockId, blockIndex, reviewed) {
             const wrapper = document.createElement('div');
             wrapper.className = 'hunk-actions';
             
@@ -896,7 +928,7 @@ export class WebviewDiffPanel {
             revertBtn.title = 'Revert this change (block ' + (blockIndex + 1) + ')';
             revertBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                sendBlockMutation('revertBlock', blockId, wrapper);
+                sendBlockMutation('revertBlock', blockId, wrapper, reviewed);
             });
 
             const keepBtn = document.createElement('button');
@@ -905,7 +937,7 @@ export class WebviewDiffPanel {
             keepBtn.title = 'Accept this change (block ' + (blockIndex + 1) + ')';
             keepBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                sendBlockMutation('keepBlock', blockId, wrapper);
+                sendBlockMutation('keepBlock', blockId, wrapper, reviewed);
             });
 
             wrapper.appendChild(revertBtn);
@@ -917,8 +949,31 @@ export class WebviewDiffPanel {
         }
 
         function renderDiff(style) {
+            const reviewed = { filePath, viewGeneration, reviewToken };
+            const sourceNotice = document.getElementById('source-note');
+            sourceNotice.textContent = sourceNote;
+            sourceNotice.hidden = !sourceNote;
             currentStyle = style;
             container.innerHTML = '';
+
+            if (unavailableReason) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                notice.textContent = 'Review unavailable: ' + unavailableReason;
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
+
+            // File existence is reviewable even when there are no text hunks.
+            if (hasFileChange && oldFile.contents === newFile.contents && changeBlocks.length === 0) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                notice.textContent = isDeleted ? 'Empty file deleted — Keep or Revert this file.' : 'Empty file created — Keep or Revert this file.';
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
 
             // Check for no changes: both content identical AND no change blocks
             const hasContentDiff = oldFile.contents !== newFile.contents;
@@ -949,7 +1004,7 @@ export class WebviewDiffPanel {
                 expandUnchanged: currentExpandAll,
                 disableFileHeader: true,
                 renderAnnotation(annotation) {
-                    return createHunkActionButtons(annotation.metadata.blockId, annotation.metadata.blockIndex);
+                    return createHunkActionButtons(annotation.metadata.blockId, annotation.metadata.blockIndex, reviewed);
                 }
             });
 
@@ -997,6 +1052,7 @@ export class WebviewDiffPanel {
             if (message.command === 'setTheme' && fileDiffInstance) {
                 fileDiffInstance.setThemeType(message.themeType);
             } else if (message.command === 'actionAck') {
+                if (message.filePath !== filePath || message.viewGeneration !== viewGeneration) { return; }
                 const requestId = typeof message.requestId === 'string' ? message.requestId : undefined;
                 if (!requestId) {
                     return;
@@ -1019,7 +1075,7 @@ export class WebviewDiffPanel {
                     pendingGlobalActionRequestId = null;
                 }
 
-                const ok = message.ok !== false;
+                const ok = message.ok === true;
                 debugActionFlow('ack', {
                     requestId,
                     ok,
@@ -1040,6 +1096,11 @@ export class WebviewDiffPanel {
                 waitingForRefresh = true;
                 updateToolbarMutationState();
             } else if (message.command === 'updateData') {
+                if (typeof message.viewGeneration !== 'number' || message.viewGeneration < viewGeneration) { return; }
+                const switchedView = message.viewGeneration !== viewGeneration;
+                viewGeneration = message.viewGeneration;
+                reviewToken = message.reviewToken;
+                serverMutationBusy = message.mutationBusy === true;
                 // Update data and re-render with current style
                 if (typeof message.filePath === 'string') {
                     filePath = message.filePath;
@@ -1052,6 +1113,10 @@ export class WebviewDiffPanel {
                     oldFile.lang = message.lang;
                     newFile.lang = message.lang;
                 }
+                hasFileChange = message.hasFileChange === true;
+                isDeleted = message.isDeleted === true;
+                unavailableReason = typeof message.unavailableReason === 'string' ? message.unavailableReason : '';
+                sourceNote = typeof message.sourceNote === 'string' ? message.sourceNote : '';
                 oldFile.contents = message.oldContents;
                 newFile.contents = message.newContents;
                 // Replace array reference atomically to avoid race conditions
@@ -1063,10 +1128,12 @@ export class WebviewDiffPanel {
                     currentExpandAll = message.expandAll;
                 }
                 waitingForRefresh = false;
-                pendingMutationRequestId = null;
-                pendingGlobalActionRequestId = null;
-                pendingRequests.clear();
-                pendingBlockActions.clear();
+                if (switchedView || !serverMutationBusy) {
+                    pendingMutationRequestId = null;
+                    pendingGlobalActionRequestId = null;
+                    pendingRequests.clear();
+                    pendingBlockActions.clear();
+                }
                 renderDiff(currentStyle);
             }
         });
@@ -1148,7 +1215,11 @@ export class WebviewDiffPanel {
     }
 
     public dispose(): void {
-        WebviewDiffPanel.currentPanel = undefined;
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.viewGeneration++;
+        this.seenRequests.clear();
+        if (WebviewDiffPanel.currentPanel === this) { WebviewDiffPanel.currentPanel = undefined; }
         this.panel.dispose();
         while (this.disposables.length) {
             const disposable = this.disposables.pop();

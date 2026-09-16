@@ -1,8 +1,16 @@
 .vscode/**
 .vscode-test/**
+.github/**
+docs/**
 src/**
+test/**
 .gitignore
 .yarnrc
+eslint.config.mjs
+esbuild.webview.js
+findings.md
+progress.md
+task_plan.md
 vsc-extension-quickstart.md
 **/tsconfig.json
 **/.eslintrc.json

@@ -1,5 +1,6 @@
+import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { DiffTracker, TrackChangesEvent } from './diffTracker';
+import { ActionResult, BatchActionResult, DiffTracker, ReviewToken, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
 import { DiffTreeDataProvider } from './diffTreeView';
 import { DiffHoverProvider } from './hoverProvider';
@@ -11,6 +12,7 @@ import { SettingsTreeDataProvider } from './settingsTreeView';
 import { WebviewDiffPanel } from './webviewDiffPanel';
 import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
+import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -21,6 +23,7 @@ let codeLensProvider: DiffCodeLensProvider;
 let settingsTreeDataProvider: SettingsTreeDataProvider;
 let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
+let gitContextMonitor: GitContextMonitor | undefined;
 
 type DefaultOpenMode = 'webview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
@@ -52,11 +55,19 @@ function getDefaultOpenMode(): DefaultOpenMode {
     return 'webview';
 }
 
+function isDeletedReview(filePath: string, filePathOrItem: string | any): boolean {
+    const tracked = diffTracker.getTrackedChanges().find(change => change.filePath === filePath);
+    return tracked ? tracked.isDeleted === true : extractIsDeleted(filePathOrItem) === true;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
+    const runningExtensionTests = context.extensionMode === vscode.ExtensionMode.Test;
 
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
-    const restoredSession = await diffTracker.restorePersistedState();
+    // Commands and restored review views must never precede Git reconciliation.
+    diffTracker.setGitContextPending(true);
+    const restoreOutcome = await diffTracker.restorePersistedState();
     decorationManager = new DecorationManager(diffTracker);
     statusBarManager = new StatusBarManager(diffTracker);
     originalContentProvider = new OriginalContentProvider(diffTracker);
@@ -95,12 +106,40 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     };
 
-    const startRecordingFlow = () => {
+    let recordingRequest = 0;
+    const startRecordingFlow = async (): Promise<boolean> => {
+        const request = ++recordingRequest;
+        // Establish Git identity before capturing a fresh baseline; never adopt
+        // a late context onto snapshots that might predate a checkout.
+        if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
+        if (request !== recordingRequest) { return false; }
+        if (diffTracker.isRecoveryBlocked()) {
+            const answer = await vscode.window.showErrorMessage(
+                'Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
+                { modal: true },
+                'Discard Saved Session and Rebuild'
+            );
+            if (answer !== 'Discard Saved Session and Rebuild' || !await diffTracker.discardRecoveryState()) {
+                return false;
+            }
+        } else if (!diffTracker.getIsRecording() && diffTracker.getBaselineState() === 'building') {
+            const answer = await vscode.window.showWarningMessage(
+                'Diff Tracker recovered an incomplete or different-workspace baseline. Starting will discard that review and build a new baseline.',
+                { modal: true },
+                'Rebuild Baseline'
+            );
+            if (answer !== 'Rebuild Baseline') { return false; }
+        }
         diffTracker.startRecording();
+        if (gitContextMonitor?.isReady()) {
+            diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
+        }
         void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', true);
+        return diffTracker.getIsRecording();
     };
 
     const stopRecordingFlow = () => {
+        ++recordingRequest;
         diffTracker.stopRecording();
         void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', false);
     };
@@ -136,20 +175,119 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.workspace.registerTextDocumentContentProvider('diff-tracker-inline', inlineContentProvider)
     );
 
+    const refreshReview = () => {
+        codeLensProvider.refresh();
+        refreshChangesTree();
+        vscode.window.visibleTextEditors.forEach(editor => decorationManager.updateDecorations(editor));
+    };
+
+    const reportAction = (result: ActionResult): ActionResult => {
+        refreshReview();
+        if (result.status !== 'success') {
+            void vscode.window.showWarningMessage(
+                `${displayFileName(result.filePath)}: ${result.reason ?? result.status}`
+            );
+        }
+        return result;
+    };
+
+    const reportBatch = (verb: string, result: BatchActionResult): BatchActionResult => {
+        refreshReview();
+        const summary = `${verb} ${result.succeeded} file(s); ${result.failed} not completed.`;
+        const failures = result.results.filter(item => item.status !== 'success');
+        if (failures.length > 0) {
+            void vscode.window.showWarningMessage(`${summary} ${failures.map(item =>
+                `${displayFileName(item.filePath)}: ${item.reason ?? item.status}`
+            ).join('; ')}`);
+        } else {
+            void vscode.window.showInformationMessage(summary);
+        }
+        return result;
+    };
+
+    const missingReview = (filePath: string): ActionResult => reportAction({
+        filePath, status: 'conflict', reason: 'Review version is unavailable; reopen or refresh the review before acting'
+    });
+
+    const gitPromptInFlight = new Set<string>();
+    const rebuildGitBaseline = async (
+        repoRoot: string,
+        contextSnapshot?: GitContextSnapshot,
+        confirmed = false
+    ): Promise<boolean> => {
+        const snapshot = contextSnapshot ?? gitContextMonitor?.getSnapshot(repoRoot);
+        if (!snapshot) {
+            void vscode.window.showWarningMessage('Diff Tracker: The Git repository is unavailable; its preserved review remains paused.');
+            return false;
+        }
+        if (snapshot.inProgress) {
+            void vscode.window.showWarningMessage('Diff Tracker: Finish or abort the Git merge/rebase before rebuilding this repository baseline.');
+            return false;
+        }
+        if (!confirmed) {
+            const answer = await vscode.window.showWarningMessage(
+                'Archive the current review and rebuild only this repository from disk? Pause automation and save or close dirty editors first.',
+                { modal: true, detail: repoRoot },
+                'Archive and Rebuild'
+            );
+            if (answer !== 'Archive and Rebuild') { return false; }
+        }
+        const currentSnapshot = gitContextMonitor?.getSnapshot(repoRoot);
+        if (!currentSnapshot || currentSnapshot.inProgress) { return false; }
+        const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
+        if (rebuilt) {
+            refreshReview();
+            void vscode.window.showInformationMessage('Diff Tracker: The repository review was archived and its baseline rebuilt.');
+        } else {
+            void vscode.window.showWarningMessage(
+                'Diff Tracker did not rebuild the repository. Its review remains paused; save dirty editors, wait for Git to become stable, and try again.'
+            );
+        }
+        return rebuilt;
+    };
+
+    const handleGitContextEvent = async (event: GitContextEvent): Promise<void> => {
+        if (event.kind === 'ready') {
+            if (diffTracker.getIsRecording() || restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
+                diffTracker.reconcileRestoredGitContexts(event.contexts);
+            }
+            diffTracker.setGitContextPending(false);
+            return;
+        }
+        const repoRoot = event.kind === 'changed' ? event.context.repoRoot : event.repoRoot;
+        const reason = event.kind === 'changed'
+            ? diffTracker.observeGitContext(event.context)
+            : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
+        if (!reason || runningExtensionTests || gitPromptInFlight.has(repoRoot)) { return; }
+        gitPromptInFlight.add(repoRoot);
+        try {
+            const answer = await vscode.window.showWarningMessage(
+                `Diff Tracker: ${reason}`,
+                { modal: true, detail: 'The existing review is preserved. Closing this message keeps it paused.' },
+                'Archive and Rebuild'
+            );
+            if (answer === 'Archive and Rebuild') {
+                await rebuildGitBaseline(repoRoot, event.kind === 'changed' ? event.context : undefined, true);
+            }
+        } finally {
+            gitPromptInFlight.delete(repoRoot);
+        }
+    };
+
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.toggleRecording', () => {
             if (diffTracker.getIsRecording()) {
                 stopRecordingFlow();
             } else {
-                startRecordingFlow();
+                return startRecordingFlow();
             }
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.startRecording', () => {
-            startRecordingFlow();
+            return startRecordingFlow();
         })
     );
 
@@ -158,6 +296,35 @@ export async function activate(context: vscode.ExtensionContext) {
             stopRecordingFlow();
         })
     );
+
+    if (runningExtensionTests) {
+        context.subscriptions.push(
+            vscode.commands.registerCommand('diffTracker._testState', () => ({
+                isRecording: diffTracker.getIsRecording(),
+                baselineState: diffTracker.getBaselineState(),
+                reviewTokens: diffTracker.getReviewTokens(),
+                trackedChanges: diffTracker.getTrackedChanges(),
+                gitPauses: diffTracker.getPausedGitRepositories()
+            })),
+            vscode.commands.registerCommand('diffTracker._testRevertFile', (filePath: string) => {
+                const token = diffTracker.getReviewToken(filePath);
+                return token ? diffTracker.revertFile(filePath, token) : undefined;
+            }),
+            vscode.commands.registerCommand('diffTracker._testRevertBlock', (filePath: string) => {
+                const token = diffTracker.getReviewToken(filePath);
+                const block = diffTracker.getChangeBlocks(filePath)[0];
+                return token && block ? diffTracker.revertBlock(filePath, block.blockId, token) : undefined;
+            }),
+            vscode.commands.registerCommand('diffTracker._testRevertAll', () => {
+                return diffTracker.revertAllChanges(diffTracker.getReviewTokens());
+            }),
+            vscode.commands.registerCommand('diffTracker._testUndoLastRevert', () => diffTracker.undoLastRevert()),
+            vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
+                const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
+                return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
+            })
+        );
+    }
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.beginAutomationSession', (target?: unknown) => {
@@ -198,7 +365,7 @@ export async function activate(context: vscode.ExtensionContext) {
             const currentUri = vscode.Uri.file(filePath);
             const originalUri = currentUri.with({ scheme: 'diff-tracker-original' });
 
-            const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'file';
+            const fileName = displayFileName(filePath);
 
             await vscode.commands.executeCommand('vscode.diff',
                 originalUri,
@@ -230,45 +397,79 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertAllChanges', async () => {
-            const changes = diffTracker.getTrackedChanges();
+        vscode.commands.registerCommand('diffTracker.revertAllChanges', async (reviewTokens?: ReviewToken[]) => {
+            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
+            const changes = tokens;
             if (changes.length === 0) {
-                return;
+                return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
             }
 
             // Confirm with user
             const answer = await vscode.window.showWarningMessage(
-                `Revert all ${changes.length} file(s) to their original state? This cannot be undone.`,
+                `Revert all ${changes.length} file(s) to their original state? Review pending changes and save any dirty editors first.`,
                 { modal: true },
                 'Revert All',
                 'Cancel'
             );
 
             if (answer === 'Revert All') {
-                const revertedCount = await diffTracker.revertAllChanges();
-                refreshChangesTree();
-                decorationManager.clearAllDecorations();
-                vscode.window.showInformationMessage(`Reverted ${revertedCount} file(s)`);
+                return reportBatch('Reverted', await diffTracker.revertAllChanges(tokens));
             }
+            return {
+                results: changes.map(change => ({ filePath: change.filePath, status: 'cancelled', reason: 'Revert cancelled' })),
+                succeeded: 0,
+                failed: changes.length
+            } satisfies BatchActionResult;
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepAllChanges', async () => {
-            const changes = diffTracker.getTrackedChanges();
+        vscode.commands.registerCommand('diffTracker.keepAllChanges', async (reviewTokens?: ReviewToken[]) => {
+            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
+            const changes = tokens;
             if (changes.length === 0) {
-                return;
+                return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
             }
 
-            const acceptedCount = await diffTracker.keepAllChanges();
-            refreshChangesTree();
-            decorationManager.clearAllDecorations();
-            vscode.window.showInformationMessage(`Accepted ${acceptedCount} file(s)`);
+            return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertFile', async (filePathOrItem: string | any) => {
+        vscode.commands.registerCommand('diffTracker.undoLastRevert', async () => {
+            const result = await diffTracker.undoLastRevert();
+            if (result.results.length === 0) {
+                void vscode.window.showInformationMessage('Diff Tracker: No recent Revert is available to undo.');
+                return result;
+            }
+            return reportBatch('Restored', result);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.rebuildGitBaseline', async () => {
+            const paused = diffTracker.getPausedGitRepositories();
+            if (paused.length === 0) {
+                void vscode.window.showInformationMessage('Diff Tracker: No Git repository review is paused.');
+                return false;
+            }
+            const selected = paused.length === 1
+                ? paused[0]
+                : await vscode.window.showQuickPick(
+                    paused.map(item => ({
+                        label: displayFileName(item.repoRoot),
+                        description: item.reason,
+                        detail: item.repoRoot,
+                        value: item
+                    })),
+                    { placeHolder: 'Choose the paused repository to archive and rebuild' }
+                ).then(item => item?.value);
+            return selected ? rebuildGitBaseline(selected.repoRoot) : false;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.revertFile', async (filePathOrItem: string | any, reviewToken?: ReviewToken) => {
             const filePath = typeof filePathOrItem === 'string'
                 ? filePathOrItem
                 : filePathOrItem?.filePath;
@@ -277,23 +478,28 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
+            // Tree items carry the version shown; direct command invocations capture
+            // their target before opening the modal and never recapture afterward.
+            const token = reviewToken ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getReviewToken(filePath) : filePathOrItem.reviewToken);
+            if (!token) { return missingReview(filePath); }
+
             const answer = await vscode.window.showWarningMessage(
-                `Revert changes for ${filePath}? This cannot be undone.`,
+                `Revert changes for ${displayFileName(filePath)}? Review pending changes and save any dirty editors first.`,
                 { modal: true },
                 'Revert',
                 'Cancel'
             );
 
             if (answer !== 'Revert') {
-                return;
+                return { status: 'cancelled', filePath, reason: 'Revert cancelled' } satisfies ActionResult;
             }
 
-            const success = await diffTracker.revertFile(filePath);
-            if (success) {
-                refreshChangesTree();
-                decorationManager.clearAllDecorations();
-                vscode.window.showInformationMessage('File reverted to original content');
+            const result = reportAction(await diffTracker.revertFile(filePath, token));
+            if (result.status === 'success') {
+                void vscode.window.showInformationMessage('File reverted to original content');
             }
+            return result;
         })
     );
 
@@ -319,12 +525,10 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const deletedFromItem = extractIsDeleted(filePathOrItem);
-            const deletedFromTracked = diffTracker.getTrackedChanges().find(change => change.filePath === filePath)?.isDeleted === true;
-            const isDeleted = deletedFromItem ?? deletedFromTracked;
+            const isDeleted = isDeletedReview(filePath, filePathOrItem);
             const defaultMode = getDefaultOpenMode();
 
-            if (isDeleted && defaultMode === 'original') {
+            if (isDeleted && (defaultMode === 'original' || defaultMode === 'splitOriginalWebview')) {
                 await vscode.commands.executeCommand('diffTracker.showWebviewDiff', filePath);
                 return;
             }
@@ -352,38 +556,33 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.clearDiffs', async () => {
-            if (diffTracker.getIsRecording()) {
-                await diffTracker.resetBaselineToCurrentState();
-            } else {
-                diffTracker.clearDiffs();
+            const wasRecording = diffTracker.getIsRecording();
+            if (!await diffTracker.resetBaselineToCurrentState()) {
+                vscode.window.showWarningMessage('Diff Tracker: Baseline reset did not complete. Check the current review and any persistence warnings.');
+                return false;
             }
             refreshChangesTree();
             decorationManager.clearAllDecorations();
-            vscode.window.showInformationMessage('Diff Tracker: Baseline reset to current workspace state');
+            vscode.window.showInformationMessage(wasRecording
+                ? 'Diff Tracker: Baseline reset to current workspace state'
+                : 'Diff Tracker: Saved baseline and recovery history cleared; recording remains stopped');
+            return true;
         })
     );
 
     // Block-wise revert command
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertBlock', async (filePath: string, blockRef: string | number) => {
-            const success = await diffTracker.revertBlock(filePath, blockRef);
-            if (success) {
-                codeLensProvider.refresh();
-                refreshChangesTree();
-            }
-            return success;
+        vscode.commands.registerCommand('diffTracker.revertBlock', async (filePath: string, blockRef: string | number, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.revertBlock(filePath, blockRef, token));
         })
     );
 
     // Block-wise keep command
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepBlock', async (filePath: string, blockRef: string | number) => {
-            const success = await diffTracker.keepBlock(filePath, blockRef);
-            if (success) {
-                codeLensProvider.refresh();
-                refreshChangesTree();
-            }
-            return success;
+        vscode.commands.registerCommand('diffTracker.keepBlock', async (filePath: string, blockRef: string | number, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.keepBlock(filePath, blockRef, token));
         })
     );
 
@@ -420,25 +619,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Revert all blocks in a file
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.revertAllBlocksInFile', async (filePath: string) => {
-            const success = await diffTracker.revertFile(filePath);
-            if (success) {
-                codeLensProvider.refresh();
-                refreshChangesTree();
-            }
-            return success;
+        vscode.commands.registerCommand('diffTracker.revertAllBlocksInFile', async (filePath: string, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.revertFile(filePath, token));
         })
     );
 
     // Keep all blocks in a file (accept all changes)
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.keepAllBlocksInFile', async (filePath: string) => {
-            const success = await diffTracker.keepAllChangesInFile(filePath);
-            if (success) {
-                codeLensProvider.refresh();
-                refreshChangesTree();
-            }
-            return success;
+        vscode.commands.registerCommand('diffTracker.keepAllBlocksInFile', async (filePath: string, token?: ReviewToken) => {
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.keepAllChangesInFile(filePath, token));
         })
     );
 
@@ -470,6 +661,11 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.showOriginalAndWebviewSplit', async (filePathOrItem: string | any) => {
             const filePath = extractFilePath(filePathOrItem);
             if (!filePath) {
+                return;
+            }
+
+            if (isDeletedReview(filePath, filePathOrItem)) {
+                await vscode.commands.executeCommand('diffTracker.showWebviewDiff', filePath);
                 return;
             }
 
@@ -587,13 +783,37 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    gitContextMonitor = new GitContextMonitor(event => { void handleGitContextEvent(event); });
+    context.subscriptions.push(gitContextMonitor);
+    const gitContextAvailable = await gitContextMonitor.start();
+    if (gitContextAvailable && gitContextMonitor.isReady()) {
+        if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
+            diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+        }
+        diffTracker.setGitContextPending(false);
+    } else if (!gitContextAvailable) {
+        diffTracker.setGitContextPending(false);
+    }
+    if (!gitContextAvailable && !runningExtensionTests) {
+        void vscode.window.showWarningMessage(
+            'Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
+        );
+    }
+
     refreshChangesTree();
     await vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', diffTracker.getIsRecording());
 
-    if (restoredSession) {
+    if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
         updateVisibleDecorations();
+        if (restoreOutcome === 'recovered') {
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the last-good review session.');
+        } else if (restoreOutcome === 'incomplete') {
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the review in paused mode. Rebuild the baseline before review actions.');
+        }
+    } else if (restoreOutcome === 'blocked') {
+        void startRecordingFlow();
     } else {
-        startRecordingFlow();
+        void startRecordingFlow();
     }
 
     // Register disposables
@@ -601,9 +821,12 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(originalContentProvider);
 }
 
-export function deactivate() {
+export async function deactivate(): Promise<void> {
+    if (gitContextMonitor) {
+        gitContextMonitor.dispose();
+    }
     if (diffTracker) {
-        diffTracker.dispose();
+        await diffTracker.dispose();
     }
     if (decorationManager) {
         decorationManager.dispose();

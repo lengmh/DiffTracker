@@ -1,14 +1,30 @@
 {
   "name": "diff-tracker",
   "displayName": "Diff Tracker",
-  "description": "Visual file diff tracking - record and display changes in real-time",
-  "version": "0.6.0",
-  "publisher": "TinyTigerPan",
+  "description": "Review, keep, and safely revert workspace file changes in real time",
+  "version": "0.7.0",
+  "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
+  "license": "MIT",
   "icon": "resources/marketplace-icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TinyTigerPan/DiffTracker.git"
+    "url": "https://github.com/lengmh/DiffTracker.git"
+  },
+  "homepage": "https://github.com/lengmh/DiffTracker#readme",
+  "bugs": {
+    "url": "https://github.com/lengmh/DiffTracker/issues"
+  },
+  "keywords": [
+    "diff",
+    "review",
+    "changes",
+    "automation",
+    "source-control"
+  ],
+  "galleryBanner": {
+    "color": "#1f2937",
+    "theme": "dark"
   },
   "engines": {
     "vscode": "^1.80.0"
@@ -116,7 +132,7 @@
         "diffTracker.onlyTrackAutomatedChanges": {
           "type": "boolean",
           "default": false,
-          "description": "Only track automated changes. Manual typing in VS Code is ignored; external tool edits and tagged agent/extension edits are still recorded."
+          "description": "Track external and tagged automation changes. Editor changes without reliable source information remain visible for review; saving does not automatically accept them."
         }
       }
     },
@@ -160,6 +176,18 @@
         "title": "Accept All Changes",
         "category": "Diff Tracker",
         "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.undoLastRevert",
+        "title": "Undo Last Revert",
+        "category": "Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "diffTracker.rebuildGitBaseline",
+        "title": "Archive and Rebuild Paused Git Baseline",
+        "category": "Diff Tracker",
+        "icon": "$(repo-pull)"
       },
       {
         "command": "diffTracker.revertFile",
@@ -305,6 +333,16 @@
           "command": "diffTracker.clearDiffs",
           "when": "view == diffTracker.changesView",
           "group": "navigation"
+        },
+        {
+          "command": "diffTracker.undoLastRevert",
+          "when": "view == diffTracker.changesView",
+          "group": "navigation"
+        },
+        {
+          "command": "diffTracker.rebuildGitBaseline",
+          "when": "view == diffTracker.changesView",
+          "group": "navigation"
         }
       ],
       "editor/title": [
@@ -341,21 +379,33 @@
     "pretest": "npm run compile",
     "test:webview-anchors": "node test/webview-annotation-mapping.mjs",
     "test:similarity-pairing": "node test/similarity-pairing.mjs",
-    "lint": "eslint src --ext ts",
-    "package": "vsce package"
+    "lint": "eslint src",
+    "package": "vsce package",
+    "test:paths": "node test/path-display.mjs",
+    "test:tracker-safety": "node test/tracker-safety.mjs",
+    "test:review-ui": "node test/review-ui.mjs",
+    "test:git-context": "node test/git-context.mjs",
+    "test:git-repositories": "node test/git-repository-integration.mjs",
+    "test:host": "node test/host/run.mjs",
+    "test:performance": "node test/performance.mjs",
+    "test:stage2-probes": "node test/known-p0.mjs",
+    "test:legacy-manual-policy": "node test/legacy-manual-policy.mjs",
+    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories"
   },
   "devDependencies": {
+    "@pierre/diffs": "1.0.10",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.x",
-    "@types/vscode": "^1.80.0",
-    "@typescript-eslint/eslint-plugin": "^6.x",
-    "@typescript-eslint/parser": "^6.x",
-    "@vscode/vsce": "^2.22.0",
+    "@types/vscode": "1.80.0",
+    "@typescript-eslint/eslint-plugin": "^8.70.0",
+    "@typescript-eslint/parser": "^8.70.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.27.2",
-    "eslint": "^8.x",
+    "eslint": "^10.10.0",
     "typescript": "^5.2.0"
   },
   "dependencies": {
-    "@pierre/diffs": "^1.0.10",
     "diff": "^8.0.3",
     "ignore": "^5.3.2"
   }

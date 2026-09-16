@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import { DiffTracker, FileDiff } from './diffTracker';
+import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
+import { DiffTracker, FileDiff, ReviewToken } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -28,6 +28,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         // Root level - show files
         if (!element) {
             const changes = this.diffTracker.getTrackedChanges();
+            const reviewTokens = this.diffTracker.getReviewTokens();
             items.push(this.createRecordingItem());
 
             if (changes.length === 0) {
@@ -39,7 +40,8 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const revertButton = new TreeItem('Revert All Changes', vscode.TreeItemCollapsibleState.None);
             revertButton.command = {
                 command: 'diffTracker.revertAllChanges',
-                title: 'Revert All Changes'
+                title: 'Revert All Changes',
+                arguments: [reviewTokens]
             };
             revertButton.iconPath = new vscode.ThemeIcon('discard');
             revertButton.tooltip = `Restore all ${changes.length} file(s) to original state`;
@@ -49,7 +51,8 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const keepButton = new TreeItem('Accept All Changes', vscode.TreeItemCollapsibleState.None);
             keepButton.command = {
                 command: 'diffTracker.keepAllChanges',
-                title: 'Accept All Changes'
+                title: 'Accept All Changes',
+                arguments: [reviewTokens]
             };
             keepButton.iconPath = new vscode.ThemeIcon('check');
             keepButton.tooltip = `Accept all ${changes.length} file(s) as new baseline`;
@@ -111,15 +114,26 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
     }
 
     private createFileItem(fileDiff: FileDiff): TreeItem {
-        const displayName = fileDiff.isDeleted ? `${fileDiff.fileName} [Deleted]` : fileDiff.fileName;
+        const fileName = displayFileName(fileDiff.filePath);
+        const displayName = fileDiff.isDeleted ? `${fileName} [Deleted]` : fileName;
         const item = new TreeItem(displayName, vscode.TreeItemCollapsibleState.None);
         item.filePath = fileDiff.filePath;
+        item.reviewToken = this.diffTracker.getReviewToken(fileDiff.filePath);
         item.isDeleted = fileDiff.isDeleted;
+        item.description = fileDiff.unavailableReason ? `Unavailable: ${fileDiff.unavailableReason}` : undefined;
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
         item.iconPath = vscode.ThemeIcon.File;
         item.tooltip = fileDiff.isDeleted
             ? `${fileDiff.filePath}\nDeleted from disk`
             : fileDiff.filePath;
+
+        if (fileDiff.unavailableReason) {
+            item.tooltip += `\n${fileDiff.unavailableReason}`;
+        }
+        if (fileDiff.sourceNote) {
+            item.tooltip += `\n${fileDiff.sourceNote}`;
+            if (!fileDiff.unavailableReason) { item.description = 'Source uncertain'; }
+        }
 
         // Open with configured default mode
         item.command = {
@@ -134,28 +148,16 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         return item;
     }
 
-    private toWorkspaceRelative(filePath: string): string {
-        const uri = vscode.Uri.file(filePath);
-        const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
-        if (!workspaceFolder) {
-            return path.basename(filePath);
-        }
-
-        const relativePath = path.relative(workspaceFolder.uri.fsPath, filePath);
-        const normalizedRelative = relativePath.split(path.sep).join('/');
-
-        // Avoid collisions across workspace folders in multi-root workspaces.
-        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-        if (workspaceFolders.length > 1) {
-            return `${workspaceFolder.name}/${normalizedRelative}`;
-        }
-
-        return normalizedRelative;
+    private toWorkspaceRelative(filePath: string): string[] {
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+        return workspaceDisplayParts(
+            filePath,
+            workspaceFolder && { fsPath: workspaceFolder.uri.fsPath, name: workspaceFolder.name },
+            (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+        );
     }
 
-    private insertFileIntoTree(rootNode: DirNode, relativePath: string, fileDiff: FileDiff): void {
-        const normalized = relativePath.replace(/\\/g, '/');
-        const parts = normalized.split('/').filter(Boolean);
+    private insertFileIntoTree(rootNode: DirNode, parts: string[], fileDiff: FileDiff): void {
         if (parts.length === 0) {
             rootNode.files.push(fileDiff);
             return;
@@ -228,6 +230,7 @@ class TreeItem extends vscode.TreeItem {
     public children?: TreeItem[];
     public filePath?: string;
     public isDeleted?: boolean;
+    public reviewToken?: ReviewToken;
 
     constructor(
         public readonly label: string,
