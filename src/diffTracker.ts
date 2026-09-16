@@ -453,16 +453,24 @@ export class DiffTracker {
         this.baselineBuilding = true;
         this._onDidChangeBaselineState.fire('building');
 
-        vscode.workspace.textDocuments.forEach(doc => {
-            this.ensureSnapshotForDocument(doc, true);
-        });
-
-        void this.startExternalWatchers();
-        void this.initializeWorkspaceSnapshots().catch(() => {
-            if (this.isCurrentEpoch(epoch) && this.baselineBuilding) {
-                vscode.window.showWarningMessage('Diff Tracker: Baseline scan did not complete; review remains incomplete.');
-            }
-        });
+        try {
+            // Register coverage synchronously before capturing even open documents.
+            // Ignore discovery belongs to the subsequent scan, not this handoff.
+            this.activateExternalWatchers(this.createExternalWatchers(epoch));
+            vscode.workspace.textDocuments.forEach(doc => {
+                this.ensureSnapshotForDocument(doc, true);
+            });
+            void this.initializeWorkspaceSnapshots().catch(() => {
+                if (this.isCurrentEpoch(epoch) && this.baselineBuilding) {
+                    vscode.window.showWarningMessage('Diff Tracker: Baseline scan did not complete; review remains incomplete.');
+                }
+            });
+        } catch (error) {
+            this.disposeFileWatchers();
+            this.externalWatcherEnabled = false;
+            vscode.window.showWarningMessage('Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
+            console.warn('Failed to start baseline recording', error);
+        }
         this.schedulePersistState();
 
         this._onDidChangeRecordingState.fire(true);
@@ -2701,14 +2709,11 @@ export class DiffTracker {
         }
         try {
             if (review && !await this.verifyReview(review)) { return this.actionResult(filePath, 'conflict', 'Review changed before deletion'); }
-            const edit = new vscode.WorkspaceEdit();
-            edit.deleteFile(uri, { ignoreIfNotExists: true, recursive: false });
             const targetError = this.validateActionTarget(filePath);
             if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
-            if (!await vscode.workspace.applyEdit(edit)) {
-                return this.actionResult(filePath, 'failed', 'Editor rejected new-file deletion');
-            }
-            return this.actionResult(filePath, 'success');
+            // Like recovery deletion, this cannot be guarded by an expected file
+            // version across an asynchronous WorkspaceEdit. Never dispatch it.
+            return this.actionResult(filePath, 'conflict', 'Revert would delete a new file. Inspect and delete it manually; review remains pending until deletion is observed');
         } catch {
             return this.actionResult(filePath, 'failed', 'New-file deletion failed; review retained');
         }

@@ -22,6 +22,7 @@ const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
 const noopEvent = () => ({ dispose() {} });
 function createWatcher() {
+    fault(root,'watcher');
     const handlers = { change: [], create: [], delete: [] };
     const watcher = {
         active: true,
@@ -191,18 +192,19 @@ test('DT-02 nonempty → empty Keep → write → Revert preserves existing empt
     fs.writeFileSync(p,'next\n'); await scan(p);
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),''); assert.equal(pending(p),undefined);
 });
-test('DT-02 empty new file has file-level pending and Revert deletes it',async()=>{
+test('DT-02 empty new file remains pending until manual deletion',async()=>{
     const p=file(); fs.writeFileSync(p,''); await tracker.onExternalFileCreated(Uri.file(p));
     assert.ok(pending(p)); assert.equal(pending(p).isDeleted,false);
-    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    assert.equal((await tracker.revertFile(p)).status,'conflict');assert.equal(disk(p),'');assert.ok(pending(p));
+    fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));assert.equal(pending(p),undefined);
 });
 test('DT-02 deleting baseline empty file has pending and Revert recreates it',async()=>{
     const p=file(); seed(p,''); fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p));
     assert.equal(pending(p)?.isDeleted,true); assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'');
 });
-test('DT-02 unaccepted nonempty new file Revert uses existing deletion path',async()=>{
+test('DT-02 unaccepted new file Revert preserves content and dispatches no edit',async()=>{
     const p=file(); fs.writeFileSync(p,'new\n'); await tracker.onExternalFileCreated(Uri.file(p));
-    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    const before=counters.apply;assert.equal((await tracker.revertFile(p)).status,'conflict');assert.equal(disk(p),'new\n');assert.equal(counters.apply,before);assert.ok(pending(p));
 });
 test('DT-02 hunk Keep on a new file establishes existence for later Revert',async()=>{
     const p=file(); fs.writeFileSync(p,'accepted\n'); await tracker.onExternalFileCreated(Uri.file(p));
@@ -211,11 +213,11 @@ test('DT-02 hunk Keep on a new file establishes existence for later Revert',asyn
     fs.writeFileSync(p,'accepted\nremaining\n'); await scan(p);
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'accepted\n');
 });
-test('DT-02 accepted deletion followed by recreation Revert deletes recreation',async()=>{
+test('DT-02 accepted deletion followed by recreation requires manual deletion',async()=>{
     const p=file(); seed(p,'old\n'); fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p));
     assert.ok(succeeded(await tracker.keepAllChangesInFile(p))); assert.equal(tracker.baselineExistingFiles.has(p),false);
     fs.writeFileSync(p,'reborn\n'); await tracker.onExternalFileCreated(Uri.file(p));
-    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    assert.equal((await tracker.revertFile(p)).status,'conflict');assert.equal(disk(p),'reborn\n');assert.ok(pending(p));
 });
 test('DT-02 clean cached document cannot hide disk deletion',async()=>{
     const p=file(); seed(p,'old\n'); document(p); fs.unlinkSync(p);
@@ -463,14 +465,14 @@ test('DT-09 recovery record persistence failure blocks file Revert before mutati
     assert.ok(fs.existsSync(path.join(storage,'session-state.unsaved')));
     faults.delete(temp);
 });
-test('DT-09 Undo Last Revert recreates an unaccepted new file',async()=>{
+test('DT-09 legacy recovery record still recreates an unaccepted new file',async()=>{
     const p=file(); fs.writeFileSync(p,'new content'); await tracker.onExternalFileCreated(Uri.file(p));
-    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
     const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(disk(p),'new content'); assert.ok(pending(p));
 });
 test('DT-09 failed recovery content write retains the record after creating the resource',async()=>{
     const p=file(); fs.writeFileSync(p,'new content'); await tracker.onExternalFileCreated(Uri.file(p));
-    assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(fs.existsSync(p),false);
+    await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
     faults.set(p,{write:error('NoPermissions')});
     const undo=await tracker.undoLastRevert();
     assert.equal(undo.succeeded,0); assert.equal(undo.failed,1); assert.equal(undo.results[0].bufferChanged,true);
@@ -783,8 +785,7 @@ test('DT-08 change-before-create watcher order still recognizes a post-baseline 
     assert.equal(pending(p)?.unavailableReason,undefined);
     assert.equal(tracker.getOriginalContent(p),'');
     assert.equal(tracker.baselineExistingFiles.has(p),false);
-    assert.ok(succeeded(await tracker.revertFile(p)));
-    assert.equal(fs.existsSync(p),false);
+    assert.equal((await tracker.revertFile(p)).status,'conflict');assert.equal(disk(p),'new content');
 });
 test('DT-08 parent-only deletion event discovers baseline child deletion',async()=>{
     const dir=file('directory');fs.mkdirSync(dir);const p=path.join(dir,'child.m');seed(p,'base');fs.rmSync(dir,{recursive:true});
@@ -803,7 +804,8 @@ test('DT-06 removed workspace roots preserve a reloadable paused session',async(
 test('DT-06 reset after reverting a new file remains reloadable',async()=>{
     const p=file();fs.writeFileSync(p,'new');await tracker.onExternalFileCreated(Uri.file(p));
     tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));const storage=tracker.storageUri;
-    assert.ok(succeeded(await tracker.revertFile(p)));const stable=file();seed(stable,'stable');listedFiles=[Uri.file(stable)];
+    assert.equal((await tracker.revertFile(p)).status,'conflict');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
+    const stable=file();seed(stable,'stable');listedFiles=[Uri.file(stable)];
     await tracker.resetBaselineToCurrentState();await tracker.flushPendingPersistence();await tracker.dispose();
     tracker=new DiffTracker(storage);
     assert.notEqual(await tracker.restorePersistedState(),'blocked');
@@ -1017,6 +1019,29 @@ for(const action of ['file','block']) test(`DT-06 ${action} Keep preserves edits
     const operation=action==='file'?tracker.keepAllChangesInFile(p):tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId);
     await gate.entered;fs.writeFileSync(p,'newer external');gate.release();assert.equal(succeeded(await operation),true);
     assert.equal(tracker.getOriginalContent(p),'reviewed');assert.equal(pending(p)?.currentContent,'newer external');
+});
+test('DT-08 fresh Start watches open-document changes while ignore discovery waits',async()=>{
+    const p=file();fs.writeFileSync(p,'before');document(p);listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    assert.ok(watcherInstances.some(w=>w.active));assert.equal(tracker.getOriginalContent(p),'before');
+    fs.writeFileSync(p,'external during startup');emitWatcher('change',Uri.file(p));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');await waitUntil(()=>pending(p)?.currentContent==='external during startup');
+});
+test('DT-08 fresh Start watcher failure keeps baseline incomplete',async()=>{
+    const p=file();fs.writeFileSync(p,'before');document(p);listedFiles=[Uri.file(p)];faults.set(root,{watcher:error('ENOSPC')});
+    tracker.startRecording();await new Promise(resolve=>setTimeout(resolve,150));
+    assert.equal(tracker.getBaselineState(),'building');assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(watcherInstances.some(w=>w.active),false);
+});
+test('DT-08 Stop during initial ignore discovery prevents late watcher or Ready publication',async()=>{
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;tracker.stopRecording();gate.release();
+    await new Promise(resolve=>setTimeout(resolve,150));assert.equal(tracker.getIsRecording(),false);
+    assert.equal(watcherInstances.some(w=>w.active),false);assert.notEqual(tracker.getBaselineState(),'ready');
+});
+test('DT-04 batch Revert preserves new files while reverting existing files',async()=>{
+    const p=file(),q=file();seed(p,'base','changed');await scan(p);fs.writeFileSync(q,'new');await tracker.onExternalFileCreated(Uri.file(q));
+    const result=await tracker.revertAllChanges();assert.equal(result.succeeded,1);assert.equal(result.failed,1);
+    assert.equal(disk(p),'base');assert.equal(disk(q),'new');assert.ok(pending(q));
 });
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;

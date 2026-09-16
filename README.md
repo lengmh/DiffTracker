@@ -8,6 +8,9 @@ Undo that would delete a restored file requires manual deletion: inspect and del
 that file yourself, then retry Undo to acknowledge it. The recovery record remains
 available until then. VS Code does not provide a conditional, version-checked file
 deletion, so this branch never automatically deletes potentially newer work.
+Revert of a file absent from the baseline follows the same rule: inspect and delete
+it manually; the watcher clears its pending review after deletion. Batch Revert
+reports that item as a conflict while continuing with other files.
 Baseline growth and Keep must persist before review resumes. An interrupted or
 failed session write leaves a recovery marker and blocks automatic restoration;
 preserve the session and workspace before explicitly rebuilding.
