@@ -144,6 +144,7 @@ export class DiffTracker {
     private latestGitContexts = new Map<string, GitContextSnapshot | undefined>();
     private fileActionQueues = new Map<string, Promise<unknown>>();
     private recoveryActionQueue: Promise<void> = Promise.resolve();
+    private readonly creationTempRoots = new Set<string>();
     private mayAdoptLegacyGitContexts = false;
 
     private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
@@ -1432,6 +1433,7 @@ export class DiffTracker {
     }
 
     private isPathIgnored(uri: vscode.Uri): boolean {
+        if ([...this.creationTempRoots].some(root => this.pathBelongsToRoot(uri.fsPath, root))) { return true; }
         if (uri.scheme !== 'file') { return true; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') {
@@ -2505,32 +2507,9 @@ export class DiffTracker {
             this.activeWriteFiles.add(item.filePath);
             let bufferChanged = false;
             try {
-                const createEdit = new vscode.WorkspaceEdit();
-                createEdit.createFile(uri, { overwrite: false, ignoreIfExists: false });
-                if (!this.isCurrentEpoch(epoch)) {
-                    return this.actionResult(item.filePath, 'cancelled', 'Session changed before recovery creation');
-                }
-                bufferChanged = true;
-                if (!await vscode.workspace.applyEdit(createEdit)) {
-                    return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery file creation', true);
-                }
-                if (!this.isCurrentEpoch(epoch)) {
-                    return this.actionResult(item.filePath, 'cancelled', 'Session changed during recovery creation', true);
-                }
-                const beforeWriteError = this.validateActionTarget(item.filePath);
-                if (beforeWriteError) { return this.actionResult(item.filePath, 'conflict', beforeWriteError, true); }
-                try {
-                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(item.before.content));
-                } catch {
-                    return this.actionResult(item.filePath, 'failed', 'Recovery file was created but writing its content failed', true);
-                }
-                const created = await this.readFileSnapshot(uri);
-                if (!this.isCurrentEpoch(epoch) || this.validateActionTarget(item.filePath)) {
-                    return this.actionResult(item.filePath, 'conflict', 'Context changed during recovery creation; recovery retained', true);
-                }
-                if (created.kind !== 'text' || created.content !== item.before.content) {
-                    return this.actionResult(item.filePath, 'failed', 'Recovery file content was not applied', true);
-                }
+                const result = await this.createFileExclusively(item.filePath, item.before.content, epoch);
+                bufferChanged = !!result.bufferChanged;
+                if (result.status !== 'success') { return result; }
                 bufferChanged = false;
             } finally {
                 if (this.isCurrentEpoch(epoch)) {
@@ -2632,6 +2611,39 @@ export class DiffTracker {
         return { results, succeeded, failed: results.length - succeeded };
     }
 
+    private async createFileExclusively(filePath: string, content: string, epoch: number): Promise<ActionResult> {
+        let staging: string | undefined;
+        let published = false;
+        try {
+            staging = await fs.promises.mkdtemp(path.join(path.dirname(filePath), '.difftracker-restore-'));
+            // Retain the exclusion for delayed watcher events after cleanup.
+            this.creationTempRoots.add(staging);
+            const payload = path.join(staging, 'content');
+            await fs.promises.writeFile(payload, content, { flag: 'wx', mode: 0o600 });
+            if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed before file creation'); }
+            const error = this.validateActionTarget(filePath);
+            if (error) { return this.actionResult(filePath, 'conflict', error); }
+            // A hard link publishes fully written bytes atomically, failing if any
+            // file/symlink already occupies the destination. Never overwrite it.
+            await fs.promises.link(payload, filePath);
+            published = true;
+            const state = await this.readFileSnapshot(vscode.Uri.file(filePath));
+            if (!this.isCurrentEpoch(epoch) || this.validateActionTarget(filePath) ||
+                state.kind !== 'text' || state.content !== content) {
+                return this.actionResult(filePath, 'conflict', 'Context or content changed during file creation; recovery retained', true);
+            }
+            return this.actionResult(filePath, 'success', undefined, true);
+        } catch (error) {
+            return this.actionResult(filePath, 'conflict', `Exclusive file creation failed; no overwrite attempted: ${error instanceof Error ? error.message : String(error)}`, published);
+        } finally {
+            if (staging) {
+                // Only remove our payload; do not recursively delete unexpected files.
+                try { fs.unlinkSync(path.join(staging, 'content')); } catch { /* Preserve the action result. */ }
+                try { fs.rmdirSync(staging); } catch { /* Never delete unexpected children. */ }
+            }
+        }
+    }
+
     private async restoreFileToContent(
         filePath: string,
         content: string,
@@ -2661,36 +2673,9 @@ export class DiffTracker {
         this.activeWriteFiles.add(filePath);
         try {
             if (state.kind === 'missing') {
-                // Only confirmed absence permits creation. No overwrite fallback after open/save errors.
-                const createEdit = new vscode.WorkspaceEdit();
-                createEdit.createFile(uri, { overwrite: false, ignoreIfExists: false });
-                const targetError = this.validateActionTarget(filePath);
-                if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
-                // A failed WorkspaceEdit may have created the resource before rejecting
-                // a later entry, so conservatively retain recovery until disk is verified.
-                bufferChanged = true;
-                if (!await vscode.workspace.applyEdit(createEdit)) {
-                    return this.actionResult(filePath, 'failed', 'File creation was rejected', true);
-                }
-                if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during file creation', true); }
-                const beforeWriteError = this.validateActionTarget(filePath);
-                if (beforeWriteError) { return this.actionResult(filePath, 'conflict', beforeWriteError, true); }
-                try {
-                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
-                } catch {
-                    if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during creation write', true); }
-                    this.markFileUnavailable(filePath, 'File was created but writing its restored content failed; review retained');
-                    return this.actionResult(filePath, 'failed', 'File was created but writing its restored content failed; review retained', true);
-                }
-                const created = await this.readFileSnapshot(uri);
-                if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during creation write', true); }
-                const afterWriteError = this.validateActionTarget(filePath);
-                if (afterWriteError) { return this.actionResult(filePath, 'conflict', afterWriteError, true); }
-                if (created.kind !== 'text' || created.content !== content) {
-                    return this.actionResult(filePath, 'failed', 'Created file content was not applied', true);
-                }
-                bufferChanged = false;
-                return this.actionResult(filePath, 'success', undefined, true);
+                const result = await this.createFileExclusively(filePath, content, epoch);
+                bufferChanged = !!result.bufferChanged;
+                return result;
             }
             const doc = await vscode.workspace.openTextDocument(uri);
             if (options?.review && !await this.verifyReview(options.review)) {
@@ -2981,7 +2966,7 @@ export class DiffTracker {
      * Updates the snapshot so this block's changes become the new baseline
      */
     public keepBlock(filePath: string, blockRef: string | number, token = this.getReviewToken(filePath)): Promise<ActionResult> {
-        return this.queueFileAction(filePath, token, review => this.keepBlockReviewed(filePath, blockRef, review));
+        return this.queueRecoveryAction(() => this.queueFileAction(filePath, token, review => this.keepBlockReviewed(filePath, blockRef, review)));
     }
 
     private async keepBlockReviewed(filePath: string, blockRef: string | number, review: ReviewToken): Promise<ActionResult> {
@@ -3100,7 +3085,7 @@ export class DiffTracker {
      * Updates the snapshot to match current document content
      */
     public keepAllChangesInFile(filePath: string, token = this.getReviewToken(filePath)): Promise<ActionResult> {
-        return this.queueFileAction(filePath, token, review => this.keepFileReviewed(filePath, review));
+        return this.queueRecoveryAction(() => this.queueFileAction(filePath, token, review => this.keepFileReviewed(filePath, review)));
     }
 
     private async keepFileReviewed(filePath: string, review: ReviewToken): Promise<ActionResult> {

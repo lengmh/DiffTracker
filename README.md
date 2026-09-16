@@ -11,6 +11,9 @@ deletion, so this branch never automatically deletes potentially newer work.
 Revert of a file absent from the baseline follows the same rule: inspect and delete
 it manually; the watcher clears its pending review after deletion. Batch Revert
 reports that item as a conflict while continuing with other files.
+Restoring a deleted file publishes fully written content with an exclusive hard
+link. If the destination appears concurrently or the filesystem does not support
+hard links, the action reports a conflict without overwriting the destination.
 Baseline growth and Keep must persist before review resumes. An interrupted or
 failed session write leaves a recovery marker and blocks automatic restoration;
 preserve the session and workspace before explicitly rebuilding.

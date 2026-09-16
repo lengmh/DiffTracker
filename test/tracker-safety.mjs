@@ -20,6 +20,12 @@ let workspaceChanged;
 const docs = [];
 const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
+const nativeLink = fs.promises.link;
+fs.promises.link = async (source, destination) => {
+    await boundary(destination,'publish');fault(destination,'publish');
+    await nativeLink(source,destination);
+    await boundary(destination,'afterPublish');
+};
 const noopEvent = () => ({ dispose() {} });
 function createWatcher() {
     fault(root,'watcher');
@@ -470,13 +476,13 @@ test('DT-09 legacy recovery record still recreates an unaccepted new file',async
     await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
     const undo=await tracker.undoLastRevert(); assert.equal(undo.succeeded,1); assert.equal(disk(p),'new content'); assert.ok(pending(p));
 });
-test('DT-09 failed recovery content write retains the record after creating the resource',async()=>{
+test('DT-09 failed exclusive recovery publication retains the record without creating the resource',async()=>{
     const p=file(); fs.writeFileSync(p,'new content'); await tracker.onExternalFileCreated(Uri.file(p));
     await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
-    faults.set(p,{write:error('NoPermissions')});
+    faults.set(p,{publish:error('NoPermissions')});
     const undo=await tracker.undoLastRevert();
-    assert.equal(undo.succeeded,0); assert.equal(undo.failed,1); assert.equal(undo.results[0].bufferChanged,true);
-    assert.equal(fs.existsSync(p),true); assert.equal(disk(p),'');
+    assert.equal(undo.succeeded,0); assert.equal(undo.results[0].status,'conflict'); assert.equal(undo.results[0].bufferChanged,false);
+    assert.equal(fs.existsSync(p),false);
     assert.equal(tracker.revertHistory.length,1,'partial recovery remains retryable');
 });
 test('DT-09 destructive recovery requires manual deletion and retains its record until verified',async()=>{
@@ -1092,13 +1098,13 @@ test('DT-09 old recovery cleanup cannot remove a new-session record with the sam
     const old=tracker.revertHistory[0],replacement={...old,items:[...old.items]};tracker.advanceEpoch();tracker.revertHistory=[replacement];
     await tracker.removeRevertRecord(old);assert.equal(tracker.revertHistory[0],replacement);
 });
-for(const phase of ['save','apply','write']) for(const change of ['branch','operation']) test(`DT-07 file Revert retains review on ${change} during ${phase}`,async()=>{
+for(const phase of ['save','publish','afterPublish']) for(const change of ['branch','operation']) test(`DT-07 file Revert retains review on ${change} during ${phase}`,async()=>{
     const p=file();seed(p,'base','changed');if(phase!=='save')fs.unlinkSync(p);await scan(p);
     const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([context]);
     const gate=pause(p,phase),operation=tracker.revertFile(p);await gate.entered;
     tracker.observeGitContext({...context,...(change==='branch'?{headName:'other'}:{inProgress:true})});gate.release();const result=await operation;
     assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);assert.ok(pending(p));
-    if(phase==='apply')assert.equal(disk(p),'','must not populate the file after pause');
+    if(phase!=='save')assert.equal(disk(p),'base');
 });
 for(const version of [1,2]) test(`DT-07 only actual V1 restoration adopts initial Git context (V${version})`,async()=>{
     const p=file();seed(p,'base','changed');const storage=path.join(root,`storage-${index++}`);fs.mkdirSync(storage);
@@ -1107,13 +1113,13 @@ for(const version of [1,2]) test(`DT-07 only actual V1 restoration adopts initia
     tracker.reconcileRestoredGitContexts([{repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
     assert.equal(!!tracker.getGitPauseReason(p),version===2);assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),version===1);
 });
-for(const phase of ['apply','write']) test(`DT-07 Undo recreation retains recovery on Git pause during ${phase}`,async()=>{
+for(const phase of ['publish','afterPublish']) test(`DT-07 Undo recreation retains recovery on Git pause during ${phase}`,async()=>{
     const p=file();fs.writeFileSync(p,'reviewed');await tracker.onExternalFileCreated(Uri.file(p));
     await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);fs.unlinkSync(p);
     const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([context]);
     const gate=pause(p,phase),operation=tracker.undoLastRevert();await gate.entered;tracker.observeGitContext({...context,headName:'other'});gate.release();
     const result=(await operation).results[0];assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);
-    if(phase==='apply')assert.equal(disk(p),'');
+    assert.equal(disk(p),'reviewed');
 });
 test('DT-07 V1 migration adoption cannot be reused for a later appearing repository',async()=>{
     const p=file(),storage=path.join(root,`storage-${index++}`);seed(p,'base');fs.mkdirSync(storage);
@@ -1176,6 +1182,37 @@ for(const kind of ['binary','bom','oversized','unreadable','missing','all-unsupp
     tracker.reconcileRestoredGitContexts([current]);assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getReviewToken(p),undefined);
     assert.equal(succeeded(await tracker.revertFile(p)),false);
     if(kind!=='all-unsupported'){assert.equal(tracker.getOriginalContent(q),'new baseline');fs.writeFileSync(q,'later change');await scan(q);assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),true);}
+});
+for(const firstBlock of [false,true]) for(const secondBlock of [false,true]) test(`DT-06 Keep transactions serialize across files (${firstBlock}/${secondBlock})`,async()=>{
+    const p=file(),q=file();for(const f of [p,q]){seed(f,'old\n','new\n');await scan(f);}
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const firstToken=tracker.getReviewToken(p),secondToken=tracker.getReviewToken(q);
+    const firstId=tracker.getChangeBlocks(p)[0].blockId,secondId=tracker.getChangeBlocks(q)[0].blockId;
+    const gate=pause(p,'read'),secondGate=pause(q,'read');
+    const one=firstBlock?tracker.keepBlock(p,firstId,firstToken):tracker.keepAllChangesInFile(p,firstToken);
+    await gate.entered;
+    const two=secondBlock?tracker.keepBlock(q,secondId,secondToken):tracker.keepAllChangesInFile(q,secondToken);
+    await new Promise(r=>setTimeout(r,20));
+    const serialized=barriers.has(`${q}:read`);secondGate.release();
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});gate.release();
+    const results=await Promise.all([one,two]);assert.equal(serialized,true,'second transaction must not enter while first is active');
+    assert.equal(results[0].status,'failed');assert.equal(succeeded(results[1]),false);
+    faults.clear();assert.equal(await tracker.completeBaseline(tracker.sessionEpoch),true);
+    assert.equal(succeeded(secondBlock?await tracker.keepBlock(q,secondId):await tracker.keepAllChangesInFile(q)),true);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getOriginalContent(p),'old\n');assert.ok(pending(p));assert.equal(tracker.getOriginalContent(q),'new\n');
+});
+for(const undo of [false,true]) for(const replacement of ['file','symlink']) test(`DT-09 exclusive creation preserves concurrent ${replacement} (undo=${undo})`,async()=>{
+    const p=file();seed(p,'baseline','reviewed');await scan(p);
+    if(undo)await tracker.prepareRevertRecord([tracker.createFileRevertItem(p)]);
+    fs.unlinkSync(p);await scan(p);
+    if(undo){tracker.revertHistory[0].items[0].after={exists:false,content:''};}
+    const gate=pause(p,'publish');const operation=undo?tracker.undoLastRevert():tracker.revertFile(p);await gate.entered;
+    const target=file();fs.writeFileSync(target,'external bytes');
+    if(replacement==='symlink')fs.symlinkSync(target,p);else fs.writeFileSync(p,'external bytes');
+    gate.release();const raw=await operation;const result=undo?raw.results[0]:raw;
+    assert.equal(result.status,'conflict');assert.equal(disk(p),'external bytes');assert.equal(disk(target),'external bytes');
+    if(undo)assert.equal(tracker.revertHistory.length,1);else assert.ok(pending(p));
 });
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
