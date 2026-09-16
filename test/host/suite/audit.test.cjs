@@ -14,36 +14,48 @@ async function until(predicate) {
         await delay(50);
     }
 }
+async function stableReview(tracker, filePath) {
+    let previous;
+    let since = Date.now();
+    await until(() => {
+        const token = tracker.getReviewToken(filePath);
+        const key = token && JSON.stringify(token);
+        if (!key || key !== previous) { previous = key; since = Date.now(); }
+        return key && Date.now() - since >= 750 && tracker.getBaselineState() === 'ready';
+    });
+}
 module.exports = async function auditHost(workspace) {
     const p = path.join(workspace, 'audit-source.txt');
     const q = path.join(workspace, 'audit-target.txt');
+    const recoveryPath = path.join(workspace, 'audit-recovery.txt');
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-audit-host-'));
     let tracker;
     let participant;
     let releaseRead;
     try {
-        fs.writeFileSync(p, 'base\n'); fs.writeFileSync(q, 'edit\n');
+        fs.writeFileSync(p, 'base\n'); fs.writeFileSync(q, 'edit\n'); fs.writeFileSync(recoveryPath, 'base\n');
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
         fs.writeFileSync(p, 'edit\n');
-        await until(() => tracker.getReviewToken(p));
+        await stableReview(tracker, p);
         const token = tracker.getReviewToken(p);
         fs.unlinkSync(p); fs.symlinkSync(q, p);
         assert.notEqual((await tracker.revertFile(p, token)).status, 'success');
         assert.equal(fs.readFileSync(q, 'utf8'), 'edit\n');
         console.log('PASS HOST-AUDIT internal symlink preserves unrelated target');
-        fs.unlinkSync(p); fs.writeFileSync(p, 'edit\n');
-        await until(() => tracker.getReviewToken(p));
-        assert.equal((await tracker.revertFile(p)).status, 'success');
+        fs.writeFileSync(recoveryPath, 'edit\n');
+        await stableReview(tracker, recoveryPath);
+        const reverted = await tracker.revertFile(recoveryPath);
+        assert.equal(reverted.status, 'success', JSON.stringify(reverted));
         participant = vscode.workspace.onWillSaveTextDocument(event => {
-            if (event.document.uri.fsPath !== p) return;
+            if (event.document.uri.fsPath !== recoveryPath) return;
             const document = event.document;
             const range = new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length));
             event.waitUntil(Promise.resolve([vscode.TextEdit.replace(range, 'save participant output\n')]));
         });
         const undo = await tracker.undoLastRevert();
         assert.equal(undo.succeeded, 0);
-        assert.equal(fs.readFileSync(p, 'utf8'), 'save participant output\n');
+        assert.equal(fs.readFileSync(recoveryPath, 'utf8'), 'save participant output\n');
         assert.equal(tracker.revertHistory.length, 1);
         console.log('PASS HOST-AUDIT real save participant retains conflicting Undo recovery');
         participant.dispose(); participant = undefined;

@@ -38,7 +38,11 @@ Three new real Extension Host scenarios cover an internal symlink, an actual
 `onWillSaveTextDocument` participant during Undo, and a native watcher event while
 a restore read is deliberately held. The third case instruments the read's
 completion time; filesystem, watcher delivery and production reconciliation are
-real. CI results will be recorded after the branch update.
+real. Initial CI run `35081315256` passed Ubuntu quality and the new symlink
+assertion, then the Host setup Revert returned conflict immediately after the
+symlink was replaced. The test now uses a separate recovery file, waits for a
+stable review before acting, and includes the full action result on failure.
+No conflict is retried or treated as success. Final CI results are recorded in PR #1.
 
 ## Second-pass review
 
