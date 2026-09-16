@@ -820,6 +820,25 @@ export class DiffTracker {
         return true;
     }
 
+    private async watchImportedTree(root: string, epoch: number): Promise<void> {
+        const pending = [root];
+        while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
+            const directory = pending.pop()!;
+            if (this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
+            // Watch before enumeration so later children cannot fall into the
+            // discovery gap. Empty and ignored-file-only directories count too.
+            this.watchImportedDirectory(directory, epoch);
+            const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            for (const entry of entries) {
+                // Never follow symlink directories outside the validated tree.
+                if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                    pending.push(path.join(directory, entry.name));
+                }
+            }
+        }
+    }
+
     private removeImportedDirectoryWatchers(root: string): void {
         for (const [directory, entry] of this.importedDirectoryWatchers) {
             if (this.pathBelongsToRoot(directory, root)) {
@@ -1722,7 +1741,7 @@ export class DiffTracker {
         return result;
     }
 
-    private isPathIgnored(uri: vscode.Uri): boolean {
+    private isPathIgnored(uri: vscode.Uri, directory = false): boolean {
         if (uri.scheme !== 'file') { return true; }
         // Lookup cost depends on path depth, not the number of recent recoveries.
         for (let current = uri.fsPath; ; current = path.dirname(current)) {
@@ -1739,7 +1758,7 @@ export class DiffTracker {
             return false;
         }
 
-        const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
+        const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
         const cacheKey = `${folder.uri.fsPath}::${relPath}`;
         const cached = this.ignoreResultCache.get(cacheKey);
         if (cached !== undefined) {
@@ -2152,7 +2171,7 @@ export class DiffTracker {
 
     private async isUntrackedDirectory(uri: vscode.Uri): Promise<boolean> {
         // A tracked file replaced with a directory must still report a conflict.
-        if (this.fileSnapshots.has(uri.fsPath)) { return false; }
+        if (this.baselineExistingFiles.has(uri.fsPath)) { return false; }
         try {
             return !!((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
         } catch {
@@ -2239,30 +2258,22 @@ export class DiffTracker {
             const directory = await this.isUntrackedDirectory(uri);
             if (!this.isCurrentEpoch(epoch)) { return; }
             if (directory) {
+                if (this.fileSnapshots.has(filePath)) {
+                    // An absent baseline no longer has a file at this path.
+                    this.updateTrackedDiff(filePath, '', { currentExists: false });
+                }
                 // Native watchers may report only the parent when a populated
                 // directory appears; its nested .gitignore events are not guaranteed.
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    this.watchImportedDirectory(filePath, epoch);
-                    let children: vscode.Uri[];
-                    let addedWatcher: boolean;
-                    do {
-                        children = await vscode.workspace.findFiles(
-                            new vscode.RelativePattern(filePath, '**/*'),
-                            new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-                        );
-                        if (!this.isCurrentEpoch(epoch)) { return; }
-                        addedWatcher = false;
-                        for (const child of children) {
-                            if (!this.pathBelongsToRoot(child.fsPath, filePath) || this.isPathIgnored(child)) { continue; }
-                            for (let directory = path.dirname(child.fsPath); directory !== filePath && this.pathBelongsToRoot(directory, filePath); directory = path.dirname(directory)) {
-                                addedWatcher = this.watchImportedDirectory(directory, epoch) || addedWatcher;
-                            }
-                        }
-                        // Enumerate once more after installing child watches to
-                        // close changes that raced the first discovery.
-                    } while (addedWatcher);
+                    await this.watchImportedTree(filePath, epoch);
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    const children = await vscode.workspace.findFiles(
+                        new vscode.RelativePattern(filePath, '**/*'),
+                        new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+                    );
+                    if (!this.isCurrentEpoch(epoch)) { return; }
                     for (const child of children) {
                         if (!this.isCurrentEpoch(epoch)) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
@@ -3586,15 +3597,20 @@ export class DiffTracker {
         const history = this.revertHistory;
         const building = this.baselineBuilding;
         const initialized = this.snapshotInitialized;
-        const change = this.trackedChanges.get(filePath);
         const transaction = this.beginBaselineTransaction(() => {
+            // Callbacks may have updated or removed the review while the
+            // candidate baseline was being persisted. Preserve that newer view.
+            const latest = this.trackedChanges.get(filePath);
+            const currentContent = latest?.currentContent ?? this.fileSnapshots.get(filePath)!;
+            const currentExists = latest ? !latest.isDeleted : this.baselineExistingFiles.has(filePath);
             this.fileSnapshots.set(filePath, content);
             if (mode === undefined) { this.fileModes.delete(filePath); } else { this.fileModes.set(filePath, mode); }
             if (exists) { this.baselineExistingFiles.add(filePath); } else { this.baselineExistingFiles.delete(filePath); }
             this.revertHistory = history;
             this.baselineBuilding = building;
             this.snapshotInitialized = initialized;
-            if (change) { this.updateTrackedDiff(filePath, change.currentContent, { baselineChanged: true, currentExists: !change.isDeleted }); }
+            this.updateTrackedDiff(filePath, currentContent, { baselineChanged: true, currentExists });
+            if (latest?.unavailableReason) { this.markFileUnavailable(filePath, latest.unavailableReason); }
         });
         transaction.valid = () => !this.validateSnapshotTarget(filePath);
         // Remove only this path's obsolete recovery items, retaining other batch members.
@@ -3605,7 +3621,7 @@ export class DiffTracker {
         return transaction;
     }
 
-    private async commitKeepTransaction(epoch: number, transaction: BaselineTransaction): Promise<boolean> {
+    private async commitKeepTransaction(filePath: string, epoch: number, transaction: BaselineTransaction): Promise<boolean> {
         let committed = false;
         try {
             committed = await this.completeBaseline(epoch, transaction) &&
@@ -3620,6 +3636,17 @@ export class DiffTracker {
             // A candidate may already have reached disk before target validation
             // failed. Publish the rolled-back baseline before returning failure.
             if (!committed && invalidTarget) { await this.flushPendingPersistence(); }
+            if (!committed && this.isCurrentEpoch(epoch)) {
+                // Also cover edits with no delivered callback. A dirty buffer
+                // remains unavailable, with its latest contents visible.
+                const state = await this.readCurrentFileState(filePath);
+                if (this.isCurrentEpoch(epoch)) {
+                    const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath && d.uri.scheme === 'file');
+                    if (doc?.isDirty) { this.updateTrackedDiff(filePath, doc.getText(), { baselineChanged: true }); }
+                    if (state.kind === 'unavailable') { this.markFileUnavailable(filePath, state.reason); }
+                    else { this.updateTrackedDiff(filePath, state.kind === 'text' ? state.content : '', { baselineChanged: true, currentExists: state.kind === 'text' }); }
+                }
+            }
         }
     }
 
@@ -3716,7 +3743,7 @@ export class DiffTracker {
         const transaction = this.beginKeepTransaction(filePath);
         this.fileSnapshots.set(filePath, newSnapshot);
         this.baselineExistingFiles.add(filePath);
-        if (!await this.commitKeepTransaction(keepEpoch, transaction)) {
+        if (!await this.commitKeepTransaction(filePath, keepEpoch, transaction)) {
             return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
         }
 
@@ -3766,7 +3793,7 @@ export class DiffTracker {
         } else {
             this.baselineExistingFiles.add(filePath);
         }
-        if (!await this.commitKeepTransaction(keepEpoch, transaction)) {
+        if (!await this.commitKeepTransaction(filePath, keepEpoch, transaction)) {
             return this.actionResult(filePath, 'failed', 'Keep could not be saved; review remains pending');
         }
         if (!this.isCurrentEpoch(keepEpoch)) { return this.actionResult(filePath, 'success', 'Keep saved before the session changed'); }

@@ -2053,6 +2053,40 @@ test('ROUND26 imported descendants remain watched after Keep and Stop/restart',a
     tracker.stopRecording();assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');fs.writeFileSync(p,'after restart');if(!process.env.DT_REAL_DIRECTORY_WATCH)notify();await waitUntil(()=>pending(p)?.currentContent==='after restart');
     fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(pending(p)?.isDeleted,true);
 });
+
+for(const existed of [false,true]) test(`ROUND27 directory replacement respects baseline existence (${existed})`,async()=>{
+    const dir=file('replacement'),p=path.join(dir,'child.txt');seed(dir,'','',existed);await scan(dir);fs.unlinkSync(dir);fs.mkdirSync(dir);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];
+    await tracker.onExternalFileCreated(Uri.file(dir));
+    if(existed){assert.ok(pending(dir)?.unavailableReason);assert.equal(pending(p),undefined);}
+    else{assert.equal(pending(dir),undefined);assert.equal(pending(p)?.currentContent,'new');assert.equal(pending(p)?.unavailableReason,undefined);assert.equal(tracker.getOriginalContent(p),'');}
+});
+for(const ignoredOnly of [false,true]) test(`ROUND27 imported empty or ignored-only subdirectory receives later files (${ignoredOnly})`,async()=>{
+    watchExclude=['**/*.log','**/excluded/'];await tracker.refreshIgnoreMatchers();
+    const dir=file('empty-import'),sub=path.join(dir,'deep','empty'),excluded=path.join(dir,'excluded');fs.mkdirSync(sub,{recursive:true});fs.mkdirSync(excluded);
+    if(ignoredOnly)fs.writeFileSync(path.join(sub,'skip.log'),'ignored');listedFiles=[];
+    await tracker.onExternalFileCreated(Uri.file(dir));
+    const p=path.join(sub,'later.txt');fs.writeFileSync(p,'later');
+    if(!process.env.DT_REAL_DIRECTORY_WATCH)for(const w of nativeDirectoryWatchers)if(w.active&&w.directory===sub)w.listener('rename','later.txt');
+    await waitUntil(()=>pending(p)?.currentContent==='later');assert.equal(pending(p)?.unavailableReason,undefined);
+    assert.equal(nativeDirectoryWatchers.some(w=>w.active&&w.directory===excluded),false);
+});
+for(const block of [false,true]) for(const failure of ['write','git']) for(const change of ['external','unnotified','buffer','deleted','equal-candidate']) test(`ROUND27 Keep rollback refreshes ${change} after ${failure} (block=${block})`,async()=>{
+    const p=file();seed(p,'base\n','reviewed\n');await scan(p);
+    const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};tracker.setBaselineGitContexts([context]);
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const temp=path.join(storage,'session-state.tmp.json'),gate=pause(temp,'write');
+    const op=block?tracker.keepBlock(p,tracker.getChangeBlocks(p)[0].blockId):tracker.keepAllChangesInFile(p);await gate.entered;
+    if(change==='buffer'){const doc=document(p);doc.text='latest buffer\n';doc.isDirty=true;doc.version++;tracker.updateTrackedDiff(p,doc.text);}
+    else{if(change==='deleted')fs.unlinkSync(p);else fs.writeFileSync(p,change==='equal-candidate'?'reviewed\n':'latest disk\n');if(change!=='unnotified')await scan(p);}
+    if(failure==='git')tracker.observeGitContext({...context,headName:'other'});
+    // The write boundary has already passed its fault check; fail the following rename.
+    else faults.set(temp,{rename:error('NoPermissions')});
+    gate.release();assert.equal(succeeded(await op),false);faults.clear();assert.equal(tracker.getOriginalContent(p),'base\n');
+    assert.equal(pending(p)?.currentContent,change==='buffer'?'latest buffer\n':change==='deleted'?'':change==='equal-candidate'?'reviewed\n':'latest disk\n');
+    if(change==='deleted')assert.equal(pending(p)?.isDeleted,true);
+    if(failure==='git')assert.ok(tracker.getGitPauseReason(p));
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }

@@ -200,11 +200,14 @@ module.exports = async function auditHost(workspace) {
             const source = path.join(storage, withRules ? 'import-rules' : 'import-plain');
             const target = vscode.Uri.file(path.join(workspace, withRules ? 'audit-import-rules' : 'audit-import-plain')).fsPath;
             fs.mkdirSync(path.join(source, 'deep'), { recursive: true });
+            fs.mkdirSync(path.join(source, 'initially-empty', 'nested'), { recursive: true });
+            fs.mkdirSync(path.join(source, 'initially-ignored'), { recursive: true });
             for (let i = 0; i < 12; i++) { fs.writeFileSync(path.join(source, 'deep', `file-${i}.txt`), `import ${i}\n`); }
             fs.writeFileSync(path.join(source, 'empty.txt'), '');
             if (withRules) {
                 fs.writeFileSync(path.join(source, '.gitignore'), '*.log\n!keep.log\n');
                 fs.writeFileSync(path.join(source, 'deep', 'skip.log'), 'ignored\n');
+                fs.writeFileSync(path.join(source, 'initially-ignored', 'skip.log'), 'ignored\n');
                 fs.writeFileSync(path.join(source, 'deep', 'keep.log'), 'included\n');
             }
             const expected = [...Array.from({length:12}, (_, i) => path.join(target, 'deep', `file-${i}.txt`)), path.join(target, 'empty.txt')];
@@ -226,6 +229,14 @@ module.exports = async function auditHost(workspace) {
             assert.equal(reverted.status, 'success', JSON.stringify(reverted));
             assert.equal(fs.readFileSync(expected[0], 'utf8'), 'import 0\n');
             console.log(`PASS HOST-DIRECTORY imported tree review/Keep/Revert (rules=${withRules})`);
+            for (const sub of ['initially-empty/nested', 'initially-ignored']) {
+                const later = path.join(target, sub, 'later.txt');
+                fs.writeFileSync(later, 'later child\n');
+                await stableReview(tracker, later);
+                assert.equal(tracker.getOriginalContent(later), '');
+                assert.equal(tracker.getTrackedChanges().find(c => c.filePath === later)?.currentContent, 'later child\n');
+            }
+            console.log(`PASS HOST-DIRECTORY empty/ignored-only descendants (rules=${withRules})`);
         }
 
 
