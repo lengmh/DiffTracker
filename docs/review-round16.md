@@ -24,8 +24,8 @@ using the repository's existing boundary scaffolding and actual production code.
 ## Local verification
 
 - Initial red run: 0/9 audit assertions passed, matching the eight reported findings.
-- Expanded audit regressions: 31/31 passed with VS Code boundary mocks.
-- `npm test`: 310/310 passed (245 tracker, 20 UI, 17 Git adapter, 9 real temporary
+- Expanded audit regressions: 34/34 passed with VS Code boundary mocks.
+- `npm test`: 313/313 passed (248 tracker, 20 UI, 17 Git adapter, 9 real temporary
   Git repositories, 6 paths, 8 Webview mapping, 5 similarity cases).
 - `npm run lint`: exit 0.
 - Performance: 1,100 files, 523.5 ms scan, 3.9 ms update, +16 MiB RSS in this run.
@@ -58,7 +58,12 @@ closed the reusable batch-ID and replay-window gaps before delivery. A further
 red/green case caught Undo executing during restore's initial ignore-rule load;
 the restoration guard now owns the entire async operation, including loading and
 replay, and clears only its own epoch. No external
-reviewer or unavailable `code-review` skill was represented as having run.
+reviewer or unavailable `code-review` skill was represented as having run during
+that second pass. A subsequent external Codex PR review (comment `4024706739`)
+identified one P2 in event coalescing: create followed by change lost creation
+provenance. Three ordered-sequence regressions were added; create/change and
+delete/recreate/change failed before the repair. Coalescing now retains create
+evidence until deletion; a later create establishes a new incarnation.
 
 This is not a proof against arbitrary external filesystem replacement during a
 native save, network-provider semantics, multi-window storage races, or forced

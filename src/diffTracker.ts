@@ -652,7 +652,16 @@ export class DiffTracker {
                 watchers.push(watcher);
                 const dispatch = (uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): void => {
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    if (this.restoringEpoch === epoch) { this.restoreEvents.set(uri.fsPath, { uri, kind }); return; }
+                    if (this.restoringEpoch === epoch) {
+                        // A change does not invalidate the evidence that a path
+                        // was created. Delete replaces it; a later create starts
+                        // a new incarnation and establishes absence again.
+                        const previous = this.restoreEvents.get(uri.fsPath);
+                        if (kind !== 'change' || previous?.kind !== 'create') {
+                            this.restoreEvents.set(uri.fsPath, { uri, kind });
+                        }
+                        return;
+                    }
                     if (kind === 'create') { void this.onExternalFileCreated(uri); }
                     else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
                     else { void this.onExternalFileChanged(uri); }
