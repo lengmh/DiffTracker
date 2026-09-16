@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export type GitRepositoryKind = 'repository' | 'submodule' | 'worktree';
 
@@ -54,6 +56,32 @@ export type GitContextEvent =
     | { kind: 'removed'; repoRoot: string }
     | { kind: 'ready'; contexts: GitContextSnapshot[] };
 
+function hasUnfinishedGitOperation(repoRoot: string): boolean {
+    try {
+        let gitDir = path.join(repoRoot, '.git');
+        const stat = fs.statSync(gitDir);
+        if (stat.isFile()) {
+            if (stat.size > 65536) { return true; }
+            const match = /^gitdir: (.+?)(?:\r?\n)?$/.exec(fs.readFileSync(gitDir, 'utf8'));
+            if (!match) { return true; }
+            gitDir = path.resolve(repoRoot, match[1]);
+        } else if (!stat.isDirectory()) { return true; }
+        if (!fs.statSync(gitDir).isDirectory()) { return true; }
+        // These belong to the worktree gitdir, never its shared commondir.
+        // mergeChanges only contains conflicts, not a clean --no-commit merge.
+        for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer']) {
+            try { fs.statSync(path.join(gitDir, marker)); return true; }
+            catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { return true; }
+            }
+        }
+        return false;
+    } catch {
+        // Unreadable/invalid metadata cannot establish a safe review context.
+        return true;
+    }
+}
+
 export function snapshotGitRepository(repository: GitRepositoryLike): GitContextSnapshot {
     const headName = repository.state.HEAD?.name;
     const headCommit = repository.state.HEAD?.commit;
@@ -64,6 +92,7 @@ export function snapshotGitRepository(repository: GitRepositoryLike): GitContext
         headCommit,
         detached: !!headCommit && !headName,
         inProgress: !!repository.state.rebaseCommit || repository.state.mergeChanges.length > 0
+            || hasUnfinishedGitOperation(repository.rootUri.fsPath)
     };
 }
 
@@ -72,7 +101,7 @@ export function compareGitContexts(baseline: GitContextSnapshot, current: GitCon
         return { compatible: false, reason: 'Git repository or worktree identity changed' };
     }
     if (current.inProgress) {
-        return { compatible: false, reason: 'Git merge or rebase is in progress' };
+        return { compatible: false, reason: 'Git operation is in progress or its metadata cannot be verified' };
     }
     if (baseline.detached !== current.detached) {
         return { compatible: false, reason: 'Git changed between a named branch and detached HEAD' };

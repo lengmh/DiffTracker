@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import Module, { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,9 +17,9 @@ Module._load = function (id, ...args) {
         ? { extensions: { getExtension: () => undefined } }
         : originalLoad.call(this, id, ...args);
 };
-let compareGitContexts;
+let compareGitContexts, snapshotGitRepository;
 try {
-    ({ compareGitContexts } = require('../out/gitContext.js'));
+    ({ compareGitContexts, snapshotGitRepository } = require('../out/gitContext.js'));
 } finally {
     Module._load = originalLoad;
 }
@@ -30,23 +30,13 @@ const tryGit = (cwd, ...args) => {
     try { return { ok: true, output: git(cwd, ...args) }; }
     catch (error) { return { ok: false, output: String(error.stderr ?? error.message) }; }
 };
-const gitPath = (cwd, name) => path.resolve(cwd, git(cwd, 'rev-parse', '--git-path', name));
-const exists = filePath => {
-    try { statSync(filePath); return true; } catch { return false; }
-};
 const context = (repoRoot, kind = 'repository') => {
     const branch = tryGit(repoRoot, 'symbolic-ref', '--quiet', '--short', 'HEAD');
     const commit = tryGit(repoRoot, 'rev-parse', '--verify', 'HEAD');
-    const rebaseMerge = gitPath(repoRoot, 'rebase-merge');
-    const rebaseApply = gitPath(repoRoot, 'rebase-apply');
-    return {
-        repoRoot,
-        kind,
-        headName: branch.ok ? branch.output : undefined,
-        headCommit: commit.ok ? commit.output : undefined,
-        detached: commit.ok && !branch.ok,
-        inProgress: exists(gitPath(repoRoot, 'MERGE_HEAD')) || exists(rebaseMerge) || exists(rebaseApply)
-    };
+    return snapshotGitRepository({rootUri:{fsPath:repoRoot},kind,state:{
+        HEAD:{name:branch.ok?branch.output:undefined,commit:commit.ok?commit.output:undefined},
+        mergeChanges:[],onDidChange:()=>({dispose(){}})
+    }});
 };
 const initRepo = (repoRoot) => {
     mkdirSync(repoRoot, { recursive: true });
@@ -144,6 +134,19 @@ test('path restore leaves HEAD context unchanged for filesystem tracking to revi
     git(repo, 'restore', 'sample.txt');
     assert.deepEqual(context(repo), before);
     assert.equal(readFileSync(path.join(repo, 'sample.txt'), 'utf8'), 'base\n');
+});
+
+for(const linked of [false,true]) for(const finish of ['abort','commit']) test(`clean no-commit merge is detected (worktree=${linked}, ${finish})`,()=>{
+    const main=path.join(tempRoot,`clean-${linked}-${finish}`);initRepo(main);
+    git(main,'switch','-c','topic');writeFileSync(path.join(main,'topic.txt'),'topic');git(main,'add','.');git(main,'commit','-m','topic');git(main,'switch','main');
+    const repo=linked?`${main}-linked`:main;
+    if(linked) git(main,'worktree','add','-b',`linked-${finish}`,repo);
+    const before=context(repo);git(repo,'merge','--no-ff','--no-commit','topic');
+    assert.equal(git(repo,'ls-files','--unmerged'),'');assert.equal(context(repo).headCommit,before.headCommit);
+    assert.equal(context(repo).inProgress,true);assert.equal(compareGitContexts(before,context(repo)).compatible,false);
+    if(linked) assert.equal(context(main).inProgress,false,'operation state is worktree-local');
+    if(finish==='abort') git(repo,'merge','--abort');else git(repo,'commit','-m','merge');
+    assert.equal(context(repo).inProgress,false);assert.equal(compareGitContexts(before,context(repo)).compatible,true);
 });
 
 let failures = 0;
