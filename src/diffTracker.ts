@@ -2180,7 +2180,12 @@ export class DiffTracker {
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
                 if (state.kind !== 'text') {
-                    throw new Error(state.kind === 'unavailable' ? state.reason : `File disappeared during baseline rebuild: ${displayFileName(uri.fsPath)}`);
+                    // An unsupported or unreadable resource is a file-level
+                    // uncertainty, not a failure of the entire repository rebuild.
+                    this.recordUnresolvedBaseline(uri.fsPath, state.kind === 'unavailable'
+                        ? state.reason
+                        : 'File disappeared during baseline rebuild; before-image is unknown');
+                    return;
                 }
                 if (this.scanUncertainFiles.has(uri.fsPath)) {
                     this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');

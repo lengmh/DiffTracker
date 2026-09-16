@@ -580,12 +580,14 @@ test('DT-07 repository rebuild watches files already captured while later files 
 });
 test('DT-07 branch change during rebuild keeps the repository paused',async()=>{
     const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
+    const binary=path.join(repo,'image.png');fs.writeFileSync(binary,Buffer.from([0,1,2]));
     const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
     const current={...base,headName:'feature'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
-    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p),Uri.file(binary)];
     const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);await gate.entered;
     tracker.observeGitContext({...base,headName:'third'});gate.release();
     assert.equal(await rebuild,false);assert.ok(tracker.getGitPauseReason(p));assert.equal(tracker.getOriginalContent(p),'old');
+    assert.equal(tracker.unresolvedBaselineFiles.has(binary),false);
 });
 test('DT-07 stale dialog context cannot rebuild after a second branch change',async()=>{
     const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
@@ -1154,6 +1156,26 @@ test('DT-06 non-file events cannot mutate a same-path local review',async()=>{
     await tracker.onExternalFileCreated(uri);await tracker.onExternalFileChanged(uri);await tracker.onExternalFileDeleted(uri);
     tracker.onDocumentOpened({uri,getText:()=> 'virtual contents'});
     assert.equal(pending(p),before);assert.equal(tracker.getOriginalContent(p),'base');
+});
+for(const kind of ['binary','bom','oversized','unreadable','missing','all-unsupported']) test(`DT-07 rebuild persists unresolved ${kind} files without blocking supported files`,async()=>{
+    const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'unsupported.dat'),q=path.join(repo,'text.m');
+    seed(q,'old','new baseline');fs.writeFileSync(p,kind==='bom'?Buffer.from([0xef,0xbb,0xbf,65]):kind==='binary'||kind==='all-unsupported'?Buffer.from([0,1,2]):'data');
+    if(kind==='oversized')faults.set(p,{size:6*1024*1024});
+    if(kind==='unreadable')faults.set(p,{read:error('NoPermissions')});
+    if(kind==='missing')fs.unlinkSync(p);
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    listedFiles=kind==='all-unsupported'?[Uri.file(p)]:[Uri.file(p),Uri.file(q)];
+    assert.equal(await tracker.rebuildRepositoryBaseline(repo,current),true);
+    assert.equal(tracker.getGitPauseReason(p),undefined);assert.ok(pending(p)?.unavailableReason);
+    assert.equal(tracker.getReviewToken(p),undefined);assert.equal(tracker.getOriginalContent(p),undefined);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.ok(saved.unresolvedBaselineFiles.some(([f])=>f===p));assert.ok(tracker.parsePersistedState(saved));
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    tracker.reconcileRestoredGitContexts([current]);assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getReviewToken(p),undefined);
+    assert.equal(succeeded(await tracker.revertFile(p)),false);
+    if(kind!=='all-unsupported'){assert.equal(tracker.getOriginalContent(q),'new baseline');fs.writeFileSync(q,'later change');await scan(q);assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),true);}
 });
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
