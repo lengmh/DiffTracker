@@ -25,8 +25,10 @@ try {
         ['batch-b.txt', 'batch b\n'],
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
-        ['audit-recovery.txt', 'base\n']
+        ['audit-recovery.txt', 'base\n'],
+        ['audit-parent/nested/child.txt', 'parent baseline\n']
     ]) {
+        mkdirSync(path.dirname(path.join(workspacePath, name)), { recursive: true });
         writeFileSync(path.join(workspacePath, name), content);
         if (name === 'deleted.txt' && process.platform !== 'win32') { chmodSync(path.join(workspacePath, name), 0o755); }
     }

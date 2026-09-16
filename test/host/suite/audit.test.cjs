@@ -50,6 +50,17 @@ module.exports = async function auditHost(workspace) {
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
         await delay(500); // Allow the native watcher backend to register.
+        const parent = vscode.Uri.file(path.join(workspace, 'audit-parent')).fsPath;
+        const child = path.join(parent, 'nested', 'child.txt');
+        for (const batch of [false, true]) {
+            fs.rmSync(parent, { recursive: true });
+            await until(() => tracker.getTrackedChanges().some(change => change.filePath === child && change.isDeleted));
+            await stableReview(tracker, child);
+            const result = batch ? await tracker.revertAllChanges([tracker.getReviewToken(child)]) : await tracker.revertFile(child);
+            assert.equal(batch ? result.succeeded === 1 : result.status === 'success', true, JSON.stringify(result));
+            assert.equal(fs.readFileSync(child, 'utf8'), 'parent baseline\n');
+        }
+        console.log('PASS HOST-AUDIT file and batch recovery recreate deleted parent hierarchy');
         fs.writeFileSync(p, 'edit\n');
         await stableReview(tracker, p);
         const token = tracker.getReviewToken(p);

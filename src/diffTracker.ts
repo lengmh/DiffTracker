@@ -2797,13 +2797,52 @@ export class DiffTracker {
         try { return fs.statSync(filePath).mode & 0o777; } catch { return undefined; }
     }
 
+    private ensureRestoreParentDirectories(filePath: string, epoch: number): string | undefined {
+        const check = (): string | undefined => !this.isCurrentEpoch(epoch)
+            ? 'Session changed before restoring parent directories' : this.validateActionTarget(filePath);
+        const initialError = check();
+        if (initialError) { return initialError; }
+        const missing: string[] = [];
+        let directory = path.dirname(filePath);
+        while (true) {
+            try {
+                const stat = fs.lstatSync(directory);
+                if (stat.isSymbolicLink() || !stat.isDirectory()) { return 'Restore parent is not an ordinary directory'; }
+                break;
+            } catch (error) {
+                if (!this.isFileNotFound(error)) { throw error; }
+                missing.push(directory);
+                const parent = path.dirname(directory);
+                if (parent === directory) { throw error; }
+                directory = parent;
+            }
+        }
+        // No await between validation and each mkdir. Never follow a link or
+        // replace a conflicting entry, and never recursively remove parents on
+        // failure: another writer may already be using an empty directory.
+        for (const parent of missing.reverse()) {
+            const error = check();
+            if (error) { return error; }
+            try { fs.mkdirSync(parent); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { throw error; } }
+            const stat = fs.lstatSync(parent);
+            if (stat.isSymbolicLink() || !stat.isDirectory()) { return 'Restore parent changed during directory creation'; }
+        }
+        return check();
+    }
+
     private async createFileExclusively(filePath: string, content: string, epoch: number, mode?: number): Promise<ActionResult> {
         let staging: string | undefined;
         let published = false;
         try {
+            const parentError = this.ensureRestoreParentDirectories(filePath, epoch);
+            if (parentError) { return this.actionResult(filePath, this.isCurrentEpoch(epoch) ? 'conflict' : 'cancelled', parentError); }
             staging = await fs.promises.mkdtemp(path.join(path.dirname(filePath), '.difftracker-restore-'));
             // Retain the exclusion for delayed watcher events after cleanup.
             this.creationTempRoots.add(staging);
+            if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during recovery staging'); }
+            const stagingError = this.validateActionTarget(filePath);
+            if (stagingError) { return this.actionResult(filePath, 'conflict', stagingError); }
             const payload = path.join(staging, 'content');
             await fs.promises.writeFile(payload, content, { flag: 'wx', mode: 0o600 });
             await fs.promises.chmod(payload, mode ?? (0o666 & ~process.umask()));

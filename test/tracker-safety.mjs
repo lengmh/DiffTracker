@@ -1399,6 +1399,34 @@ for(const ending of ['change','delete','recreate']) test(`AUDIT-4 restore retain
     assert.equal(pending(p)?.unavailableReason,undefined);assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
     assert.equal(pending(p)?.currentContent,ending==='change'?'new content':'replacement');
 });
+for(const entry of ['file','batch','undo']) test(`PARENT recovery recreates nested parents (${entry})`,async()=>{
+    const dir=file('deleted-parent'),p=path.join(dir,'nested','p'),q=path.join(dir,'nested','q');fs.mkdirSync(path.dirname(p),{recursive:true});seed(p,'base','edit');seed(q,'other');await scan(p);
+    if(entry==='undo')await tracker.prepareRevertRecord([tracker.createRevertItem(p,{exists:true,content:'edit'},{exists:false,content:''},'disk')]);
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.ok(pending(p)?.isDeleted);
+    const result=entry==='file'?await tracker.revertFile(p):entry==='batch'?await tracker.revertAllChanges():await tracker.undoLastRevert();
+    assert.equal(entry==='file'?succeeded(result):result.succeeded===(entry==='batch'?2:1),true,JSON.stringify(result));
+    assert.equal(disk(p),entry==='undo'?'edit':'base');if(entry==='batch')assert.equal(disk(q),'other');
+});
+for(const obstruction of ['file','symlink']) test(`PARENT recovery rejects parent ${obstruction}`,async()=>{
+    const dir=file('parent'),p=path.join(dir,'nested','p');fs.mkdirSync(path.dirname(p),{recursive:true});seed(p,'base');fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));
+    const target=file('target');fs.mkdirSync(target);
+    if(obstruction==='file')fs.writeFileSync(dir,'do not replace');else fs.symlinkSync(target,dir,process.platform==='win32'?'junction':'dir');
+    assert.equal(succeeded(await tracker.revertFile(p)),false);assert.equal(fs.existsSync(path.join(target,'nested')),false);assert.ok(pending(p));
+    if(obstruction==='file')assert.equal(disk(dir),'do not replace');
+});
+for(const interruption of ['stop','symlink','permission']) test(`PARENT recovery stops safely on ${interruption} during directory creation`,async()=>{
+    const dir=file('parent'),p=path.join(dir,'nested','p'),target=file('target');fs.mkdirSync(path.dirname(p),{recursive:true});fs.mkdirSync(target);seed(p,'base');fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));
+    const mkdir=fs.mkdirSync;
+    fs.mkdirSync=function(name,...args){
+        if(name===dir && interruption==='permission')throw error('EACCES');
+        const result=mkdir.call(this,name,...args);
+        if(name===dir){if(interruption==='stop')tracker.stopRecording();else if(interruption==='symlink'){fs.rmdirSync(dir);fs.symlinkSync(target,dir,process.platform==='win32'?'junction':'dir');}}
+        return result;
+    };
+    try{assert.equal(succeeded(await tracker.revertFile(p)),false);}finally{fs.mkdirSync=mkdir;}
+    assert.equal(fs.existsSync(p),false);assert.equal(fs.existsSync(path.join(target,'nested')),false);assert.ok(pending(p));
+});
+if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
