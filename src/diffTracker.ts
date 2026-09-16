@@ -2295,7 +2295,8 @@ export class DiffTracker {
 
     private async removeRevertRecord(record: PersistedRevertRecord): Promise<void> {
         const previousLength = this.revertHistory.length;
-        this.revertHistory = this.revertHistory.filter(candidate => candidate.id !== record.id);
+        // IDs can be reused after session reset; an old callback owns only this object.
+        this.revertHistory = this.revertHistory.filter(candidate => candidate !== record);
         if (this.revertHistory.length !== previousLength) { await this.flushPendingPersistence(); }
     }
 
@@ -2539,6 +2540,9 @@ export class DiffTracker {
             if (!await vscode.workspace.applyEdit(edit) || document.getText() !== item.before.content) {
                 return this.actionResult(item.filePath, 'failed', 'Editor rejected recovery edit', document.getText() !== item.after.content);
             }
+            if (!await canRecover(item.before.content)) {
+                return this.actionResult(item.filePath, 'conflict', 'Session, baseline or action target changed during recovery; buffer changed and recovery retained', true);
+            }
             if (item.saveMode === 'disk') {
                 if (!await canRecover(item.before.content)) {
                     return this.actionResult(item.filePath, 'conflict', 'File changed before recovery save; buffer changed but disk was preserved', true);
@@ -2547,12 +2551,20 @@ export class DiffTracker {
                     return this.actionResult(item.filePath, 'failed', 'Recovery changed the buffer but saving failed', true);
                 }
             }
+            if (!this.isCurrentEpoch(epoch) || this.validateActionTarget(item.filePath)) {
+                return this.actionResult(item.filePath, 'conflict', 'Session or action target changed during recovery; recovery retained', true);
+            }
             this.pendingWriteFiles.delete(item.filePath);
             this.updateTrackedDiff(item.filePath, item.before.content, { currentExists: true });
             return this.actionResult(item.filePath, 'success', undefined, true);
+        } catch {
+            return this.actionResult(item.filePath, this.isCurrentEpoch(epoch) ? 'failed' : 'cancelled',
+                'Recovery edit failed or its session changed; recovery retained', document.getText() !== item.after.content);
         } finally {
-            this.activeWriteFiles.delete(item.filePath);
-            this.pendingWriteFiles.delete(item.filePath);
+            if (this.isCurrentEpoch(epoch)) {
+                this.activeWriteFiles.delete(item.filePath);
+                this.pendingWriteFiles.delete(item.filePath);
+            }
         }
     }
 
@@ -2857,15 +2869,25 @@ export class DiffTracker {
             edit.replace(uri, fullRange, nextText);
 
             const targetError = this.validateActionTarget(filePath);
-            if (targetError) {
+            if (targetError || !await this.verifyReview(review) || doc.isDirty || doc.getText() !== beforeText) {
                 await this.removeRevertRecord(recoveryRecord);
                 recoveryRecord = undefined;
-                return this.actionResult(filePath, 'conflict', targetError);
+                return this.actionResult(filePath, 'conflict', targetError ?? 'Review or document changed while persisting recovery');
+            }
+            const beforeEditError = this.validateActionTarget(filePath);
+            if (beforeEditError) {
+                await this.removeRevertRecord(recoveryRecord);
+                recoveryRecord = undefined;
+                return this.actionResult(filePath, 'conflict', beforeEditError);
             }
             this.pendingWriteFiles.add(filePath);
             this.activeWriteFiles.add(filePath);
             const success = await vscode.workspace.applyEdit(edit);
-            if (!this.matchesReview(review)) {
+            if (!this.isCurrentEpoch(review.epoch)) {
+                return this.actionResult(filePath, 'cancelled', 'Session changed during block edit', doc.getText() !== beforeText);
+            }
+            const afterEditError = this.validateActionTarget(filePath);
+            if (afterEditError || !this.matchesReview(review)) {
                 const bufferChanged = doc.getText() !== beforeText;
                 if (!bufferChanged) {
                     this.pendingWriteFiles.delete(filePath);
@@ -2874,7 +2896,7 @@ export class DiffTracker {
                 } else {
                     this.markFileUnavailable(filePath, 'Review changed after the editor buffer was modified; recovery retained');
                 }
-                return this.actionResult(filePath, 'conflict', 'Session or review changed during block edit', bufferChanged);
+                return this.actionResult(filePath, 'conflict', afterEditError ?? 'Session or review changed during block edit', bufferChanged);
             }
             if (!success) {
                 const bufferChanged = doc.getText() !== beforeText;
@@ -2902,8 +2924,8 @@ export class DiffTracker {
             this.schedulePersistState();
             return this.actionResult(filePath, 'success', undefined, true);
         } catch {
-            if (!this.isCurrentEpoch(review.epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during block edit'); }
             const bufferChanged = !!editedDocument && beforeText !== undefined && editedDocument.getText() !== beforeText;
+            if (!this.isCurrentEpoch(review.epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during block edit', bufferChanged); }
             if (!bufferChanged) { this.pendingWriteFiles.delete(filePath); }
             else {
                 this.pendingWriteFiles.add(filePath);

@@ -1043,6 +1043,53 @@ test('DT-04 batch Revert preserves new files while reverting existing files',asy
     const result=await tracker.revertAllChanges();assert.equal(result.succeeded,1);assert.equal(result.failed,1);
     assert.equal(disk(p),'base');assert.equal(disk(q),'new');assert.ok(pending(q));
 });
+for(const action of ['revert','undo']) for(const transition of ['branch','operation']) test(`DT-07 block ${action} retains recovery when ${transition} pauses during apply`,async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);
+    const context={repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    tracker.setBaselineGitContexts([context]);const block=tracker.getChangeBlocks(p)[0];
+    if(action==='undo') assert.ok(succeeded(await tracker.revertBlock(p,block.blockId)));
+    const gate=pause(p,'apply'),operation=action==='undo'?tracker.undoLastRevert():tracker.revertBlock(p,block.blockId);
+    await gate.entered;tracker.observeGitContext({...context,...(transition==='branch'?{headName:'other'}:{inProgress:true})});gate.release();
+    const outcome=await operation,result=action==='undo'?outcome.results[0]:outcome;
+    assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);
+    assert.equal(disk(p),'changed\n');assert.equal(document(p).isDirty,true);
+});
+for(const action of ['revert','undo']) test(`DT-08 late block ${action} completion cannot mutate new-session review or flags`,async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);const block=tracker.getChangeBlocks(p)[0];
+    if(action==='undo') await tracker.revertBlock(p,block.blockId);
+    const gate=pause(p,'apply'),operation=action==='undo'?tracker.undoLastRevert():tracker.revertBlock(p,block.blockId);
+    await gate.entered;tracker.advanceEpoch();tracker.fileSnapshots.set(p,'new baseline');tracker.updateTrackedDiff(p,'new pending');
+    tracker.pendingWriteFiles.add(p);tracker.activeWriteFiles.add(p);const current=pending(p);
+    gate.release();const outcome=await operation,result=action==='undo'?outcome.results[0]:outcome;
+    assert.notEqual(result.status,'success');assert.equal(result.bufferChanged,true);
+    assert.equal(pending(p),current);assert.equal(tracker.pendingWriteFiles.has(p),true);assert.equal(tracker.activeWriteFiles.has(p),true);
+});
+test('DT-04 block Revert revalidates after recovery persistence before touching newer editor content',async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);const block=tracker.getChangeBlocks(p)[0];
+    const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write'),before=counters.apply;
+    const operation=tracker.revertBlock(p,block.blockId);await gate.entered;
+    const doc=document(p);doc.text='new editor work';doc.isDirty=true;doc.version++;gate.release();
+    assert.equal((await operation).status,'conflict');assert.equal(counters.apply,before);assert.equal(doc.getText(),'new editor work');
+});
+test('DT-09 buffer Undo retains recovery if baseline changes during apply',async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);await tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId);
+    const gate=pause(p,'apply'),operation=tracker.undoLastRevert();await gate.entered;
+    tracker.fileSnapshots.set(p,'replacement baseline');gate.release();const result=(await operation).results[0];
+    assert.equal(result.status,'conflict');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);
+    assert.equal(tracker.getOriginalContent(p),'replacement baseline');assert.equal(disk(p),'changed\n');
+});
+test('DT-09 buffer Undo reports changed buffer when applyEdit throws after mutation',async()=>{
+    const p=file();seed(p,'base\n','changed\n');await scan(p);await tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId);
+    faults.set(p,{afterApply:error('after edit')});const result=(await tracker.undoLastRevert()).results[0];
+    assert.equal(result.status,'failed');assert.equal(result.bufferChanged,true);assert.equal(tracker.revertHistory.length,1);
+    assert.equal(disk(p),'changed\n');assert.equal(document(p).isDirty,true);
+});
+test('DT-09 old recovery cleanup cannot remove a new-session record with the same ID',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);await tracker.revertBlock(p,tracker.getChangeBlocks(p)[0].blockId);
+    const old=tracker.revertHistory[0],replacement={...old,items:[...old.items]};tracker.advanceEpoch();tracker.revertHistory=[replacement];
+    await tracker.removeRevertRecord(old);assert.equal(tracker.revertHistory[0],replacement);
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
