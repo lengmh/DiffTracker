@@ -197,6 +197,7 @@ export class DiffTracker {
         return operation;
     }
     private scanUncertainFiles = new Set<string>();
+    private activeCreations = new Map<string, { duringScan: boolean }>();
 
     private isCurrentEpoch(epoch: number): boolean {
         return !this.disposed && epoch === this.sessionEpoch;
@@ -213,6 +214,7 @@ export class DiffTracker {
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
         this.scanUncertainFiles.clear();
+        this.activeCreations.clear();
         this.activeWriteFiles.clear();
         this.pendingWriteFiles.clear();
         return ++this.sessionEpoch;
@@ -1464,7 +1466,9 @@ export class DiffTracker {
     private async loadIgnoreMatchers(version: number): Promise<void> {
         const epoch = this.sessionEpoch;
         const matchers = new Map<string, Ignore>();
-        const evidence: string[] = [];
+        // Matching semantics are part of scan provenance: older implementations
+        // may have excluded a different set even with identical rule text.
+        const evidence: string[] = ['ignore-semantics-v2'];
         const previousMatchers = this.ignoreMatchers;
         for (const folder of this.getSupportedWorkspaceFolders()) {
             const matcher = await this.buildIgnoreMatcher(folder, evidence);
@@ -1505,8 +1509,8 @@ export class DiffTracker {
         ];
     }
 
-    private getVsCodeExcludePatterns(): string[] {
-        const config = vscode.workspace.getConfiguration();
+    private getVsCodeExcludePatterns(resource: vscode.Uri): string[] {
+        const config = vscode.workspace.getConfiguration(undefined, resource);
         const watcherExclude = config.get<Record<string, boolean>>('files.watcherExclude', {});
         const searchExclude = config.get<Record<string, boolean>>('search.exclude', {});
         const filesExclude = config.get<Record<string, boolean>>('files.exclude', {});
@@ -1527,8 +1531,8 @@ export class DiffTracker {
         return Array.from(patterns);
     }
 
-    private getWatchExcludePatterns(): string[] {
-        const config = vscode.workspace.getConfiguration('diffTracker');
+    private getWatchExcludePatterns(resource: vscode.Uri): string[] {
+        const config = vscode.workspace.getConfiguration('diffTracker', resource);
         const raw = config.get<string[]>('watchExclude', []) ?? [];
         const ignoreRules: string[] = [];
 
@@ -1564,10 +1568,10 @@ export class DiffTracker {
 
     private async readIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
         const ig = ignore();
-        const watchExcludes = this.getWatchExcludePatterns();
+        const watchExcludes = this.getWatchExcludePatterns(folder.uri);
         const basePatterns = [
             ...this.getDefaultExcludePatterns(),
-            ...this.getVsCodeExcludePatterns(),
+            ...this.getVsCodeExcludePatterns(folder.uri),
             ...watchExcludes
         ];
         ig.add(basePatterns);
@@ -1576,6 +1580,14 @@ export class DiffTracker {
         const scoped = vscode.workspace.getConfiguration(undefined, folder.uri);
         evidence.push(JSON.stringify(['files.exclude', 'files.watcherExclude', 'search.exclude']
             .map(key => scoped.get(key, {}))));
+
+        // Repository-local excludes have lower priority than .gitignore files.
+        const infoExcludePath = path.join(folder.uri.fsPath, '.git', 'info', 'exclude');
+        if (fs.existsSync(infoExcludePath)) {
+            const text = fs.readFileSync(infoExcludePath, 'utf8');
+            this.addGitignorePatterns(ig, text, '');
+            evidence.push('.git/info/exclude', text);
+        }
 
         const gitignoreFiles = await this.getGitignoreFiles(folder);
 
@@ -1587,13 +1599,6 @@ export class DiffTracker {
             const prefix = relDir === '.' ? '' : `${relDir}/`;
             this.addGitignorePatterns(ig, text, prefix);
             evidence.push(relPath, text);
-        }
-
-        const infoExcludePath = path.join(folder.uri.fsPath, '.git', 'info', 'exclude');
-        if (fs.existsSync(infoExcludePath)) {
-            const text = fs.readFileSync(infoExcludePath, 'utf8');
-            this.addGitignorePatterns(ig, text, '');
-            evidence.push('.git/info/exclude', text);
         }
 
         return ig;
@@ -1608,18 +1613,19 @@ export class DiffTracker {
     }
 
     private addGitignorePatterns(ig: Ignore, content: string, prefix: string) {
-        const lines = content.split(/\r?\n/);
-        lines.forEach(line => {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('#')) {
-                return;
-            }
-            if (trimmed.startsWith('!')) {
-                ig.add(`!${prefix}${trimmed.slice(1)}`);
-            } else {
-                ig.add(`${prefix}${trimmed}`);
-            }
-        });
+        // Directory names are literal, even when they contain glob characters.
+        const literalPrefix = prefix.replace(/([\\*?\[\]!#])/g, '\\$1');
+        for (const line of content.split(/\r?\n/)) {
+            if (!line.trim() || line.startsWith('#') || line === '!') { continue; }
+            if (!prefix) { ig.add(line); continue; }
+            const negated = line.startsWith('!');
+            const pattern = negated ? line.slice(1) : line;
+            // A slashless rule (including directory-only foo/) applies at every
+            // depth below its .gitignore. Leading/inner slashes anchor it there.
+            const recursive = !pattern.replace(/ +$/, '').replace(/\/$/, '').includes('/');
+            const scoped = `${literalPrefix}${recursive ? '**/' : ''}${pattern.replace(/^\//, '')}`;
+            ig.add(`${negated ? '!' : ''}${scoped}`);
+        }
     }
 
     private toPosixPath(value: string): string {
@@ -1936,6 +1942,13 @@ export class DiffTracker {
         this.schedulePersistState();
     }
 
+    private hasObservedCreation(filePath: string): boolean {
+        for (let current = filePath; ; current = path.dirname(current)) {
+            if (this.activeCreations.get(current)?.duringScan === false || this.restoreEvents.get(current)?.kind === 'create') { return true; }
+            if (path.dirname(current) === current) { return false; }
+        }
+    }
+
     private async discoverRestoredFiles(epoch: number): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
         for (const folder of this.getSupportedWorkspaceFolders()) {
@@ -1958,7 +1971,7 @@ export class DiffTracker {
             if (await this.isUntrackedDirectory(uri)) { continue; }
             if (!this.isCurrentEpoch(epoch)) { return; }
             if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath)) { continue; }
-            const observedCreation = this.restoreEvents.get(filePath)?.kind === 'create';
+            const observedCreation = this.hasObservedCreation(filePath);
             if (observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)) {
                 this.fileSnapshots.set(filePath, '');
                 this.baselineExistingFiles.delete(filePath);
@@ -2147,7 +2160,7 @@ export class DiffTracker {
         this.ensureSnapshotForDocument(doc);
     }
 
-    private async onExternalFileCreated(uri: vscode.Uri): Promise<void> {
+    private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
             return;
@@ -2163,32 +2176,57 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
-        const scanEvent = this.markScanEvent(filePath);
-        const directory = await this.isUntrackedDirectory(uri);
-        if (!this.isCurrentEpoch(epoch)) { return; }
-        if (directory) {
-            // Native watchers may report only the parent when a populated
-            // directory appears; its nested .gitignore events are not guaranteed.
-            await this.refreshIgnoreMatchers().catch(() => undefined);
-            return;
+        const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.fileSnapshots.has(filePath));
+        // Capture creation evidence before stat/ignore discovery can yield. A
+        // concurrent refresh must not classify this directory's children as old.
+        const creation = { duringScan: scanEvent };
+        this.activeCreations.set(filePath, creation);
+        try {
+            const directory = await this.isUntrackedDirectory(uri);
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (directory) {
+                // Native watchers may report only the parent when a populated
+                // directory appears; its nested .gitignore events are not guaranteed.
+                try {
+                    await this.refreshIgnoreMatchers();
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    const children = await vscode.workspace.findFiles(
+                        new vscode.RelativePattern(filePath, '**/*'),
+                        new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+                    );
+                    for (const child of children) {
+                        if (!this.isCurrentEpoch(epoch)) { return; }
+                        if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
+                            await this.onExternalFileCreated(child, scanEvent);
+                        }
+                    }
+                } catch {
+                    if (this.isCurrentEpoch(epoch)) {
+                        this.markFileUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure');
+                    }
+                }
+                return;
+            }
+            if (scanEvent) {
+                this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
+                return;
+            }
+            const state = await this.readFileSnapshot(uri);
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!this.fileSnapshots.has(filePath) && (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+                this.unresolvedBaselineFiles.delete(filePath);
+                this.postBaselineUnknownFiles.delete(filePath);
+                this.fileSnapshots.set(filePath, '');
+                if (!await this.completeBaseline(epoch)) { return; }
+            }
+            if (state.kind === 'unavailable') {
+                this.markFileUnavailable(filePath, state.reason);
+                return;
+            }
+            await this.readFileAndUpdate(filePath, uri);
+        } finally {
+            if (this.activeCreations.get(filePath) === creation) { this.activeCreations.delete(filePath); }
         }
-        if (scanEvent) {
-            this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
-            return;
-        }
-        const state = await this.readFileSnapshot(uri);
-        if (!this.isCurrentEpoch(epoch)) { return; }
-        if (!this.fileSnapshots.has(filePath) && (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
-            this.unresolvedBaselineFiles.delete(filePath);
-            this.postBaselineUnknownFiles.delete(filePath);
-            this.fileSnapshots.set(filePath, '');
-            if (!await this.completeBaseline(epoch)) { return; }
-        }
-        if (state.kind === 'unavailable') {
-            this.markFileUnavailable(filePath, state.reason);
-            return;
-        }
-        await this.readFileAndUpdate(filePath, uri);
     }
 
     private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {

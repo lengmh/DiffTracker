@@ -62,6 +62,15 @@ module.exports = async function auditHost(workspace) {
             assert.equal(initialState.unresolvedBaselineFiles.some(([filePath]) => filePath === ignored), false);
         }
         console.log('PASS HOST-AUDIT ignored open documents never enter persisted baseline');
+        for (const name of ['scope-files.txt', 'scope-watcher.txt', 'scope-search.txt']) {
+            const included = vscode.Uri.file(path.join(workspace, name)).fsPath;
+            const excluded = vscode.Uri.file(path.join(process.env.DIFF_TRACKER_HOST_SECOND_ROOT, name)).fsPath;
+            assert.equal(tracker.getOriginalContent(included), 'scope baseline\n');
+            assert.equal(tracker.getOriginalContent(excluded), undefined);
+            assert.equal(tracker.testIgnorePath(excluded).ignored, true);
+        }
+        console.log('PASS HOST-SCOPE folder exclusions stay within their workspace root');
+
         await delay(500); // Allow the native watcher backend to register.
         for (const batch of [false, true]) {
             const parent = vscode.Uri.file(path.join(workspace, batch ? 'audit-parent-batch' : 'audit-parent-file')).fsPath;
@@ -176,6 +185,41 @@ module.exports = async function auditHost(workspace) {
         assert.equal((await tracker.revertFile(ignoredFile)).status, 'conflict');
         assert.equal(fs.readFileSync(ignoredFile, 'utf8'), 'existed before the baseline\n');
         console.log('PASS HOST-IGNORE offline rule removal retains unknown before-image');
+
+        // Import complete trees from outside the watched workspace. Linux may
+        // deliver only a directory create; Windows may deliver child events too.
+        for (const withRules of [false, true]) {
+            const source = path.join(storage, withRules ? 'import-rules' : 'import-plain');
+            const target = vscode.Uri.file(path.join(workspace, withRules ? 'audit-import-rules' : 'audit-import-plain')).fsPath;
+            fs.mkdirSync(path.join(source, 'deep'), { recursive: true });
+            for (let i = 0; i < 12; i++) { fs.writeFileSync(path.join(source, 'deep', `file-${i}.txt`), `import ${i}\n`); }
+            fs.writeFileSync(path.join(source, 'empty.txt'), '');
+            if (withRules) {
+                fs.writeFileSync(path.join(source, '.gitignore'), '*.log\n!keep.log\n');
+                fs.writeFileSync(path.join(source, 'deep', 'skip.log'), 'ignored\n');
+                fs.writeFileSync(path.join(source, 'deep', 'keep.log'), 'included\n');
+            }
+            const expected = [...Array.from({length:12}, (_, i) => path.join(target, 'deep', `file-${i}.txt`)), path.join(target, 'empty.txt')];
+            if (withRules) { expected.push(path.join(target, 'deep', 'keep.log')); }
+            const editors = vscode.window.visibleTextEditors.length;
+            fs.renameSync(source, target);
+            await until(() => expected.every(p => tracker.getTrackedChanges().some(c => c.filePath === p && !c.unavailableReason)));
+            await stableReview(tracker, expected[0]);
+            assert.equal(vscode.window.visibleTextEditors.length, editors);
+            for (const p of expected) { assert.equal(tracker.getOriginalContent(p), ''); }
+            if (withRules) { assert.equal(tracker.getTrackedChanges().some(c => c.filePath === path.join(target, 'deep', 'skip.log')), false); }
+            const tokens = expected.map(p => tracker.getReviewToken(p));
+            const accepted = await tracker.keepAllChanges(tokens);
+            assert.equal(accepted.failed, 0, JSON.stringify(accepted));
+            assert.equal(accepted.succeeded, expected.length);
+            fs.writeFileSync(expected[0], 'external follow-up\n');
+            await stableReview(tracker, expected[0]);
+            const reverted = await tracker.revertFile(expected[0]);
+            assert.equal(reverted.status, 'success', JSON.stringify(reverted));
+            assert.equal(fs.readFileSync(expected[0], 'utf8'), 'import 0\n');
+            console.log(`PASS HOST-DIRECTORY imported tree review/Keep/Revert (rules=${withRules})`);
+        }
+
 
 
 

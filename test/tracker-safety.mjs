@@ -4,6 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import Module, { createRequire } from 'node:module';
@@ -1974,6 +1975,68 @@ test('IGNORE-RETRY info exclude disappearing after exists check is rediscovered'
     const read=fs.readFileSync;let failed=false;fs.readFileSync=function(filePath,...args){if(filePath===exclude&&!failed){failed=true;fs.unlinkSync(exclude);throw error('ENOENT');}return read.call(this,filePath,...args);};
     try{await tracker.initializeWorkspaceSnapshots();assert.equal(failed,true);assert.equal(tracker.getBaselineState(),'ready');assert.equal(tracker.getOriginalContent(p),'known');const fingerprint=tracker.ignoreFingerprint;await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint);}
     finally{fs.readFileSync=read;fs.rmSync(path.join(root,'.git'),{recursive:true,force:true});}
+});
+for(const setting of ['files.exclude','files.watcherExclude','search.exclude']) test(`ROUND26 folder-scoped ${setting} excludes only its own workspace root`,async()=>{
+    const a=file('root-a'),b=file('root-b');fs.mkdirSync(a);fs.mkdirSync(b);const pa=path.join(a,'generated.txt'),pb=path.join(b,'generated.txt');fs.writeFileSync(pa,'generated');fs.writeFileSync(pb,'source');
+    const folders=vscode.workspace.workspaceFolders,configuration=vscode.workspace.getConfiguration,folderFor=vscode.workspace.getWorkspaceFolder;
+    vscode.workspace.workspaceFolders=[a,b].map(p=>({uri:Uri.file(p),name:path.basename(p)}));
+    vscode.workspace.getWorkspaceFolder=uri=>vscode.workspace.workspaceFolders.find(f=>uri.fsPath.startsWith(f.uri.fsPath+path.sep));
+    vscode.workspace.getConfiguration=(section,resource)=>({get:(key,fallback)=>!section&&key===setting&&resource?.fsPath===a?{'generated.txt':true}:fallback});
+    listedFiles=[Uri.file(pa),Uri.file(pb)];
+    try {tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(pa),undefined);assert.equal(tracker.getOriginalContent(pb),'source');fs.writeFileSync(pa,'changed');fs.writeFileSync(pb,'changed');emitWatcher('change',Uri.file(pa));emitWatcher('change',Uri.file(pb));await waitUntil(()=>!!pending(pb));assert.equal(pending(pa),undefined);}
+    finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getConfiguration=configuration;vscode.workspace.getWorkspaceFolder=folderFor;}
+});
+for(const scopeName of ['sub[1]','#scope','!scope']) test(`ROUND26 nested ignore semantics agree with Git (${scopeName})`,async()=>{
+    const dir=file('git-oracle'),sub=path.join(dir,scopeName);fs.mkdirSync(sub,{recursive:true});
+    const top=path.join(dir,'.gitignore'),nested=path.join(sub,'.gitignore');
+    fs.writeFileSync(top,'*.tmp\n');fs.writeFileSync(nested,'   \n*.log\n!keep.log\n/root.txt\ncache/\nlocal/file.txt\n\\#secret\n\\!secret\n leading.txt\n');
+    assert.equal(spawnSync('git',['init','-q',dir]).status,0);
+    const names=['a.log','deep/a.log','deep/keep.log','root.txt','deep/root.txt','cache/a.txt','deep/cache/a.txt','local/file.txt','deep/local/file.txt','#secret','deep/!secret',' leading.txt','normal.txt','deep/a.tmp'];
+    const files=names.map(name=>path.join(sub,name));for(const p of files){fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,'content');}
+    const folders=vscode.workspace.workspaceFolders,folderFor=vscode.workspace.getWorkspaceFolder;vscode.workspace.workspaceFolders=[{uri:Uri.file(dir),name:'oracle'}];vscode.workspace.getWorkspaceFolder=uri=>uri.fsPath.startsWith(dir+path.sep)?vscode.workspace.workspaceFolders[0]:undefined;
+    listedIgnores=[Uri.file(top),Uri.file(nested)];listedFiles=files.map(Uri.file);
+    try{tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');for(const p of files){const result=spawnSync('git',['check-ignore','--no-index','-q','--',path.relative(dir,p)],{cwd:dir});assert.ok(result.status===0||result.status===1);assert.equal(tracker.testIgnorePath(p).ignored,result.status===0,path.relative(dir,p));assert.equal(tracker.getOriginalContent(p),result.status===0?undefined:'content',path.relative(dir,p));}}
+    finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getWorkspaceFolder=folderFor;}
+});
+test('ROUND26 populated directory notification records every included descendant without rule changes',async()=>{
+    const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
+    const dir=file('copied'),a=path.join(dir,'a.txt'),b=path.join(dir,'deep','empty.txt');fs.mkdirSync(path.dirname(b),{recursive:true});fs.writeFileSync(a,'copied');fs.writeFileSync(b,'');listedFiles=[Uri.file(a),Uri.file(b)];
+    emitWatcher('create',Uri.file(dir));await waitUntil(()=>!!pending(a)&&!!pending(b));
+    assert.equal(tracker.getOriginalContent(a),'');assert.equal(tracker.getOriginalContent(b),'');assert.equal(pending(a).unavailableReason,undefined);assert.equal(pending(b).unavailableReason,undefined);assert.equal(pending(dir),undefined);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(pending(a));assert.ok(pending(b));assert.equal(tracker.getOriginalContent(a),'');
+});
+for(const rulesChanged of [false,true]) test(`ROUND26 copied directory preserves known and unknown baselines and filters descendants (rules=${rulesChanged})`,async()=>{
+    const dir=file('copy'),a=path.join(dir,'a.txt'),b=path.join(dir,'deep','b.txt'),ignored=path.join(dir,'deep','skip.log'),old=path.join(dir,'old.txt'),unknown=path.join(dir,'unknown.txt');
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');fs.mkdirSync(path.dirname(b),{recursive:true});for(const p of [a,b,ignored,old,unknown])fs.writeFileSync(p,'new');
+    tracker.fileSnapshots.set(old,'old');tracker.baselineExistingFiles.add(old);tracker.recordUnresolvedBaseline(unknown,'unknown before copy');
+    const rule=path.join(dir,'.gitignore');if(rulesChanged){fs.writeFileSync(rule,'*.log');listedIgnores=[Uri.file(rule)];}else{watchExclude=['**/*.log'];await tracker.refreshIgnoreMatchers();}
+    listedFiles=[a,b,ignored,old,unknown].map(Uri.file);await tracker.onExternalFileCreated(Uri.file(dir));
+    for(const p of [a,b]){assert.equal(tracker.getOriginalContent(p),'');assert.equal(pending(p)?.currentContent,'new');assert.equal(pending(p)?.unavailableReason,undefined);}
+    assert.equal(pending(ignored),undefined);assert.equal(tracker.getOriginalContent(old),'old');assert.ok(pending(unknown)?.unavailableReason);assert.equal(tracker.getOriginalContent(unknown),undefined);assert.equal(pending(dir),undefined);
+});
+for(const lifecycle of ['stop','restart','dispose']) test(`ROUND26 ${lifecycle} cancels a pending directory enumeration`,async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('cancel-dir'),p=path.join(dir,'a.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'late');
+    const find=vscode.workspace.findFiles,gate=pause(dir,'directoryScan');vscode.workspace.findFiles=async pattern=>{if(pattern.base===dir){await boundary(dir,'directoryScan');return [Uri.file(p)];}return find(pattern);};
+    try{const work=tracker.onExternalFileCreated(Uri.file(dir));await gate.entered;if(lifecycle==='dispose')await tracker.dispose();else{tracker.stopRecording();if(lifecycle==='restart'){tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');}}const state=JSON.stringify(tracker.buildPersistedState());gate.release();await work;assert.equal(JSON.stringify(tracker.buildPersistedState()),state);assert.equal(pending(p),undefined);}
+    finally{gate.release();vscode.workspace.findFiles=find;}
+});
+test('ROUND26 directory event observed during scan remains unknown after scan completion',async()=>{
+    const p=file(),dir=file('scan-dir'),child=path.join(dir,'child.txt');fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];const scanning=pause(p,'read');tracker.startRecording();await scanning.entered;
+    fs.mkdirSync(dir);fs.writeFileSync(child,'during scan');const stat=pause(dir,'stat');const event=tracker.onExternalFileCreated(Uri.file(dir));await stat.entered;listedFiles=[Uri.file(p),Uri.file(child)];scanning.release();await waitUntil(()=>tracker.getBaselineState()==='ready');stat.release();await event;
+    assert.equal(tracker.getOriginalContent(child),undefined);assert.ok(pending(child)?.unavailableReason);assert.equal(tracker.getOriginalContent(p),'base');
+});
+test('ROUND26 directory scan failure is visible and never accepts its children',async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('failed-dir');fs.mkdirSync(dir);const find=vscode.workspace.findFiles;vscode.workspace.findFiles=async pattern=>{if(pattern.base===dir)throw error('EACCES');return find(pattern);};
+    try{await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);}finally{vscode.workspace.findFiles=find;}
+});
+test('ROUND26 overlapping ignore refresh retains directory creation evidence before stat completes',async()=>{
+    tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('racing-dir'),p=path.join(dir,'child.txt'),rule=path.join(dir,'.gitignore');fs.mkdirSync(dir);fs.writeFileSync(p,'new');fs.writeFileSync(rule,'*.log');listedFiles=[Uri.file(p)];listedIgnores=[Uri.file(rule)];
+    const gate=pause(dir,'stat'),event=tracker.onExternalFileCreated(Uri.file(dir));await gate.entered;await tracker.refreshIgnoreMatchers();gate.release();await event;assert.equal(tracker.getOriginalContent(p),'');assert.equal(pending(p)?.unavailableReason,undefined);assert.equal(pending(p)?.currentContent,'new');
+});
+test('ROUND26 repository info excludes have lower precedence than nested rules',async()=>{
+    const dir=file('precedence'),sub=path.join(dir,'sub');fs.mkdirSync(sub,{recursive:true});assert.equal(spawnSync('git',['init','-q',dir]).status,0);const info=path.join(dir,'.git','info','exclude'),rule=path.join(sub,'.gitignore'),p=path.join(sub,'keep.cfg');fs.writeFileSync(info,'*.cfg\n');fs.writeFileSync(rule,'!keep.cfg\n');fs.writeFileSync(p,'source');
+    const folders=vscode.workspace.workspaceFolders;vscode.workspace.workspaceFolders=[{uri:Uri.file(dir),name:'repository'}];const folderFor=vscode.workspace.getWorkspaceFolder;vscode.workspace.getWorkspaceFolder=uri=>uri.fsPath.startsWith(dir+path.sep)?vscode.workspace.workspaceFolders[0]:undefined;
+    listedIgnores=[Uri.file(rule)];listedFiles=[Uri.file(p)];try{tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(spawnSync('git',['check-ignore','--no-index','-q','--','sub/keep.cfg'],{cwd:dir}).status,1);assert.equal(tracker.getOriginalContent(p),'source');}finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getWorkspaceFolder=folderFor;}
 });
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }

@@ -4,6 +4,9 @@ Restored discoveries are classified as new files only when a completed baseline
 scan recorded matching ignore rules. Files newly exposed by changed ignore rules,
 or discovered from older sessions without scan provenance, remain pending with an
 unknown baseline until an explicit rebuild. Existing known baselines are retained.
+The corrected folder-scoped and nested ignore semantics invalidate older scan
+provenance even if rule text is unchanged. After upgrading, newly discovered paths
+may need an explicit baseline rebuild; existing pending reviews remain intact.
 
 
 Review workspace changes as they happen, then keep or safely revert them by block,

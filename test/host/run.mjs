@@ -9,6 +9,8 @@ const extensionDevelopmentPath = path.resolve(path.dirname(fileURLToPath(import.
 const extensionTestsPath = path.join(extensionDevelopmentPath, 'test', 'host', 'suite', 'index.cjs');
 const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'diff-tracker-host-'));
 const workspacePath = path.join(tempRoot, 'workspace 中文');
+const secondRoot = path.join(tempRoot, 'second root');
+const workspaceFile = path.join(tempRoot, 'host.code-workspace');
 const git = (...args) => execFileSync('git', args, {
     cwd: workspacePath,
     encoding: 'utf8',
@@ -35,6 +37,18 @@ try {
         writeFileSync(path.join(workspacePath, name), content);
         if (name === 'deleted.txt' && process.platform !== 'win32') { chmodSync(path.join(workspacePath, name), 0o755); }
     }
+    mkdirSync(path.join(secondRoot, '.vscode'), { recursive: true });
+    for (const folder of [workspacePath, secondRoot]) {
+        for (const name of ['scope-files.txt', 'scope-watcher.txt', 'scope-search.txt']) {
+            writeFileSync(path.join(folder, name), 'scope baseline\n');
+        }
+    }
+    writeFileSync(path.join(secondRoot, '.vscode', 'settings.json'), JSON.stringify({
+        'files.exclude': { 'scope-files.txt': true },
+        'files.watcherExclude': { 'scope-watcher.txt': true },
+        'search.exclude': { 'scope-search.txt': true }
+    }));
+    writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: workspacePath }, { path: secondRoot }] }));
     git('init', '-b', 'main');
     git('config', 'user.email', 'diff-tracker@example.invalid');
     git('config', 'user.name', 'Diff Tracker Host Test');
@@ -47,10 +61,11 @@ try {
         extensionDevelopmentPath,
         extensionTestsPath,
         extensionTestsEnv: {
-            DIFF_TRACKER_HOST_WORKSPACE: workspacePath
+            DIFF_TRACKER_HOST_WORKSPACE: workspacePath,
+            DIFF_TRACKER_HOST_SECOND_ROOT: secondRoot
         },
         launchArgs: [
-            workspacePath,
+            workspaceFile,
             `--user-data-dir=${path.join(tempRoot, 'user-data')}`,
             `--extensions-dir=${path.join(tempRoot, 'extensions')}`,
             '--disable-workspace-trust',
