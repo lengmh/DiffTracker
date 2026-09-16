@@ -2033,6 +2033,14 @@ export class DiffTracker {
         }
     }
 
+    private markScanEvent(filePath: string): boolean {
+        if (this.snapshotInitialized || this.fileSnapshots.has(filePath)) { return false; }
+        // Register before any await so scanners and editor opens cannot adopt
+        // these bytes. Keep directory markers too, to protect their children.
+        this.scanUncertainFiles.add(filePath);
+        return true;
+    }
+
     private async isUntrackedDirectory(uri: vscode.Uri): Promise<boolean> {
         // A tracked file replaced with a directory must still report a conflict.
         if (this.fileSnapshots.has(uri.fsPath)) { return false; }
@@ -2060,19 +2068,17 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
-
+        const scanEvent = this.markScanEvent(filePath);
         if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
+        if (scanEvent) {
+            this.pendingExternalChanges.add(filePath);
+            this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
+            return;
+        }
 
         const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
         if (doc && doc.isDirty) {
             this.markFileUnavailable(filePath, 'External change while editor has unsaved content; reconcile disk and buffer before review');
-            return;
-        }
-
-        if (!this.fileSnapshots.has(filePath) && !this.snapshotInitialized) {
-            this.scanUncertainFiles.add(filePath);
-            this.pendingExternalChanges.add(filePath);
-            this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
             return;
         }
 
@@ -2115,9 +2121,9 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        const scanEvent = this.markScanEvent(filePath);
         if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
-        if (!this.snapshotInitialized && !this.fileSnapshots.has(filePath)) {
-            this.scanUncertainFiles.add(filePath);
+        if (scanEvent) {
             this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
             return;
         }

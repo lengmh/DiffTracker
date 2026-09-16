@@ -1763,6 +1763,57 @@ for(const event of ['change','delete','recreate']) test(`RESTORE-OFFLINE replays
     gate.release();assert.equal(await restoring,'restored');assert.equal(tracker.getOriginalContent(q),'');
     if(event==='delete')assert.equal(pending(q),undefined);else assert.equal(pending(q)?.currentContent,'latest');
 });
+// Hold only the event's stat; the concurrent baseline worker must remain free.
+for (const kind of ['Created','Changed']) {
+    for (const listed of [true,false]) test(`SCAN-STAT ${kind} ${listed?'enumerated':'unlisted'} event stays unknown after scan completes`,async()=>{
+        const p=file(),blocker=file(),storage=file('storage');
+        fs.writeFileSync(p,'new content');fs.writeFileSync(blocker,'stable');
+        listedFiles=[Uri.file(blocker),...(listed?[Uri.file(p)]:[])];
+        tracker.storageUri=Uri.file(storage);tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        const read=pause(listed?p:blocker,'read'),scanning=tracker.initializeWorkspaceSnapshots();await read.entered;
+        const stat=pause(p,'stat'),event=tracker[`onExternalFile${kind}`](Uri.file(p));await stat.entered;
+        try { read.release();await scanning; } finally { stat.release();await event; }
+        assert.equal(tracker.fileSnapshots.has(p),false);assert.ok(pending(p)?.unavailableReason);
+        assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getReviewToken(p),undefined);
+    });
+}
+for (const kind of ['Created','Changed']) {
+    test(`SCAN-STAT ${kind} directory protects descendants without phantom file`,async()=>{
+        const parent=file('dir'),p=path.join(parent,'child.m');fs.mkdirSync(parent);fs.writeFileSync(p,'new');
+        tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        const stat=pause(parent,'stat'),event=tracker[`onExternalFile${kind}`](Uri.file(parent));await stat.entered;
+        listedFiles=[Uri.file(p)];await tracker.initializeWorkspaceSnapshots();stat.release();await event;
+        assert.equal(tracker.fileSnapshots.has(p),false);assert.ok(pending(p)?.unavailableReason);
+        assert.equal(pending(parent),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(parent),false);
+    });
+    test(`SCAN-STAT ${kind} editor open during stat cannot accept content`,async()=>{
+        const p=file();fs.writeFileSync(p,'new');tracker.snapshotInitialized=false;
+        const stat=pause(p,'stat'),event=tracker[`onExternalFile${kind}`](Uri.file(p));await stat.entered;
+        tracker.onDocumentOpened(document(p));stat.release();await event;
+        assert.equal(tracker.fileSnapshots.has(p),false);assert.ok(pending(p)?.unavailableReason);
+    });
+    test(`SCAN-STAT ${kind} late classification cannot change a new session`,async()=>{
+        const p=file();fs.writeFileSync(p,'new');tracker.snapshotInitialized=false;
+        const stat=pause(p,'stat'),event=tracker[`onExternalFile${kind}`](Uri.file(p));await stat.entered;
+        tracker.stopRecording();await tracker.startRecording();seed(p,'next baseline');stat.release();await event;
+        assert.equal(tracker.getOriginalContent(p),'next baseline');assert.equal(pending(p),undefined);
+        assert.equal(tracker.scanUncertainFiles.has(p),false);
+    });
+    test(`SCAN-STAT ${kind} preserves known baseline during scan`,async()=>{
+        const p=file();seed(p,'before','after');tracker.snapshotInitialized=false;
+        await tracker[`onExternalFile${kind}`](Uri.file(p));await scan(p);
+        assert.equal(tracker.getOriginalContent(p),'before');assert.equal(pending(p)?.currentContent,'after');
+        assert.equal(tracker.scanUncertainFiles.has(p),false);assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    });
+    test(`SCAN-STAT ${kind} ignores excluded paths before marking uncertainty`,async()=>{
+        const p=file('ignored.m');fs.writeFileSync(p,'new');watchExclude=['*ignored.m'];
+        await tracker.refreshIgnoreMatchers();tracker.snapshotInitialized=false;
+        await tracker[`onExternalFile${kind}`](Uri.file(p));
+        assert.equal(tracker.scanUncertainFiles.has(p),false);assert.equal(pending(p),undefined);
+    });
+}
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
