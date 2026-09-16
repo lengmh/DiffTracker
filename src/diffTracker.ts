@@ -1544,6 +1544,25 @@ export class DiffTracker {
     }
 
     private async buildIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
+        const epoch = this.sessionEpoch;
+        for (let attempt = 0; ; attempt++) {
+            const candidateEvidence: string[] = [];
+            try {
+                const matcher = await this.readIgnoreMatcher(folder, candidateEvidence);
+                evidence.push(...candidateEvidence);
+                return matcher;
+            } catch (error) {
+                // Atomic replacement/deletion and transient provider errors can
+                // race discovery. Retry the whole candidate, never skip a rule
+                // or publish evidence from a partially read set of files.
+                if (attempt >= 2 || !this.isCurrentEpoch(epoch)) { throw error; }
+                await new Promise(resolve => setTimeout(resolve, 25));
+                if (!this.isCurrentEpoch(epoch)) { throw error; }
+            }
+        }
+    }
+
+    private async readIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
         const ig = ignore();
         const watchExcludes = this.getWatchExcludePatterns();
         const basePatterns = [

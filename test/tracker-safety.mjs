@@ -1954,6 +1954,27 @@ for(const partial of [false,true]) test(`AUDIT-25 bounded history commits only w
     if(partial)assert.deepEqual(tracker.revertHistory.at(-1).items.map(i=>i.filePath),[q]);
     const history=JSON.stringify(tracker.revertHistory);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(JSON.stringify(tracker.revertHistory),history);
 });
+for(const restoring of [false,true]) for(const transient of ['removed','permission']) test(`IGNORE-RETRY ${transient} during ${restoring?'restore':'initial scan'} rediscovers complete rules`,async()=>{
+    const p=file(),q=file(),ignorePath=path.join(root,'.gitignore'),storage=file('storage');fs.writeFileSync(p,'known');fs.writeFileSync(q,'previously ignored');fs.writeFileSync(ignorePath,path.basename(q));
+    listedFiles=[Uri.file(p),Uri.file(q)];listedIgnores=[Uri.file(ignorePath)];tracker.storageUri=Uri.file(storage);tracker.snapshotInitialized=false;
+    if(restoring){await tracker.initializeWorkspaceSnapshots();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));}
+    const read=vscode.workspace.fs.readFile;let attempts=0;
+    vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===ignorePath&&attempts++===0){if(transient==='removed'){fs.unlinkSync(ignorePath);listedIgnores=[];}throw error(transient==='removed'?'FileNotFound':'NoPermissions');}return read(uri);};
+    try {
+        if(restoring)assert.equal(await tracker.restorePersistedState(),'restored');else await tracker.initializeWorkspaceSnapshots();
+        assert.equal(tracker.getBaselineState(),'ready');
+        if(transient==='permission'){assert.equal(attempts,2);assert.equal(tracker.isPathIgnored(Uri.file(q)),true);assert.equal(pending(q),undefined);}
+        else if(restoring){assert.equal(tracker.getOriginalContent(q),undefined);assert.ok(pending(q)?.unavailableReason);}
+        else assert.equal(tracker.getOriginalContent(q),'previously ignored');
+        const fingerprint=tracker.ignoreFingerprint;await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint,'Failed attempt evidence must not contaminate the fingerprint');
+    }finally{vscode.workspace.fs.readFile=read;fs.rmSync(ignorePath,{force:true});}
+});
+test('IGNORE-RETRY info exclude disappearing after exists check is rediscovered',async()=>{
+    const p=file(),exclude=path.join(root,'.git','info','exclude');fs.mkdirSync(path.dirname(exclude),{recursive:true});fs.writeFileSync(exclude,'*.ignored');fs.writeFileSync(p,'known');listedFiles=[Uri.file(p)];tracker.snapshotInitialized=false;
+    const read=fs.readFileSync;let failed=false;fs.readFileSync=function(filePath,...args){if(filePath===exclude&&!failed){failed=true;fs.unlinkSync(exclude);throw error('ENOENT');}return read.call(this,filePath,...args);};
+    try{await tracker.initializeWorkspaceSnapshots();assert.equal(failed,true);assert.equal(tracker.getBaselineState(),'ready');assert.equal(tracker.getOriginalContent(p),'known');const fingerprint=tracker.ignoreFingerprint;await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint);}
+    finally{fs.readFileSync=read;fs.rmSync(path.join(root,'.git'),{recursive:true,force:true});}
+});
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
