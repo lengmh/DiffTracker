@@ -582,7 +582,7 @@ export class DiffTracker {
     private createExternalWatchers(epoch: number): vscode.FileSystemWatcher[] {
         const watchers: vscode.FileSystemWatcher[] = [];
         try {
-            for (const folder of vscode.workspace.workspaceFolders ?? []) {
+            for (const folder of this.getSupportedWorkspaceFolders()) {
                 const pattern = new vscode.RelativePattern(folder, '**/*');
                 const watcher = vscode.workspace.createFileSystemWatcher(pattern);
                 watchers.push(watcher);
@@ -613,7 +613,7 @@ export class DiffTracker {
 
     private async startExternalWatchers(): Promise<void> {
         const epoch = this.sessionEpoch;
-        const folders = vscode.workspace.workspaceFolders;
+        const folders = this.getSupportedWorkspaceFolders();
         if (!folders || folders.length === 0) {
             this.disposeFileWatchers();
             this.externalWatcherEnabled = false;
@@ -664,9 +664,15 @@ export class DiffTracker {
         return vscode.Uri.joinPath(this.storageUri, fileName);
     }
 
-    private getWorkspaceRoots(): string[] {
+    private getSupportedWorkspaceFolders(): vscode.WorkspaceFolder[] {
+        // Snapshots and persisted identities currently support file URIs only.
+        // Discovery must use the same scope as restoration validation.
         return (vscode.workspace.workspaceFolders ?? [])
-            .filter(folder => folder.uri.scheme === 'file')
+            .filter(folder => folder.uri.scheme === 'file');
+    }
+
+    private getWorkspaceRoots(): string[] {
+        return this.getSupportedWorkspaceFolders()
             .map(folder => path.resolve(folder.uri.fsPath))
             .sort((left, right) => left.localeCompare(right));
     }
@@ -1222,7 +1228,7 @@ export class DiffTracker {
         const epoch = this.sessionEpoch;
         this.ignoreMatchers.clear();
         this.ignoreResultCache.clear();
-        const folders = vscode.workspace.workspaceFolders;
+        const folders = this.getSupportedWorkspaceFolders();
         if (!folders) {
             return;
         }
@@ -1352,7 +1358,7 @@ export class DiffTracker {
         const gitignoreFiles = await vscode.workspace.findFiles(
             new vscode.RelativePattern(folder, '**/.gitignore'),
             new vscode.RelativePattern(folder, '**/.git/**')
-        );
+        ).then(files => files.filter(uri => uri.scheme === 'file'));
 
         const mtimeMap = new Map<string, number>();
         const files: string[] = [];
@@ -1395,7 +1401,7 @@ export class DiffTracker {
         }
 
         const normalizedInput = inputPath.trim();
-        const folders = vscode.workspace.workspaceFolders;
+        const folders = this.getSupportedWorkspaceFolders();
         if (!folders || folders.length === 0) {
             return { ignored: false, reason: 'No workspace folders' };
         }
@@ -1426,8 +1432,9 @@ export class DiffTracker {
     }
 
     private isPathIgnored(uri: vscode.Uri): boolean {
+        if (uri.scheme !== 'file') { return true; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
-        if (!folder) {
+        if (!folder || folder.uri.scheme !== 'file') {
             return true;
         }
 
@@ -1469,7 +1476,7 @@ export class DiffTracker {
 
     private async initializeWorkspaceSnapshots(): Promise<void> {
         const epoch = this.sessionEpoch;
-        const folders = vscode.workspace.workspaceFolders;
+        const folders = this.getSupportedWorkspaceFolders();
         if (!folders || folders.length === 0) {
             await this.completeBaseline(epoch);
             return;

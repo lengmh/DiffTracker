@@ -1120,6 +1120,41 @@ test('DT-07 V1 migration adoption cannot be reused for a later appearing reposit
     tracker.reconcileRestoredGitContexts([{repoRoot:root,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false}]);
     assert.ok(tracker.getGitPauseReason(p));
 });
+for(const mixed of [false,true]) test(`DT-06 unsupported workspace scan round-trips safely (mixed=${mixed})`,async()=>{
+    const folders=vscode.workspace.workspaceFolders, findFiles=vscode.workspace.findFiles;
+    const remote=Uri.file(path.join(root,'virtual','remote.txt'));remote.scheme='vscode-remote';
+    const virtualFolder={uri:Uri.file(path.join(root,'virtual')),name:'virtual'};virtualFolder.uri.scheme='vscode-remote';
+    const local=file();fs.writeFileSync(local,'local baseline');
+    const scanned=[];
+    try {
+        vscode.workspace.workspaceFolders=mixed?[...folders,virtualFolder]:[virtualFolder];
+        vscode.workspace.findFiles=async pattern=>{
+            scanned.push(pattern.base.uri.scheme);
+            return pattern.pattern==='**/*'?(pattern.base.uri.scheme==='file'?[Uri.file(local),remote]:[remote]):[];
+        };
+        await tracker.dispose();const storage=path.join(root,`storage-${index++}`);tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.baselineBuilding=true;tracker.snapshotInitialized=false;
+        tracker.activateExternalWatchers(tracker.createExternalWatchers(tracker.sessionEpoch));
+        await tracker.initializeWorkspaceSnapshots();await tracker.flushPendingPersistence();
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        assert.ok(tracker.parsePersistedState(saved),'writer must produce restorable state');
+        assert.deepEqual(saved.unresolvedBaselineFiles,[]);
+        assert.deepEqual(saved.fileSnapshots,mixed?[[local,'local baseline']]:[]);
+        assert.ok(scanned.every(scheme=>scheme==='file'),'do not query unsupported folders');
+        assert.equal(tracker.fileWatchers.length,mixed?1:0);
+        await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(tracker.isRecoveryBlocked(),false);
+        if(mixed){fs.writeFileSync(local,'changed');await scan(local);assert.equal(pending(local)?.currentContent,'changed');}
+    } finally {await tracker.dispose();vscode.workspace.workspaceFolders=folders;vscode.workspace.findFiles=findFiles;}
+});
+test('DT-06 non-file events cannot mutate a same-path local review',async()=>{
+    const p=file();seed(p,'base','changed');await scan(p);const before=pending(p);
+    const uri=Uri.file(p);uri.scheme='virtual';
+    await tracker.onExternalFileCreated(uri);await tracker.onExternalFileChanged(uri);await tracker.onExternalFileDeleted(uri);
+    tracker.onDocumentOpened({uri,getText:()=> 'virtual contents'});
+    assert.equal(pending(p),before);assert.equal(tracker.getOriginalContent(p),'base');
+});
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
