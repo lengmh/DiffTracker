@@ -161,6 +161,8 @@ export class DiffTracker {
     private fileActionQueues = new Map<string, Promise<unknown>>();
     private recoveryActionQueue: Promise<void> = Promise.resolve();
     private readonly creationTempRoots = new Set<string>();
+    private readonly creationTempExpiryTimers = new Map<string, NodeJS.Timeout>();
+    private readonly creationTempGraceMs = 5000;
     private fileModes = new Map<string, number>();
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
@@ -1556,8 +1558,12 @@ export class DiffTracker {
     }
 
     private isPathIgnored(uri: vscode.Uri): boolean {
-        if ([...this.creationTempRoots].some(root => this.pathBelongsToRoot(uri.fsPath, root))) { return true; }
         if (uri.scheme !== 'file') { return true; }
+        // Lookup cost depends on path depth, not the number of recent recoveries.
+        for (let current = uri.fsPath; ; current = path.dirname(current)) {
+            if (this.creationTempRoots.has(this.creationTempKey(current))) { return true; }
+            if (path.dirname(current) === current) { break; }
+        }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') {
             return true;
@@ -2883,7 +2889,9 @@ export class DiffTracker {
         for (const parent of missing.reverse()) {
             const error = check();
             if (error) { return error; }
-            try { fs.mkdirSync(parent); }
+            // Directory modes were not captured. Never widen access by inheriting
+            // the usual 0777 default; existing directories are left untouched.
+            try { fs.mkdirSync(parent, { mode: 0o700 }); }
             catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { throw error; } }
             const stat = fs.lstatSync(parent);
             if (stat.isSymbolicLink() || !stat.isDirectory()) { return 'Restore parent changed during directory creation'; }
@@ -2898,8 +2906,14 @@ export class DiffTracker {
             const parentError = this.ensureRestoreParentDirectories(filePath, epoch);
             if (parentError) { return this.actionResult(filePath, this.isCurrentEpoch(epoch) ? 'conflict' : 'cancelled', parentError); }
             staging = await fs.promises.mkdtemp(path.join(path.dirname(filePath), '.difftracker-restore-'));
-            // Retain the exclusion for delayed watcher events after cleanup.
-            this.creationTempRoots.add(staging);
+            // Active operations must remain excluded even if they outlive the
+            // grace interval. Expiry starts only when their cleanup completes.
+            if (!this.disposed) {
+                const key = this.creationTempKey(staging);
+                const previous = this.creationTempExpiryTimers.get(key);
+                if (previous) { clearTimeout(previous); this.creationTempExpiryTimers.delete(key); }
+                this.creationTempRoots.add(key);
+            }
             if (!this.isCurrentEpoch(epoch)) { return this.actionResult(filePath, 'cancelled', 'Session changed during recovery staging'); }
             const stagingError = this.validateActionTarget(filePath);
             if (stagingError) { return this.actionResult(filePath, 'conflict', stagingError); }
@@ -2926,8 +2940,25 @@ export class DiffTracker {
                 // Only remove our payload; do not recursively delete unexpected files.
                 try { fs.unlinkSync(path.join(staging, 'content')); } catch { /* Preserve the action result. */ }
                 try { fs.rmdirSync(staging); } catch { /* Never delete unexpected children. */ }
+                this.expireCreationTempRoot(staging);
             }
         }
+    }
+
+    private creationTempKey(filePath: string): string {
+        return process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+    }
+
+    private expireCreationTempRoot(staging: string): void {
+        const key = this.creationTempKey(staging);
+        if (this.disposed) { this.creationTempRoots.delete(key); return; }
+        const timer = setTimeout(() => {
+            if (this.creationTempExpiryTimers.get(key) !== timer) { return; }
+            this.creationTempExpiryTimers.delete(key);
+            this.creationTempRoots.delete(key);
+        }, this.creationTempGraceMs);
+        timer.unref();
+        this.creationTempExpiryTimers.set(key, timer);
     }
 
     private async restoreFileToContent(
@@ -4792,6 +4823,9 @@ export class DiffTracker {
     public async dispose(): Promise<void> {
         this.advanceEpoch();
         this.disposed = true;
+        this.creationTempExpiryTimers.forEach(timer => clearTimeout(timer));
+        this.creationTempExpiryTimers.clear();
+        this.creationTempRoots.clear();
         await this.flushPendingPersistence();
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();

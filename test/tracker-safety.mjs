@@ -1575,6 +1575,58 @@ for(const entry of ['file','batch','undo']) test(`PARENT recovery recreates nest
     assert.equal(entry==='file'?succeeded(result):result.succeeded===(entry==='batch'?2:1),true,JSON.stringify(result));
     assert.equal(disk(p),entry==='undo'?'edit':'base');if(entry==='batch')assert.equal(disk(q),'other');
 });
+for(const entry of ['file','batch','undo']) test(`AUDIT-20 ${entry} recovery creates private parents without changing file mode`,async()=>{
+    if(process.platform==='win32')return;
+    const previous=process.umask(0o022);
+    try{
+        const dir=file('private'),p=path.join(dir,'nested','p');fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});seed(p,'base');tracker.fileModes.set(p,0o644);
+        if(entry==='undo')await tracker.prepareRevertRecord([tracker.createRevertItem(p,{exists:true,content:'base',mode:0o644},{exists:false,content:''},'disk')]);
+        fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));
+        const r=entry==='file'?await tracker.revertFile(p):entry==='batch'?await tracker.revertAllChanges():await tracker.undoLastRevert();
+        assert.equal(entry==='file'?succeeded(r):r.succeeded===1,true);
+        assert.equal(fs.statSync(dir).mode&0o777,0o700);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);assert.equal(fs.statSync(p).mode&0o777,0o644);
+    }finally{process.umask(previous);}
+});
+for(const restart of [false,true]) test(`AUDIT-20 completed staging exclusions expire${restart?' across restart':''}`,async()=>{
+    tracker.creationTempGraceMs=20;
+    for(let i=0;i<3;i++){const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));assert.ok(succeeded(await tracker.revertFile(p)));}
+    const roots=[...tracker.creationTempRoots];assert.ok(roots.length>0);
+    for(const dir of roots){assert.equal(fs.existsSync(dir),false);assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),true);}
+    if(restart){tracker.stopRecording();tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');}
+    await waitUntil(()=>tracker.creationTempRoots.size===0,300);
+    for(const dir of roots)assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),false);
+});
+test('AUDIT-20 existing parent permissions remain unchanged',async()=>{
+    if(process.platform==='win32')return;
+    const dir=file('existing'),p=path.join(dir,'nested','p');fs.mkdirSync(path.dirname(p),{recursive:true});fs.chmodSync(dir,0o750);seed(p,'base');
+    fs.rmSync(path.dirname(p),{recursive:true});await tracker.onExternalFileDeleted(Uri.file(path.dirname(p)));
+    assert.ok(succeeded(await tracker.revertFile(p)));assert.equal(fs.statSync(dir).mode&0o777,0o750);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);
+});
+for(const ending of ['success','failure','restart','dispose','unexpected-child']) test(`AUDIT-20 active staging survives grace interval then cleans up on ${ending}`,async()=>{
+    tracker.creationTempGraceMs=20;
+    const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
+    const gate=pause(p,'publish'),op=tracker.revertFile(p);await gate.entered;
+    const [staging]=tracker.creationTempRoots;assert.ok(staging);const payload=path.join(staging,'content');
+    await new Promise(resolve=>setTimeout(resolve,40));assert.equal(tracker.isPathIgnored(Uri.file(payload)),true);
+    emitWatcher('create',Uri.file(payload));emitWatcher('change',Uri.file(payload));assert.equal(pending(payload),undefined);
+    if(process.platform==='win32')assert.equal(tracker.isPathIgnored(Uri.file(payload.toUpperCase())),true);
+    if(ending==='restart'){tracker.stopRecording();listedFiles=[Uri.file(payload)];tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.isPathIgnored(Uri.file(payload)),true);}
+    if(ending==='failure')faults.set(p,{publish:error('NoPermissions')});
+    if(ending==='unexpected-child')fs.writeFileSync(path.join(staging,'other'),'preserve me');
+    if(ending==='dispose')await tracker.dispose();
+    gate.release();const result=await op;
+    assert.equal(succeeded(result),ending==='success'||ending==='unexpected-child');
+    await waitUntil(()=>tracker.creationTempRoots.size===0,300);assert.equal(tracker.creationTempExpiryTimers.size,0);
+    if(ending==='unexpected-child'){assert.equal(disk(path.join(staging,'other')),'preserve me');assert.equal(tracker.isPathIgnored(Uri.file(path.join(staging,'other'))),false);}
+});
+test('AUDIT-20 dispose before staging allocation returns cannot resurrect exclusion timers',async()=>{
+    const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
+    const native=fs.promises.mkdtemp,entered=deferred(),release=deferred();
+    fs.promises.mkdtemp=async(...args)=>{const dir=await native(...args);entered.resolve();await release.promise;return dir;};
+    try{const op=tracker.revertFile(p);await entered.promise;await tracker.dispose();release.resolve();assert.equal(succeeded(await op),false);}
+    finally{release.resolve();fs.promises.mkdtemp=native;}
+    assert.equal(tracker.creationTempRoots.size,0);assert.equal(tracker.creationTempExpiryTimers.size,0);assert.equal(fs.existsSync(p),false);
+});
 for(const obstruction of ['file','symlink']) test(`PARENT recovery rejects parent ${obstruction}`,async()=>{
     const dir=file('parent'),p=path.join(dir,'nested','p');fs.mkdirSync(path.dirname(p),{recursive:true});seed(p,'base');fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));
     const target=file('target');fs.mkdirSync(target);

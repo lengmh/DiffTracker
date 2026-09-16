@@ -75,6 +75,11 @@ module.exports = async function auditHost(workspace) {
             const result = batch ? await tracker.revertAllChanges([tracker.getReviewToken(child)]) : await tracker.revertFile(child);
             assert.equal(batch ? result.succeeded === 1 : result.status === 'success', true, JSON.stringify(result));
             assert.equal(fs.readFileSync(child, 'utf8'), 'parent baseline\n');
+            if (process.platform !== 'win32') {
+                assert.equal(fs.statSync(parent).mode & 0o777, 0o700);
+                assert.equal(fs.statSync(path.dirname(child)).mode & 0o777, 0o700);
+                console.log('PASS HOST-PARENT restored parents have private POSIX permissions');
+            }
             console.log(`PASS HOST-PARENT ${batch ? 'batch' : 'file'} recovery`);
         }
         console.log('PASS HOST-AUDIT file and batch recovery recreate deleted parent hierarchy');
