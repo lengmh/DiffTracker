@@ -112,6 +112,10 @@ module.exports = async function auditHost(workspace) {
         console.log('PASS HOST-AUDIT real save participant retains conflicting Undo recovery');
         participant.dispose(); participant = undefined;
         await tracker.flushPendingPersistence(); await tracker.dispose();
+        const offline = vscode.Uri.file(path.join(workspace, 'audit-offline.txt')).fsPath;
+        const offlineEmpty = vscode.Uri.file(path.join(workspace, 'audit-offline-empty.txt')).fsPath;
+        fs.writeFileSync(offline, 'created while tracker was disposed\n');
+        fs.writeFileSync(offlineEmpty, '');
         tracker = new DiffTracker(vscode.Uri.file(storage));
         const read = tracker.readCurrentFileState.bind(tracker);
         const gate = new Promise(resolve => { releaseRead = resolve; });
@@ -132,6 +136,13 @@ module.exports = async function auditHost(workspace) {
         assert.equal(await restoring, 'restored');
         await until(() => tracker.getTrackedChanges().some(change => change.filePath === q && change.currentContent === 'external during restore\n'));
         console.log('PASS HOST-AUDIT real watcher replays write over stale restore read');
+        for (const filePath of [offline, offlineEmpty]) {
+            assert.ok(tracker.getTrackedChanges().some(change => change.filePath === filePath));
+            assert.equal(tracker.getOriginalContent(filePath), '');
+            assert.equal(tracker.baselineExistingFiles.has(filePath), false);
+        }
+        console.log('PASS HOST-RESTORE offline text and empty additions retain absent baselines');
+
         tracker.stopRecording();
         assert.equal(await tracker.resetBaselineToCurrentState(), true);
         await tracker.dispose();

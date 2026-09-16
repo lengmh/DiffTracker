@@ -461,17 +461,42 @@ export class DiffTracker {
         this.baselineBuilding = incomplete;
         this.workspaceContextChanged = !rootsMatch;
 
+        // Cover ignore discovery too; restore callbacks queue until reconciliation.
+        if (this.isRecording) {
+            try {
+                this.activateExternalWatchers(this.createExternalWatchers(epoch));
+            } catch (error) {
+                this.recoveryBlocked = true;
+                this.isRecording = false;
+                this.persistenceIssue = 'Cannot restore watcher coverage; persisted review is preserved.';
+                return 'blocked';
+            }
+        }
         try {
             await this.refreshIgnoreMatchers();
         } catch (error) {
-            console.warn('Failed to refresh ignore rules while restoring session state', error);
+            if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+            this.recoveryBlocked = true;
+            this.isRecording = false;
+            this.disposeFileWatchers();
+            this.persistenceIssue = 'Cannot restore ignore rules; persisted review is preserved.';
+            return 'blocked';
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
 
-        // Watch before reading snapshots, and replay events after reconciliation
-        // so an older in-flight read cannot erase a newer notification.
+        // Discover offline additions before rebuilding diffs. An existing empty
+        // file and an absent baseline are distinct, including across reloads.
         if (this.isRecording) {
-            await this.startExternalWatchers();
+            try {
+                await this.discoverRestoredFiles(epoch);
+            } catch (error) {
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                this.recoveryBlocked = true;
+                this.isRecording = false;
+                this.disposeFileWatchers();
+                this.persistenceIssue = 'Cannot reconcile restored workspace files; persisted review is preserved.';
+                return 'blocked';
+            }
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         } else {
             this.externalWatcherEnabled = false;
@@ -1871,6 +1896,38 @@ export class DiffTracker {
         this.unresolvedBaselineFiles.set(filePath, reason);
         this.markFileUnavailable(filePath, reason);
         this.schedulePersistState();
+    }
+
+    private async discoverRestoredFiles(epoch: number): Promise<void> {
+        const candidates = new Map<string, vscode.Uri>();
+        for (const folder of this.getSupportedWorkspaceFolders()) {
+            const files = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(folder, '**/*'),
+                new vscode.RelativePattern(folder, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
+            );
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            for (const uri of files) { candidates.set(uri.fsPath, uri); }
+        }
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.scheme === 'file') { candidates.set(doc.uri.fsPath, doc.uri); }
+        }
+        let added = false;
+        for (const uri of candidates.values()) {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            const filePath = uri.fsPath;
+            if (uri.scheme !== 'file' || this.isPathIgnored(uri) ||
+                this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath)) { continue; }
+            if (await this.isUntrackedDirectory(uri)) { continue; }
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            // A complete persisted recording enumerates the baseline. Never
+            // infer absence for an unresolved path or accept newly found bytes.
+            this.fileSnapshots.set(filePath, '');
+            this.baselineExistingFiles.delete(filePath);
+            added = true;
+        }
+        if (added && !await this.flushPendingPersistence()) {
+            throw new Error('Restored additions could not be persisted');
+        }
     }
 
     private async rebuildTrackedChangesFromSnapshots(): Promise<void> {
@@ -3780,6 +3837,12 @@ export class DiffTracker {
 
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
+        if (this.restoringEpoch === epoch) {
+            if (this.restoreEvents.get(filePath)?.kind !== 'create') {
+                this.restoreEvents.set(filePath, { uri, kind: 'change' });
+            }
+            return;
+        }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
@@ -3887,7 +3950,7 @@ export class DiffTracker {
     }
 
     private ensureSnapshotForDocument(doc: vscode.TextDocument, useDocumentContent = false): void {
-        if (!this.isRecording || this.initialIgnoreEpoch === this.sessionEpoch) {
+        if (!this.isRecording || this.initialIgnoreEpoch === this.sessionEpoch || this.restoringEpoch !== undefined) {
             return;
         }
 

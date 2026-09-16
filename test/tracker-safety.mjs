@@ -179,6 +179,7 @@ try {
         const source=fs.readFileSync(process.env.DT_SOURCE,'utf8');
         const code=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,esModuleInterop:true}}).outputText;
         const mod=new Module(path.resolve('out/baseline-diffTracker.js'));
+        mod.filename=mod.id;
         mod.paths=Module._nodeModulePaths(path.resolve('out'));
         mod._compile(code,mod.id); DiffTracker=mod.exports.DiffTracker;
     } else ({DiffTracker}=require('../out/diffTracker.js'));
@@ -1693,6 +1694,76 @@ for(const interruption of ['stop','symlink','permission']) test(`PARENT recovery
     try{assert.equal(succeeded(await tracker.revertFile(p)),false);}finally{fs.mkdirSync=mkdir;}
     assert.equal(fs.existsSync(p),false);assert.equal(fs.existsSync(path.join(target,'nested')),false);assert.ok(pending(p));
 });
+
+for(const content of ['', 'offline addition\n']) test(`RESTORE-OFFLINE discovers ${content?'text':'empty'} additions and persists absence`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old','changed');tracker.storageUri=Uri.file(storage);
+    await tracker.dispose();fs.writeFileSync(q,content);listedFiles=[Uri.file(p),Uri.file(q)];
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getOriginalContent(p),'old');assert.equal(pending(p)?.currentContent,'changed');
+    assert.equal(tracker.getOriginalContent(q),'');assert.equal(tracker.baselineExistingFiles.has(q),false);assert.ok(pending(q));
+    tracker.onDocumentOpened(document(q));assert.equal(tracker.getOriginalContent(q),'');
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.ok(pending(q));assert.equal(tracker.baselineExistingFiles.has(q),false);
+    assert.equal((await tracker.revertFile(q)).status,'conflict');assert.equal(disk(q),content);
+    assert.equal((await tracker.keepAllChangesInFile(q)).status,'success');assert.equal(tracker.baselineExistingFiles.has(q),true);
+});
+for(const kind of ['dirty','binary','unreadable']) test(`RESTORE-OFFLINE ${kind} addition stays protected`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    fs.writeFileSync(q,kind==='binary'?Buffer.from([0,1,2]):'disk');listedFiles=[Uri.file(q)];
+    if(kind==='dirty'){const doc=document(q);doc.text='unsaved';doc.isDirty=true;}
+    if(kind==='unreadable')faults.set(q,{read:error('EACCES')});
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getOriginalContent(q),'');assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.baselineExistingFiles.has(q),false);
+    assert.equal((await tracker.revertFile(q)).status,'conflict');if(kind==='dirty')assert.equal(document(q).text,'unsaved');
+});
+test('RESTORE-OFFLINE excludes ignored paths and preserves unresolved baselines',async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.unresolvedBaselineFiles.set(q,'unknown before close');
+    tracker.storageUri=Uri.file(storage);await tracker.dispose();fs.writeFileSync(q,'new bytes');
+    const ignored=file('skip.txt');fs.writeFileSync(ignored,'ignored');watchExclude=[path.basename(ignored)];
+    listedFiles=[Uri.file(ignored),Uri.file(q)];tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(tracker.fileSnapshots.has(ignored),false);assert.equal(pending(ignored),undefined);
+    assert.equal(tracker.fileSnapshots.has(q),false);assert.ok(pending(q)?.unavailableReason);
+});
+for(const stopped of [true,false]) test(`RESTORE-OFFLINE ${stopped?'stopped':'partial'} sessions do not infer absence`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);
+    if(stopped)tracker.stopRecording();else tracker.baselineBuilding=true;
+    await tracker.dispose();fs.writeFileSync(q,'new');listedFiles=[Uri.file(q)];tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),stopped?'restored':'incomplete');assert.equal(tracker.fileSnapshots.has(q),false);
+});
+test('RESTORE-OFFLINE watcher covers ignore discovery and editor open cannot accept addition',async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));const gate=pause(root,'ignoreScan'),restoring=tracker.restorePersistedState();await gate.entered;
+    fs.writeFileSync(q,'new');tracker.onDocumentOpened(document(q));assert.equal(tracker.fileSnapshots.has(q),false);
+    emitWatcher('create',Uri.file(q));emitWatcher('change',Uri.file(q));gate.release();
+    assert.equal(await restoring,'restored');assert.equal(tracker.getOriginalContent(q),'');assert.ok(pending(q));
+});
+for(const action of ['stop','scan-error','persist-error']) test(`RESTORE-OFFLINE ${action} preserves previous durable review`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old','edit');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    const primary=path.join(storage,'session-state.json'),before=fs.readFileSync(primary,'utf8'),find=vscode.workspace.findFiles;
+    fs.writeFileSync(q,'new');tracker=new DiffTracker(Uri.file(storage));
+    vscode.workspace.findFiles=async pattern=>{
+        if(pattern.pattern!=='**/*')return [];
+        if(action==='stop')tracker.stopRecording();
+        if(action==='scan-error')throw error('EACCES');
+        return [Uri.file(q)];
+    };
+    if(action==='persist-error')faults.set(path.join(storage,'session-state.tmp.json'),{write:error('EACCES')});
+    try {assert.equal(await tracker.restorePersistedState(),'blocked');assert.equal(tracker.getOriginalContent(p),'old');
+        if(action!=='stop')assert.equal(fs.readFileSync(primary,'utf8'),before);
+        assert.equal(tracker.getIsRecording(),false);
+    } finally {vscode.workspace.findFiles=find;}
+});
+
+for(const event of ['change','delete','recreate']) test(`RESTORE-OFFLINE replays ${event} during discovery`,async()=>{
+    const p=file(),q=file(),storage=file('storage');seed(p,'old');tracker.storageUri=Uri.file(storage);await tracker.dispose();
+    fs.writeFileSync(q,'first');listedFiles=[Uri.file(q)];tracker=new DiffTracker(Uri.file(storage));
+    const gate=pause(q,'stat'),restoring=tracker.restorePersistedState();await gate.entered;
+    if(event!=='change'){fs.unlinkSync(q);emitWatcher('delete',Uri.file(q));}
+    if(event!=='delete'){fs.writeFileSync(q,'latest');emitWatcher(event==='change'?'change':'create',Uri.file(q));}
+    gate.release();assert.equal(await restoring,'restored');assert.equal(tracker.getOriginalContent(q),'');
+    if(event==='delete')assert.equal(pending(q),undefined);else assert.equal(pending(q)?.currentContent,'latest');
+});
+if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
