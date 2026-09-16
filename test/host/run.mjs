@@ -22,7 +22,10 @@ try {
         ['crlf.txt', 'one\r\ntwo\r\n'],
         ['deleted.txt', 'delete baseline\n'],
         ['batch-a.txt', 'batch a\n'],
-        ['batch-b.txt', 'batch b\n']
+        ['batch-b.txt', 'batch b\n'],
+        ['audit-source.txt', 'base\n'],
+        ['audit-target.txt', 'edit\n'],
+        ['audit-recovery.txt', 'base\n']
     ]) {
         writeFileSync(path.join(workspacePath, name), content);
         if (name === 'deleted.txt' && process.platform !== 'win32') { chmodSync(path.join(workspacePath, name), 0o755); }

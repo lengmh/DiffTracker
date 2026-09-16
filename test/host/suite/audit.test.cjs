@@ -43,7 +43,10 @@ module.exports = async function auditHost(workspace) {
     let participant;
     let releaseRead;
     try {
-        fs.writeFileSync(p, 'base\n'); fs.writeFileSync(q, 'edit\n'); fs.writeFileSync(recoveryPath, 'base\n');
+        // Fixtures predate host startup. Creating them here queues native Windows
+        // create events into the scan, correctly producing unknown baselines.
+        assert.equal(fs.readFileSync(p, 'utf8'), 'base\n');
+        assert.equal(fs.readFileSync(recoveryPath, 'utf8'), 'base\n');
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
         await delay(500); // Allow the native watcher backend to register.

@@ -42,7 +42,12 @@ real. Initial CI run `35081315256` passed Ubuntu quality and the new symlink
 assertion, then the Host setup Revert returned conflict immediately after the
 symlink was replaced. The test now uses a separate recovery file, waits for a
 stable review before acting, and includes the full action result on failure.
-No conflict is retried or treated as success. Final CI results are recorded in PR #1.
+No conflict is retried or treated as success. Windows diagnostics in run
+`35082083762` then established that newly created fixtures delivered delayed
+create/change notifications during the scan, correctly becoming unresolved
+baselines. Audit fixtures now predate VS Code startup, use URI-normalized paths,
+and keep native writes for the actual scenarios. The product's scan uncertainty
+rule was not relaxed. Final CI results are recorded in PR #1.
 
 ## Second-pass review
 
