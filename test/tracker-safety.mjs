@@ -145,7 +145,7 @@ const vscode = {
             return true;
         },
         fs: {
-            async stat(uri) { fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
+            async stat(uri) { await boundary(uri.fsPath,'stat'); fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); await boundary(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
@@ -1114,6 +1114,81 @@ test('AUDIT-18 directory creation during ignore discovery cannot accept its chil
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
     fs.mkdirSync(dir);fs.writeFileSync(p,'new child');emitWatcher('create',Uri.file(dir));gate.release();
     await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+});
+for(const resource of ['directory','file']) test(`AUDIT-19 startup transient ${resource} leaves no persistent review entry`,async()=>{
+    const p=file('transient'),storage=file('storage');tracker.storageUri=Uri.file(storage);
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    if(resource==='directory')fs.mkdirSync(p);else fs.writeFileSync(p,'temporary');
+    emitWatcher('create',Uri.file(p));emitWatcher('change',Uri.file(p));
+    fs.rmSync(p,{recursive:true});emitWatcher('delete',Uri.file(p));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(pending(p),undefined);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(disk(path.join(storage,'session-state.json')));
+    assert.equal(saved.unresolvedBaselineFiles.some(([name])=>name===p),false);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+});
+for(const kinds of [
+    ['create','delete','create'], ['delete','create','delete'], ['change','create','delete'], ['delete']
+]) test(`AUDIT-19 startup ${kinds.join('-')} preserves unresolved evidence`,async()=>{
+    const p=file();fs.writeFileSync(p,'before');
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    for(const kind of kinds){if(kind==='delete')fs.rmSync(p,{force:true});else fs.writeFileSync(p,'current');emitWatcher(kind,Uri.file(p));}
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
+});
+test('AUDIT-19 multiple completed startup incarnations leave no review entry',async()=>{
+    const p=file();const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    for(let i=0;i<2;i++){fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));fs.unlinkSync(p);emitWatcher('delete',Uri.file(p));}
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(pending(p),undefined);
+});
+for(const mode of ['preexisting','dirty','clean']) test(`AUDIT-19 transient path respects ${mode} document evidence`,async()=>{
+    const p=file();if(mode==='preexisting'){fs.writeFileSync(p,'before');document(p);}
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));const doc=document(p);doc.isDirty=mode==='dirty';
+    fs.unlinkSync(p);emitWatcher('delete',Uri.file(p));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    if(mode==='clean'){assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),undefined);}
+    else {assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getOriginalContent(p),undefined);}
+});
+test('AUDIT-19 inability to stat a create-delete path never proves absence',async()=>{
+    const p=file();const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));fs.unlinkSync(p);emitWatcher('delete',Uri.file(p));faults.set(p,{stat:error('NoPermissions')});
+    gate.release();await waitUntil(()=>tracker.getBaselineState()==='ready');assert.ok(pending(p)?.unavailableReason);
+});
+test('AUDIT-19 deletion during another path classification retains the earlier create event',async()=>{
+    const p=file(),q=file();fs.writeFileSync(q,'before');
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));emitWatcher('change',Uri.file(q));
+    const statGate=pause(q,'stat');gate.release();await statGate.entered;
+    fs.unlinkSync(p);emitWatcher('delete',Uri.file(p));statGate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(pending(p),undefined);assert.ok(pending(q)?.unavailableReason);
+});
+test('AUDIT-19 recreation during classification invalidates transient cancellation',async()=>{
+    const p=file();const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));fs.unlinkSync(p);emitWatcher('delete',Uri.file(p));
+    const statGate=pause(p,'stat');gate.release();await statGate.entered;
+    fs.writeFileSync(p,'survivor');emitWatcher('create',Uri.file(p));statGate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.ok(pending(p)?.unavailableReason);assert.equal(disk(p),'survivor');assert.equal(tracker.getOriginalContent(p),undefined);
+});
+test('AUDIT-19 stopped classifier cannot publish into restarted session',async()=>{
+    const p=file();const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));const statGate=pause(p,'stat');gate.release();await statGate.entered;
+    tracker.stopRecording();listedFiles=[Uri.file(p)];fs.writeFileSync(p,'new baseline');tracker.startRecording();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');statGate.release();await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(tracker.getOriginalContent(p),'new baseline');assert.equal(pending(p),undefined);
+});
+test('AUDIT-19 parent and child transient events leave no stale entries from enumeration',async()=>{
+    const dir=file('parent'),p=path.join(dir,'child');listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    fs.mkdirSync(dir);emitWatcher('create',Uri.file(dir));fs.writeFileSync(p,'temporary');emitWatcher('create',Uri.file(p));
+    fs.rmSync(dir,{recursive:true});emitWatcher('delete',Uri.file(p));emitWatcher('delete',Uri.file(dir));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(pending(p),undefined);assert.equal(pending(dir),undefined);
+});
+test('AUDIT-19 transient parent evidence never hides a pre-existing open child',async()=>{
+    const dir=file('parent'),p=path.join(dir,'child');fs.mkdirSync(dir);fs.writeFileSync(p,'before');document(p);
+    const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
+    emitWatcher('create',Uri.file(dir));fs.rmSync(dir,{recursive:true});emitWatcher('delete',Uri.file(dir));gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(pending(dir),undefined);assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getOriginalContent(p),undefined);
 });
 test('DT-08 Stop during initial ignore discovery prevents late watcher or Ready publication',async()=>{
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;tracker.stopRecording();gate.release();

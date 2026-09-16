@@ -104,6 +104,12 @@ interface BaselineTransaction {
     finish: () => void;
 }
 
+interface StartupEvent {
+    uri: vscode.Uri;
+    firstKind: 'change' | 'create' | 'delete';
+    kind: 'change' | 'create' | 'delete';
+}
+
 interface PersistedTrackerState {
     version: 2;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
@@ -159,7 +165,7 @@ export class DiffTracker {
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
     private initialIgnoreEpoch?: number;
-    private initialIgnoreEvents = new Map<string, vscode.Uri>();
+    private initialIgnoreEvents = new Map<string, StartupEvent>();
     private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
     // Only same-session post-baseline notifications can be resolved by a later
     // create event. Restored or scan-time uncertainty still requires a rebuild.
@@ -1596,29 +1602,55 @@ export class DiffTracker {
     private async initializeWorkspaceSnapshots(): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
+        const initialDocuments = new Set(vscode.workspace.textDocuments.filter(doc => doc.uri.scheme === 'file').map(doc => doc.uri.fsPath));
+        const transientPaths = new Set<string>();
         await this.refreshIgnoreMatchers();
         if (!this.isCurrentEpoch(epoch)) { return; }
 
         if (this.initialIgnoreEpoch === epoch) {
-            while (this.initialIgnoreEvents.size > 0) {
-                const events = [...this.initialIgnoreEvents.values()];
-                this.initialIgnoreEvents.clear();
-                for (const uri of events) {
+            const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
+            // Keep each path's first event across I/O rounds. An event arriving
+            // during stat invalidates that classification, not its earlier history.
+            while (true) {
+                const events = [...this.initialIgnoreEvents.values()].filter(event => classified.get(event.uri.fsPath)?.event !== event);
+                if (events.length === 0) { break; }
+                for (const event of events) {
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    if (this.isPathIgnored(uri)) { continue; }
-                    const directory = await this.isUntrackedDirectory(uri);
+                    const uri = event.uri;
+                    let state: 'ignored' | 'directory' | 'missing' | 'other' = 'other';
+                    if (this.isPathIgnored(uri)) { state = 'ignored'; }
+                    else {
+                        try {
+                            const stat = await vscode.workspace.fs.stat(uri);
+                            if (stat.type & vscode.FileType.Directory) { state = 'directory'; }
+                        } catch (error) {
+                            if (this.isFileNotFound(error)) { state = 'missing'; }
+                        }
+                    }
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    this.scanUncertainFiles.add(uri.fsPath);
-                    // Directory notifications also invalidate unscanned children,
-                    // but directories themselves are not reviewable file entries.
-                    if (directory) { continue; }
-                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during ignore discovery; before-image is unknown');
-                    this.pendingExternalChanges.add(uri.fsPath);
+                    classified.set(uri.fsPath, { event, state });
                 }
             }
             this.initialIgnoreEpoch = undefined;
+            this.initialIgnoreEvents.clear();
+            for (const [filePath, { event, state }] of classified) {
+                if (state === 'ignored') { continue; }
+                // Even a transient parent must not cause surviving children or
+                // pre-existing open documents to be accepted as a fresh baseline.
+                this.scanUncertainFiles.add(filePath);
+                if (state === 'directory') { continue; }
+                const dirty = vscode.workspace.textDocuments.some(doc => doc.uri.scheme === 'file' && doc.uri.fsPath === filePath && doc.isDirty);
+                if (state === 'missing' && event.firstKind === 'create' && event.kind === 'delete' && !initialDocuments.has(filePath) && !dirty) {
+                    transientPaths.add(filePath);
+                    continue;
+                }
+                this.recordUnresolvedBaseline(filePath, 'File changed during ignore discovery; before-image is unknown');
+                this.pendingExternalChanges.add(filePath);
+            }
             // Unchanged editors may be ahead of disk. Changed paths stay unknown.
-            vscode.workspace.textDocuments.forEach(doc => this.ensureSnapshotForDocument(doc, true));
+            vscode.workspace.textDocuments.forEach(doc => {
+                if (!transientPaths.has(doc.uri.fsPath)) { this.ensureSnapshotForDocument(doc, true); }
+            });
         }
 
         for (const folder of folders) {
@@ -1657,6 +1689,7 @@ export class DiffTracker {
                     }
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (state.kind === 'missing' && transientPaths.has(uri.fsPath)) { return; }
                     if (this.hasScanUncertainty(uri.fsPath)) {
                         this.recordUnresolvedBaseline(uri.fsPath, 'File changed during baseline scan; before-image is unknown');
                         return;
@@ -1968,7 +2001,7 @@ export class DiffTracker {
             return;
         }
 
-        if (this.deferInitialIgnoreEvent(uri)) { return; }
+        if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -1998,7 +2031,7 @@ export class DiffTracker {
     private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' ||
-            this.deferInitialIgnoreEvent(uri) || this.isPathIgnored(uri)) {
+            this.deferInitialIgnoreEvent(uri, 'delete') || this.isPathIgnored(uri)) {
             return;
         }
         // A delete notification may race an atomic replacement; confirm actual state.
@@ -3761,9 +3794,12 @@ export class DiffTracker {
         return doc?.getText();
     }
 
-    private deferInitialIgnoreEvent(uri: vscode.Uri): boolean {
+    private deferInitialIgnoreEvent(uri: vscode.Uri, kind: StartupEvent['kind'] = 'change'): boolean {
         if (this.initialIgnoreEpoch !== this.sessionEpoch) { return false; }
-        this.initialIgnoreEvents.set(uri.fsPath, uri);
+        const previous = this.initialIgnoreEvents.get(uri.fsPath);
+        // First + latest event summarize complete transient incarnations while
+        // retaining uncertainty that preceded the first observed creation.
+        this.initialIgnoreEvents.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
         return true;
     }
 
