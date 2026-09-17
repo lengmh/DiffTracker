@@ -1,4 +1,5 @@
 name: One-shot run opaque baseline patch
+# retry after updating the regression synchronization point
 
 on:
   push:
