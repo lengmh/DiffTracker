@@ -81,9 +81,16 @@ try {
     assert.equal(await monitor.start(), true);
     assert.equal(monitor.isReady(), false);
 
-    // VS Code can discover/open repositories and publish repository-state changes while
-    // its Git API is still uninitialized. These are startup reconciliation, not changes
-    // that happened after a Code Diff Tracker baseline.
+    // VS Code can discover/open/close repositories and publish repository-state changes
+    // while its Git API is still uninitialized. These are startup reconciliation, not
+    // changes that happened after a Code Diff Tracker baseline.
+    repositories.push(repo);
+    opened.fire(repo);
+    repositories.splice(0, repositories.length);
+    closed.fire(repo);
+    assert.deepEqual(events, []);
+    assert.deepEqual(monitor.getSnapshots(), []);
+
     repositories.push(repo);
     opened.fire(repo);
     repo.state.HEAD = { name: 'feature', commit: 'bbb' };
@@ -102,7 +109,7 @@ try {
     assert.equal(events[0].contexts[0].headName, 'feature');
     assert.equal(events[0].contexts[0].headCommit, 'bbb');
 
-    // Once ready, ordinary repository changes must still be reported.
+    // Once ready, ordinary repository changes and removals must still be reported.
     repo.state.HEAD = { name: 'hotfix', commit: 'ccc' };
     stateChanged.fire();
     assert.equal(events.at(-1).kind, 'changed');
