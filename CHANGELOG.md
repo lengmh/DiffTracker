@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2
+
+- Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
+- Cover oversized files, UTF-8 BOM files, unsupported UTF-8 text, and binary-only resources consistently while preserving transient read/scan uncertainty.
+- Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews and unresolved baseline markers and persists an empty stopped session.
+- Add regression coverage for Clear/reset, session reload, later file events, and stopped-session clearing of unsupported resources.
+
 ## 0.7.1
 
 - Prevent delayed VS Code Git initialization from being misclassified as a repository appearing after the review baseline.
