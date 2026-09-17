@@ -920,6 +920,7 @@ for(const kind of ['oversized','bom','invalid-utf8']) test(`DT-08 clear/reset ac
     assert.ok(tracker.unresolvedBaselineFiles.has(p));assert.equal(await tracker.flushPendingPersistence(),true);
     await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
     assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+    tracker.onDocumentOpened(document(p));assert.equal(pending(p),undefined,'opening an unchanged opaque baseline must stay quiet');
     await scan(p);assert.ok(pending(p)?.unavailableReason,'a post-baseline event must surface the unsupported path again');
     faults.delete(p);
 });

@@ -4388,7 +4388,13 @@ export class DiffTracker {
             this.recordUnresolvedBaseline(filePath, 'File or parent changed during baseline scan; before-image is unknown');
             return;
         }
-        if (this.unresolvedBaselineFiles.has(filePath) ||
+        const unresolvedReason = this.unresolvedBaselineFiles.get(filePath);
+        if (unresolvedReason && this.isStableUnsupportedBaselineReason(unresolvedReason)) {
+            // Opening an unchanged opaque-baseline resource is not evidence of a file change.
+            // Actual document/file change events still surface it for explicit review.
+            return;
+        }
+        if (unresolvedReason ||
             (this.snapshotInitialized && (!this.scanCoverage || this.scanCoverage !== this.ignoreFingerprint))) {
             this.recordUnresolvedBaseline(filePath, 'Path was not covered by the baseline scan; before-image is unknown');
             return;
