@@ -155,15 +155,20 @@ export class GitContextMonitor implements vscode.Disposable {
             await this.discoverInitialRepositories();
             if (this.disposed) { return false; }
             this.disposables.push(
-                this.api.onDidOpenRepository(repository => this.attachRepository(repository, true)),
-                this.api.onDidCloseRepository(repository => this.detachRepository(repository.rootUri.fsPath, true)),
+                this.api.onDidOpenRepository(repository => this.attachRepository(repository, this.ready)),
+                this.api.onDidCloseRepository(repository => this.detachRepository(repository.rootUri.fsPath, this.ready)),
                 this.api.onDidChangeState(state => {
-                    this.refreshRepositories();
                     if (state === 'initialized' && !this.ready) {
+                        // Initial Git discovery establishes the reconciliation boundary. Repository
+                        // events observed before this point belong to startup state and must not be
+                        // mistaken for post-baseline Git changes.
+                        this.refreshRepositories(false);
                         this.ready = true;
                         this.onContextEvent({ kind: 'ready', contexts: this.getSnapshots() });
                         this.readyWaiters.splice(0).forEach(resolve => resolve(true));
+                        return;
                     }
+                    this.refreshRepositories(this.ready);
                 })
             );
             this.refreshRepositories(false);
@@ -232,11 +237,11 @@ export class GitContextMonitor implements vscode.Disposable {
             }
             this.repositoryDisposables.set(repoRoot, subscriptions);
         }
-        if (emit) { this.emitRepository(repository); }
+        if (emit && this.ready) { this.emitRepository(repository); }
     }
 
     private emitRepository(repository: GitRepositoryLike): void {
-        if (!this.disposed && this.repositories.get(repository.rootUri.fsPath) === repository) {
+        if (this.ready && !this.disposed && this.repositories.get(repository.rootUri.fsPath) === repository) {
             this.onContextEvent({ kind: 'changed', context: snapshotGitRepository(repository) });
         }
     }
@@ -245,7 +250,7 @@ export class GitContextMonitor implements vscode.Disposable {
         this.repositoryDisposables.get(repoRoot)?.forEach(disposable => disposable.dispose());
         this.repositoryDisposables.delete(repoRoot);
         const removed = this.repositories.delete(repoRoot);
-        if (removed && emit && !this.disposed) { this.onContextEvent({ kind: 'removed', repoRoot }); }
+        if (removed && emit && this.ready && !this.disposed) { this.onContextEvent({ kind: 'removed', repoRoot }); }
     }
 
     public getSnapshots(): GitContextSnapshot[] {

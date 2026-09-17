@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1
+
+- Prevent delayed VS Code Git initialization from being misclassified as a repository appearing after the review baseline.
+- Make the initial Git reconciliation boundary emit `ready` before any repository `changed` or `removed` events.
+- Add regression coverage for repository open, close, and HEAD-change events that occur while the Git API is still uninitialized.
+
 ## 0.7.0
 
 - Publish under the unique Marketplace identity `lengmh.code-diff-tracker` and display name **Code Diff Tracker**.
