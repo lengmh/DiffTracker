@@ -6,9 +6,10 @@
 - Persist opaque baseline identity for oversized, UTF-8 BOM, unsupported UTF-8, and binary resources, while preserving transient read/scan uncertainty as unresolved review state.
 - Revalidate opaque baselines after restart so offline deletion, replacement, format changes, and file-to-directory replacements surface as unavailable reviews instead of being silently hidden.
 - Use streaming SHA-256 identity for oversized files so same-size, timestamp-preserving rewrites are still detected without loading the full file into memory.
-- Keep an unchanged opaque-baseline file quiet when it is opened; later file changes or actual document edits still surface it for explicit review.
+- Keep unchanged opaque-baseline files quiet when opened or reported through an identical delete/create replacement; later file changes or actual document edits still surface them for explicit review.
+- Preserve watcher-observed scan uncertainty during repository baseline rebuilds so a concurrent unsupported-file change cannot be silently accepted as a new opaque baseline.
 - Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews, unresolved markers, and opaque baseline state and persists an empty stopped session.
-- Add regression coverage for Clear/reset, session reload, offline replacement/deletion, file-to-directory replacement, timestamp-preserving large-file rewrites, document edits, later file events, and stopped-session clearing of unsupported resources.
+- Add regression coverage for Clear/reset, session reload, offline replacement/deletion, identical create reconciliation, file-to-directory replacement, timestamp-preserving large-file rewrites, repository-rebuild races, document edits, later file events, and stopped-session clearing of unsupported resources.
 
 ## 0.7.1
 
