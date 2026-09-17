@@ -1355,7 +1355,7 @@ export class DiffTracker {
                 snapshotPaths.has(filePath) || unresolvedPaths.has(filePath) || opaquePaths.has(filePath) ||
                 typeof value.reason !== 'string' || !this.isStableUnsupportedBaselineReason(value.reason) ||
                 typeof value.size !== 'number' || !Number.isFinite(value.size) || value.size < 0 ||
-                typeof value.mtime !== 'number' || !Number.isFinite(value.mtime) || value.mtime < 0 ||
+                typeof value.mtime !== 'number' || !Number.isFinite(value.mtime) ||
                 (value.fingerprint !== undefined && (typeof value.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.fingerprint)))) {
                 return undefined;
             }
