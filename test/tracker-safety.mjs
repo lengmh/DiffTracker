@@ -907,6 +907,37 @@ test('DT-08 reset cannot scan ahead of replacement watcher registration',async()
     await new Promise(resolve=>setTimeout(resolve,180));
     assert.ok(!scanned || pending(p)?.currentContent==='external','a scanned file must have live watcher coverage');
 });
+for(const kind of ['oversized','bom','invalid-utf8']) test(`DT-08 clear/reset accepts stable unsupported ${kind} without recreating an unavailable review`,async()=>{
+    const p=file(`${kind}-clear.txt`),storage=file('storage');
+    seed(p,'baseline','pending');await scan(p);
+    if(kind==='oversized') faults.set(p,{size:6*1024*1024});
+    else if(kind==='bom') fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    else fs.writeFileSync(p,Buffer.from([0xc3,0x28]));
+    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(tracker.getBaselineState(),'ready');assert.equal(pending(p),undefined);
+    assert.ok(tracker.unresolvedBaselineFiles.has(p));assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+    await scan(p);assert.ok(pending(p)?.unavailableReason,'a post-baseline event must surface the unsupported path again');
+    faults.delete(p);
+});
+for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unavailable ${kind} review and unresolved baseline`,async()=>{
+    const p=file(`${kind}-stopped-clear.txt`),storage=file('storage');
+    seed(p,'baseline','pending');await scan(p);
+    if(kind==='oversized') faults.set(p,{size:6*1024*1024});
+    else fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    tracker.storageUri=Uri.file(storage);tracker.stopRecording();
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    const saved=JSON.parse(disk(path.join(storage,'session-state.json')));
+    assert.equal(saved.unresolvedBaselineFiles.length,0);assert.equal(saved.fileSnapshots.length,0);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+    faults.delete(p);
+});
 test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{
     const p=file('dirty-reset.m');seed(p,'old baseline','saved disk');const doc=document(p);
     doc.text='dirty current';doc.isDirty=true;doc.version++;
@@ -1400,15 +1431,15 @@ for(const kind of ['binary','bom','oversized','unreadable','missing','all-unsupp
     const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
     listedFiles=kind==='all-unsupported'?[Uri.file(p)]:[Uri.file(p),Uri.file(q)];
     assert.equal(await tracker.rebuildRepositoryBaseline(repo,current),true);
-    const binary=kind==='binary'||kind==='all-unsupported';
+    const quiet=kind==='binary'||kind==='all-unsupported'||kind==='bom'||kind==='oversized';
     assert.equal(tracker.getGitPauseReason(p),undefined);
-    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
+    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
     assert.equal(tracker.getReviewToken(p),undefined);assert.equal(tracker.getOriginalContent(p),undefined);
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
     assert.ok(saved.unresolvedBaselineFiles.some(([f])=>f===p));assert.ok(tracker.parsePersistedState(saved));
     await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
     tracker.reconcileRestoredGitContexts([current]);
-    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
+    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
     assert.equal(tracker.getReviewToken(p),undefined);
     assert.equal(succeeded(await tracker.revertFile(p)),false);
     if(kind!=='all-unsupported'){assert.equal(tracker.getOriginalContent(q),'new baseline');fs.writeFileSync(q,'later change');await scan(q);assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),true);}
