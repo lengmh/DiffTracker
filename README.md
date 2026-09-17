@@ -1,81 +1,26 @@
 # Code Diff Tracker
 
-Restored discoveries are classified as new files only when a completed baseline
-scan recorded matching ignore rules. Files newly exposed by changed ignore rules,
-or discovered from older sessions without scan provenance, remain pending with an
-unknown baseline until an explicit rebuild. Existing known baselines are retained.
-The corrected folder-scoped and nested ignore semantics invalidate older scan
-provenance even if rule text is unchanged. After upgrading, newly discovered paths
-may need an explicit baseline rebuild; existing pending reviews remain intact.
+Code Diff Tracker is a VS Code extension that records workspace file changes and provides three review modes:
 
-
-Review workspace changes as they happen, then keep or safely revert them by block,
-file, or batch. Version 0.7.0 adds versioned review actions, durable session recovery,
-bounded **Undo Last Revert**, and Git-context safety.
-
-Undo that would delete a restored file requires manual deletion: inspect and delete
-that file yourself, then retry Undo to acknowledge it. The recovery record remains
-available until then. VS Code does not provide a conditional, version-checked file
-deletion, so this branch never automatically deletes potentially newer work.
-Revert of a file absent from the baseline follows the same rule: inspect and delete
-it manually; the watcher clears its pending review after deletion. Batch Revert
-reports that item as a conflict while continuing with other files.
-Restoring a deleted file publishes fully written content with an exclusive hard
-link. If the destination appears concurrently or the filesystem does not support
-hard links, the action reports a conflict without overwriting the destination.
-New snapshots and recovery records preserve POSIX file permission bits, including
-executability. Older sessions without mode metadata use the normal creation mode
-filtered by the process umask; original permissions cannot be inferred retroactively.
-Missing parent directories are recreated privately with mode `0700` (subject to
-umask); existing directories are not chmodded. Original directory modes and ACLs
-are not restored, so shared-directory access may need to be re-enabled explicitly.
-Fresh recording waits for an available Git API to initialize before taking its baseline.
-Baseline growth and Keep must persist before review resumes. An interrupted or
-failed session write leaves a recovery marker and blocks automatic restoration;
-preserve the session and workspace before explicitly rebuilding.
-
-This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) fork of
-[TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining the
-MIT license and upstream attribution. Its Marketplace extension ID is
-`lengmh.code-diff-tracker`.
-
-> Before installing, disable or uninstall `TinyTigerPan.diff-tracker` and any earlier
-> test VSIX published as `lengmh.diff-tracker`. These IDs register the same commands,
-> views, and configuration keys and are not supported side by side. VS Code treats
-> each ID as a separate extension, so saved review sessions are not migrated.
-
-Code Diff Tracker blocks a review action when the displayed version is stale, a file is
-unsafe to decode or write, or the repository has moved to a different Git context.
-When a Git branch, detached HEAD, worktree, or conflict context changes, existing
-review data remains available but writes pause until you explicitly archive and
-rebuild that repository's baseline. Session data is written atomically and keeps a
-last-known-good copy; corrupt recovery data is reported instead of silently replaced.
-
-Automation-only mode conservatively retains editor changes whose source cannot be
-proven. Saving a document does not silently accept it. Extensions can use the
-existing automation-session API to identify their own edits.
-
-Unsupported text encodings, binary or oversized files, UTF-8 BOM files, unreadable
-files, paths outside the workspace, and symlink write targets are review-only or
-skipped; Code Diff Tracker will not decode and write them back speculatively. Pure EOL
-style changes are treated as no logical content change.
-
-[中文说明](./README_CN.md)
-
-
-Code Diff Tracker is a VS Code extension that records file changes and provides three review modes:
-- Inline readonly diff document
+- Inline read-only diff document
 - VS Code side-by-side diff
 - Cursor-like WebView diff with floating Undo/Keep actions
 
-**Fork From [wizyoung/DiffTracker](https://github.com/wizyoung/DiffTracker)**
+Review changes as they happen, then keep or safely revert them by block, file, or batch. Pending reviews can survive VS Code restarts, stale review actions are rejected, and Git-context changes are guarded before write operations continue.
 
+[中文说明](./README_CN.md)
+
+This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
+[`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
+[`TinyTigerPan/DiffTracker`](https://github.com/TinyTigerPan/DiffTracker) →
+[`lengmh/DiffTracker`](https://github.com/lengmh/DiffTracker).
+The project retains the MIT license and upstream attribution. The Marketplace extension ID is `lengmh.code-diff-tracker`.
+
+> **Compatibility note:** Before installing, disable or uninstall `TinyTigerPan.diff-tracker` and any earlier test VSIX published as `lengmh.diff-tracker`. These extensions register the same commands, views, and configuration keys and are not supported side by side. VS Code treats each extension ID separately, so saved review sessions are not migrated between IDs.
 
 ## Screenshots
 
-💥 **Highlights in 0.6.0: Auto-start recording, persistent review sessions, automation-only tracking, and more flexible WebView opening behavior.**
-
-| Cursor like WebView Unified | Cursor like WebView Split |
+| Cursor-like WebView Unified | Cursor-like WebView Split |
 |:---------------:|:--------------:|
 | ![Word diff](./resources/webview1.png) | ![Settings](./resources/webview2.png) |
 
@@ -87,49 +32,87 @@ Code Diff Tracker is a VS Code extension that records file changes and provides 
 |:---------------:|:--------------:|
 | ![Word diff](./resources/diff2.png) | ![Settings](./resources/diff3.png) |
 
-
 ## Features
-- [New 🚀] Pending, unaccepted changes survive VS Code restarts and are restored from the saved baseline
-- [New 🚀] Automation-only tracking mode for AI/agent or extension-driven edits
-- [New 🚀] Configurable WebView opening position (`current group` or `beside`)
-- [New 🚀] Automatically start recording file changes after the extension is activated
+
+- Persistent review sessions: pending, unaccepted changes survive VS Code restarts
+- Versioned review actions that reject stale CodeLens and WebView operations
+- Block-, file-, and batch-level Keep/Revert workflows
+- Bounded **Undo Last Revert** recovery for supported revert operations
+- Git-context protection for branch, detached HEAD, worktree, and conflict changes
+- Automation-only tracking mode for AI/agent or extension-driven edits
+- Configurable WebView opening position (`current group` or `beside`)
+- Automatic recording after extension activation
 - Activity Bar **Change Recording** tree with file grouping
-- Recording mode (start/stop) with workspace baseline snapshot
-- Workspace-wide file watching (including external file changes)
-- Inline readonly diff view with line and word-level highlights
-- Side-by-side diff (`Original ↔ Current`) via built-in VS Code diff
-- Cursor-like WebView diff (Split/Unified, Wrap, Expand, Keep All, Reject All)
-- Block-wise actions: Undo/Keep per change block
-- File-level actions: Revert file, Revert all files, Keep all changes in file
-- Deleted-line badge, CodeLens actions, and hover details
-- Settings panel + Watch Ignore editor (`.gitignore` style patterns)
+- Workspace baseline snapshots with start/stop recording controls
+- Workspace-wide file watching, including external file changes
+- Inline read-only diff view with line- and word-level highlights
+- Side-by-side diff (`Original ↔ Current`) through the built-in VS Code diff editor
+- Cursor-like WebView diff with Split/Unified, Wrap, Expand, Keep All, and Reject All
+- Deleted-line badges, CodeLens actions, and hover details
+- Settings panel and Watch Ignore editor with `.gitignore`-style patterns
 
 ## Usage
 
 1. Open **Code Diff Tracker** from the Activity Bar.
-2. Recording starts automatically after the extension activates.
+2. Recording starts automatically after the extension activates and establishes a baseline.
 3. Edit files in your workspace.
-4. In **Change Recording**, click a changed file to open inline diff.
-5. Use context menu or editor title buttons to open:
-   - Inline Diff (active file)
+4. In **Change Recording**, select a changed file to open the configured review view.
+5. Use the context menu or editor title actions to open:
+   - Inline Diff
    - Side-by-Side Diff
    - WebView Diff
 6. In WebView Diff, use block-level **Undo/Keep** or file-level **Keep All/Reject All**.
-7. Use **Revert File** / **Revert All Changes** as needed.
-8. Stop recording when done.
+7. Use **Revert File** / **Revert All Changes** when needed.
+8. Stop recording when you no longer want to track changes.
 
-**Clear Diffs** resets the baseline to the current workspace while recording.
-When stopped, it clears the saved baseline and Undo history and remains stopped,
-including after reload. It does not change workspace files or dirty buffers.
+**Clear Diffs** resets the baseline to the current workspace while recording. When recording is stopped, it clears the saved baseline and Undo history and remains stopped, including after reload. It does not modify workspace files or dirty buffers.
 
 ## How It Works
 
 When recording starts, Code Diff Tracker:
-1. Captures baseline snapshots for workspace files (batched)
-2. Tracks file/document changes and rebuilds line/block diffs
-3. Serves virtual inline/original documents
-4. Restores pending changes after restart until they are accepted/reverted or the baseline is cleared
-5. Keeps tree, decorations, CodeLens, and WebView in sync
+
+1. Captures baseline snapshots for supported workspace files.
+2. Tracks file and document changes and rebuilds line/block diffs.
+3. Serves virtual inline/original documents for review views.
+4. Persists the baseline and pending reviews so they can be restored after restart.
+5. Keeps the tree, decorations, CodeLens, and WebView synchronized.
+6. Verifies review version, file state, persistence state, and Git context before mutating reviewed files.
+
+## Safety and Recovery Behavior
+
+### Review consistency and persistence
+
+Code Diff Tracker rejects an action when the displayed review is stale, the baseline is incomplete, persistence has failed, or the target cannot be validated safely. Session state is written atomically and retains a last-known-good copy. If recovery data is corrupt or a session write is interrupted, automatic restoration is blocked instead of silently replacing the saved review state.
+
+Baseline growth and Keep operations must be persisted before review actions resume.
+
+### Git context changes
+
+Fresh recording waits for the VS Code Git API to become ready before establishing the Git baseline. If a repository later changes branch, detached HEAD, worktree identity, or enters an unstable merge/rebase state, existing review data is preserved but write actions for that repository pause. Use **Archive and Rebuild Paused Git Baseline** only after the repository reaches a stable state.
+
+Ordinary commits on the same named branch do not invalidate the review context.
+
+### Created and deleted files
+
+Code Diff Tracker does not automatically delete a file when a Revert or Undo operation would remove a file that was absent from the baseline. VS Code does not expose a conditional, version-checked delete primitive, so automatic deletion could destroy newer work. Inspect and delete the file manually, then retry the operation if required. Batch Revert reports that item as a conflict and continues with other eligible files.
+
+When restoring a deleted file, Code Diff Tracker publishes fully written content without overwriting a destination that appeared concurrently. If the destination already exists or the filesystem cannot provide the required safe publication behavior, the action reports a conflict.
+
+### Baseline and ignore provenance
+
+A newly discovered path is classified as a new file only when Code Diff Tracker has sufficient baseline-scan provenance to prove that it was absent. Files exposed by changed ignore rules, or restored from older sessions without compatible scan provenance, remain pending with an unknown baseline until an explicit rebuild. Existing known baselines are preserved.
+
+Changes to folder-scoped or nested ignore semantics may invalidate older scan provenance even when the visible rule text is unchanged.
+
+### Unsupported or unsafe files
+
+Binary files, unsupported text encodings, UTF-8 BOM files, oversized or unreadable files, paths outside the workspace, and unsafe symlink write targets are skipped or retained as unavailable review entries instead of being decoded and written speculatively. Pure line-ending-style changes are treated as no logical content change.
+
+New snapshots and recovery records preserve POSIX file permission bits, including executability. Older sessions without mode metadata cannot reconstruct original permissions. Missing parent directories created during recovery use private permissions (`0700`, subject to umask); existing directory permissions are not changed. Directory ACLs and historical directory modes are not reconstructed automatically.
+
+### Automation-only mode
+
+Automation-only mode conservatively retains editor changes when their source cannot be proven. Saving a document does not silently accept those changes. Extensions can use the automation-session API described under **Extension Settings** to identify their own edits.
 
 ## Installation
 
@@ -142,25 +125,25 @@ code --install-extension lengmh.code-diff-tracker
 ```
 
 ### From VSIX
-1. Download the .vsix file
-2. Open VS Code
-3. Open Extensions (Cmd+Shift+X)
-4. Click ... -> Install from VSIX...
-5. Select the downloaded .vsix
+
+1. Download the `.vsix` file.
+2. Open VS Code.
+3. Open Extensions (`Cmd+Shift+X` / `Ctrl+Shift+X`).
+4. Open the Extensions menu and select **Install from VSIX...**.
+5. Select the downloaded file.
 
 ### Development
-1. Clone the repository
-2. Run npm install
-3. Run npm run compile
-4. Press F5 to launch the Extension Development Host
+
+1. Clone the repository.
+2. Run `npm install`.
+3. Run `npm run compile`.
+4. Press `F5` to launch the Extension Development Host.
 
 ## Requirements
 
-- VS Code ^1.80.0
+- VS Code `^1.80.0`
 
 ## Extension Settings
-
-This extension provides the following settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -169,18 +152,19 @@ This extension provides the following settings:
 | `diffTracker.highlightAddedLines` | `true` | Highlight added lines with green background |
 | `diffTracker.highlightModifiedLines` | `true` | Highlight modified lines with blue background |
 | `diffTracker.highlightWordChanges` | `true` | Highlight word-level changes within modified lines |
-| `diffTracker.openWebviewBeside` | `false` | Open Webview diff in a side editor group instead of the current editor group |
-| `diffTracker.watchExclude` | `[]` | Additional watch ignore patterns (`.gitignore` style) |
-| `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits; retain uncertain editor edits for explicit review without automatic baseline acceptance |
+| `diffTracker.openWebviewBeside` | `false` | Open WebView diff in a side editor group instead of the current editor group |
+| `diffTracker.watchExclude` | `[]` | Additional watch-ignore patterns (`.gitignore` style) |
+| `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits while retaining uncertain editor edits for explicit review |
 
-You can toggle display/highlight settings in the sidebar **Settings** panel, and edit watch ignore patterns via **Edit Watch Ignores**.
+Display/highlight settings can be toggled in the sidebar **Settings** panel. Watch-ignore patterns can be edited through **Edit Watch Ignores**.
 
-When `diffTracker.openWebviewBeside` is enabled, Webview diff opens in a side editor group. By default it opens in the current editor group.
+When `diffTracker.openWebviewBeside` is enabled, WebView diff opens in a side editor group. By default it opens in the current editor group.
 
 When `diffTracker.onlyTrackAutomatedChanges` is enabled:
-- Editor events without reliable source information remain visible with an uncertainty notice
-- External tools/CLI that modify files on disk are still tracked through file watchers
-- VS Code extensions should call `diffTracker.beginAutomationSession` before applying edits, and `diffTracker.endAutomationSession` after they finish
+
+- Editor events without reliable source information remain visible with an uncertainty notice.
+- External tools or CLI processes that modify files on disk are still tracked through file watchers.
+- VS Code extensions should call `diffTracker.beginAutomationSession` before applying edits and `diffTracker.endAutomationSession` after they finish.
 
 Example integration from another VS Code extension:
 
@@ -191,104 +175,34 @@ const sessionId = await vscode.commands.executeCommand<string>(
 );
 
 try {
-  // apply WorkspaceEdit or editor edits here
+  // Apply WorkspaceEdit or editor edits here.
 } finally {
   await vscode.commands.executeCommand('diffTracker.endAutomationSession', sessionId);
 }
 ```
 
+## Upgrade Notes
+
+When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
+
+If an older saved session lacks current baseline-scan provenance, newly discovered paths may require an explicit baseline rebuild. Existing pending reviews and known baselines are preserved whenever they can be validated safely.
+
 ## Known Issues
 
-- Pure line-ending-style changes (CRLF/LF only) are currently treated as no logical content change.
-- If you find a reproducible diff/render edge case, please open an issue with a minimal file sample.
+- Pure line-ending-style changes (CRLF/LF only) are treated as no logical content change.
+- Unsupported or unsafe files are not eligible for text Keep/Revert actions.
+- If you find a reproducible diff/render edge case, open an issue with a minimal file sample.
 
 ## Release Notes
 
-### 0.7.0
-
-- Add stale-action rejection and serialized same-file review actions
-- Add atomic session persistence, last-known-good recovery, strict migration, and corruption blocking
-- Add bounded **Undo Last Revert** for file, hunk, creation, deletion, and batch reverts
-- Pause writes across Git branch, detached HEAD, worktree, and conflict-context changes
-- Preserve failed/conflicted batch items and empty-file existence semantics
-- Add Linux and Windows CI, real VS Code Stable Extension Host coverage, and performance measurements
-
-### 0.1.0
-
-- Activity Bar entry
-- Recording mode for change tracking
-- Inline diff highlighting
-- Side-by-side diff
-- Multi-file tracking with timestamps
-- Revert file and revert all
-- Clear diffs
-
-### 0.2.0
-- Change from LCS-based diff to Patience Diff algorithm for more intuitive diff display
-
-### 0.3.0
-- Add Partial Revert/Keep buttons, just like cursor
-- Add go-to-original-file button in left panel
-
-### 0.3.1
-- Add file-level "Revert All" / "Keep All" buttons (CodeLens at file top)
-- Add settings panel in sidebar to toggle display options
-- Fix block-wise keep/revert affecting all blocks instead of just one
-- Fix hover showing "unknown" for deleted empty lines
-
-### 0.3.2
-- Tiny bug fix
-
-### 0.3.3
-- Add word-level diff highlighting for modified lines
-- Add "Highlight Word Changes" setting to toggle word-level highlighting
-
-### 0.4.0
-- Cursor-like WebView diff: floating Undo/Keep, unified view default, wrap/expand, and Keep All/Reject All in the toolbar
-- Offline WebView rendering (bundled @pierre/diffs)
-- Workspace-wide file watching (no longer limited to open files)
-- New Watch Ignore panel with `.gitignore` support
-- Faster tracking in large workspaces (debounced changes + optimized watchers)
-- Smoother recording start on big repos (baseline builds in batches, large files skipped)
-
-### 0.4.1
-- Refactor diff pipeline to use a unified logical-line model
-- Stabilize block grouping for large paste/delete and EOF scenarios
-- Fix WebView empty-file rendering fallback that could hide block actions after full deletion
-- Unify inline virtual URI mapping and refresh flow to prevent stale inline readonly content
-- Improve mixed newline handling (LF/CRLF/CR) in Keep/Revert block operations
-
-### 0.5.0
-- Add Explorer file context action for Code Diff Tracker while recording, with the final label: **Open with Code Diff Tracker**
-- Add configurable default open mode for changed files (WebView / Inline / Side-by-side / Original / Split Original+WebView)
-- Add `Open split view` mode (left original file + right WebView diff)
-- Add global recording toggle shortcut: `Shift+Alt+D`
-- Improve changes tree to workspace-relative nested directory grouping
-- Use VS Code native file icons in the changes tree
-- Show changed-file count badge on the Code Diff Tracker activity icon
-- Add and streamline global file actions in changes view workflows (Keep All / Revert All)
-- Add `Clear Diffs` baseline reset to current workspace state
-- lots of optimizations & fixes
-
-### 0.5.1
-- Improve recording controls in Change Recording with inline start entry, starting status, and title start/stop actions
-
-### 0.5.2
-- Fix watch ignore rules not refreshing in some recording states
-- Reuse snapshot filtering in watcher updates to avoid tracking binary/oversized files
-- Clear pre-seeded empty baseline for non-trackable created files in watcher flow
-
-### 0.6.0
-- Persist recording session state and workspace baselines so pending diffs can be restored after restarting VS Code
-- Add `diffTracker.onlyTrackAutomatedChanges` plus `diffTracker.beginAutomationSession` / `diffTracker.endAutomationSession` for automation-aware tracking workflows
-- Add `diffTracker.openWebviewBeside`, expose the new recording/display toggles in the settings tree, and make WebView diff open behavior more configurable
-- Start recording automatically after activation and restore decorations/tree state when a previous session is resumed
+Release history is maintained in [CHANGELOG.md](./CHANGELOG.md). GitHub releases provide the corresponding tagged release notes and source archives.
 
 ## License
 
 MIT
 
-## Acknowledge
+## Acknowledgements
+
 [![LinuxDO](https://img.shields.io/badge/Community-Linux.do-blue?style=flat-square)](https://linux.do/)
 
-Discuss, free ai, and get help at [linux.do](https://linux.do/).
+Discuss, free AI, and get help at [linux.do](https://linux.do/).
