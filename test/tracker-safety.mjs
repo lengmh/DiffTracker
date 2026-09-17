@@ -2357,7 +2357,7 @@ for(const stop of [false,true]) test(`ROUND27 overlapping successful watch resum
 });
 
 registerOpaqueBaselineInvariants({
-    test, root, Uri, DiffTracker, docs, counters, document, file, pending, pause, waitUntil,
+    test, root, Uri, DiffTracker, docs, counters, faults, document, file, pending, pause, waitUntil,
     getTracker: () => tracker,
     setTracker: value => { tracker = value; },
     setListedFiles: value => { listedFiles = value; }

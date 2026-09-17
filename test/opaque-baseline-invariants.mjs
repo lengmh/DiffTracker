@@ -19,7 +19,7 @@ function bytes(format, changed = false) {
 }
 
 export function registerOpaqueBaselineInvariants(harness) {
-    const { test, Uri, DiffTracker, docs, counters, document, file, pending,
+    const { test, Uri, DiffTracker, docs, counters, faults, document, file, pending,
         pause, waitUntil, getTracker, setTracker, setListedFiles } = harness;
 
     async function setup(format) {
@@ -217,6 +217,64 @@ export function registerOpaqueBaselineInvariants(harness) {
                 assert.deepEqual(tracker.opaqueBaselineFiles.get(target), before);
                 assert.equal(tracker.unresolvedBaselineFiles.has(target), false);
             });
+        }
+    }
+
+    // A failed rebuild must restore its old before-image without rolling back
+    // live editor observations. Exercise both pre-capture and captured states.
+    for (const format of formats) {
+        for (const captured of [false, true]) {
+            for (const saved of [false, true]) {
+                for (const abort of ['git', 'stop', 'persistence']) {
+                    test(`OPAQUE-ROLLBACK ${format}/captured=${captured}/saved=${saved}/${abort} retains current edits`, async () => {
+                        let { tracker, repo, target, storage } = await setup(format);
+                        const original = { ...tracker.opaqueBaselineFiles.get(target) };
+                        const doc = document(target);
+                        const blocked = path.join(repo, 'blocked.txt');
+                        fs.writeFileSync(blocked, 'stable');
+                        setListedFiles([Uri.file(target), Uri.file(blocked)]);
+                        const gate = pause(captured ? blocked : target, captured ? 'read' : 'stat');
+                        const operation = beginScan('repository', tracker, repo);
+                        const tempState = path.join(storage.fsPath, 'session-state.tmp.json');
+                        try {
+                            await gate.entered;
+                            if (captured) { await waitUntil(() => tracker.opaqueBaselineFiles.has(target), 5000); }
+                            edit(tracker, doc);
+                            if (saved) {
+                                fs.writeFileSync(target, bytes(format, true));
+                                doc.isDirty = false;
+                                tracker.onDidSaveDocument(doc);
+                                if (captured) {
+                                    await waitUntil(() => /changed since the baseline/i.test(pending(target)?.unavailableReason ?? ''), 5000);
+                                }
+                            }
+                            assert.ok(pending(target)?.unavailableReason);
+                            if (abort === 'git') {
+                                tracker.observeGitContext({ repoRoot: repo, kind: 'repository', headName: 'third',
+                                    headCommit: 'ccc', detached: false, inProgress: false });
+                            } else if (abort === 'stop') {
+                                tracker.stopRecording();
+                            } else {
+                                faults.set(tempState, { write: Object.assign(new Error('NoPermissions'), { code: 'NoPermissions' }) });
+                            }
+                        } finally { gate.release(); }
+                        try {
+                            assert.equal(await operation, false);
+                            assert.deepEqual(tracker.opaqueBaselineFiles.get(target), original, 'rollback restores the old before-image');
+                            assert.ok(pending(target)?.unavailableReason, 'rollback must not erase an edit observed during the rebuild');
+                            assert.deepEqual(fs.readFileSync(target), bytes(format, saved));
+                            assert.equal(doc.isDirty, !saved);
+                        } finally { faults.delete(tempState); }
+                        assert.equal(await tracker.flushPendingPersistence(), true);
+                        await tracker.dispose();
+                        tracker = new DiffTracker(storage);
+                        setTracker(tracker);
+                        assert.equal(await tracker.restorePersistedState(), 'restored');
+                        assert.ok(pending(target)?.unavailableReason);
+                        assert.deepEqual(tracker.opaqueBaselineFiles.get(target), original);
+                    });
+                }
+            }
         }
     }
 }

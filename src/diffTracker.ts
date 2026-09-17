@@ -2976,6 +2976,9 @@ export class DiffTracker {
         };
         let transaction: BaselineTransaction;
         const restoreMemory = (): void => {
+            // Roll back the baseline candidate, not observations made while it
+            // was being built. Editor-only changes need not emit a watcher event.
+            const observedReviewPaths = [...this.trackedChanges.keys()].filter(ownsPath);
             this.fileSnapshots = previous.fileSnapshots;
             this.fileModes = previous.fileModes;
             this.baselineExistingFiles = previous.baselineExistingFiles;
@@ -2992,6 +2995,14 @@ export class DiffTracker {
             this.snapshotInitialized = previous.snapshotInitialized;
             this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
             this.baselineBuilding = previous.baselineBuilding;
+            for (const filePath of observedReviewPaths) {
+                if (this.isPathIgnored(vscode.Uri.file(filePath))) { continue; }
+                // Preserve a visible conflict synchronously even when Stop or
+                // disposal cancels the remaining async reconciliation. When the
+                // session stays active, reread against the restored before-image.
+                this.markFileUnavailable(filePath, 'Baseline rebuild was interrupted; reconcile current file and editor changes before review');
+                this.pendingExternalChanges.add(filePath);
+            }
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
