@@ -1,6 +1,6 @@
 {
-  "name": "diff-tracker",
-  "displayName": "Diff Tracker",
+  "name": "code-diff-tracker",
+  "displayName": "Code Diff Tracker",
   "description": "Review, keep, and safely revert workspace file changes in real time",
   "version": "0.7.0",
   "publisher": "lengmh",
@@ -46,7 +46,7 @@
       "activitybar": [
         {
           "id": "diffTracker",
-          "title": "Diff Tracker",
+          "title": "Code Diff Tracker",
           "icon": "resources/record-icon.svg"
         }
       ]
@@ -64,7 +64,7 @@
       ]
     },
     "configuration": {
-      "title": "Diff Tracker",
+      "title": "Code Diff Tracker",
       "properties": {
         "diffTracker.showDeletedLinesBadge": {
           "type": "boolean",
@@ -108,7 +108,7 @@
             "Open original file directly",
             "Open split view: left original file, right webview diff panel"
           ],
-          "description": "Default open mode when clicking a changed file in Diff Tracker"
+          "description": "Default open mode when clicking a changed file in Code Diff Tracker"
         },
         "diffTracker.openWebviewBeside": {
           "type": "boolean",
@@ -140,76 +140,76 @@
       {
         "command": "diffTracker.toggleRecording",
         "title": "Toggle Recording",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(record)"
       },
       {
         "command": "diffTracker.startRecording",
         "title": "Start Recording",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(record)"
       },
       {
         "command": "diffTracker.stopRecording",
         "title": "Stop Recording",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(debug-stop)"
       },
       {
         "command": "diffTracker.showDiffs",
         "title": "Show Diffs",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.clearDiffs",
         "title": "Clear Diffs",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.revertAllChanges",
         "title": "Revert All Changes",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(discard)"
       },
       {
         "command": "diffTracker.keepAllChanges",
         "title": "Accept All Changes",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(check)"
       },
       {
         "command": "diffTracker.undoLastRevert",
         "title": "Undo Last Revert",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(discard)"
       },
       {
         "command": "diffTracker.rebuildGitBaseline",
         "title": "Archive and Rebuild Paused Git Baseline",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(repo-pull)"
       },
       {
         "command": "diffTracker.revertFile",
         "title": "Revert File",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(discard)"
       },
       {
         "command": "diffTracker.showInlineDiff",
         "title": "Show Inline Diff",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.showSideBySideDiff",
         "title": "Show Side-by-Side Diff",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(split-horizontal)"
       },
       {
         "command": "diffTracker.showSideBySideDiffActive",
         "title": "Show Side-by-Side Diff (Active)",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": {
           "dark": "resources/diff-sbs-dark.svg",
           "light": "resources/diff-sbs-light.svg"
@@ -218,7 +218,7 @@
       {
         "command": "diffTracker.showInlineDiffActive",
         "title": "Show Inline Diff (Active)",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": {
           "dark": "resources/diff-inline-dark.svg",
           "light": "resources/diff-inline-light.svg"
@@ -227,65 +227,65 @@
       {
         "command": "diffTracker.revertBlock",
         "title": "Revert Block",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.keepBlock",
         "title": "Keep Block",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.goToBlock",
         "title": "Go to Block",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.openOriginalFile",
         "title": "Open Original File",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(go-to-file)"
       },
       {
         "command": "diffTracker.openDiffDefault",
-        "title": "Open with Diff Tracker",
-        "category": "Diff Tracker"
+        "title": "Open with Code Diff Tracker",
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.revertAllBlocksInFile",
         "title": "Revert All Changes in File",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.keepAllBlocksInFile",
         "title": "Keep All Changes in File",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.showWebviewDiff",
         "title": "Show Webview Diff",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(preview)"
       },
       {
         "command": "diffTracker.showWebviewDiffActive",
         "title": "Show Webview Diff (Active)",
-        "category": "Diff Tracker",
+        "category": "Code Diff Tracker",
         "icon": "$(preview)"
       },
       {
         "command": "diffTracker.showOriginalAndWebviewSplit",
         "title": "Show Split: Original | Webview",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.selectDefaultOpenMode",
         "title": "Select Default Open Mode",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.editWatchExcludes",
         "title": "Edit Watch Ignores",
-        "category": "Diff Tracker"
+        "category": "Code Diff Tracker"
       }
     ],
     "menus": {

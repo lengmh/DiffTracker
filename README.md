@@ -1,4 +1,4 @@
-# Diff Tracker
+# Code Diff Tracker
 
 Restored discoveries are classified as new files only when a completed baseline
 scan recorded matching ignore rules. Files newly exposed by changed ignore rules,
@@ -37,14 +37,14 @@ preserve the session and workspace before explicitly rebuilding.
 This is the [lengmh/DiffTracker](https://github.com/lengmh/DiffTracker) fork of
 [TinyTigerPan/DiffTracker](https://github.com/TinyTigerPan/DiffTracker), retaining the
 MIT license and upstream attribution. Its Marketplace extension ID is
-`lengmh.diff-tracker`.
+`lengmh.code-diff-tracker`.
 
-> If `TinyTigerPan.diff-tracker` is installed, disable it before enabling this fork.
-> Both extensions register the same commands, views, and configuration keys and are
-> not supported side by side. Their VS Code storage is separate, so review sessions
-> are not migrated automatically.
+> Before installing, disable or uninstall `TinyTigerPan.diff-tracker` and any earlier
+> test VSIX published as `lengmh.diff-tracker`. These IDs register the same commands,
+> views, and configuration keys and are not supported side by side. VS Code treats
+> each ID as a separate extension, so saved review sessions are not migrated.
 
-Diff Tracker blocks a review action when the displayed version is stale, a file is
+Code Diff Tracker blocks a review action when the displayed version is stale, a file is
 unsafe to decode or write, or the repository has moved to a different Git context.
 When a Git branch, detached HEAD, worktree, or conflict context changes, existing
 review data remains available but writes pause until you explicitly archive and
@@ -57,13 +57,13 @@ existing automation-session API to identify their own edits.
 
 Unsupported text encodings, binary or oversized files, UTF-8 BOM files, unreadable
 files, paths outside the workspace, and symlink write targets are review-only or
-skipped; Diff Tracker will not decode and write them back speculatively. Pure EOL
+skipped; Code Diff Tracker will not decode and write them back speculatively. Pure EOL
 style changes are treated as no logical content change.
 
 [中文说明](./README_CN.md)
 
 
-Diff Tracker is a VS Code extension that records file changes and provides three review modes:
+Code Diff Tracker is a VS Code extension that records file changes and provides three review modes:
 - Inline readonly diff document
 - VS Code side-by-side diff
 - Cursor-like WebView diff with floating Undo/Keep actions
@@ -106,7 +106,7 @@ Diff Tracker is a VS Code extension that records file changes and provides three
 
 ## Usage
 
-1. Open **Diff Tracker** from the Activity Bar.
+1. Open **Code Diff Tracker** from the Activity Bar.
 2. Recording starts automatically after the extension activates.
 3. Edit files in your workspace.
 4. In **Change Recording**, click a changed file to open inline diff.
@@ -124,7 +124,7 @@ including after reload. It does not change workspace files or dirty buffers.
 
 ## How It Works
 
-When recording starts, Diff Tracker:
+When recording starts, Code Diff Tracker:
 1. Captures baseline snapshots for workspace files (batched)
 2. Tracks file/document changes and rebuilds line/block diffs
 3. Serves virtual inline/original documents
@@ -135,10 +135,10 @@ When recording starts, Diff Tracker:
 
 ### Marketplace
 
-Search for **Diff Tracker** by publisher `lengmh`, or run:
+Search for **Code Diff Tracker** by publisher `lengmh`, or run:
 
 ```bash
-code --install-extension lengmh.diff-tracker
+code --install-extension lengmh.code-diff-tracker
 ```
 
 ### From VSIX
@@ -259,13 +259,13 @@ try {
 - Improve mixed newline handling (LF/CRLF/CR) in Keep/Revert block operations
 
 ### 0.5.0
-- Add Explorer file context action for Diff Tracker while recording, with the final label: **Open with Diff Tracker**
+- Add Explorer file context action for Code Diff Tracker while recording, with the final label: **Open with Code Diff Tracker**
 - Add configurable default open mode for changed files (WebView / Inline / Side-by-side / Original / Split Original+WebView)
 - Add `Open split view` mode (left original file + right WebView diff)
 - Add global recording toggle shortcut: `Shift+Alt+D`
 - Improve changes tree to workspace-relative nested directory grouping
 - Use VS Code native file icons in the changes tree
-- Show changed-file count badge on the Diff Tracker activity icon
+- Show changed-file count badge on the Code Diff Tracker activity icon
 - Add and streamline global file actions in changes view workflows (Keep All / Revert All)
 - Add `Clear Diffs` baseline reset to current workspace state
 - lots of optimizations & fixes

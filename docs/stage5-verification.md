@@ -77,6 +77,7 @@ as the active filesystem provider, and changes that never reach the durable queu
 before a process is killed are not guaranteed. Multi-window shared storage is not
 supported. Git context is a write-safety signal, not an authorship detector.
 
-The Marketplace package keeps publisher `lengmh`, extension name `diff-tracker`,
+The Marketplace package keeps publisher `lengmh`, extension name `code-diff-tracker`,
 MIT license and upstream attribution. It must not be enabled together with
-`TinyTigerPan.diff-tracker`; their storage is separate and sessions do not migrate.
+`TinyTigerPan.diff-tracker` or the earlier local-test identity `lengmh.diff-tracker`;
+their storage is separate and sessions do not migrate.

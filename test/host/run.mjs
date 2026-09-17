@@ -74,7 +74,7 @@ try {
         ]
     });
 } catch (error) {
-    console.error('Diff Tracker Extension Host tests failed.', error);
+    console.error('Code Diff Tracker Extension Host tests failed.', error);
     process.exitCode = 1;
 } finally {
     try { rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }

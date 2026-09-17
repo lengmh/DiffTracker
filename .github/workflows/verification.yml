@@ -79,9 +79,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
-      - run: npm run package -- --out diff-tracker.vsix
+      - run: npm run package -- --out code-diff-tracker.vsix
       - uses: actions/upload-artifact@v4
         with:
-          name: diff-tracker-vsix
-          path: diff-tracker.vsix
+          name: code-diff-tracker-vsix
+          path: code-diff-tracker.vsix
           if-no-files-found: error

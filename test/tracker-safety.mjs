@@ -21,6 +21,7 @@ let listedFiles=[];
 let listedIgnores=[];
 let vscodeExcludes={};
 let workspaceChanged;
+let workspaceFilesCreated;
 const docs = [];
 const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
@@ -136,6 +137,7 @@ const vscode = {
         getConfiguration:()=>({ get:(key, fallback)=>key==='onlyTrackAutomatedChanges'?automationOnly:key==='watchExclude'?watchExclude:key in vscodeExcludes?vscodeExcludes[key]:fallback }),
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
+        onDidCreateFiles:handler=>{workspaceFilesCreated=handler;return {dispose(){}};},
         onDidChangeConfiguration:noopEvent,
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
         findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:pattern.pattern==='**/.gitignore'?listedIgnores:[];},
@@ -232,6 +234,20 @@ test('DT-02 unaccepted new file Revert preserves content and dispatches no edit'
     const p=file(); fs.writeFileSync(p,'new\n'); await tracker.onExternalFileCreated(Uri.file(p));
     const before=counters.apply;assert.equal((await tracker.revertFile(p)).status,'conflict');assert.equal(disk(p),'new\n');assert.equal(counters.apply,before);assert.ok(pending(p));
 });
+test('DT-02 VS Code create event repairs a change-first new text file',async()=>{
+    const p=file('workspace-created.txt');fs.writeFileSync(p,'new text');
+    await tracker.onExternalFileChanged(Uri.file(p));await waitUntil(()=>!!pending(p)?.unavailableReason);
+    workspaceFilesCreated({files:[Uri.file(p)]});
+    await waitUntil(()=>!!pending(p)&&pending(p).unavailableReason===undefined);
+    assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.ok(succeeded(await tracker.keepAllChangesInFile(p)));
+});
+test('DT-02 newly created binary files are excluded from text review',async()=>{
+    const p=file('image.png');fs.writeFileSync(p,Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]));
+    await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+});
 test('DT-02 hunk Keep on a new file establishes existence for later Revert',async()=>{
     const p=file(); fs.writeFileSync(p,'accepted\n'); await tracker.onExternalFileCreated(Uri.file(p));
     const block=tracker.getChangeBlocks(p)[0]; assert.ok(block);
@@ -287,7 +303,9 @@ test('DT-03 arbitrary open failure cannot rebuild/overwrite existing file',async
 });
 test('DT-03 dirty document is skipped without apply/save or acceptance',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); const doc=document(p); doc.text='unsaved manual'; doc.isDirty=true;
-    const before={...counters}; assert.equal(succeeded(await tracker.revertFile(p)),false); assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false);
+    const before={...counters}; const revert=await tracker.revertFile(p);const keep=await tracker.keepAllChangesInFile(p);
+    assert.equal(succeeded(revert),false);assert.equal(succeeded(keep),false);
+    assert.match(revert.reason??'',/save/i);assert.match(keep.reason??'',/save/i);
     assert.deepEqual(counters,before); assert.equal(doc.text,'unsaved manual'); assert.equal(disk(p),'changed');
     assert.equal(pending(p)?.currentContent,'unsaved manual','rejected actions must retain the dirty buffer as the pending review');
 });
@@ -861,7 +879,7 @@ for(const transition of ['stop','restart','dispose'])test(`AUDIT-21 ${transition
 test('AUDIT-21 stopped clear handles empty, missing, unknown and dirty resources without disk mutation',async()=>{
     const empty=file(),deleted=file(),dirty=file(),unknown=file();seed(empty,'');seed(deleted,'gone');seed(dirty,'before','saved');
     fs.unlinkSync(deleted);await tracker.onExternalFileDeleted(Uri.file(deleted));const doc=document(dirty);doc.text='unsaved';doc.isDirty=true;tracker.processDocumentChange(doc);
-    fs.writeFileSync(unknown,Buffer.from([0,1]));await tracker.onExternalFileCreated(Uri.file(unknown));assert.ok(pending(unknown)?.unavailableReason);
+    fs.writeFileSync(unknown,Buffer.from([0,1]));await tracker.onExternalFileCreated(Uri.file(unknown));assert.equal(pending(unknown),undefined);
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.equal(disk(empty),'');assert.equal(fs.existsSync(deleted),false);assert.equal(disk(dirty),'saved');assert.equal(doc.getText(),'unsaved');assert.equal(doc.isDirty,true);
     const saved=JSON.parse(disk(path.join(storage,'session-state.json')));assert.equal(saved.unresolvedBaselineFiles.length,0);assert.equal(saved.fileSnapshots.length,0);
@@ -1382,12 +1400,16 @@ for(const kind of ['binary','bom','oversized','unreadable','missing','all-unsupp
     const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
     listedFiles=kind==='all-unsupported'?[Uri.file(p)]:[Uri.file(p),Uri.file(q)];
     assert.equal(await tracker.rebuildRepositoryBaseline(repo,current),true);
-    assert.equal(tracker.getGitPauseReason(p),undefined);assert.ok(pending(p)?.unavailableReason);
+    const binary=kind==='binary'||kind==='all-unsupported';
+    assert.equal(tracker.getGitPauseReason(p),undefined);
+    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
     assert.equal(tracker.getReviewToken(p),undefined);assert.equal(tracker.getOriginalContent(p),undefined);
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
     assert.ok(saved.unresolvedBaselineFiles.some(([f])=>f===p));assert.ok(tracker.parsePersistedState(saved));
     await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
-    tracker.reconcileRestoredGitContexts([current]);assert.ok(pending(p)?.unavailableReason);assert.equal(tracker.getReviewToken(p),undefined);
+    tracker.reconcileRestoredGitContexts([current]);
+    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
+    assert.equal(tracker.getReviewToken(p),undefined);
     assert.equal(succeeded(await tracker.revertFile(p)),false);
     if(kind!=='all-unsupported'){assert.equal(tracker.getOriginalContent(q),'new baseline');fs.writeFileSync(q,'later change');await scan(q);assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),true);}
 });
@@ -1521,10 +1543,10 @@ test('AUDIT-4 restored watcher covers writes during reconciliation',async()=>{
     fs.writeFileSync(p,'external');emitWatcher('change',Uri.file(p));gate.release();assert.equal(await restore,'restored');
     await new Promise(r=>setTimeout(r,180));assert.equal(pending(p)?.currentContent,'external');
 });
-test('AUDIT-5 unavailable new file remains visible after restart',async()=>{
-    const p=file(),q=file();seed(p,'base');fs.writeFileSync(q,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(q));assert.ok(pending(q)?.unavailableReason);
+test('AUDIT-5 binary new file remains excluded from text review after restart',async()=>{
+    const p=file(),q=file();seed(p,'base');fs.writeFileSync(q,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(q));assert.equal(pending(q),undefined);
     const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();await tracker.dispose();
-    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(pending(q)?.unavailableReason);
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(q),undefined);
 });
 test('AUDIT-6 failed old recovery preparation cannot resurrect old history',async()=>{
     const p=file(),q=file();for(const f of [p,q]){seed(f,'base','edit');await scan(f);}await tracker.revertFile(q);
@@ -1724,7 +1746,9 @@ for(const kind of ['dirty','binary','unreadable']) test(`RESTORE-OFFLINE ${kind}
     if(kind==='dirty'){const doc=document(q);doc.text='unsaved';doc.isDirty=true;}
     if(kind==='unreadable')faults.set(q,{read:error('EACCES')});
     tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
-    assert.equal(tracker.getOriginalContent(q),'');assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.baselineExistingFiles.has(q),false);
+    assert.equal(tracker.getOriginalContent(q),'');
+    if(kind==='binary')assert.equal(pending(q),undefined);else assert.ok(pending(q)?.unavailableReason);
+    assert.equal(tracker.baselineExistingFiles.has(q),false);
     assert.equal((await tracker.revertFile(q)).status,'conflict');if(kind==='dirty')assert.equal(document(q).text,'unsaved');
 });
 test('RESTORE-OFFLINE excludes ignored paths and preserves unresolved baselines',async()=>{

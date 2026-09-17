@@ -52,7 +52,7 @@ const missing = async name => {
 
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
-        const extension = vscode.extensions.getExtension('lengmh.diff-tracker');
+        const extension = vscode.extensions.getExtension('lengmh.code-diff-tracker');
         assert.ok(extension, 'development extension is installed');
         await extension.activate();
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
@@ -124,6 +124,21 @@ module.exports = async function runExtensionHostScenario() {
         await vscode.workspace.fs.delete(uri('new-nonempty.txt'));
         assert.equal(await missing('new-nonempty.txt'), true);
         await untilStable('new-file manual deletion clears review', async () => !(await pending('new-nonempty.txt')));
+
+        // VS Code's create-file event supplies creation provenance even when the
+        // filesystem watcher reports a change before (or instead of) a create.
+        const createEdit = new vscode.WorkspaceEdit();
+        createEdit.createFile(uri('workspace-created.txt'));
+        assert.equal(await vscode.workspace.applyEdit(createEdit), true);
+        await write('workspace-created.txt', 'created through WorkspaceEdit\n');
+        await untilStable('WorkspaceEdit-created text review', () => reviewablePending('workspace-created.txt'));
+        await vscode.workspace.fs.delete(uri('workspace-created.txt'));
+        await untilStable('WorkspaceEdit-created review cleared', async () => !(await pending('workspace-created.txt')));
+
+        await vscode.workspace.fs.writeFile(uri('new-image.png'), Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
+        await delay(1000);
+        assert.equal(await pending('new-image.png'), undefined, 'binary additions are excluded from text review');
+        await vscode.workspace.fs.delete(uri('new-image.png'));
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
