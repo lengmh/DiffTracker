@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.7.3"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and validate only; do not create a tag or GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+      VSIX: code-diff-tracker-${{ inputs.version }}.vsix
+      CHECKSUM: code-diff-tracker-${{ inputs.version }}.vsix.sha256
+
+    steps:
+      - name: Require main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release must be dispatched from the main branch; got $GITHUB_REF"
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require successful Verification for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          successful_runs="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow verification.yml \
+            --branch main \
+            --commit "$GITHUB_SHA" \
+            --event push \
+            --status completed \
+            --limit 20 \
+            --json conclusion \
+            --jq '[.[] | select(.conclusion == "success")] | length')"
+          if [ "$successful_runs" -lt 1 ]; then
+            echo "No successful main-branch Verification run was found for $GITHUB_SHA."
+            echo "Wait for Verification to finish successfully, then run Release again."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate release metadata and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $VERSION"
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./package.json').version")"
+          lock_version="$(node -p "require('./package-lock.json').version")"
+          lock_root_version="$(node -p "require('./package-lock.json').packages[''].version")"
+          package_name="$(node -p "require('./package.json').name")"
+          publisher="$(node -p "require('./package.json').publisher")"
+
+          test "$package_version" = "$VERSION" || {
+            echo "package.json version is $package_version, expected $VERSION"
+            exit 1
+          }
+          test "$lock_version" = "$VERSION" || {
+            echo "package-lock.json version is $lock_version, expected $VERSION"
+            exit 1
+          }
+          test "$lock_root_version" = "$VERSION" || {
+            echo "package-lock root package version is $lock_root_version, expected $VERSION"
+            exit 1
+          }
+          test "$package_name" = "code-diff-tracker" || {
+            echo "Unexpected package name: $package_name"
+            exit 1
+          }
+          test "$publisher" = "lengmh" || {
+            echo "Unexpected publisher: $publisher"
+            exit 1
+          }
+
+          node <<'NODE'
+          const fs = require('fs');
+          const version = process.env.VERSION;
+          const lines = fs.readFileSync('CHANGELOG.md', 'utf8').split(/\r?\n/);
+          const header = `## ${version}`;
+          const start = lines.findIndex(line => line.trim() === header);
+          if (start < 0) {
+            throw new Error(`CHANGELOG.md does not contain an exact ${header} section`);
+          }
+          let end = lines.length;
+          for (let index = start + 1; index < lines.length; index += 1) {
+            if (/^##\s+/.test(lines[index])) {
+              end = index;
+              break;
+            }
+          }
+          const body = lines.slice(start + 1, end).join('\n').trim();
+          if (!body) {
+            throw new Error(`${header} has no release notes`);
+          }
+          fs.writeFileSync(
+            'release-notes.md',
+            `## Code Diff Tracker ${version}\n\n${body}\n`
+          );
+          NODE
+
+      - name: Check tag and release state
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "$TAG")"
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "$TAG already exists on $tag_sha, not current commit $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists. Refusing to overwrite a published release."
+            exit 1
+          fi
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run package -- --out "$VSIX"
+          test -s "$VSIX"
+
+      - name: Create SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum "$VSIX" > "$CHECKSUM"
+          cat "$CHECKSUM"
+
+      - name: Upload release files as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-diff-tracker-${{ inputs.version }}-release-files
+          path: |
+            ${{ env.VSIX }}
+            ${{ env.CHECKSUM }}
+            release-notes.md
+          if-no-files-found: error
+
+      - name: Create release tag
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" "$GITHUB_SHA" -m "Code Diff Tracker $VERSION"
+            git push origin "$TAG"
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            "$VSIX" \
+            "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Code Diff Tracker $VERSION" \
+            --notes-file release-notes.md
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          echo "Dry run complete. No tag or GitHub Release was created."
+          echo "Validated and packaged Code Diff Tracker $VERSION from $GITHUB_SHA."
