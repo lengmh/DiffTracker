@@ -1,4 +1,5 @@
 name: One-shot opaque directory and hash fix
+# retry after awaiting the debounced change-event path
 
 on:
   push:
