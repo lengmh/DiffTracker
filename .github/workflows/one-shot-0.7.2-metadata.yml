@@ -1,4 +1,4 @@
-name: One-shot 0.7.2 metadata
+name: One-shot 0.7.2 package metadata
 
 on:
   push:
@@ -21,31 +21,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Bump package metadata
-        run: npm version 0.7.2 --no-git-tag-version
-      - name: Add changelog entry
-        shell: python
-        run: |
-          from pathlib import Path
-          p = Path('CHANGELOG.md')
-          s = p.read_text(encoding='utf-8')
-          marker = '# Changelog\n\n'
-          assert s.startswith(marker)
-          entry = '''## 0.7.2
-
-- Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
-- Cover oversized files, UTF-8 BOM files, unsupported UTF-8 text, and binary-only resources consistently while preserving transient read/scan uncertainty.
-- Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews and unresolved baseline markers and persists an empty stopped session.
-- Add regression coverage for Clear/reset, session reload, later file events, and stopped-session clearing of unsupported resources.
-
-'''
-          assert '## 0.7.2\n' not in s
-          p.write_text(marker + entry + s[len(marker):], encoding='utf-8')
-      - name: Commit metadata
-        run: |
+      - run: npm version 0.7.2 --no-git-tag-version
+      - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/one-shot-0.7.2-metadata.yml
-          git add package.json package-lock.json CHANGELOG.md
-          git commit -m "chore: prepare 0.7.2 metadata"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to 0.7.2"
           git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
