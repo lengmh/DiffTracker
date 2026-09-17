@@ -44,6 +44,7 @@ const vscode = {
         onDidOpenTextDocument: noopEvent,
         onWillSaveTextDocument: noopEvent,
         onDidSaveTextDocument: noopEvent,
+        onDidCreateFiles: noopEvent,
         onDidChangeConfiguration: noopEvent,
         onDidChangeWorkspaceFolders: noopEvent,
         findFiles: async pattern => pattern.pattern === '**/*' ? files.map(Uri.file) : [],

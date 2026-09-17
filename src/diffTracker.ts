@@ -269,8 +269,15 @@ export class DiffTracker {
         const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
         const task = previous.catch(() => undefined).then(async () => {
             if (!token || token.filePath !== filePath || !await this.verifyReview(token)) {
+                const dirty = vscode.workspace.textDocuments.some(document =>
+                    document.uri.scheme === 'file' && document.uri.fsPath === filePath && document.isDirty
+                );
+                const reason = dirty
+                    ? 'Save the file before Keep or Revert so the reviewed content matches disk'
+                    : this.trackedChanges.get(filePath)?.unavailableReason
+                        ?? 'Review is stale or unavailable; refresh and review again';
                 if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
-                return this.actionResult(filePath, 'conflict', 'Review is stale or unavailable; refresh and review again');
+                return this.actionResult(filePath, 'conflict', reason);
             }
             return action(token);
         });
@@ -372,6 +379,14 @@ export class DiffTracker {
 
         this.disposables.push(
             vscode.workspace.onDidSaveTextDocument(this.onDidSaveDocument, this)
+        );
+
+        this.disposables.push(
+            vscode.workspace.onDidCreateFiles(event => {
+                for (const uri of event.files) {
+                    void this.onExternalFileCreated(uri);
+                }
+            })
         );
 
         if (vscode.workspace.onDidChangeWorkspaceFolders) {
@@ -2104,7 +2119,33 @@ export class DiffTracker {
         return state;
     }
 
+    private isBinaryUnavailableReason(reason: string): boolean {
+        return reason === 'Binary content is unsupported' || reason === 'Binary baseline content is unsupported';
+    }
+
     private markFileUnavailable(filePath: string, reason: string): void {
+        if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath)) {
+            // Diff Tracker is text-oriented. Retain an internal unresolved marker
+            // when the before-image is unknown, but do not count a binary-only
+            // path as an actionable text review. A known-absent baseline remains
+            // available so a later text incarnation can still be reviewed.
+            if (!this.fileSnapshots.has(filePath)) {
+                this.unresolvedBaselineFiles.set(filePath, reason);
+                this.schedulePersistState();
+            }
+            const wasTracked = this.trackedChanges.has(filePath);
+            const hadLineChanges = this.lineChanges.has(filePath);
+            const hadInlineView = this.inlineViews.has(filePath);
+            this.deleteTrackedChange(filePath);
+            this.lineChanges.delete(filePath);
+            this.inlineViews.delete(filePath);
+            this.invalidateChangeBlocksCache(filePath);
+            if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
+            if (wasTracked || hadLineChanges || hadInlineView) {
+                this.emitTrackChangesEvent({ removedFiles: [filePath] });
+            }
+            return;
+        }
         // Unknown paths must survive restart too. A later create notification may
         // establish an absent baseline, but unavailable bytes are never accepted.
         if (!this.fileSnapshots.has(filePath)) {
