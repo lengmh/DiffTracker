@@ -5,3 +5,5 @@ out
 .DS_Store
 dummy_test
 
+# planning files
+.planning/
