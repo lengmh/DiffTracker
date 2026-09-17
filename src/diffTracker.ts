@@ -4395,6 +4395,13 @@ export class DiffTracker {
         // We do this immediately (before debounce) to avoid autosave overwriting
         // the on-disk content and erasing the true baseline.
         if (!this.fileSnapshots.has(filePath)) {
+            if (this.opaqueBaselineFiles.has(filePath)) {
+                // Opening an opaque-baseline document is quiet, but an actual editor
+                // mutation must be visible even though the original bytes cannot be
+                // decoded into a normal text diff.
+                this.markFileUnavailable(filePath, 'Document changed from an unsupported baseline; original content is unavailable');
+                return;
+            }
             this.ensureSnapshotForDocument(doc);
             if (!this.fileSnapshots.has(filePath)) { return; }
         }

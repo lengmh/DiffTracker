@@ -942,6 +942,14 @@ for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unav
     assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
     faults.delete(p);
 });
+test('DT-08 editing an open opaque-baseline document surfaces an unavailable review',async()=>{
+    const p=file('opaque-document-edit-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    const doc=document(p);tracker.onDocumentOpened(doc);assert.equal(pending(p),undefined,'opening alone must stay quiet');
+    doc.text='edited in memory';doc.isDirty=true;doc.version++;tracker.onDocumentChanged({document:doc});
+    assert.match(pending(p)?.unavailableReason??'',/Document changed from an unsupported baseline/i);
+    assert.ok(tracker.opaqueBaselineFiles.has(p),'document edits must not erase the opaque before-image identity');
+});
 test('DT-08 deleting an accepted opaque baseline surfaces an unavailable review',async()=>{
     const p=file('opaque-delete-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
     assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
