@@ -1,0 +1,65 @@
+name: One-shot opaque rollback validation
+on:
+  push:
+    branches: [fix/0.7.2-clear-unavailable-baseline]
+    paths:
+      - .github/workflows/one-shot-opaque-rollback.yml
+      - .github/scripts/patch-opaque-rollback.py
+permissions:
+  contents: write
+concurrency:
+  group: opaque-rollback-patch
+  cancel-in-progress: false
+jobs:
+  validate-and-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/0.7.2-clear-unavailable-baseline
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply guarded source and fault-injection tests
+        run: |
+          cp src/diffTracker.ts "$RUNNER_TEMP/opaque-rollback-before.ts"
+          python .github/scripts/patch-opaque-rollback.py
+          npm run compile
+      - name: Confirm rollback regression on previous source
+        run: |
+          set +e
+          DT_SOURCE="$RUNNER_TEMP/opaque-rollback-before.ts" DT_TEST_FILTER=OPAQUE-ROLLBACK timeout 120 node test/tracker-safety.mjs > "$RUNNER_TEMP/rollback-red.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/rollback-red.log"
+          test "$result" -eq 1
+          grep -q 'rollback must not erase an edit observed during the rebuild' "$RUNNER_TEMP/rollback-red.log"
+      - name: Lint and all regression suites
+        run: |
+          npm run lint
+          npm test 2>&1 | tee "$RUNNER_TEMP/rollback-green.log"
+      - name: Preserve fault-injection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opaque-rollback-red-green
+          path: |
+            ${{ runner.temp }}/rollback-red.log
+            ${{ runner.temp }}/rollback-green.log
+          if-no-files-found: ignore
+      - name: Commit validated fix and remove temporary scripts
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/scripts/patch-opaque-rollback.py .github/workflows/one-shot-opaque-rollback.yml
+          git add src/diffTracker.ts test/tracker-safety.mjs test/opaque-baseline-invariants.mjs
+          git diff --cached --check
+          git commit -m 'fix: retain observed editor changes when repository rebuild rolls back'
+          git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
