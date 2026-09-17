@@ -14,7 +14,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
@@ -22,11 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ inputs.version }}
-      TAG: v${{ inputs.version }}
       VSIX: code-diff-tracker-${{ inputs.version }}.vsix
       CHECKSUM: code-diff-tracker-${{ inputs.version }}.vsix.sha256
 
@@ -44,6 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Require successful Verification for this commit
         env:
@@ -139,28 +139,6 @@ jobs:
           );
           NODE
 
-      - name: Check tag and release state
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --tags --force
-
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            tag_sha="$(git rev-list -n 1 "$TAG")"
-            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
-              echo "$TAG already exists on $tag_sha, not current commit $GITHUB_SHA"
-              exit 1
-            fi
-          fi
-
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub Release $TAG already exists. Refusing to overwrite a published release."
-            exit 1
-          fi
-
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 
@@ -188,8 +166,77 @@ jobs:
             release-notes.md
           if-no-files-found: error
 
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          echo "Dry run complete. No tag or GitHub Release was created."
+          echo "Validated and packaged Code Diff Tracker $VERSION from $GITHUB_SHA."
+
+  publish:
+    if: ${{ !inputs.dry_run }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+      VSIX: code-diff-tracker-${{ inputs.version }}.vsix
+      CHECKSUM: code-diff-tracker-${{ inputs.version }}.vsix.sha256
+
+    steps:
+      - name: Require main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release must be dispatched from the main branch; got $GITHUB_REF"
+            exit 1
+          fi
+
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download validated release files
+        uses: actions/download-artifact@v4
+        with:
+          name: code-diff-tracker-${{ inputs.version }}-release-files
+
+      - name: Verify downloaded package checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$VSIX"
+          test -s "$CHECKSUM"
+          test -s release-notes.md
+          sha256sum -c "$CHECKSUM"
+
+      - name: Check tag and release state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "$TAG")"
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "$TAG already exists on $tag_sha, not current commit $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists. Refusing to overwrite a published release."
+            exit 1
+          fi
+
       - name: Create release tag
-        if: ${{ !inputs.dry_run }}
         shell: bash
         run: |
           set -euo pipefail
@@ -201,7 +248,6 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -214,10 +260,3 @@ jobs:
             --verify-tag \
             --title "Code Diff Tracker $VERSION" \
             --notes-file release-notes.md
-
-      - name: Dry-run summary
-        if: ${{ inputs.dry_run }}
-        shell: bash
-        run: |
-          echo "Dry run complete. No tag or GitHub Release was created."
-          echo "Validated and packaged Code Diff Tracker $VERSION from $GITHUB_SHA."
