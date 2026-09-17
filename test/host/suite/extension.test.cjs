@@ -196,6 +196,10 @@ module.exports = async function runExtensionHostScenario() {
         }
         await until('20 bulk pending files', async () => (await state()).reviewTokens.filter(token =>
             path.basename(token.filePath).startsWith('bulk-')).length === 20);
+        // New-file baseline publication is asynchronous. Wait for it to settle before
+        // starting the branch-safety scenario so this assertion tests the Git pause,
+        // not a transient "baseline incomplete" guard while those creations persist.
+        await untilStable('bulk baseline publication', async () => (await state()).baselineState === 'ready');
         assert.equal(vscode.window.visibleTextEditors.length, visibleBefore);
 
         // The real built-in Git extension reports a branch switch and blocks writes.
