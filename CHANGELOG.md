@@ -4,8 +4,9 @@
 
 - Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
 - Cover oversized files, UTF-8 BOM files, unsupported UTF-8 text, and binary-only resources consistently while preserving transient read/scan uncertainty.
+- Keep an unchanged opaque-baseline file quiet when it is opened; a later file or document change still surfaces it for explicit review.
 - Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews and unresolved baseline markers and persists an empty stopped session.
-- Add regression coverage for Clear/reset, session reload, later file events, and stopped-session clearing of unsupported resources.
+- Add regression coverage for Clear/reset, session reload, later file events, document reopen, and stopped-session clearing of unsupported resources.
 
 ## 0.7.1
 
