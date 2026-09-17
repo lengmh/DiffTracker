@@ -2168,25 +2168,25 @@ export class DiffTracker {
     }
 
     private isStableUnsupportedBaselineReason(reason: string): boolean {
-    return reason === 'File exceeds the 5 MiB limit' ||
-        reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
-        reason === 'Binary content is unsupported' ||
-        reason === 'Unsupported text encoding (expected UTF-8)';
-}
-
-private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
-    this.postBaselineUnknownFiles.delete(filePath);
-    this.unresolvedBaselineFiles.set(filePath, reason);
-    if (publishReview) {
-        this.markFileUnavailable(filePath, reason);
-    } else {
-        this.deleteTrackedChange(filePath);
-        this.lineChanges.delete(filePath);
-        this.markLineChangesUpdated(filePath);
-        this.inlineViews.delete(filePath);
+        return reason === 'File exceeds the 5 MiB limit' ||
+            reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
+            reason === 'Binary content is unsupported' ||
+            reason === 'Unsupported text encoding (expected UTF-8)';
     }
-    this.schedulePersistState();
-}
+
+    private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
+        this.postBaselineUnknownFiles.delete(filePath);
+        this.unresolvedBaselineFiles.set(filePath, reason);
+        if (publishReview) {
+            this.markFileUnavailable(filePath, reason);
+        } else {
+            this.deleteTrackedChange(filePath);
+            this.lineChanges.delete(filePath);
+            this.markLineChangesUpdated(filePath);
+            this.inlineViews.delete(filePath);
+        }
+        this.schedulePersistState();
+    }
 
     private hasObservedCreation(filePath: string): boolean {
         for (let current = filePath; ; current = path.dirname(current)) {
@@ -2261,11 +2261,11 @@ private recordUnresolvedBaseline(filePath: string, reason: string, publishReview
         });
         if (!this.isCurrentEpoch(epoch)) { return; }
         for (const [filePath, reason] of this.unresolvedBaselineFiles) {
-    if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
-        !this.isStableUnsupportedBaselineReason(reason)) {
-        this.markFileUnavailable(filePath, reason);
-    }
-}
+            if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
+                !this.isStableUnsupportedBaselineReason(reason)) {
+                this.markFileUnavailable(filePath, reason);
+            }
+        }
     }
 
     private isLikelyBinaryContent(content: Uint8Array): boolean {
@@ -2883,16 +2883,16 @@ private recordUnresolvedBaseline(filePath: string, reason: string, publishReview
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
                 if (state.kind !== 'text') {
-            // Stable unsupported resources can be accepted as an opaque baseline.
-            // They remain unresolved internally so a later file event can surface
-            // the path again without pretending Code Diff Tracker can decode it.
-            const reason = state.kind === 'unavailable'
-                ? state.reason
-                : 'File disappeared during baseline rebuild; before-image is unknown';
-            const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
-            this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
-            return;
-        }
+                    // Stable unsupported resources can be accepted as an opaque baseline.
+                    // They remain unresolved internally so a later file event can surface
+                    // the path again without pretending Code Diff Tracker can decode it.
+                    const reason = state.kind === 'unavailable'
+                        ? state.reason
+                        : 'File disappeared during baseline rebuild; before-image is unknown';
+                    const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
+                    this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
+                    return;
+                }
                 if (this.hasScanUncertainty(uri.fsPath)) {
                     this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
                     return;
