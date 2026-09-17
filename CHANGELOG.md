@@ -2,21 +2,15 @@
 
 ## 0.7.2
 
-- Write session schema V3 for opaque baselines while migrating V1/V2 sessions. Older releases reject V3 rather than silently drop unsupported-file identities during downgrade.
-
-- Unify workspace and repository scan acceptance checks; preserve concurrent editor changes even if the editor is saved or closed before scanning completes.
-- Keep already-captured opaque identities intact during remaining scan work, and revalidate clean save/reload notifications without dropping dirty-buffer reviews.
-- Add a cross-product regression matrix for unsupported formats, scan scopes, document transitions, and follow-up file events.
-
-- Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
-- Persist opaque baseline identity for oversized, UTF-8 BOM, unsupported UTF-8, and binary resources, while preserving transient read/scan uncertainty as unresolved review state.
-- Revalidate opaque baselines after restart so offline deletion, replacement, format changes, and file-to-directory replacements surface as unavailable reviews instead of being silently hidden.
-- Use streaming SHA-256 identity for oversized files so same-size, timestamp-preserving rewrites are still detected without loading the full file into memory.
-- Keep unchanged opaque-baseline files quiet when opened or reported through an identical delete/create replacement; later file changes or actual document edits still surface them for explicit review.
-- Preserve dirty opaque-editor reviews across create notifications and keep scan-uncertain binary paths visible during repository-rebuild reconciliation.
-- Preserve watcher-observed scan uncertainty during repository baseline rebuilds so a concurrent unsupported-file change cannot be silently accepted as a new opaque baseline.
-- Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews, unresolved markers, and opaque baseline state and persists an empty stopped session.
-- Add regression coverage for Clear/reset, session reload, offline replacement/deletion, identical create reconciliation, file-to-directory replacement, timestamp-preserving large-file rewrites, repository-rebuild races, dirty opaque editors, scan-uncertain binary rereads, document edits, later file events, and stopped-session clearing of unsupported resources.
+- Fix **Clear Diffs** immediately recreating unavailable reviews for stable unsupported files. **Stop Recording** followed by **Clear Diffs** now persists an empty stopped session without modifying workspace files.
+- Preserve opaque baseline existence and content identity for UTF-8 BOM, binary, invalid-UTF-8, and oversized resources. Detect subsequent deletion, replacement, format changes, and file-to-directory replacement, including changes made while VS Code was closed.
+- Unify workspace-scan and repository-rebuild acceptance checks. Concurrent editor and watcher changes remain unresolved, even if an editor is saved or closed before the scan completes; already-captured before-images are not overwritten or downgraded.
+- Preserve dirty-editor reviews across identical disk replacement notifications. Clean save, reload, and unchanged create notifications reconcile actual bytes instead of creating false pending reviews or treating unsupported content as a text baseline.
+- Preserve newly observed file/editor changes when repository rebuilds roll back after a Git-context change, Stop, or persistence failure.
+- Use streaming SHA-256 identity for oversized files so same-size, timestamp-preserving rewrites are detected without loading the entire file into memory. The 5 MiB text-review limit remains unchanged.
+- Write session schema **V3** while migrating V1/V2 sessions. Older releases reject V3 rather than silently discard opaque identities; downgrade recovery remains blocked until the user explicitly handles the incompatible state.
+- Accept valid finite pre-epoch modification timestamps while retaining strict validation of malformed metadata.
+- Add cross-product production regressions for unsupported formats, scan scopes, editor transitions, rollback, persistence, and schema compatibility, plus downgrade checks against the released 0.7.1 source. Verification details are maintained in `docs/opaque-baseline-invariants.md`.
 
 ## 0.7.1
 
@@ -35,7 +29,7 @@
 - Add bounded **Undo Last Revert** recovery for file, hunk, creation, deletion, and batch reverts.
 - Pause review writes when a Git branch, detached HEAD, worktree, or conflict context changes; add explicit archive-and-rebuild recovery.
 - Recognize VS Code file-creation events so new text files receive an explicit absent baseline, exclude binary additions from text review counts, and explain that dirty files must be saved before Keep/Revert.
-- Add Linux and Windows CI, real VS Code Stable Extension Host coverage, and performance measurements.
+- Add Linux and Windows quality gates, real VS Code Stable Extension Host tests, temporary-repository Git tests, and workspace performance measurements.
 
 ## 0.6.0
 
@@ -45,4 +39,4 @@
 
 ## Earlier versions
 
-See the repository history and README release notes for the 0.1.x–0.5.x changes inherited from the upstream project.
+See the repository history for the 0.1.x–0.5.x changes inherited from the upstream project.
