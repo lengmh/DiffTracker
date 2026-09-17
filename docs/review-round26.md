@@ -9,7 +9,7 @@
 | 问题 | 修复与保护 |
 | --- | --- |
 | 只有父目录 create 时漏掉子文件 | 无论规则指纹是否变化，都枚举目录中的文件，按 live create 处理；空文件也保留待审，已知和未知的旧基线不会被覆盖 |
-| 多根工作区共用全局排除配置 | 按当前 folder URI 读取 files.exclude、files.watcherExclude、search.exclude 和 Diff Tracker watchExclude |
+| 多根工作区共用全局排除配置 | 按当前 folder URI 读取 files.exclude、files.watcherExclude、search.exclude 和 Code Diff Tracker watchExclude |
 | 嵌套 slashless 规则失去递归语义 | 区分递归、根锚定与含路径的规则；保留否定、转义、开头空格；空白行不变成排除整棵目录的规则 |
 | 关联：路径被当成 glob/注释/否定规则 | 将作用域目录里的 glob 字符、#、! 转义为字面字符；以真实 Git 结果为对照 |
 | 关联：info/exclude 优先级反转 | 在 .gitignore 之前应用较低优先级的仓库本地排除规则 |

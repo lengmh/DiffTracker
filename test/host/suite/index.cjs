@@ -7,12 +7,12 @@ exports.run = async () => {
             runExtensionHostScenario(),
             new Promise((_, reject) => {
                 timeout = setTimeout(
-                    () => reject(new Error('Diff Tracker Extension Host scenario timed out')),
+                    () => reject(new Error('Code Diff Tracker Extension Host scenario timed out')),
                     90_000
                 );
             })
         ]);
-        console.log('PASS Diff Tracker real Extension Host scenario');
+        console.log('PASS Code Diff Tracker real Extension Host scenario');
     } finally {
         if (timeout) {
             clearTimeout(timeout);

@@ -2,6 +2,7 @@
 
 ## 0.7.0
 
+- Publish under the unique Marketplace identity `lengmh.code-diff-tracker` and display name **Code Diff Tracker**.
 - Preserve file-existence semantics for empty, created, deleted, and restored files.
 - Keep failed or conflicted items visible during file, hunk, and batch review actions.
 - Reject stale CodeLens and Webview actions with versioned review tokens.

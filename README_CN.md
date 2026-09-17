@@ -1,7 +1,7 @@
-> 本 fork 的扩展 ID 为 `lengmh.diff-tracker`。如果已经安装上游
-> `TinyTigerPan.diff-tracker`，请先禁用上游版本；二者共享命令、视图和配置
-> 名称，不支持同时启用。两者的 VS Code 存储互相隔离，待审 session 不会
-> 自动迁移。
+> 本 fork 的扩展 ID 为 `lengmh.code-diff-tracker`。安装前，请禁用或卸载上游
+> `TinyTigerPan.diff-tracker`，以及此前用于测试的 `lengmh.diff-tracker` VSIX。
+> 这些扩展共享命令、视图和配置名称，不支持同时启用。VS Code 会把各 ID
+> 视为不同扩展，因此已保存的待审 session 不会自动迁移。
 
 0.7.0 增加版本化审阅、耐故障 session 恢复、有界的 **Undo Last Revert**
 以及 Git 上下文保护。分支、detached HEAD、worktree 或冲突上下文改变时，
@@ -28,7 +28,7 @@ Revert 基线中不存在的新文件也采用相同规则：人工检查并删�
 内容变化。automation-only 模式也不会把普通保存事件当成人工来源证明；
 来源不明的编辑仍保留待审，需要明确 Keep 或 Revert。
 
-# Diff Tracker
+# Code Diff Tracker
 
 恢复时，只有此前完整扫描的忽略规则与当前一致，才将新发现路径判为新增文件。
 取消忽略后重新出现的文件，以及缺少扫描覆盖记录的旧会话中的新发现路径，
@@ -37,7 +37,7 @@ Revert 基线中不存在的新文件也采用相同规则：人工检查并删�
 升级后新发现的路径可能需要显式重建基线，已有待审记录仍会保留。
 
 
-Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化，并提供多种差异查看与变更处理方式，适合日常开发、代码审阅，以及 AI / 自动化工具改动后的快速验收。
+Code Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化，并提供多种差异查看与变更处理方式，适合日常开发、代码审阅，以及 AI / 自动化工具改动后的快速验收。
 
 项目当前支持三种主要查看模式：
 
@@ -84,11 +84,11 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
 
 ## 使用方式
 
-1. 在 VS Code 左侧 Activity Bar 中打开 **Diff Tracker**。
+1. 在 VS Code 左侧 Activity Bar 中打开 **Code Diff Tracker**。
 2. 扩展激活后会自动开始录制；也可以手动执行：
-   - `Diff Tracker: Start Recording`
-   - `Diff Tracker: Stop Recording`
-   - `Diff Tracker: Toggle Recording`
+   - `Code Diff Tracker: Start Recording`
+   - `Code Diff Tracker: Stop Recording`
+   - `Code Diff Tracker: Toggle Recording`
 3. 在工作区中编辑文件，或通过外部工具改动文件。
 4. 在 **Change Recording** 面板中点击已变更文件，按默认模式打开 Diff。
 5. 也可以通过右键菜单或编辑器标题栏切换其他查看方式：
@@ -98,11 +98,11 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
    - Original File
    - Split: Original | Webview
 6. 在 WebView Diff 中，可对每个变更块执行 `Undo / Keep`，或在文件级执行 `Keep All / Reject All`。
-7. `Diff Tracker: Clear Diffs` 在录制中会以当前工作区状态重建基线；停止录制后会清除已保存的基线和 Undo 历史，重载后仍保持停止。该命令不会修改工作区文件或未保存的缓冲区。
+7. `Code Diff Tracker: Clear Diffs` 在录制中会以当前工作区状态重建基线；停止录制后会清除已保存的基线和 Undo 历史，重载后仍保持停止。该命令不会修改工作区文件或未保存的缓冲区。
 
 ## 工作原理
 
-开始录制后，Diff Tracker 会：
+开始录制后，Code Diff Tracker 会：
 
 1. 为工作区文件建立初始基线快照
 2. 监听文档和文件系统变化，并重新计算行级 / 块级差异
@@ -114,10 +114,10 @@ Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件变化�
 
 ### 从 Marketplace 安装
 
-在 VS Code 扩展页搜索发布者 `lengmh` 的 **Diff Tracker**，或使用：
+在 VS Code 扩展页搜索发布者 `lengmh` 的 **Code Diff Tracker**，或使用：
 
 ```bash
-code --install-extension lengmh.diff-tracker
+code --install-extension lengmh.code-diff-tracker
 ```
 
 ### 通过 VSIX 安装
@@ -207,16 +207,16 @@ try {
 ## 快捷键与常用命令
 
 - `Shift + Alt + D`：切换录制状态
-- `Diff Tracker: Start Recording`
-- `Diff Tracker: Stop Recording`
-- `Diff Tracker: Show Diffs`
-- `Diff Tracker: Clear Diffs`
-- `Diff Tracker: Revert All Changes`
-- `Diff Tracker: Undo Last Revert`
-- `Diff Tracker: Accept All Changes`
-- `Diff Tracker: Archive and Rebuild Paused Git Baseline`
-- `Diff Tracker: Select Default Open Mode`
-- `Diff Tracker: Edit Watch Ignores`
+- `Code Diff Tracker: Start Recording`
+- `Code Diff Tracker: Stop Recording`
+- `Code Diff Tracker: Show Diffs`
+- `Code Diff Tracker: Clear Diffs`
+- `Code Diff Tracker: Revert All Changes`
+- `Code Diff Tracker: Undo Last Revert`
+- `Code Diff Tracker: Accept All Changes`
+- `Code Diff Tracker: Archive and Rebuild Paused Git Baseline`
+- `Code Diff Tracker: Select Default Open Mode`
+- `Code Diff Tracker: Edit Watch Ignores`
 
 ## 已知问题
 
@@ -243,7 +243,7 @@ try {
 
 ### 0.5.x
 
-- 增加资源管理器右键入口 `Open with Diff Tracker`
+- 增加资源管理器右键入口 `Open with Code Diff Tracker`
 - 支持默认打开模式配置
 - 增加 `Original + WebView` 分屏模式
 - 增加全局快捷键 `Shift + Alt + D`

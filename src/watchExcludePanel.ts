@@ -35,7 +35,7 @@ export class WatchExcludePanel {
 
         const panel = vscode.window.createWebviewPanel(
             'diffTrackerWatchExcludes',
-            'Diff Tracker: Watch Ignores',
+            'Code Diff Tracker: Watch Ignores',
             column ?? vscode.ViewColumn.Active,
             {
                 enableScripts: true,
@@ -52,7 +52,7 @@ export class WatchExcludePanel {
         if (message.command === 'save' && Array.isArray(message.patterns)) {
             const config = vscode.workspace.getConfiguration('diffTracker');
             await config.update('watchExclude', message.patterns, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage('Diff Tracker: Watch ignore rules saved');
+            vscode.window.showInformationMessage('Code Diff Tracker: Watch ignore rules saved');
             await this.postCurrentPatterns();
             return;
         }

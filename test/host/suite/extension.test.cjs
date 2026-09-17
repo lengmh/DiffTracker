@@ -52,7 +52,7 @@ const missing = async name => {
 
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
-        const extension = vscode.extensions.getExtension('lengmh.diff-tracker');
+        const extension = vscode.extensions.getExtension('lengmh.code-diff-tracker');
         assert.ok(extension, 'development extension is installed');
         await extension.activate();
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');

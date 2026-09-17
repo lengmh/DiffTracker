@@ -115,7 +115,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (request !== recordingRequest) { return false; }
         if (diffTracker.isRecoveryBlocked()) {
             const answer = await vscode.window.showErrorMessage(
-                'Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
+                'Code Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
                 { modal: true },
                 'Discard Saved Session and Rebuild'
             );
@@ -124,7 +124,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         } else if (!diffTracker.getIsRecording() && diffTracker.getBaselineState() === 'building') {
             const answer = await vscode.window.showWarningMessage(
-                'Diff Tracker recovered an incomplete or different-workspace baseline. Starting will discard that review and build a new baseline.',
+                'Code Diff Tracker recovered an incomplete or different-workspace baseline. Starting will discard that review and build a new baseline.',
                 { modal: true },
                 'Rebuild Baseline'
             );
@@ -217,11 +217,11 @@ export async function activate(context: vscode.ExtensionContext) {
     ): Promise<boolean> => {
         const snapshot = contextSnapshot ?? gitContextMonitor?.getSnapshot(repoRoot);
         if (!snapshot) {
-            void vscode.window.showWarningMessage('Diff Tracker: The Git repository is unavailable; its preserved review remains paused.');
+            void vscode.window.showWarningMessage('Code Diff Tracker: The Git repository is unavailable; its preserved review remains paused.');
             return false;
         }
         if (snapshot.inProgress) {
-            void vscode.window.showWarningMessage('Diff Tracker: Finish or abort the Git merge/rebase before rebuilding this repository baseline.');
+            void vscode.window.showWarningMessage('Code Diff Tracker: Finish or abort the Git merge/rebase before rebuilding this repository baseline.');
             return false;
         }
         if (!confirmed) {
@@ -237,10 +237,10 @@ export async function activate(context: vscode.ExtensionContext) {
         const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
         if (rebuilt) {
             refreshReview();
-            void vscode.window.showInformationMessage('Diff Tracker: The repository review was archived and its baseline rebuilt.');
+            void vscode.window.showInformationMessage('Code Diff Tracker: The repository review was archived and its baseline rebuilt.');
         } else {
             void vscode.window.showWarningMessage(
-                'Diff Tracker did not rebuild the repository. Its review remains paused; save dirty editors, wait for Git to become stable, and try again.'
+                'Code Diff Tracker did not rebuild the repository. Its review remains paused; save dirty editors, wait for Git to become stable, and try again.'
             );
         }
         return rebuilt;
@@ -262,7 +262,7 @@ export async function activate(context: vscode.ExtensionContext) {
         gitPromptInFlight.add(repoRoot);
         try {
             const answer = await vscode.window.showWarningMessage(
-                `Diff Tracker: ${reason}`,
+                `Code Diff Tracker: ${reason}`,
                 { modal: true, detail: 'The existing review is preserved. Closing this message keeps it paused.' },
                 'Archive and Rebuild'
             );
@@ -439,7 +439,7 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.undoLastRevert', async () => {
             const result = await diffTracker.undoLastRevert();
             if (result.results.length === 0) {
-                void vscode.window.showInformationMessage('Diff Tracker: No recent Revert is available to undo.');
+                void vscode.window.showInformationMessage('Code Diff Tracker: No recent Revert is available to undo.');
                 return result;
             }
             return reportBatch('Restored', result);
@@ -450,7 +450,7 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.rebuildGitBaseline', async () => {
             const paused = diffTracker.getPausedGitRepositories();
             if (paused.length === 0) {
-                void vscode.window.showInformationMessage('Diff Tracker: No Git repository review is paused.');
+                void vscode.window.showInformationMessage('Code Diff Tracker: No Git repository review is paused.');
                 return false;
             }
             const selected = paused.length === 1
@@ -558,14 +558,14 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.clearDiffs', async () => {
             const wasRecording = diffTracker.getIsRecording();
             if (!await diffTracker.resetBaselineToCurrentState()) {
-                vscode.window.showWarningMessage('Diff Tracker: Baseline reset did not complete. Check the current review and any persistence warnings.');
+                vscode.window.showWarningMessage('Code Diff Tracker: Baseline reset did not complete. Check the current review and any persistence warnings.');
                 return false;
             }
             refreshChangesTree();
             decorationManager.clearAllDecorations();
             vscode.window.showInformationMessage(wasRecording
-                ? 'Diff Tracker: Baseline reset to current workspace state'
-                : 'Diff Tracker: Saved baseline and recovery history cleared; recording remains stopped');
+                ? 'Code Diff Tracker: Baseline reset to current workspace state'
+                : 'Code Diff Tracker: Saved baseline and recovery history cleared; recording remains stopped');
             return true;
         })
     );
@@ -796,7 +796,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     if (!gitContextAvailable && !runningExtensionTests) {
         void vscode.window.showWarningMessage(
-            'Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
+            'Code Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
         );
     }
 
@@ -806,9 +806,9 @@ export async function activate(context: vscode.ExtensionContext) {
     if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
         updateVisibleDecorations();
         if (restoreOutcome === 'recovered') {
-            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the last-good review session.');
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Code Diff Tracker restored the last-good review session.');
         } else if (restoreOutcome === 'incomplete') {
-            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Diff Tracker restored the review in paused mode. Rebuild the baseline before review actions.');
+            void vscode.window.showWarningMessage(diffTracker.getPersistenceIssue() ?? 'Code Diff Tracker restored the review in paused mode. Rebuild the baseline before review actions.');
         }
     } else if (restoreOutcome === 'blocked') {
         void startRecordingFlow();

@@ -395,7 +395,7 @@ export class DiffTracker {
                 // data, but require an explicit start/reset before establishing new roots.
                 this.stopRecording();
                 this.workspaceContextChanged = true;
-                vscode.window.showWarningMessage('Diff Tracker: Workspace folders changed. Review paused; establish a new baseline explicitly.');
+                vscode.window.showWarningMessage('Code Diff Tracker: Workspace folders changed. Review paused; establish a new baseline explicitly.');
             }));
         }
 
@@ -474,7 +474,7 @@ export class DiffTracker {
         this.scanCoverage = state.scanCoverage;
         this.recoveryBlocked = false;
         this.persistenceIssue = loaded.kind === 'recovered'
-            ? 'Recovered the last-good Diff Tracker session because the primary state was unreadable.'
+            ? 'Recovered the last-good Code Diff Tracker session because the primary state was unreadable.'
             : undefined;
 
         this.clearExternalChangeTimers();
@@ -614,13 +614,13 @@ export class DiffTracker {
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
             void this.initializeWorkspaceSnapshots().catch(() => {
                 if (this.isCurrentEpoch(epoch) && this.baselineBuilding) {
-                    vscode.window.showWarningMessage('Diff Tracker: Baseline scan did not complete; review remains incomplete.');
+                    vscode.window.showWarningMessage('Code Diff Tracker: Baseline scan did not complete; review remains incomplete.');
                 }
             });
         } catch (error) {
             this.disposeFileWatchers();
             this.externalWatcherEnabled = false;
-            vscode.window.showWarningMessage('Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
+            vscode.window.showWarningMessage('Code Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
             console.warn('Failed to start baseline recording', error);
         }
         this.schedulePersistState();
@@ -963,8 +963,8 @@ export class DiffTracker {
 
     private reportExternalWatcherFailure(error: any): void {
         const message = error?.code === 'ENOSPC'
-            ? 'Diff Tracker: File watcher limit reached (ENOSPC). Falling back to open files only.'
-            : 'Diff Tracker: File watcher failed. Falling back to open files only.';
+            ? 'Code Diff Tracker: File watcher limit reached (ENOSPC). Falling back to open files only.'
+            : 'Code Diff Tracker: File watcher failed. Falling back to open files only.';
         vscode.window.showWarningMessage(message);
     }
 
@@ -1129,14 +1129,14 @@ export class DiffTracker {
         let limitError: string | undefined;
         if (state) {
             if (state.fileSnapshots.length > this.maxPersistedSnapshots) {
-                limitError = `Failed to persist Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`;
+                limitError = `Failed to persist Code Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`;
             }
             if (!limitError && !this.parsePersistedState(state)) {
-                limitError = 'Failed to persist Diff Tracker session: state does not satisfy recovery schema and limits.';
+                limitError = 'Failed to persist Code Diff Tracker session: state does not satisfy recovery schema and limits.';
             }
             payload = new TextEncoder().encode(JSON.stringify(state));
             if (payload.byteLength > this.maxPersistedBytes) {
-                limitError = `Failed to persist Diff Tracker session: state exceeds ${this.maxPersistedBytes} bytes.`;
+                limitError = `Failed to persist Code Diff Tracker session: state exceeds ${this.maxPersistedBytes} bytes.`;
             }
         }
 
@@ -1161,7 +1161,7 @@ export class DiffTracker {
                     this.persistenceFailed = false;
                     return true;
                 } catch (error) {
-                    if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to clear Diff Tracker persisted session state.', error); }
+                    if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to clear Code Diff Tracker persisted session state.', error); }
                     return false;
                 }
             }
@@ -1189,7 +1189,7 @@ export class DiffTracker {
                 return true;
             } catch (error) {
                 try { await this.deletePersistedFile(tempUri); } catch { /* Retain the primary failure. */ }
-                if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to persist Diff Tracker session state; the previous valid state was preserved.', error); }
+                if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to persist Code Diff Tracker session state; the previous valid state was preserved.', error); }
                 return false;
             }
         };
@@ -1236,7 +1236,7 @@ export class DiffTracker {
         if (primary.kind === 'absent' && backup.kind === 'absent') { return { kind: 'absent' }; }
         return {
             kind: 'blocked',
-            reason: `Diff Tracker session recovery is blocked: primary ${primary.kind === 'invalid' ? primary.reason : 'is absent'}; last-good ${backup.kind === 'invalid' ? backup.reason : 'is absent'}.`
+            reason: `Code Diff Tracker session recovery is blocked: primary ${primary.kind === 'invalid' ? primary.reason : 'is absent'}; last-good ${backup.kind === 'invalid' ? backup.reason : 'is absent'}.`
         };
     }
 
@@ -1432,7 +1432,7 @@ export class DiffTracker {
             this.persistenceIssue = undefined;
             return true;
         } catch (error) {
-            this.reportPersistenceIssue('Failed to discard the unreadable Diff Tracker session.', error);
+            this.reportPersistenceIssue('Failed to discard the unreadable Code Diff Tracker session.', error);
             return false;
         }
     }
@@ -2125,7 +2125,7 @@ export class DiffTracker {
 
     private markFileUnavailable(filePath: string, reason: string): void {
         if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath)) {
-            // Diff Tracker is text-oriented. Retain an internal unresolved marker
+            // Code Diff Tracker is text-oriented. Retain an internal unresolved marker
             // when the before-image is unknown, but do not count a binary-only
             // path as an actionable text review. A known-absent baseline remains
             // available so a later text incarnation can still be reviewed.
@@ -2732,7 +2732,7 @@ export class DiffTracker {
             await vscode.workspace.fs.copy(targetUri, archiveUri, { overwrite: true });
             return true;
         } catch (error) {
-            this.reportPersistenceIssue('Failed to archive the current Diff Tracker review; repository rebuild was blocked.', error);
+            this.reportPersistenceIssue('Failed to archive the current Code Diff Tracker review; repository rebuild was blocked.', error);
             return false;
         }
     }
