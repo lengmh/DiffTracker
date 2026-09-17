@@ -2627,6 +2627,9 @@ export class DiffTracker {
                 this.fileSnapshots.set(filePath, '');
                 if (!await this.completeBaseline(epoch)) { return; }
             }
+            if (this.reconcileOpaqueBaseline(filePath, state)) {
+                return;
+            }
             if (state.kind === 'unavailable') {
                 this.markFileUnavailable(filePath, state.reason);
                 return;
@@ -3023,6 +3026,10 @@ export class DiffTracker {
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+                if (this.hasScanUncertainty(uri.fsPath)) {
+                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
+                    return;
+                }
                 if (state.kind !== 'text') {
                     if (this.isStableUnsupportedState(state)) {
                         this.recordOpaqueBaseline(uri.fsPath, state);
@@ -3032,10 +3039,6 @@ export class DiffTracker {
                         ? state.reason
                         : 'File disappeared during baseline rebuild; before-image is unknown';
                     this.recordUnresolvedBaseline(uri.fsPath, reason);
-                    return;
-                }
-                if (this.hasScanUncertainty(uri.fsPath)) {
-                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
                     return;
                 }
                 this.unresolvedBaselineFiles.delete(uri.fsPath);
