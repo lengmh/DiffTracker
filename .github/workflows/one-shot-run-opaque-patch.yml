@@ -1,5 +1,5 @@
 name: One-shot run opaque baseline patch
-# retry after persisting the adjusted rollback regression
+# final retry: tests are green; force-remove patch helpers after they modify themselves
 
 on:
   push:
@@ -32,10 +32,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/one-shot-run-opaque-patch.yml
-          git rm .github/workflows/one-shot-opaque-baseline-state.yml
-          git rm .github/scripts/apply-opaque-baseline-v2.py
-          git rm .github/scripts/fix-opaque-patch-runner.py
+          git rm -f .github/workflows/one-shot-run-opaque-patch.yml
+          git rm -f .github/workflows/one-shot-opaque-baseline-state.yml
+          git rm -f .github/scripts/apply-opaque-baseline-v2.py
+          git rm -f .github/scripts/fix-opaque-patch-runner.py
           git add src/diffTracker.ts test/tracker-safety.mjs
           git commit -m "fix: persist and reconcile opaque baseline identities"
           git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
