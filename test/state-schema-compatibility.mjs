@@ -1,0 +1,188 @@
+/** Persisted-schema migration and downgrade safety, using the production tracker.
+ * DT_EXPECT_LEGACY_REJECTION=1 runs the downgrade subset with DT_SOURCE pointing
+ * to the released 0.7.1 tracker; normal npm test exercises the current writer.
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+
+export function registerStateSchemaCompatibility(harness) {
+    const { test, root, Uri, DiffTracker, faults, file, pending,
+        getTracker, setTracker, setListedFiles } = harness;
+
+    function fixture(version = 3) {
+        const target = file('schema-bom.txt');
+        const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x61]);
+        fs.writeFileSync(target, bytes);
+        const stat = fs.statSync(target);
+        return {
+            target,
+            state: {
+                version, isRecording: true, baselineState: 'ready', workspaceRoots: [root],
+                fileSnapshots: [], fileModes: [], baselineExistingFiles: [],
+                unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
+                opaqueBaselineFiles: [[target, {
+                    reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version',
+                    size: stat.size, mtime: stat.mtimeMs,
+                    fingerprint: createHash('sha256').update(bytes).digest('hex')
+                }]]
+            }
+        };
+    }
+
+    if (process.env.DT_EXPECT_LEGACY_REJECTION === '1') {
+        for (const layout of ['primary', 'both', 'backup', 'interrupted-upgrade']) {
+            test(`SCHEMA-DOWNGRADE released 0.7.1 preserves ${layout} V3 state`, async () => {
+                const tracker = getTracker();
+                const { target, state } = fixture();
+                assert.equal(tracker.parsePersistedState(state), undefined,
+                    'the released parser must reject rather than silently strip opaque identity');
+                const storage = file('downgrade-storage');
+                fs.mkdirSync(storage);
+                tracker.storageUri = Uri.file(storage);
+                setListedFiles([Uri.file(target)]);
+                const primary = path.join(storage, 'session-state.json');
+                const backup = path.join(storage, 'session-state.last-good.json');
+                const intent = path.join(storage, 'session-state.unsaved');
+                if (layout !== 'backup') { fs.writeFileSync(primary, JSON.stringify(state)); }
+                if (layout === 'both' || layout === 'backup') { fs.writeFileSync(backup, JSON.stringify(state)); }
+                if (layout === 'interrupted-upgrade') {
+                    const legacy = { ...state, version: 2 };
+                    delete legacy.opaqueBaselineFiles;
+                    fs.writeFileSync(backup, JSON.stringify(legacy));
+                    fs.writeFileSync(intent, 'Session write incomplete');
+                }
+                const before = new Map(fs.readdirSync(storage).map(name =>
+                    [name, fs.readFileSync(path.join(storage, name))]));
+                const diskBefore = fs.readFileSync(target);
+                assert.equal(await tracker.restorePersistedState(), 'blocked');
+                tracker.startRecording();
+                assert.equal(tracker.getIsRecording(), false);
+                assert.equal(await tracker.flushPendingPersistence(), false);
+                await tracker.dispose();
+                assert.deepEqual(fs.readdirSync(storage).sort(), [...before.keys()].sort());
+                for (const [name, content] of before) {
+                    assert.deepEqual(fs.readFileSync(path.join(storage, name)), content);
+                }
+                assert.deepEqual(fs.readFileSync(target), diskBefore);
+            });
+        }
+        return;
+    }
+
+    for (const version of [1, 2, 3]) {
+        test(`SCHEMA-V3 normalize V${version} preserves existence and provenance`, async () => {
+            const tracker = getTracker();
+            const existing = file('existing.txt'), absent = file('new.txt');
+            const state = {
+                version, isRecording: false, baselineState: 'ready', workspaceRoots: [root],
+                fileSnapshots: [[existing, ''], [absent, '']],
+                fileModes: [[existing, 0o644]], baselineExistingFiles: [existing],
+                unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
+                scanCoverage: 'a'.repeat(64)
+            };
+            if (version === 3) { state.opaqueBaselineFiles = []; }
+            const parsed = tracker.parsePersistedState(state);
+            assert.ok(parsed);
+            assert.equal(parsed.version, 3);
+            assert.equal(parsed.migratedFromV1, version === 1);
+            assert.equal(parsed.scanCoverage, version === 1 ? undefined : state.scanCoverage);
+            assert.deepEqual(parsed.fileSnapshots, state.fileSnapshots);
+            assert.deepEqual(parsed.baselineExistingFiles, [existing]);
+            assert.deepEqual(parsed.fileModes, [[existing, 0o644]]);
+            assert.deepEqual(parsed.opaqueBaselineFiles, []);
+        });
+    }
+
+    test('SCHEMA-V3 migrates pre-release V2 opaque identities without discarding them', async () => {
+        const { state } = fixture(2);
+        const parsed = getTracker().parsePersistedState(state);
+        assert.ok(parsed);
+        assert.equal(parsed.version, 3);
+        assert.deepEqual(parsed.opaqueBaselineFiles, state.opaqueBaselineFiles);
+        assert.equal(parsed.migratedFromV1, false);
+    });
+
+    for (const invalid of [undefined, null]) {
+        test(`SCHEMA-V3 rejects ${String(invalid)} opaque identity array`, async () => {
+            const { state } = fixture();
+            state.opaqueBaselineFiles = invalid;
+            assert.equal(getTracker().parsePersistedState(state), undefined);
+        });
+    }
+    for (const version of [0, 4, 999, '3']) {
+        test(`SCHEMA-V3 rejects unsupported version ${JSON.stringify(version)}`, async () => {
+            const { state } = fixture(version);
+            assert.equal(getTracker().parsePersistedState(state), undefined);
+        });
+    }
+
+    test('SCHEMA-V3 writes primary and backup with opaque identities and version 3', async () => {
+        const tracker = getTracker();
+        const { target } = fixture();
+        const storage = file('writer-storage');
+        tracker.storageUri = Uri.file(storage);
+        setListedFiles([Uri.file(target)]);
+        assert.equal(await tracker.resetBaselineToCurrentState(), true);
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        for (const name of ['session-state.json', 'session-state.last-good.json']) {
+            const saved = JSON.parse(fs.readFileSync(path.join(storage, name), 'utf8'));
+            assert.equal(saved.version, 3);
+            assert.deepEqual(saved.opaqueBaselineFiles, [...tracker.opaqueBaselineFiles.entries()]);
+            assert.equal(saved.fileSnapshots.some(([p]) => p === target), false);
+        }
+    });
+
+    for (const layout of ['primary', 'both', 'recover-backup']) {
+        test(`SCHEMA-V3 restores ${layout} opaque identity and detects offline deletion`, async () => {
+            const { target, state } = fixture();
+            const storage = file('restore-storage');
+            fs.mkdirSync(storage);
+            fs.writeFileSync(path.join(storage, 'session-state.json'),
+                layout === 'recover-backup' ? 'corrupt' : JSON.stringify(state));
+            if (layout !== 'primary') {
+                fs.writeFileSync(path.join(storage, 'session-state.last-good.json'), JSON.stringify(state));
+            }
+            fs.unlinkSync(target);
+            const tracker = new DiffTracker(Uri.file(storage));
+            setTracker(tracker);
+            assert.equal(await tracker.restorePersistedState(), layout === 'recover-backup' ? 'recovered' : 'restored');
+            assert.ok(tracker.opaqueBaselineFiles.has(target));
+            assert.match(pending(target)?.unavailableReason ?? '', /deleted.*unsupported baseline/i);
+            assert.equal(await tracker.flushPendingPersistence(), true);
+            const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+            assert.equal(saved.version, 3);
+            assert.deepEqual(saved.opaqueBaselineFiles, state.opaqueBaselineFiles);
+        });
+    }
+
+    for (const failAt of ['write', 'rename', 'copy']) {
+        test(`SCHEMA-V3 interrupted V2 upgrade at ${failAt} retains durable intent until retry`, async () => {
+            const tracker = getTracker();
+            const { state } = fixture(2);
+            state.isRecording = false;
+            delete state.opaqueBaselineFiles;
+            const storage = file('upgrade-storage');
+            fs.mkdirSync(storage);
+            tracker.storageUri = Uri.file(storage);
+            const primary = path.join(storage, 'session-state.json');
+            const backup = path.join(storage, 'session-state.last-good.json');
+            const temp = path.join(storage, 'session-state.tmp.json');
+            fs.writeFileSync(primary, JSON.stringify(state));
+            fs.writeFileSync(backup, JSON.stringify(state));
+            assert.equal(await tracker.restorePersistedState(), 'restored');
+            const faultPath = failAt === 'copy' ? primary : temp;
+            faults.set(faultPath, { [failAt]: Object.assign(new Error('NoPermissions'), { code: 'NoPermissions' }) });
+            try {
+                assert.equal(await tracker.flushPendingPersistence(), false);
+                assert.equal(fs.existsSync(path.join(storage, 'session-state.unsaved')), true);
+            } finally { faults.delete(faultPath); }
+            assert.equal(await tracker.flushPendingPersistence(), true);
+            assert.equal(fs.existsSync(path.join(storage, 'session-state.unsaved')), false);
+            for (const p of [primary, backup]) {
+                assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).version, 3);
+            }
+        });
+    }
+}
