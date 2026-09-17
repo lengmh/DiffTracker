@@ -48,6 +48,26 @@ work. An active session also rereads them against the restored before-image.
 The operation does not restore, overwrite, save, or otherwise mutate workspace
 file bytes or editor buffers.
 
+## Persisted schema and compatibility
+
+0.7.2 writes schema **V3**, including both the primary and last-good session files.
+V1 and V2 sessions migrate to the current representation; V2 scan provenance and
+file-existence semantics are retained. The parser also preserves opaque entries
+from development V2 sessions. Only genuine V1 input grants legacy Git-context
+adoption. V3 requires its opaque identity array instead of silently treating a
+missing array as an empty baseline.
+
+The released 0.7.1 reader rejects V3 rather than ignoring unsupported-file
+identities and reinterpreting their paths as absent. A partially published upgrade
+with a V3 primary and V2 backup remains protected by the existing durable
+incomplete-write marker. Downgrading with saved V3 state therefore blocks session
+recovery; it does not automatically convert or discard the review. Preserve the
+review before deliberately resetting or discarding incompatible state.
+
+Opaque `mtime` metadata accepts any finite numeric timestamp, including valid
+pre-1970 values. Non-numeric and infinite timestamps remain invalid. Equality
+uses size and SHA-256 identity, not timestamp equality.
+
 ## Verification
 
 `test/opaque-baseline-invariants.mjs` registers a cross-product matrix in the
@@ -58,6 +78,10 @@ dirty editor reconciliation; clean save/reload; persisted uncertainty and stoppe
 Clear. Rollback coverage adds Git changes, Stop and injected persistence failures,
 both before and after candidate capture, with dirty and saved editor changes.
 
+`test/state-schema-compatibility.mjs` adds migration, primary/backup publication,
+interrupted upgrade and timestamp cases. Its separately selected downgrade subset
+runs against the actual released 0.7.1 source using `DT_SOURCE`.
+
 The VS Code API boundary is mocked, but the production tracker and actual
 temporary filesystem are used. Extension Host checks remain separate CI jobs.
 
@@ -66,9 +90,10 @@ Run the focused matrices after compilation:
 ```sh
 DT_TEST_FILTER=OPAQUE-INVARIANT node test/tracker-safety.mjs
 DT_TEST_FILTER=OPAQUE-ROLLBACK node test/tracker-safety.mjs
+DT_TEST_FILTER=SCHEMA- node test/tracker-safety.mjs
 ```
 
-Both matrices also run as part of `npm test` on Linux and Windows.
+All current-source matrices also run as part of `npm test` on Linux and Windows.
 
 ### Recorded red/green results
 
@@ -91,6 +116,21 @@ then tested 48 additional combinations against the refactored source:
   including all 136 new cases. Lint and the remaining `npm test` suites also passed.
 - The run preserves `opaque-rollback-red-green` logs as an Actions artifact.
 
-The PR-level cross-platform and Extension Host checks must still be evaluated on
-the final PR head. These results do not claim exhaustive verification of every
-filesystem/provider schedule.
+[Schema compatibility validation](https://github.com/lengmh/DiffTracker/actions/runs/35211008840)
+adds 17 current-source cases. It also ran four downgrade cases against the
+released v0.7.1 production source: primary-only, primary+backup, backup-only, and
+interrupted V3/V2 publication. All four confirmed blocked recovery and unchanged
+session/workspace bytes across Start, flush and disposal. The run passed lint and
+the complete `npm test` suite, and retains `state-schema-v3-compatibility` logs.
+
+[Timestamp validation](https://github.com/lengmh/DiffTracker/actions/runs/35211184594)
+adds nine cases for valid pre-epoch timestamps, invalid metadata, and actual
+pre-1970 files through workspace/repository scanning and restore. The old parser
+failed the negative-timestamp regressions; the fixed source passed lint and the
+complete `npm test` suite. Logs are retained in `opaque-mtime-red-green`.
+
+The 162 new current-source cases comprise 88 acceptance/reconciliation cases,
+48 rollback cases and 26 schema/timestamp cases. Four legacy-source downgrade
+cases run separately. The PR-level cross-platform and Extension Host checks must
+still be evaluated on the final PR head. These results do not claim exhaustive
+verification of every filesystem/provider schedule.
