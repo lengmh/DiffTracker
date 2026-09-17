@@ -86,6 +86,7 @@ regression = r'''for(const eventKind of ['Changed','Created']) test(`DT-08 opaqu
     assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
     fs.unlinkSync(p);fs.mkdirSync(p);
     await tracker[`onExternalFile${eventKind}`](Uri.file(p));
+    await waitUntil(()=>!!pending(p)?.unavailableReason);
     assert.match(pending(p)?.unavailableReason??'',/directory/i);
     fs.rmSync(p,{recursive:true,force:true});
 });
