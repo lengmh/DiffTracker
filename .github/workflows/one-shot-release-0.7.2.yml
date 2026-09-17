@@ -1,0 +1,73 @@
+name: One-shot 0.7.2 release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-release-0.7.2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_SHA: 8b57373d89f3649754eada0b924c0ff593ee6839
+      RELEASE_TAG: v0.7.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify release metadata
+        shell: bash
+        run: |
+          test "$(node -p "require('./package.json').version")" = "0.7.2"
+          test "$(node -p "require('./package.json').publisher")" = "lengmh"
+          test "$(node -p "require('./package.json').name")" = "code-diff-tracker"
+      - name: Build Marketplace-ready VSIX
+        run: npm run package -- --out code-diff-tracker-0.7.2.vsix
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git fetch --tags --force
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${RELEASE_SHA}"
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "${RELEASE_TAG}" "${RELEASE_SHA}" -m 'Code Diff Tracker 0.7.2'
+            git push origin "${RELEASE_TAG}"
+          fi
+
+          cat > release-notes.md <<'EOF'
+          ## Code Diff Tracker 0.7.2
+
+          - Clear stable unsupported files without losing their existence or future change detection by storing persisted opaque baseline identities for oversized, UTF-8 BOM, invalid UTF-8, and binary resources.
+          - Revalidate unsupported-file identities after restart and on file/editor events, including deletion, replacement, file-to-directory changes, and same-size timestamp-preserving large-file rewrites.
+          - Preserve scan-time and editor-change evidence across workspace scans, repository rebuilds, autosave/close transitions, Git changes, Stop, and rebuild rollback failures.
+          - Write session schema V3 while migrating V1/V2 state; released 0.7.1 rejects V3 on downgrade instead of silently dropping opaque identities.
+          - Accept valid finite pre-1970 timestamps and strengthen cross-platform regression coverage. The production tracker suite now contains 625 cases, with Linux/Windows quality, VS Code 1.80/Stable Extension Host, dependency audit, performance, and VSIX packaging gates passing before release.
+
+          Unsupported files remain read-only for review: this release does not enable text Keep/Revert when the original text cannot be represented safely.
+
+          The attached `code-diff-tracker-0.7.2.vsix` is the package prepared for VS Code Marketplace publication.
+          EOF
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" code-diff-tracker-0.7.2.vsix --clobber
+          else
+            gh release create "${RELEASE_TAG}" code-diff-tracker-0.7.2.vsix \
+              --target "${RELEASE_SHA}" \
+              --title 'Code Diff Tracker 0.7.2' \
+              --notes-file release-notes.md
+          fi
