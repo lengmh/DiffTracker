@@ -29,6 +29,7 @@ work has disappeared. Caller-specific checks are not a substitute for this rule.
 | Captured opaque identity | Clean save/reload with identical bytes | Clear the review only after verifying current disk content. |
 | Captured opaque identity | Clean save with changed bytes | Keep a read-only unavailable review; never run text Keep/Revert. |
 | Unresolved scan evidence | Subsequent binary read or restart | Preserve visible uncertainty rather than apply binary-only suppression. |
+| Repository rebuild candidate | Git changes, Stop, or persistence failure after a current edit was observed | Restore the old before-image, preserve the observed edit as a visible conflict, and reconcile against the restored baseline when the session remains active. |
 | Stopped recording | Explicit Clear Diffs | Persist an empty stopped session without writing workspace files. |
 
 Opening an unchanged document is not an editor mutation. A file already captured
@@ -37,6 +38,16 @@ Historical scan evidence and the current `isDirty` flag serve different purposes
 saving or closing an editor can clear `isDirty`, but cannot retroactively make an
 observed scan-time mutation safe to accept.
 
+## Rebuild rollback
+
+A baseline transaction may discard its candidate baseline; it must not discard
+live file/editor observations with that candidate. Repository rollback therefore
+preserves candidate review paths before restoring the old maps. These paths keep
+a synchronous unavailable review even if Stop cancels the remaining asynchronous
+work. An active session also rereads them against the restored before-image.
+The operation does not restore, overwrite, save, or otherwise mutate workspace
+file bytes or editor buffers.
+
 ## Verification
 
 `test/opaque-baseline-invariants.mjs` registers a cross-product matrix in the
@@ -44,20 +55,24 @@ existing production tracker regression harness. It covers BOM, binary,
 invalid-UTF-8 and actual >5 MiB files; workspace and repository scanning;
 concurrent dirty/saved/closed documents; captured-file change/create/open events;
 dirty editor reconciliation; clean save/reload; persisted uncertainty and stopped
-Clear. The VS Code API boundary is mocked, but the production tracker and actual
+Clear. Rollback coverage adds Git changes, Stop and injected persistence failures,
+both before and after candidate capture, with dirty and saved editor changes.
+
+The VS Code API boundary is mocked, but the production tracker and actual
 temporary filesystem are used. Extension Host checks remain separate CI jobs.
 
-Run the focused matrix after compilation:
+Run the focused matrices after compilation:
 
 ```sh
 DT_TEST_FILTER=OPAQUE-INVARIANT node test/tracker-safety.mjs
+DT_TEST_FILTER=OPAQUE-ROLLBACK node test/tracker-safety.mjs
 ```
 
-The full matrix also runs as part of `npm test` on Linux and Windows.
+Both matrices also run as part of `npm test` on Linux and Windows.
 
-### Recorded red/green result
+### Recorded red/green results
 
-[Validation run 35209233511](https://github.com/lengmh/DiffTracker/actions/runs/35209233511)
+[Acceptance/reconciliation validation](https://github.com/lengmh/DiffTracker/actions/runs/35209233511)
 tested the same 88 new scenarios against the previous production source and the
 refactored source:
 
@@ -66,6 +81,15 @@ refactored source:
 - After (`55abb8d`): all 88 new scenarios passed; the complete tracker suite passed
   551/551. Lint and the remaining `npm test` suites also passed.
 - The run preserves `opaque-invariant-red-green` logs as an Actions artifact.
+
+[Rollback fault-injection validation](https://github.com/lengmh/DiffTracker/actions/runs/35210238873)
+then tested 48 additional combinations against the refactored source:
+
+- Before the rollback fix (`339b844`): all 48 failed because restoring the old maps
+  erased the current edit's review.
+- After (`9d0c893`): all 48 passed; the complete tracker suite passed 599/599,
+  including all 136 new cases. Lint and the remaining `npm test` suites also passed.
+- The run preserves `opaque-rollback-red-green` logs as an Actions artifact.
 
 The PR-level cross-platform and Extension Host checks must still be evaluated on
 the final PR head. These results do not claim exhaustive verification of every
