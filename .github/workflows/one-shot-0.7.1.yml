@@ -1,0 +1,68 @@
+name: One-shot 0.7.0 release and 0.7.1 version bump
+
+on:
+  push:
+    branches:
+      - hotfix/0.7.1-git-init-race
+    paths:
+      - .github/workflows/one-shot-0.7.1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out hotfix branch
+        uses: actions/checkout@v4
+        with:
+          ref: hotfix/0.7.1-git-init-race
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bump package metadata to 0.7.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm version 0.7.1 --no-git-tag-version
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to 0.7.1"
+            git push origin HEAD:hotfix/0.7.1-git-init-race
+          fi
+
+      - name: Create GitHub release 0.7.0 if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v0.7.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v0.7.0 release already exists"
+            exit 0
+          fi
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Code Diff Tracker 0.7.0
+
+          - Publish under the unique Marketplace identity `lengmh.code-diff-tracker` and display name **Code Diff Tracker**.
+          - Preserve file-existence semantics for empty, created, deleted, and restored files.
+          - Keep failed or conflicted items visible during file, hunk, and batch review actions.
+          - Reject stale CodeLens and Webview actions with versioned review tokens.
+          - Coordinate same-file review actions and session lifecycle callbacks to prevent stale writes.
+          - Persist versioned sessions atomically with last-known-good recovery, strict migration, and corruption blocking.
+          - Add bounded **Undo Last Revert** recovery for file, hunk, creation, deletion, and batch reverts.
+          - Pause review writes when a Git branch, detached HEAD, worktree, or conflict context changes; add explicit archive-and-rebuild recovery.
+          - Recognize VS Code file-creation events so new text files receive an explicit absent baseline, exclude binary additions from text review counts, and explain that dirty files must be saved before Keep/Revert.
+          - Add Linux and Windows quality gates, real VS Code Stable Extension Host tests, temporary-repository Git tests, and workspace performance measurements.
+          EOF
+          gh release create v0.7.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target 67cd4bc95384f84fe9798ed1198aeda8a494ca54 \
+            --title "Code Diff Tracker 0.7.0" \
+            --notes-file /tmp/release-notes.md
