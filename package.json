@@ -384,7 +384,7 @@
     "test:paths": "node test/path-display.mjs",
     "test:tracker-safety": "node test/tracker-safety.mjs",
     "test:review-ui": "node test/review-ui.mjs",
-    "test:git-context": "node test/git-context.mjs",
+    "test:git-context": "node test/git-context.mjs && node test/git-readiness-race.mjs",
     "test:git-repositories": "node test/git-repository-integration.mjs",
     "test:host": "node test/host/run.mjs",
     "test:performance": "node test/performance.mjs",
