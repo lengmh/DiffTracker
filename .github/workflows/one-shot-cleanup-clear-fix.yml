@@ -27,92 +27,18 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-
           p = Path('src/diffTracker.ts')
           s = p.read_text(encoding='utf-8')
-
-          old = '''    private isStableUnsupportedBaselineReason(reason: string): boolean {
-          return reason === 'File exceeds the 5 MiB limit' ||
-              reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
-              reason === 'Binary content is unsupported' ||
-              reason === 'Unsupported text encoding (expected UTF-8)';
-      }
-
-      private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
-          this.postBaselineUnknownFiles.delete(filePath);
-          this.unresolvedBaselineFiles.set(filePath, reason);
-          if (publishReview) {
-              this.markFileUnavailable(filePath, reason);
-          } else {
-              this.deleteTrackedChange(filePath);
-              this.lineChanges.delete(filePath);
-              this.markLineChangesUpdated(filePath);
-              this.inlineViews.delete(filePath);
-          }
-          this.schedulePersistState();
-      }'''
-          new = '''    private isStableUnsupportedBaselineReason(reason: string): boolean {
-              return reason === 'File exceeds the 5 MiB limit' ||
-                  reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
-                  reason === 'Binary content is unsupported' ||
-                  reason === 'Unsupported text encoding (expected UTF-8)';
-          }
-
-          private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
-              this.postBaselineUnknownFiles.delete(filePath);
-              this.unresolvedBaselineFiles.set(filePath, reason);
-              if (publishReview) {
-                  this.markFileUnavailable(filePath, reason);
-              } else {
-                  this.deleteTrackedChange(filePath);
-                  this.lineChanges.delete(filePath);
-                  this.markLineChangesUpdated(filePath);
-                  this.inlineViews.delete(filePath);
-              }
-              this.schedulePersistState();
-          }'''
+          old = "    private isStableUnsupportedBaselineReason(reason: string): boolean {\n    return reason === 'File exceeds the 5 MiB limit' ||\n        reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||\n        reason === 'Binary content is unsupported' ||\n        reason === 'Unsupported text encoding (expected UTF-8)';\n}\n\nprivate recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {\n    this.postBaselineUnknownFiles.delete(filePath);\n    this.unresolvedBaselineFiles.set(filePath, reason);\n    if (publishReview) {\n        this.markFileUnavailable(filePath, reason);\n    } else {\n        this.deleteTrackedChange(filePath);\n        this.lineChanges.delete(filePath);\n        this.markLineChangesUpdated(filePath);\n        this.inlineViews.delete(filePath);\n    }\n    this.schedulePersistState();\n}"
+          new = "    private isStableUnsupportedBaselineReason(reason: string): boolean {\n        return reason === 'File exceeds the 5 MiB limit' ||\n            reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||\n            reason === 'Binary content is unsupported' ||\n            reason === 'Unsupported text encoding (expected UTF-8)';\n    }\n\n    private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {\n        this.postBaselineUnknownFiles.delete(filePath);\n        this.unresolvedBaselineFiles.set(filePath, reason);\n        if (publishReview) {\n            this.markFileUnavailable(filePath, reason);\n        } else {\n            this.deleteTrackedChange(filePath);\n            this.lineChanges.delete(filePath);\n            this.markLineChangesUpdated(filePath);\n            this.inlineViews.delete(filePath);\n        }\n        this.schedulePersistState();\n    }"
           assert s.count(old) == 1, f'helper block count={s.count(old)}'
           s = s.replace(old, new)
-
-          old = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
-      if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
-          !this.isStableUnsupportedBaselineReason(reason)) {
-          this.markFileUnavailable(filePath, reason);
-      }
-  }
-      }'''
-          new = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
-              if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
-                  !this.isStableUnsupportedBaselineReason(reason)) {
-                  this.markFileUnavailable(filePath, reason);
-              }
-          }
-      }'''
+          old = "        for (const [filePath, reason] of this.unresolvedBaselineFiles) {\n    if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&\n        !this.isStableUnsupportedBaselineReason(reason)) {\n        this.markFileUnavailable(filePath, reason);\n    }\n}\n    }"
+          new = "        for (const [filePath, reason] of this.unresolvedBaselineFiles) {\n            if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&\n                !this.isStableUnsupportedBaselineReason(reason)) {\n                this.markFileUnavailable(filePath, reason);\n            }\n        }\n    }"
           assert s.count(old) == 1, f'restore loop count={s.count(old)}'
           s = s.replace(old, new)
-
-          old = '''                if (state.kind !== 'text') {
-          // Stable unsupported resources can be accepted as an opaque baseline.
-          // They remain unresolved internally so a later file event can surface
-          // the path again without pretending Code Diff Tracker can decode it.
-          const reason = state.kind === 'unavailable'
-              ? state.reason
-              : 'File disappeared during baseline rebuild; before-image is unknown';
-          const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
-          this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
-          return;
-      }'''
-          new = '''                if (state.kind !== 'text') {
-                      // Stable unsupported resources can be accepted as an opaque baseline.
-                      // They remain unresolved internally so a later file event can surface
-                      // the path again without pretending Code Diff Tracker can decode it.
-                      const reason = state.kind === 'unavailable'
-                          ? state.reason
-                          : 'File disappeared during baseline rebuild; before-image is unknown';
-                      const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
-                      this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
-                      return;
-                  }'''
+          old = "                if (state.kind !== 'text') {\n            // Stable unsupported resources can be accepted as an opaque baseline.\n            // They remain unresolved internally so a later file event can surface\n            // the path again without pretending Code Diff Tracker can decode it.\n            const reason = state.kind === 'unavailable'\n                ? state.reason\n                : 'File disappeared during baseline rebuild; before-image is unknown';\n            const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);\n            this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);\n            return;\n        }"
+          new = "                if (state.kind !== 'text') {\n                    // Stable unsupported resources can be accepted as an opaque baseline.\n                    // They remain unresolved internally so a later file event can surface\n                    // the path again without pretending Code Diff Tracker can decode it.\n                    const reason = state.kind === 'unavailable'\n                        ? state.reason\n                        : 'File disappeared during baseline rebuild; before-image is unknown';\n                    const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);\n                    this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);\n                    return;\n                }"
           assert s.count(old) == 1, f'rebuild block count={s.count(old)}'
           s = s.replace(old, new)
           p.write_text(s, encoding='utf-8')
