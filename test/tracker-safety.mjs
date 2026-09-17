@@ -2,6 +2,7 @@
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
  * DT_SOURCE may point at an archived baseline source for red/green comparison.
  */
+import { registerOpaqueBaselineInvariants } from './opaque-baseline-invariants.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -2353,6 +2354,13 @@ for(const stop of [false,true]) test(`ROUND27 overlapping successful watch resum
     const read=fs.promises.readdir,entered=deferred(),release=deferred();let first=true;fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return read(directory,...args);};
     const old=tracker.refreshIgnoreMatchers();try{await entered.promise;const newer=tracker.refreshIgnoreMatchers();if(stop)tracker.stopRecording();release.resolve();await Promise.all([old,newer]);if(stop){assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);return;}assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);}
     finally{release.resolve();await old;fs.promises.readdir=read;}
+});
+
+registerOpaqueBaselineInvariants({
+    test, root, Uri, DiffTracker, docs, counters, document, file, pending, pause, waitUntil,
+    getTracker: () => tracker,
+    setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; }
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

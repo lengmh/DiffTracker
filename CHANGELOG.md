@@ -2,6 +2,10 @@
 
 ## 0.7.2
 
+- Unify workspace and repository scan acceptance checks; preserve concurrent editor changes even if the editor is saved or closed before scanning completes.
+- Keep already-captured opaque identities intact during remaining scan work, and revalidate clean save/reload notifications without dropping dirty-buffer reviews.
+- Add a cross-product regression matrix for unsupported formats, scan scopes, document transitions, and follow-up file events.
+
 - Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
 - Persist opaque baseline identity for oversized, UTF-8 BOM, unsupported UTF-8, and binary resources, while preserving transient read/scan uncertainty as unresolved review state.
 - Revalidate opaque baselines after restart so offline deletion, replacement, format changes, and file-to-directory replacements surface as unavailable reviews instead of being silently hidden.
