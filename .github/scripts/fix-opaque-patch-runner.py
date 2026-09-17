@@ -19,4 +19,18 @@ assert rblock.count(old_read) == 1, f'read update target count={rblock.count(old
 rblock = rblock.replace(old_read, new_read, 1)
 s = s[:rstart] + rblock + s[rend:]'''
 assert s.count(old) == 1, f'meta target count={s.count(old)}'
-p.write_text(s.replace(old, new, 1), encoding='utf-8')
+s = s.replace(old, new, 1)
+
+# Existing long-rebuild rollback test used a binary unresolved marker as its
+# mid-transaction synchronization point. Binary is now a first-class opaque
+# baseline, so wait for the opaque identity instead.
+s += r'''
+
+tone(
+    "    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));",
+    "    await waitUntil(()=>tracker.opaqueBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));",
+    'long rebuild opaque synchronization',
+)
+'''
+
+p.write_text(s, encoding='utf-8')
