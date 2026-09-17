@@ -2199,14 +2199,20 @@ export class DiffTracker {
     }
 
     private markFileUnavailable(filePath: string, reason: string): void {
+        const existingUnresolvedReason = this.unresolvedBaselineFiles.get(filePath);
+        const preservedUncertaintyReason = existingUnresolvedReason &&
+            !this.isStableUnsupportedBaselineReason(existingUnresolvedReason) &&
+            !this.isBinaryUnavailableReason(existingUnresolvedReason)
+            ? existingUnresolvedReason
+            : undefined;
         if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath) &&
-            !this.opaqueBaselineFiles.has(filePath)) {
+            !this.opaqueBaselineFiles.has(filePath) && !preservedUncertaintyReason) {
             // Code Diff Tracker is text-oriented. Retain an internal unresolved marker
             // when the before-image is unknown, but do not count a binary-only
             // path as an actionable text review. A known-absent baseline remains
             // available so a later text incarnation can still be reviewed.
             if (!this.fileSnapshots.has(filePath)) {
-                this.unresolvedBaselineFiles.set(filePath, reason);
+                this.unresolvedBaselineFiles.set(filePath, existingUnresolvedReason ?? reason);
                 this.schedulePersistState();
             }
             const wasTracked = this.trackedChanges.has(filePath);
@@ -2225,19 +2231,22 @@ export class DiffTracker {
         // Unknown paths must survive restart too. A later create notification may
         // establish an absent baseline, but unavailable bytes are never accepted.
         if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
-            if (!this.unresolvedBaselineFiles.has(filePath) && this.snapshotInitialized && !this.baselineBuilding && this.restoringEpoch === undefined) {
+            if (!existingUnresolvedReason && this.snapshotInitialized && !this.baselineBuilding && this.restoringEpoch === undefined) {
                 this.postBaselineUnknownFiles.add(filePath);
             }
-            this.unresolvedBaselineFiles.set(filePath, reason.slice(0, 1000));
-            this.schedulePersistState();
+            if (!preservedUncertaintyReason) {
+                this.unresolvedBaselineFiles.set(filePath, reason.slice(0, 1000));
+                this.schedulePersistState();
+            }
         }
+        const effectiveReason = preservedUncertaintyReason ?? reason;
         const previous = this.trackedChanges.get(filePath);
         this.setTrackedChange(filePath, {
             filePath, fileName: displayFileName(filePath),
             originalContent: this.fileSnapshots.get(filePath) ?? '',
             currentContent: previous?.currentContent ?? '',
             isDeleted: previous?.isDeleted ?? false,
-            changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: reason
+            changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: effectiveReason
         });
         this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
@@ -2626,6 +2635,14 @@ export class DiffTracker {
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
                 if (!await this.completeBaseline(epoch)) { return; }
+            }
+            const opaqueDocument = this.opaqueBaselineFiles.has(filePath)
+                ? vscode.workspace.textDocuments.find(document =>
+                    document.uri.scheme === 'file' && document.uri.fsPath === filePath)
+                : undefined;
+            if (opaqueDocument?.isDirty) {
+                this.markFileUnavailable(filePath, 'Create notification while editor has unsaved content; reconcile disk and buffer before review');
+                return;
             }
             if (this.reconcileOpaqueBaseline(filePath, state)) {
                 return;

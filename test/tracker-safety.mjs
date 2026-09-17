@@ -636,6 +636,21 @@ test('DT-07 repository rebuild preserves scan uncertainty for opaque files',asyn
     assert.equal(tracker.opaqueBaselineFiles.has(p),false,'scan uncertainty must not be replaced by an opaque baseline');
     assert.ok(tracker.unresolvedBaselineFiles.has(p));assert.ok(pending(p)?.unavailableReason);
 });
+test('DT-07 repository rebuild keeps scan-uncertain binary review visible after pending reread',async()=>{
+    const repo=path.join(root,'repo-rebuild-binary-uncertainty');fs.mkdirSync(repo);
+    const p=path.join(repo,'scan-binary.dat');tracker.fileSnapshots.set(p,'old text baseline');tracker.baselineExistingFiles.add(p);
+    fs.writeFileSync(p,Buffer.from([0x00,0x01,0x02,0x03]));
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    await tracker.startExternalWatchers();const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);await gate.entered;
+    fs.writeFileSync(p,Buffer.from([0x00,0x09,0x08,0x07]));emitWatcher('change',Uri.file(p));
+    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(p));gate.release();
+    assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
+    assert.equal(tracker.opaqueBaselineFiles.has(p),false,'scan-uncertain binary content must not become an accepted opaque baseline');
+    assert.ok(tracker.unresolvedBaselineFiles.has(p));
+    assert.match(pending(p)?.unavailableReason??'',/before-image|baseline rebuild|scan/i,'binary reread must not hide rebuild uncertainty');
+});
 test('DT-07 branch change during rebuild keeps the repository paused',async()=>{
     const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
     const binary=path.join(repo,'image.png');fs.writeFileSync(binary,Buffer.from([0,1,2]));
@@ -991,6 +1006,16 @@ test('DT-08 identical opaque create event stays quiet after delete-create replac
     await tracker.onExternalFileCreated(Uri.file(p));
     assert.equal(pending(p),undefined,'identical opaque replacement must not become a false pending review');
     assert.ok(tracker.opaqueBaselineFiles.has(p));
+});
+test('DT-08 identical opaque create cannot clear a dirty editor review',async()=>{
+    const p=file('opaque-dirty-create-bom.txt'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));
+    const doc=document(p);tracker.onDocumentOpened(doc);doc.text='dirty editor content';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc});assert.ok(pending(p)?.unavailableReason);
+    fs.unlinkSync(p);fs.writeFileSync(p,bytes);await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(doc.isDirty,true);assert.ok(tracker.opaqueBaselineFiles.has(p));
+    assert.match(pending(p)?.unavailableReason??'',/unsaved|unsupported baseline|Document changed/i,'create reconciliation must not erase a dirty buffer review');
 });
 test('DT-08 editing an open opaque-baseline document surfaces an unavailable review',async()=>{
     const p=file('opaque-document-edit-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
