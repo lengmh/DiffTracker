@@ -124,8 +124,12 @@ session/workspace bytes across Start, flush and disposal. The run passed lint an
 the complete `npm test` suite, and retains `state-schema-v3-compatibility` logs.
 
 [Timestamp validation](https://github.com/lengmh/DiffTracker/actions/runs/35211184594)
-adds nine cases for valid pre-epoch timestamps, invalid metadata, and actual
-pre-1970 files through workspace/repository scanning and restore. The old parser
+adds nine cases for valid pre-epoch timestamps, invalid metadata, and
+pre-1970 timestamps through workspace/repository scanning and restore. The fixture
+uses actual filesystem timestamps when the host exposes them; otherwise it
+supplies negative mtime metadata at the existing mocked VS Code provider boundary.
+Both paths exercise the production reader, scanner, persistence and restore with
+real file bytes; neither path skips or weakens the negative-timestamp assertions. The old parser
 failed the negative-timestamp regressions; the fixed source passed lint and the
 complete `npm test` suite. Logs are retained in `opaque-mtime-red-green`.
 

@@ -179,29 +179,41 @@ export function registerStateSchemaCompatibility(harness) {
             const { target } = fixture();
             const stamp = new Date('1960-01-01T00:00:00Z');
             fs.utimesSync(target, stamp, stamp);
-            assert.ok(fs.statSync(target).mtimeMs < 0);
-            const storage = Uri.file(file('pre-epoch-storage'));
-            tracker.storageUri = storage;
-            setListedFiles([Uri.file(target)]);
-            if (scope === 'workspace') {
-                assert.equal(await tracker.resetBaselineToCurrentState(), true);
-            } else {
-                const base = { repoRoot: root, kind: 'repository', headName: 'main',
-                    headCommit: 'aaa', detached: false, inProgress: false };
-                const current = { ...base, headName: 'next', headCommit: 'bbb' };
-                tracker.setBaselineGitContexts([base]);
-                tracker.observeGitContext(current);
-                assert.equal(await tracker.rebuildRepositoryBaseline(root, current), true);
+            // Some hosts do not expose a pre-epoch mtime through Node's local
+            // filesystem boundary. Keep the production scan/persistence/restore
+            // assertions: supply that valid metadata at the already-mocked VS Code
+            // provider boundary instead of skipping the test or changing bytes.
+            if (!(fs.statSync(target).mtimeMs < 0)) {
+                faults.set(target, { mtime: stamp.getTime() });
             }
-            assert.equal(pending(target), undefined);
-            assert.ok(tracker.opaqueBaselineFiles.get(target)?.mtime < 0);
-            assert.equal(await tracker.flushPendingPersistence(), true);
-            await tracker.dispose();
-            tracker = new DiffTracker(storage);
-            setTracker(tracker);
-            assert.equal(await tracker.restorePersistedState(), 'restored');
-            assert.ok(tracker.opaqueBaselineFiles.get(target)?.mtime < 0);
-            assert.equal(pending(target), undefined);
+            try {
+                assert.ok((await tracker.readFileSnapshot(Uri.file(target))).mtime < 0,
+                    'the production reader must observe a valid negative provider timestamp');
+                const storage = Uri.file(file('pre-epoch-storage'));
+                tracker.storageUri = storage;
+                setListedFiles([Uri.file(target)]);
+                if (scope === 'workspace') {
+                    assert.equal(await tracker.resetBaselineToCurrentState(), true);
+                } else {
+                    const base = { repoRoot: root, kind: 'repository', headName: 'main',
+                        headCommit: 'aaa', detached: false, inProgress: false };
+                    const current = { ...base, headName: 'next', headCommit: 'bbb' };
+                    tracker.setBaselineGitContexts([base]);
+                    tracker.observeGitContext(current);
+                    assert.equal(await tracker.rebuildRepositoryBaseline(root, current), true);
+                }
+                assert.equal(pending(target), undefined);
+                assert.ok(tracker.opaqueBaselineFiles.get(target)?.mtime < 0);
+                assert.equal(await tracker.flushPendingPersistence(), true);
+                await tracker.dispose();
+                tracker = new DiffTracker(storage);
+                setTracker(tracker);
+                assert.equal(await tracker.restorePersistedState(), 'restored');
+                assert.ok(tracker.opaqueBaselineFiles.get(target)?.mtime < 0);
+                assert.equal(pending(target), undefined);
+            } finally {
+                faults.delete(target);
+            }
         });
     }
 

@@ -165,7 +165,7 @@ const vscode = {
             return true;
         },
         fs: {
-            async stat(uri) { await boundary(uri.fsPath,'stat'); fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
+            async stat(uri) { await boundary(uri.fsPath,'stat'); fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:fault(uri.fsPath,'mtime')??stat.mtimeMs}; },
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); await boundary(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
