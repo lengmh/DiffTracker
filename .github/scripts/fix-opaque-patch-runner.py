@@ -31,6 +31,7 @@ tone(
     "    await waitUntil(()=>tracker.opaqueBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));",
     'long rebuild opaque synchronization',
 )
+TEST.write_text(t, encoding='utf-8')
 '''
 
 p.write_text(s, encoding='utf-8')
