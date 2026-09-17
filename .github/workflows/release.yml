@@ -223,7 +223,9 @@ jobs:
           set -euo pipefail
           git fetch --tags --force
 
+          tag_exists=false
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tag_exists=true
             tag_sha="$(git rev-list -n 1 "$TAG")"
             if [ "$tag_sha" != "$GITHUB_SHA" ]; then
               echo "$TAG already exists on $tag_sha, not current commit $GITHUB_SHA"
@@ -232,8 +234,17 @@ jobs:
           fi
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub Release $TAG already exists. Refusing to overwrite a published release."
-            exit 1
+            is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "GitHub Release $TAG is already published. Refusing to overwrite it."
+              exit 1
+            fi
+            if [ "$tag_exists" != "true" ]; then
+              echo "Draft release $TAG exists without the expected tag; refusing automatic recovery."
+              exit 1
+            fi
+            echo "Removing incomplete draft release $TAG so this run can recreate it safely."
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
           fi
 
       - name: Create release tag
@@ -247,16 +258,60 @@ jobs:
             git push origin "$TAG"
           fi
 
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          release_flags=(--draft)
+          if [[ "$VERSION" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$TAG" \
-            "$VSIX" \
-            "$CHECKSUM" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "Code Diff Tracker $VERSION" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            "${release_flags[@]}"
+
+      - name: Upload GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            "$VSIX" \
+            "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_id="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')"
+          gh api \
+            --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            >/dev/null
+
+          is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$is_draft" != "false" ]; then
+            echo "Release $TAG did not transition out of draft state."
+            exit 1
+          fi
+
+          expected_prerelease=false
+          if [[ "$VERSION" == *-* ]]; then
+            expected_prerelease=true
+          fi
+          actual_prerelease="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')"
+          if [ "$actual_prerelease" != "$expected_prerelease" ]; then
+            echo "Release prerelease state is $actual_prerelease, expected $expected_prerelease."
+            exit 1
+          fi
