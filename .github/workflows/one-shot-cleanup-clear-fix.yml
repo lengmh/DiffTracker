@@ -1,0 +1,128 @@
+name: One-shot cleanup Clear fix
+
+on:
+  push:
+    branches:
+      - fix/0.7.2-clear-unavailable-baseline
+    paths:
+      - .github/workflows/one-shot-cleanup-clear-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/0.7.2-clear-unavailable-baseline
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Normalize TypeScript formatting
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('src/diffTracker.ts')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''    private isStableUnsupportedBaselineReason(reason: string): boolean {
+          return reason === 'File exceeds the 5 MiB limit' ||
+              reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
+              reason === 'Binary content is unsupported' ||
+              reason === 'Unsupported text encoding (expected UTF-8)';
+      }
+
+      private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
+          this.postBaselineUnknownFiles.delete(filePath);
+          this.unresolvedBaselineFiles.set(filePath, reason);
+          if (publishReview) {
+              this.markFileUnavailable(filePath, reason);
+          } else {
+              this.deleteTrackedChange(filePath);
+              this.lineChanges.delete(filePath);
+              this.markLineChangesUpdated(filePath);
+              this.inlineViews.delete(filePath);
+          }
+          this.schedulePersistState();
+      }'''
+          new = '''    private isStableUnsupportedBaselineReason(reason: string): boolean {
+              return reason === 'File exceeds the 5 MiB limit' ||
+                  reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
+                  reason === 'Binary content is unsupported' ||
+                  reason === 'Unsupported text encoding (expected UTF-8)';
+          }
+
+          private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
+              this.postBaselineUnknownFiles.delete(filePath);
+              this.unresolvedBaselineFiles.set(filePath, reason);
+              if (publishReview) {
+                  this.markFileUnavailable(filePath, reason);
+              } else {
+                  this.deleteTrackedChange(filePath);
+                  this.lineChanges.delete(filePath);
+                  this.markLineChangesUpdated(filePath);
+                  this.inlineViews.delete(filePath);
+              }
+              this.schedulePersistState();
+          }'''
+          assert s.count(old) == 1, f'helper block count={s.count(old)}'
+          s = s.replace(old, new)
+
+          old = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+      if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
+          !this.isStableUnsupportedBaselineReason(reason)) {
+          this.markFileUnavailable(filePath, reason);
+      }
+  }
+      }'''
+          new = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+              if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
+                  !this.isStableUnsupportedBaselineReason(reason)) {
+                  this.markFileUnavailable(filePath, reason);
+              }
+          }
+      }'''
+          assert s.count(old) == 1, f'restore loop count={s.count(old)}'
+          s = s.replace(old, new)
+
+          old = '''                if (state.kind !== 'text') {
+          // Stable unsupported resources can be accepted as an opaque baseline.
+          // They remain unresolved internally so a later file event can surface
+          // the path again without pretending Code Diff Tracker can decode it.
+          const reason = state.kind === 'unavailable'
+              ? state.reason
+              : 'File disappeared during baseline rebuild; before-image is unknown';
+          const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
+          this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
+          return;
+      }'''
+          new = '''                if (state.kind !== 'text') {
+                      // Stable unsupported resources can be accepted as an opaque baseline.
+                      // They remain unresolved internally so a later file event can surface
+                      // the path again without pretending Code Diff Tracker can decode it.
+                      const reason = state.kind === 'unavailable'
+                          ? state.reason
+                          : 'File disappeared during baseline rebuild; before-image is unknown';
+                      const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
+                      this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
+                      return;
+                  }'''
+          assert s.count(old) == 1, f'rebuild block count={s.count(old)}'
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8')
+      - run: npm run lint
+      - run: npm test
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-shot-cleanup-clear-fix.yml
+          git add src/diffTracker.ts
+          git commit -m "style: normalize Clear fix formatting"
+          git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
