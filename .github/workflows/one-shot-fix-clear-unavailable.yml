@@ -1,0 +1,165 @@
+name: One-shot fix Clear unavailable baseline
+
+on:
+  push:
+    branches:
+      - fix/0.7.2-clear-unavailable-baseline
+    paths:
+      - .github/workflows/one-shot-fix-clear-unavailable.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/0.7.2-clear-unavailable-baseline
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Patch baseline handling and regressions
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source_path = Path('src/diffTracker.ts')
+          s = source_path.read_text(encoding='utf-8')
+
+          old = '''    private recordUnresolvedBaseline(filePath: string, reason: string): void {
+              this.postBaselineUnknownFiles.delete(filePath);
+              this.unresolvedBaselineFiles.set(filePath, reason);
+              this.markFileUnavailable(filePath, reason);
+              this.schedulePersistState();
+          }
+          '''
+          new = '''    private isStableUnsupportedBaselineReason(reason: string): boolean {
+              return reason === 'File exceeds the 5 MiB limit' ||
+                  reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
+                  reason === 'Binary content is unsupported' ||
+                  reason === 'Unsupported text encoding (expected UTF-8)';
+          }
+
+          private recordUnresolvedBaseline(filePath: string, reason: string, publishReview = true): void {
+              this.postBaselineUnknownFiles.delete(filePath);
+              this.unresolvedBaselineFiles.set(filePath, reason);
+              if (publishReview) {
+                  this.markFileUnavailable(filePath, reason);
+              } else {
+                  this.deleteTrackedChange(filePath);
+                  this.lineChanges.delete(filePath);
+                  this.markLineChangesUpdated(filePath);
+                  this.inlineViews.delete(filePath);
+              }
+              this.schedulePersistState();
+          }
+          '''
+          assert s.count(old) == 1, f'recordUnresolvedBaseline block count={s.count(old)}'
+          s = s.replace(old, new)
+
+          old = '''                    if (state.kind !== 'text') {
+                              const reason = state.kind === 'unavailable'
+                                  ? state.reason
+                                  : 'File disappeared during baseline scan; before-image is unknown';
+                              this.recordUnresolvedBaseline(uri.fsPath, reason);
+                              return;
+                          }
+          '''
+          new = '''                    if (state.kind !== 'text') {
+                              const reason = state.kind === 'unavailable'
+                                  ? state.reason
+                                  : 'File disappeared during baseline scan; before-image is unknown';
+                              const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
+                              this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
+                              return;
+                          }
+          '''
+          assert s.count(old) == 1, f'baseline scan block count={s.count(old)}'
+          s = s.replace(old, new)
+
+          old = '''                if (state.kind !== 'text') {
+                              // An unsupported or unreadable resource is a file-level
+                              // uncertainty, not a failure of the entire repository rebuild.
+                              this.recordUnresolvedBaseline(uri.fsPath, state.kind === 'unavailable'
+                                  ? state.reason
+                                  : 'File disappeared during baseline rebuild; before-image is unknown');
+                              return;
+                          }
+          '''
+          new = '''                if (state.kind !== 'text') {
+                              // Stable unsupported files are part of the rebuilt baseline but
+                              // remain opaque. They should not immediately recreate a pending
+                              // review; later file events still surface them as unavailable.
+                              const reason = state.kind === 'unavailable'
+                                  ? state.reason
+                                  : 'File disappeared during baseline rebuild; before-image is unknown';
+                              const publishReview = state.kind !== 'unavailable' || !this.isStableUnsupportedBaselineReason(reason);
+                              this.recordUnresolvedBaseline(uri.fsPath, reason, publishReview);
+                              return;
+                          }
+          '''
+          assert s.count(old) == 1, f'rebuild block count={s.count(old)}'
+          s = s.replace(old, new)
+
+          old = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+                      if (!this.isPathIgnored(vscode.Uri.file(filePath))) {
+                          this.markFileUnavailable(filePath, reason);
+                      }
+                  }
+          '''
+          new = '''        for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+                      if (!this.isPathIgnored(vscode.Uri.file(filePath)) &&
+                          !this.isStableUnsupportedBaselineReason(reason)) {
+                          this.markFileUnavailable(filePath, reason);
+                      }
+                  }
+          '''
+          assert s.count(old) == 1, f'restore unresolved loop count={s.count(old)}'
+          s = s.replace(old, new)
+
+          source_path.write_text(s, encoding='utf-8')
+
+          test_path = Path('test/tracker-safety.mjs')
+          t = test_path.read_text(encoding='utf-8')
+
+          old = "    const binary=kind==='binary'||kind==='all-unsupported';\n    assert.equal(tracker.getGitPauseReason(p),undefined);\n    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);"
+          new = "    const quiet=kind==='binary'||kind==='all-unsupported'||kind==='bom'||kind==='oversized';\n    assert.equal(tracker.getGitPauseReason(p),undefined);\n    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);"
+          assert t.count(old) == 1, f'rebuild immediate expectation count={t.count(old)}'
+          t = t.replace(old, new)
+          old = "    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);\n    assert.equal(tracker.getReviewToken(p),undefined);"
+          new = "    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);\n    assert.equal(tracker.getReviewToken(p),undefined);"
+          assert t.count(old) == 1, f'rebuild restored expectation count={t.count(old)}'
+          t = t.replace(old, new)
+
+          marker = "test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{"
+          assert t.count(marker) == 1
+          regression = r'''test('DT-08 clear/reset accepts a stable oversized file without recreating an unavailable review',async()=>{
+              const p=file('oversized-clear.txt'),storage=file('storage');
+              seed(p,'baseline','pending');await scan(p);
+              faults.set(p,{size:6*1024*1024});await scan(p);assert.ok(pending(p)?.unavailableReason);
+              tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];
+              assert.equal(await tracker.resetBaselineToCurrentState(),true);
+              assert.equal(tracker.getBaselineState(),'ready');assert.equal(pending(p),undefined);
+              assert.ok(tracker.unresolvedBaselineFiles.has(p));assert.equal(await tracker.flushPendingPersistence(),true);
+              await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+              assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+              await scan(p);assert.ok(pending(p)?.unavailableReason,'a post-baseline event must surface the unsupported change again');
+          });
+          '''
+          t = t.replace(marker, regression + marker)
+          test_path.write_text(t, encoding='utf-8')
+      - run: npm run lint
+      - run: npm test
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-shot-fix-clear-unavailable.yml
+          git add src/diffTracker.ts test/tracker-safety.mjs
+          git commit -m "fix: clear stable unsupported baseline reviews"
+          git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
