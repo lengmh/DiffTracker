@@ -1,0 +1,51 @@
+name: One-shot Windows fixture validation
+on:
+  push:
+    branches: [fix/0.7.2-clear-unavailable-baseline]
+    paths:
+      - .github/workflows/one-shot-mtime-fixture.yml
+      - .github/scripts/patch-mtime-fixture.py
+permissions:
+  contents: write
+concurrency:
+  group: mtime-fixture-patch
+  cancel-in-progress: false
+jobs:
+  validate-and-patch:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/0.7.2-clear-unavailable-baseline
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply provider-boundary fixture adaptation
+        run: python .github/scripts/patch-mtime-fixture.py
+      - name: Lint and full Windows regression suite
+        run: |
+          npm run lint
+          npm test 2>&1 | tee "$RUNNER_TEMP/windows-regressions.log"
+      - name: Preserve Windows test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mtime-fixture-validation
+          path: ${{ runner.temp }}/windows-regressions.log
+          if-no-files-found: ignore
+      - name: Commit validated tests and remove temporary scripts
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/scripts/patch-mtime-fixture.py .github/workflows/one-shot-mtime-fixture.yml
+          git add test/tracker-safety.mjs test/state-schema-compatibility.mjs docs/opaque-baseline-invariants.md
+          git diff --cached --check
+          git commit -m 'test: preserve pre-epoch coverage across filesystem providers'
+          git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
