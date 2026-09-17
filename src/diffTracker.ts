@@ -124,7 +124,7 @@ interface OpaqueBaselineState {
 }
 
 interface PersistedTrackerState {
-    version: 2;
+    version: 3;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
     migratedFromV1?: boolean;
     isRecording: boolean;
@@ -1067,7 +1067,7 @@ export class DiffTracker {
         }
 
         return {
-            version: 2,
+            version: 3,
             isRecording: this.isRecording,
             baselineState: this.baselineBuilding || !this.snapshotInitialized ? 'building' : 'ready',
             scanCoverage: this.scanCoverage,
@@ -1277,7 +1277,7 @@ export class DiffTracker {
             gitContexts?: unknown;
         };
 
-        if ((candidate.version !== 1 && candidate.version !== 2) || typeof candidate.isRecording !== 'boolean') {
+        if ((candidate.version !== 1 && candidate.version !== 2 && candidate.version !== 3) || typeof candidate.isRecording !== 'boolean') {
             return undefined;
         }
 
@@ -1339,7 +1339,11 @@ export class DiffTracker {
             unresolvedPaths.add(filePath);
         }
 
-        const rawOpaque = candidate.version === 1 ? [] : (candidate.opaqueBaselineFiles ?? []);
+        // V1/V2 sessions remain readable, including development V2 states that
+        // already contain opaque entries. V3 requires the field so corruption
+        // cannot silently erase the only before-image for unsupported files.
+        const rawOpaque = candidate.version === 1 ? [] : candidate.version === 2
+            ? (candidate.opaqueBaselineFiles ?? []) : candidate.opaqueBaselineFiles;
         if (!Array.isArray(rawOpaque) || rawOpaque.length > this.maxPersistedSnapshots) { return undefined; }
         const opaqueBaselineFiles: Array<[string, OpaqueBaselineState]> = [];
         const opaquePaths = new Set<string>();
@@ -1386,11 +1390,11 @@ export class DiffTracker {
         if (!gitContexts) { return undefined; }
 
         return {
-            version: 2,
+            version: 3,
             isRecording: candidate.isRecording,
             migratedFromV1: candidate.version === 1,
             baselineState,
-            scanCoverage: candidate.version === 2 ? candidate.scanCoverage as string | undefined : undefined,
+            scanCoverage: candidate.version !== 1 ? candidate.scanCoverage as string | undefined : undefined,
             workspaceRoots: normalizedRoots,
             fileSnapshots,
             fileModes,

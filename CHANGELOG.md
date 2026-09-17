@@ -2,6 +2,8 @@
 
 ## 0.7.2
 
+- Write session schema V3 for opaque baselines while migrating V1/V2 sessions. Older releases reject V3 rather than silently drop unsupported-file identities during downgrade.
+
 - Unify workspace and repository scan acceptance checks; preserve concurrent editor changes even if the editor is saved or closed before scanning completes.
 - Keep already-captured opaque identities intact during remaining scan work, and revalidate clean save/reload notifications without dropping dirty-buffer reviews.
 - Add a cross-product regression matrix for unsupported formats, scan scopes, document transitions, and follow-up file events.
