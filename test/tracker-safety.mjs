@@ -942,6 +942,33 @@ for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unav
     assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
     faults.delete(p);
 });
+for(const eventKind of ['Changed','Created']) test(`DT-08 opaque file replaced by directory is reported (${eventKind})`,async()=>{
+    const p=file(`opaque-to-directory-${eventKind}.dat`);fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    fs.unlinkSync(p);fs.mkdirSync(p);
+    await tracker[`onExternalFile${eventKind}`](Uri.file(p));
+    await waitUntil(()=>!!pending(p)?.unavailableReason);
+    assert.match(pending(p)?.unavailableReason??'',/directory/i);
+    fs.rmSync(p,{recursive:true,force:true});
+});
+test('DT-08 oversized opaque baseline detects same-size same-mtime rewrite',async()=>{
+    const p=file('opaque-large-same-mtime.bin');
+    const size=5*1024*1024+4096,stamp=new Date(1700000000000);
+    fs.writeFileSync(p,Buffer.alloc(size,0x41));fs.utimesSync(p,stamp,stamp);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);const baseline=tracker.opaqueBaselineFiles.get(p);assert.ok(baseline?.fingerprint);
+    fs.writeFileSync(p,Buffer.alloc(size,0x42));fs.utimesSync(p,stamp,stamp);
+    const currentStat=fs.statSync(p);assert.equal(currentStat.size,size);assert.equal(currentStat.mtimeMs,stamp.getTime());
+    await scan(p);assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+});
+test('DT-08 restored oversized opaque baseline detects timestamp-preserving offline rewrite',async()=>{
+    const p=file('opaque-large-offline-rewrite.bin'),storage=file('storage');
+    const size=5*1024*1024+4096,stamp=new Date(1700000000000);
+    fs.writeFileSync(p,Buffer.alloc(size,0x31));fs.utimesSync(p,stamp,stamp);listedFiles=[Uri.file(p)];tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.get(p)?.fingerprint);
+    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    fs.writeFileSync(p,Buffer.alloc(size,0x32));fs.utimesSync(p,stamp,stamp);tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+});
 test('DT-08 editing an open opaque-baseline document surfaces an unavailable review',async()=>{
     const p=file('opaque-document-edit-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
     assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);

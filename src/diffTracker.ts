@@ -2124,6 +2124,16 @@ export class DiffTracker {
         return code === 'FileNotFound' || code === 'ENOENT';
     }
 
+    private async fingerprintLocalFile(filePath: string): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            const hash = createHash('sha256');
+            const stream = fs.createReadStream(filePath);
+            stream.on('data', chunk => hash.update(chunk));
+            stream.once('error', reject);
+            stream.once('end', () => resolve(hash.digest('hex')));
+        });
+    }
+
     private async readFileSnapshot(uri: vscode.Uri): Promise<CurrentFileState> {
         const targetError = this.validateResourceTarget(uri.fsPath);
         if (uri.scheme !== 'file' || targetError) {
@@ -2135,7 +2145,18 @@ export class DiffTracker {
                 return { kind: 'unavailable', reason: 'Resource is a directory' };
             }
             if (stat.size > 5 * 1024 * 1024) {
-                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit', size: stat.size, mtime: stat.mtime };
+                const fingerprint = await this.fingerprintLocalFile(uri.fsPath);
+                const afterStat = await vscode.workspace.fs.stat(uri);
+                if (stat.size !== afterStat.size || stat.mtime !== afterStat.mtime || stat.type !== afterStat.type) {
+                    return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
+                }
+                return {
+                    kind: 'unavailable',
+                    reason: 'File exceeds the 5 MiB limit',
+                    size: stat.size,
+                    mtime: stat.mtime,
+                    fingerprint
+                };
             }
             const content = await vscode.workspace.fs.readFile(uri);
             const afterStat = await vscode.workspace.fs.stat(uri);
@@ -2143,7 +2164,7 @@ export class DiffTracker {
                 return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
             }
             if (content.length > 5 * 1024 * 1024) {
-                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit', size: stat.size, mtime: stat.mtime };
+                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
             }
             if (content[0] === 0xef && content[1] === 0xbb && content[2] === 0xbf) {
                 return { kind: 'unavailable', reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
@@ -2259,10 +2280,8 @@ export class DiffTracker {
 
     private opaqueBaselineMatches(baseline: OpaqueBaselineState, state: CurrentFileState): boolean {
         if (!this.isStableUnsupportedState(state) || baseline.reason !== state.reason) { return false; }
-        if (baseline.fingerprint !== undefined) {
-            return baseline.fingerprint === state.fingerprint;
-        }
-        return baseline.size === state.size && baseline.mtime === state.mtime;
+        return baseline.fingerprint !== undefined && state.fingerprint !== undefined &&
+            baseline.size === state.size && baseline.fingerprint === state.fingerprint;
     }
 
     private reconcileOpaqueBaseline(filePath: string, state: CurrentFileState): boolean {
@@ -2458,7 +2477,7 @@ export class DiffTracker {
 
     private async isUntrackedDirectory(uri: vscode.Uri): Promise<boolean> {
         // A tracked file replaced with a directory must still report a conflict.
-        if (this.baselineExistingFiles.has(uri.fsPath)) { return false; }
+        if (this.baselineExistingFiles.has(uri.fsPath) || this.opaqueBaselineFiles.has(uri.fsPath)) { return false; }
         try {
             return !!((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
         } catch {
