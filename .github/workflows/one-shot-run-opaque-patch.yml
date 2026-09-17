@@ -23,6 +23,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: python .github/scripts/fix-opaque-patch-runner.py
       - run: python .github/scripts/apply-opaque-baseline-v2.py
       - run: npm run lint
       - run: npm test
@@ -33,6 +34,7 @@ jobs:
           git rm .github/workflows/one-shot-run-opaque-patch.yml
           git rm .github/workflows/one-shot-opaque-baseline-state.yml
           git rm .github/scripts/apply-opaque-baseline-v2.py
+          git rm .github/scripts/fix-opaque-patch-runner.py
           git add src/diffTracker.ts test/tracker-safety.mjs
           git commit -m "fix: persist and reconcile opaque baseline identities"
           git push origin HEAD:fix/0.7.2-clear-unavailable-baseline
