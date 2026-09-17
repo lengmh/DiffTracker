@@ -2,7 +2,7 @@
   "name": "code-diff-tracker",
   "displayName": "Code Diff Tracker",
   "description": "Review, keep, and safely revert workspace file changes in real time",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
   "license": "MIT",

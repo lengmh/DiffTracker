@@ -2,6 +2,8 @@
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
  * DT_SOURCE may point at an archived baseline source for red/green comparison.
  */
+import { registerOpaqueBaselineInvariants } from './opaque-baseline-invariants.mjs';
+import { registerStateSchemaCompatibility } from './state-schema-compatibility.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -163,7 +165,7 @@ const vscode = {
             return true;
         },
         fs: {
-            async stat(uri) { await boundary(uri.fsPath,'stat'); fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:stat.mtimeMs}; },
+            async stat(uri) { await boundary(uri.fsPath,'stat'); fault(uri.fsPath,'stat'); const stat=fs.statSync(uri.fsPath); return {type:stat.isDirectory()?2:1,size:fault(uri.fsPath,'size')??stat.size,mtime:fault(uri.fsPath,'mtime')??stat.mtimeMs}; },
             async readFile(uri) { fault(uri.fsPath,'read'); const bytes=new Uint8Array(fs.readFileSync(uri.fsPath)); await boundary(uri.fsPath,'read'); return bytes; },
             async writeFile(uri, bytes) { counters.write++; fault(uri.fsPath,'write'); await boundary(uri.fsPath,'write'); fs.writeFileSync(uri.fsPath,bytes); },
             async createDirectory(uri) { fs.mkdirSync(uri.fsPath,{recursive:true}); },
@@ -349,7 +351,7 @@ test('existing V1 persistence preserves absent versus empty baseline and paused 
     const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage); tracker.isRecording=false;
     await tracker.flushPersistState();
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
-    assert.equal(saved.version,2); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
+    assert.equal(saved.version,3); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
     const loaded=await tracker.loadPersistedState(); assert.equal(loaded.isRecording,false);
     assert.ok(loaded.baselineExistingFiles.includes(empty)); assert.equal(loaded.baselineExistingFiles.includes(absent),false);
     assert.ok(loaded.fileSnapshots.some(([p,t])=>p===absent&&t===''));
@@ -361,7 +363,7 @@ test('DT-06 atomic persistence keeps a last-good state and recovers a corrupted 
     const primary=path.join(storage,'session-state.json');
     const backup=path.join(storage,'session-state.last-good.json');
     assert.equal(fs.existsSync(backup),true);
-    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,2);
+    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,3);
     fs.writeFileSync(primary,'{"version":2,');
 
     tracker=new DiffTracker(Uri.file(storage));
@@ -478,7 +480,7 @@ test('DT-08 queued Undo calls cannot mutate after the recording session stops',a
     assert.equal(results.reduce((total,result)=>total+result.succeeded,0),0);
     assert.equal(disk(p),'baseline');assert.equal(tracker.revertHistory.length,1);
 });
-test('DT-06 valid V1 state migrates in memory and the next durable write is strict V2',async()=>{
+test('DT-06 valid V1 state migrates in memory and the next durable write is strict V3',async()=>{
     const p=file(); fs.writeFileSync(p,'changed');
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
     fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
@@ -487,7 +489,7 @@ test('DT-06 valid V1 state migrates in memory and the next durable write is stri
     tracker.storageUri=Uri.file(storage); assert.equal(await tracker.restorePersistedState(),'restored');
     assert.equal(tracker.getOriginalContent(p),'baseline'); assert.ok(pending(p));
     assert.equal(await tracker.flushPendingPersistence(),true);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,2);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,3);
 });
 test('DT-06 explicit discard is required before a blocked session can start',async()=>{
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
@@ -621,6 +623,35 @@ test('DT-07 repository rebuild watches files already captured while later files 
     fs.writeFileSync(p,'late external');emitWatcher('change',Uri.file(p));gate.release();
     assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
     assert.equal(tracker.getOriginalContent(p),'branch baseline');assert.equal(pending(p)?.currentContent,'late external');
+});
+test('DT-07 repository rebuild preserves scan uncertainty for opaque files',async()=>{
+    const repo=path.join(root,'repo-rebuild-opaque-uncertainty');fs.mkdirSync(repo);
+    const p=path.join(repo,'opaque.dat');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    await tracker.startExternalWatchers();
+    const gate=pause(p,'stat');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);await gate.entered;
+    fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x62]));emitWatcher('change',Uri.file(p));
+    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(p));gate.release();
+    assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
+    assert.equal(tracker.opaqueBaselineFiles.has(p),false,'scan uncertainty must not be replaced by an opaque baseline');
+    assert.ok(tracker.unresolvedBaselineFiles.has(p));assert.ok(pending(p)?.unavailableReason);
+});
+test('DT-07 repository rebuild keeps scan-uncertain binary review visible after pending reread',async()=>{
+    const repo=path.join(root,'repo-rebuild-binary-uncertainty');fs.mkdirSync(repo);
+    const p=path.join(repo,'scan-binary.dat');tracker.fileSnapshots.set(p,'old text baseline');tracker.baselineExistingFiles.add(p);
+    fs.writeFileSync(p,Buffer.from([0x00,0x01,0x02,0x03]));
+    const base={repoRoot:repo,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    tracker.storageUri=Uri.file(path.join(root,`storage-${index++}`));listedFiles=[Uri.file(p)];
+    await tracker.startExternalWatchers();const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,current);await gate.entered;
+    fs.writeFileSync(p,Buffer.from([0x00,0x09,0x08,0x07]));emitWatcher('change',Uri.file(p));
+    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(p));gate.release();
+    assert.equal(await rebuild,true);await new Promise(resolve=>setTimeout(resolve,180));
+    assert.equal(tracker.opaqueBaselineFiles.has(p),false,'scan-uncertain binary content must not become an accepted opaque baseline');
+    assert.ok(tracker.unresolvedBaselineFiles.has(p));
+    assert.match(pending(p)?.unavailableReason??'',/before-image|baseline rebuild|scan/i,'binary reread must not hide rebuild uncertainty');
 });
 test('DT-07 branch change during rebuild keeps the repository paused',async()=>{
     const repo=file('repo');fs.mkdirSync(repo);const p=path.join(repo,'a.m');seed(p,'old','branch');
@@ -906,6 +937,114 @@ test('DT-08 reset cannot scan ahead of replacement watcher registration',async()
     fs.writeFileSync(p,'external');emitWatcher('change',Uri.file(p));gate.release();await reset;
     await new Promise(resolve=>setTimeout(resolve,180));
     assert.ok(!scanned || pending(p)?.currentContent==='external','a scanned file must have live watcher coverage');
+});
+for(const kind of ['oversized','bom','invalid-utf8']) test(`DT-08 clear/reset accepts stable unsupported ${kind} without recreating an unavailable review`,async()=>{
+    const p=file(`${kind}-clear.txt`),storage=file('storage');
+    seed(p,'baseline','pending');await scan(p);
+    if(kind==='oversized') faults.set(p,{size:6*1024*1024});
+    else if(kind==='bom') fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    else fs.writeFileSync(p,Buffer.from([0xc3,0x28]));
+    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(tracker.getBaselineState(),'ready');assert.equal(pending(p),undefined);
+    assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(tracker.unresolvedBaselineFiles.has(p),false);assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+    tracker.onDocumentOpened(document(p));assert.equal(pending(p),undefined,'opening an unchanged opaque baseline must stay quiet');
+    if(kind==='oversized') fs.writeFileSync(p,'changed-after-clear');
+    else if(kind==='bom') fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61,0x62]));
+    else fs.writeFileSync(p,Buffer.from([0xc3,0x28,0x41]));
+    await scan(p);assert.ok(pending(p)?.unavailableReason,'a changed opaque baseline must surface for review');
+    faults.delete(p);
+});
+for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unavailable ${kind} review and unresolved baseline`,async()=>{
+    const p=file(`${kind}-stopped-clear.txt`),storage=file('storage');
+    seed(p,'baseline','pending');await scan(p);
+    if(kind==='oversized') faults.set(p,{size:6*1024*1024});
+    else fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    tracker.storageUri=Uri.file(storage);tracker.stopRecording();
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(p),false);assert.equal(tracker.opaqueBaselineFiles.has(p),false);
+    const saved=JSON.parse(disk(path.join(storage,'session-state.json')));
+    assert.equal(saved.unresolvedBaselineFiles.length,0);assert.equal(saved.opaqueBaselineFiles.length,0);assert.equal(saved.fileSnapshots.length,0);
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+    faults.delete(p);
+});
+for(const eventKind of ['Changed','Created']) test(`DT-08 opaque file replaced by directory is reported (${eventKind})`,async()=>{
+    const p=file(`opaque-to-directory-${eventKind}.dat`);fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    fs.unlinkSync(p);fs.mkdirSync(p);
+    await tracker[`onExternalFile${eventKind}`](Uri.file(p));
+    await waitUntil(()=>!!pending(p)?.unavailableReason);
+    assert.match(pending(p)?.unavailableReason??'',/directory/i);
+    fs.rmSync(p,{recursive:true,force:true});
+});
+test('DT-08 oversized opaque baseline detects same-size same-mtime rewrite',async()=>{
+    const p=file('opaque-large-same-mtime.bin');
+    const size=5*1024*1024+4096,stamp=new Date(1700000000000);
+    fs.writeFileSync(p,Buffer.alloc(size,0x41));fs.utimesSync(p,stamp,stamp);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);const baseline=tracker.opaqueBaselineFiles.get(p);assert.ok(baseline?.fingerprint);
+    fs.writeFileSync(p,Buffer.alloc(size,0x42));fs.utimesSync(p,stamp,stamp);
+    const currentStat=fs.statSync(p);assert.equal(currentStat.size,size);assert.equal(currentStat.mtimeMs,stamp.getTime());
+    await scan(p);assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+});
+test('DT-08 restored oversized opaque baseline detects timestamp-preserving offline rewrite',async()=>{
+    const p=file('opaque-large-offline-rewrite.bin'),storage=file('storage');
+    const size=5*1024*1024+4096,stamp=new Date(1700000000000);
+    fs.writeFileSync(p,Buffer.alloc(size,0x31));fs.utimesSync(p,stamp,stamp);listedFiles=[Uri.file(p)];tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.get(p)?.fingerprint);
+    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    fs.writeFileSync(p,Buffer.alloc(size,0x32));fs.utimesSync(p,stamp,stamp);tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+});
+test('DT-08 identical opaque create event stays quiet after delete-create replacement',async()=>{
+    const p=file('opaque-identical-create-bom.txt'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    fs.unlinkSync(p);fs.writeFileSync(p,bytes);
+    await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(pending(p),undefined,'identical opaque replacement must not become a false pending review');
+    assert.ok(tracker.opaqueBaselineFiles.has(p));
+});
+test('DT-08 identical opaque create cannot clear a dirty editor review',async()=>{
+    const p=file('opaque-dirty-create-bom.txt'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));
+    const doc=document(p);tracker.onDocumentOpened(doc);doc.text='dirty editor content';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc});assert.ok(pending(p)?.unavailableReason);
+    fs.unlinkSync(p);fs.writeFileSync(p,bytes);await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(doc.isDirty,true);assert.ok(tracker.opaqueBaselineFiles.has(p));
+    assert.match(pending(p)?.unavailableReason??'',/unsaved|unsupported baseline|Document changed/i,'create reconciliation must not erase a dirty buffer review');
+});
+test('DT-08 editing an open opaque-baseline document surfaces an unavailable review',async()=>{
+    const p=file('opaque-document-edit-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    const doc=document(p);tracker.onDocumentOpened(doc);assert.equal(pending(p),undefined,'opening alone must stay quiet');
+    doc.text='edited in memory';doc.isDirty=true;doc.version++;tracker.onDocumentChanged({document:doc});
+    assert.match(pending(p)?.unavailableReason??'',/Document changed from an unsupported baseline/i);
+    assert.ok(tracker.opaqueBaselineFiles.has(p),'document edits must not erase the opaque before-image identity');
+});
+test('DT-08 deleting an accepted opaque baseline surfaces an unavailable review',async()=>{
+    const p=file('opaque-delete-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
+    fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
+    assert.match(pending(p)?.unavailableReason??'',/deleted.*unsupported baseline/i);
+});
+test('DT-08 restored opaque baseline detects offline replacement with ordinary text',async()=>{
+    const p=file('opaque-offline-replace.txt'),storage=file('storage');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    fs.writeFileSync(p,'ordinary text after restart');tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/unsupported baseline/i);
+});
+test('DT-08 restored opaque baseline detects offline deletion',async()=>{
+    const p=file('opaque-offline-delete.txt'),storage=file('storage');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
+    tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();fs.unlinkSync(p);tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/deleted.*unsupported baseline/i);
 });
 test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{
     const p=file('dirty-reset.m');seed(p,'old baseline','saved disk');const doc=document(p);
@@ -1400,15 +1539,16 @@ for(const kind of ['binary','bom','oversized','unreadable','missing','all-unsupp
     const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);
     listedFiles=kind==='all-unsupported'?[Uri.file(p)]:[Uri.file(p),Uri.file(q)];
     assert.equal(await tracker.rebuildRepositoryBaseline(repo,current),true);
-    const binary=kind==='binary'||kind==='all-unsupported';
+    const quiet=kind==='binary'||kind==='all-unsupported'||kind==='bom'||kind==='oversized';
     assert.equal(tracker.getGitPauseReason(p),undefined);
-    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
+    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
     assert.equal(tracker.getReviewToken(p),undefined);assert.equal(tracker.getOriginalContent(p),undefined);
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
-    assert.ok(saved.unresolvedBaselineFiles.some(([f])=>f===p));assert.ok(tracker.parsePersistedState(saved));
+    if(quiet)assert.ok(saved.opaqueBaselineFiles.some(([f])=>f===p));else assert.ok(saved.unresolvedBaselineFiles.some(([f])=>f===p));
+    assert.ok(tracker.parsePersistedState(saved));
     await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
     tracker.reconcileRestoredGitContexts([current]);
-    if(binary)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
+    if(quiet)assert.equal(pending(p),undefined);else assert.ok(pending(p)?.unavailableReason);
     assert.equal(tracker.getReviewToken(p),undefined);
     assert.equal(succeeded(await tracker.revertFile(p)),false);
     if(kind!=='all-unsupported'){assert.equal(tracker.getOriginalContent(q),'new baseline');fs.writeFileSync(q,'later change');await scan(q);assert.equal(succeeded(await tracker.keepAllChangesInFile(q)),true);}
@@ -1477,7 +1617,7 @@ for(const stop of [false,true]) test(`DT-07 failed long rebuild never persists a
     tracker.setBaselineGitContexts([base]);tracker.observeGitContext(next);
     const storage=path.join(root,`storage-${index++}`);tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
     listedFiles=[Uri.file(binary),Uri.file(p)];const gate=pause(p,'read');const rebuild=tracker.rebuildRepositoryBaseline(repo,next);await gate.entered;
-    await waitUntil(()=>tracker.unresolvedBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));
+    await waitUntil(()=>tracker.opaqueBaselineFiles.has(binary));await new Promise(r=>setTimeout(r,350));
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
     assert.ok(saved.fileSnapshots.some(([f,c])=>f===p&&c==='old'));assert.equal(saved.baselineState,'ready');
     if(stop)tracker.stopRecording();else tracker.observeGitContext({...base,headName:'third'});
@@ -2215,6 +2355,20 @@ for(const stop of [false,true]) test(`ROUND27 overlapping successful watch resum
     const read=fs.promises.readdir,entered=deferred(),release=deferred();let first=true;fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return read(directory,...args);};
     const old=tracker.refreshIgnoreMatchers();try{await entered.promise;const newer=tracker.refreshIgnoreMatchers();if(stop)tracker.stopRecording();release.resolve();await Promise.all([old,newer]);if(stop){assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);return;}assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);}
     finally{release.resolve();await old;fs.promises.readdir=read;}
+});
+
+registerOpaqueBaselineInvariants({
+    test, root, Uri, DiffTracker, docs, counters, faults, document, file, pending, pause, waitUntil,
+    getTracker: () => tracker,
+    setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; }
+});
+
+registerStateSchemaCompatibility({
+    test, root, Uri, DiffTracker, faults, file, pending,
+    getTracker: () => tracker,
+    setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; }
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

@@ -116,8 +116,15 @@ interface StartupEvent {
     kind: 'change' | 'create' | 'delete';
 }
 
+interface OpaqueBaselineState {
+    reason: string;
+    size: number;
+    mtime: number;
+    fingerprint?: string;
+}
+
 interface PersistedTrackerState {
-    version: 2;
+    version: 3;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
     migratedFromV1?: boolean;
     isRecording: boolean;
@@ -128,6 +135,7 @@ interface PersistedTrackerState {
     fileModes: Array<[string, number]>;
     baselineExistingFiles: string[];
     unresolvedBaselineFiles: Array<[string, string]>;
+    opaqueBaselineFiles: Array<[string, OpaqueBaselineState]>;
     revertHistory: PersistedRevertRecord[];
     gitContexts: GitContextSnapshot[];
 }
@@ -157,7 +165,7 @@ export interface ReviewToken {
 type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
-    | { kind: 'unavailable'; reason: string };
+    | { kind: 'unavailable'; reason: string; size?: number; mtime?: number; fingerprint?: string };
 
 export class DiffTracker {
     private sessionEpoch = 0;
@@ -304,6 +312,7 @@ export class DiffTracker {
     private fileSnapshots = new Map<string, string>();
     private baselineExistingFiles = new Set<string>();
     private unresolvedBaselineFiles = new Map<string, string>();
+    private opaqueBaselineFiles = new Map<string, OpaqueBaselineState>();
     private trackedChanges = new Map<string, FileDiff>();
     private trackedChangesVersion = 0;
     private trackedChangesCacheVersion = -1;
@@ -492,6 +501,7 @@ export class DiffTracker {
         this.fileModes = new Map(state.fileModes);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
         this.unresolvedBaselineFiles = new Map(state.unresolvedBaselineFiles);
+        this.opaqueBaselineFiles = new Map(state.opaqueBaselineFiles);
         this.revertHistory = state.revertHistory.slice(-this.maxRevertHistory);
         this.baselineGitContexts = new Map(state.gitContexts.map(context => [context.repoRoot, context]));
         this.pausedGitRepositories.clear();
@@ -594,6 +604,7 @@ export class DiffTracker {
         this.fileModes.clear();
         this.baselineExistingFiles.clear();
         this.unresolvedBaselineFiles.clear();
+        this.opaqueBaselineFiles.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -702,6 +713,7 @@ export class DiffTracker {
         this.fileModes.clear();
         this.baselineExistingFiles.clear();
         this.unresolvedBaselineFiles.clear();
+        this.opaqueBaselineFiles.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -734,6 +746,7 @@ export class DiffTracker {
         const previous = {
             fileSnapshots: this.fileSnapshots, fileModes: this.fileModes,
             baselineExistingFiles: this.baselineExistingFiles, unresolvedBaselineFiles: this.unresolvedBaselineFiles,
+            opaqueBaselineFiles: this.opaqueBaselineFiles,
             revertHistory: this.revertHistory, baselineGitContexts: this.baselineGitContexts,
             pausedGitRepositories: this.pausedGitRepositories, sessionWorkspaceRoots: this.sessionWorkspaceRoots,
             snapshotInitialized: this.snapshotInitialized, baselineBuilding: this.baselineBuilding,
@@ -745,6 +758,7 @@ export class DiffTracker {
         this.fileModes = new Map();
         this.baselineExistingFiles = new Set();
         this.unresolvedBaselineFiles = new Map();
+        this.opaqueBaselineFiles = new Map();
         this.revertHistory = [];
         this.baselineGitContexts = new Map();
         this.pausedGitRepositories = new Map();
@@ -1047,12 +1061,13 @@ export class DiffTracker {
             return undefined;
         }
 
-        if (!this.isRecording && !this.baselineBuilding && !this.snapshotInitialized && this.fileSnapshots.size === 0 && this.unresolvedBaselineFiles.size === 0) {
+        if (!this.isRecording && !this.baselineBuilding && !this.snapshotInitialized && this.fileSnapshots.size === 0 &&
+            this.unresolvedBaselineFiles.size === 0 && this.opaqueBaselineFiles.size === 0) {
             return undefined;
         }
 
         return {
-            version: 2,
+            version: 3,
             isRecording: this.isRecording,
             baselineState: this.baselineBuilding || !this.snapshotInitialized ? 'building' : 'ready',
             scanCoverage: this.scanCoverage,
@@ -1063,6 +1078,8 @@ export class DiffTracker {
             baselineExistingFiles: Array.from(this.baselineExistingFiles.values())
                 .sort((leftPath, rightPath) => leftPath.localeCompare(rightPath)),
             unresolvedBaselineFiles: Array.from(this.unresolvedBaselineFiles.entries())
+                .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
+            opaqueBaselineFiles: Array.from(this.opaqueBaselineFiles.entries())
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             revertHistory: this.revertHistory.slice(-this.maxRevertHistory),
             gitContexts: [...this.baselineGitContexts.values()]
@@ -1255,11 +1272,12 @@ export class DiffTracker {
             fileModes?: unknown;
             baselineExistingFiles?: unknown;
             unresolvedBaselineFiles?: unknown;
+            opaqueBaselineFiles?: unknown;
             revertHistory?: unknown;
             gitContexts?: unknown;
         };
 
-        if ((candidate.version !== 1 && candidate.version !== 2) || typeof candidate.isRecording !== 'boolean') {
+        if ((candidate.version !== 1 && candidate.version !== 2 && candidate.version !== 3) || typeof candidate.isRecording !== 'boolean') {
             return undefined;
         }
 
@@ -1321,6 +1339,35 @@ export class DiffTracker {
             unresolvedPaths.add(filePath);
         }
 
+        // V1/V2 sessions remain readable, including development V2 states that
+        // already contain opaque entries. V3 requires the field so corruption
+        // cannot silently erase the only before-image for unsupported files.
+        const rawOpaque = candidate.version === 1 ? [] : candidate.version === 2
+            ? (candidate.opaqueBaselineFiles ?? []) : candidate.opaqueBaselineFiles;
+        if (!Array.isArray(rawOpaque) || rawOpaque.length > this.maxPersistedSnapshots) { return undefined; }
+        const opaqueBaselineFiles: Array<[string, OpaqueBaselineState]> = [];
+        const opaquePaths = new Set<string>();
+        for (const entry of rawOpaque) {
+            if (!Array.isArray(entry) || entry.length !== 2 || !entry[1] || typeof entry[1] !== 'object') { return undefined; }
+            const [filePath, rawState] = entry;
+            const value = rawState as Partial<OpaqueBaselineState>;
+            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) ||
+                snapshotPaths.has(filePath) || unresolvedPaths.has(filePath) || opaquePaths.has(filePath) ||
+                typeof value.reason !== 'string' || !this.isStableUnsupportedBaselineReason(value.reason) ||
+                typeof value.size !== 'number' || !Number.isFinite(value.size) || value.size < 0 ||
+                typeof value.mtime !== 'number' || !Number.isFinite(value.mtime) ||
+                (value.fingerprint !== undefined && (typeof value.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.fingerprint)))) {
+                return undefined;
+            }
+            opaqueBaselineFiles.push([filePath, {
+                reason: value.reason,
+                size: value.size,
+                mtime: value.mtime,
+                fingerprint: value.fingerprint
+            }]);
+            opaquePaths.add(filePath);
+        }
+
         if (candidate.scanCoverage !== undefined &&
             (typeof candidate.scanCoverage !== 'string' || !/^[a-f0-9]{64}$/.test(candidate.scanCoverage))) { return undefined; }
         const baselineState = candidate.version === 1 ? 'ready' : candidate.baselineState;
@@ -1343,16 +1390,17 @@ export class DiffTracker {
         if (!gitContexts) { return undefined; }
 
         return {
-            version: 2,
+            version: 3,
             isRecording: candidate.isRecording,
             migratedFromV1: candidate.version === 1,
             baselineState,
-            scanCoverage: candidate.version === 2 ? candidate.scanCoverage as string | undefined : undefined,
+            scanCoverage: candidate.version !== 1 ? candidate.scanCoverage as string | undefined : undefined,
             workspaceRoots: normalizedRoots,
             fileSnapshots,
             fileModes,
             baselineExistingFiles,
             unresolvedBaselineFiles,
+            opaqueBaselineFiles,
             revertHistory,
             gitContexts
         };
@@ -1671,7 +1719,7 @@ export class DiffTracker {
             // A same-fingerprint retry must reconcile the gap too. Retain this
             // obligation if discovery fails, even though OS watches now exist.
             await this.discoverRestoredFiles(epoch);
-            for (const filePath of [...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys()]) {
+            for (const filePath of [...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys(), ...this.opaqueBaselineFiles.keys()]) {
                 if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 if (restoredMarkers.has(filePath)) { continue; }
                 const uri = vscode.Uri.file(filePath);
@@ -2014,21 +2062,7 @@ export class DiffTracker {
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     if (state.kind === 'missing' && transientPaths.has(uri.fsPath)) { return; }
-                    if (this.hasScanUncertainty(uri.fsPath)) {
-                        this.recordUnresolvedBaseline(uri.fsPath, 'File changed during baseline scan; before-image is unknown');
-                        return;
-                    }
-                    if (state.kind !== 'text') {
-                        const reason = state.kind === 'unavailable'
-                            ? state.reason
-                            : 'File disappeared during baseline scan; before-image is unknown';
-                        this.recordUnresolvedBaseline(uri.fsPath, reason);
-                        return;
-                    }
-                    this.unresolvedBaselineFiles.delete(uri.fsPath);
-                    this.fileSnapshots.set(uri.fsPath, state.content);
-                    if (state.mode !== undefined) { this.fileModes.set(uri.fsPath, state.mode); }
-                    this.baselineExistingFiles.add(uri.fsPath);
+                    this.recordScannedBaseline(uri.fsPath, state, 'workspace');
                 });
 
                 if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
@@ -2070,6 +2104,16 @@ export class DiffTracker {
         return code === 'FileNotFound' || code === 'ENOENT';
     }
 
+    private async fingerprintLocalFile(filePath: string): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            const hash = createHash('sha256');
+            const stream = fs.createReadStream(filePath);
+            stream.on('data', chunk => hash.update(chunk));
+            stream.once('error', reject);
+            stream.once('end', () => resolve(hash.digest('hex')));
+        });
+    }
+
     private async readFileSnapshot(uri: vscode.Uri): Promise<CurrentFileState> {
         const targetError = this.validateResourceTarget(uri.fsPath);
         if (uri.scheme !== 'file' || targetError) {
@@ -2081,7 +2125,18 @@ export class DiffTracker {
                 return { kind: 'unavailable', reason: 'Resource is a directory' };
             }
             if (stat.size > 5 * 1024 * 1024) {
-                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit' };
+                const fingerprint = await this.fingerprintLocalFile(uri.fsPath);
+                const afterStat = await vscode.workspace.fs.stat(uri);
+                if (stat.size !== afterStat.size || stat.mtime !== afterStat.mtime || stat.type !== afterStat.type) {
+                    return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
+                }
+                return {
+                    kind: 'unavailable',
+                    reason: 'File exceeds the 5 MiB limit',
+                    size: stat.size,
+                    mtime: stat.mtime,
+                    fingerprint
+                };
             }
             const content = await vscode.workspace.fs.readFile(uri);
             const afterStat = await vscode.workspace.fs.stat(uri);
@@ -2089,18 +2144,18 @@ export class DiffTracker {
                 return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
             }
             if (content.length > 5 * 1024 * 1024) {
-                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit' };
+                return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
             }
             if (content[0] === 0xef && content[1] === 0xbb && content[2] === 0xbf) {
-                return { kind: 'unavailable', reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version' };
+                return { kind: 'unavailable', reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
             }
             if (this.isLikelyBinaryContent(content)) {
-                return { kind: 'unavailable', reason: 'Binary content is unsupported' };
+                return { kind: 'unavailable', reason: 'Binary content is unsupported', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
             }
             try {
                 return { kind: 'text', content: new TextDecoder('utf-8', { fatal: true }).decode(content), mode: fs.statSync(uri.fsPath).mode & 0o777 };
             } catch {
-                return { kind: 'unavailable', reason: 'Unsupported text encoding (expected UTF-8)' };
+                return { kind: 'unavailable', reason: 'Unsupported text encoding (expected UTF-8)', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
             }
         } catch (error) {
             return this.isFileNotFound(error)
@@ -2124,13 +2179,20 @@ export class DiffTracker {
     }
 
     private markFileUnavailable(filePath: string, reason: string): void {
-        if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath)) {
+        const existingUnresolvedReason = this.unresolvedBaselineFiles.get(filePath);
+        const preservedUncertaintyReason = existingUnresolvedReason &&
+            !this.isStableUnsupportedBaselineReason(existingUnresolvedReason) &&
+            !this.isBinaryUnavailableReason(existingUnresolvedReason)
+            ? existingUnresolvedReason
+            : undefined;
+        if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath) &&
+            !this.opaqueBaselineFiles.has(filePath) && !preservedUncertaintyReason) {
             // Code Diff Tracker is text-oriented. Retain an internal unresolved marker
             // when the before-image is unknown, but do not count a binary-only
             // path as an actionable text review. A known-absent baseline remains
             // available so a later text incarnation can still be reviewed.
             if (!this.fileSnapshots.has(filePath)) {
-                this.unresolvedBaselineFiles.set(filePath, reason);
+                this.unresolvedBaselineFiles.set(filePath, existingUnresolvedReason ?? reason);
                 this.schedulePersistState();
             }
             const wasTracked = this.trackedChanges.has(filePath);
@@ -2148,25 +2210,139 @@ export class DiffTracker {
         }
         // Unknown paths must survive restart too. A later create notification may
         // establish an absent baseline, but unavailable bytes are never accepted.
-        if (!this.fileSnapshots.has(filePath)) {
-            if (!this.unresolvedBaselineFiles.has(filePath) && this.snapshotInitialized && !this.baselineBuilding && this.restoringEpoch === undefined) {
+        if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
+            if (!existingUnresolvedReason && this.snapshotInitialized && !this.baselineBuilding && this.restoringEpoch === undefined) {
                 this.postBaselineUnknownFiles.add(filePath);
             }
-            this.unresolvedBaselineFiles.set(filePath, reason.slice(0, 1000));
-            this.schedulePersistState();
+            if (!preservedUncertaintyReason) {
+                this.unresolvedBaselineFiles.set(filePath, reason.slice(0, 1000));
+                this.schedulePersistState();
+            }
         }
+        const effectiveReason = preservedUncertaintyReason ?? reason;
         const previous = this.trackedChanges.get(filePath);
         this.setTrackedChange(filePath, {
             filePath, fileName: displayFileName(filePath),
             originalContent: this.fileSnapshots.get(filePath) ?? '',
             currentContent: previous?.currentContent ?? '',
             isDeleted: previous?.isDeleted ?? false,
-            changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: reason
+            changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: effectiveReason
         });
         this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
 
+    private isStableUnsupportedBaselineReason(reason: string): boolean {
+        return reason === 'File exceeds the 5 MiB limit' ||
+            reason === 'UTF-8 BOM files require encoding preservation and are read-only in this version' ||
+            reason === 'Binary content is unsupported' ||
+            reason === 'Unsupported text encoding (expected UTF-8)';
+    }
+
+    private isStableUnsupportedState(state: CurrentFileState): state is Extract<CurrentFileState, { kind: 'unavailable' }> & { size: number; mtime: number } {
+        return state.kind === 'unavailable' && this.isStableUnsupportedBaselineReason(state.reason) &&
+            typeof state.size === 'number' && Number.isFinite(state.size) &&
+            typeof state.mtime === 'number' && Number.isFinite(state.mtime);
+    }
+
+    private hasCapturedBaseline(filePath: string): boolean {
+        return this.fileSnapshots.has(filePath) || this.opaqueBaselineFiles.has(filePath);
+    }
+
+    private hasDirtyDocument(filePath: string): boolean {
+        return vscode.workspace.textDocuments.some(document =>
+            document.uri.scheme === 'file' && document.uri.fsPath === filePath && document.isDirty);
+    }
+
+    private recordScannedBaseline(filePath: string, state: CurrentFileState, scope: 'workspace' | 'repository'): void {
+        // Recheck after the scanner's await. An editor may have captured a valid
+        // before-image in the meantime; neither scanner may overwrite it.
+        if (this.hasCapturedBaseline(filePath) || this.isPathIgnored(vscode.Uri.file(filePath))) { return; }
+        const phase = scope === 'repository' ? 'repository baseline rebuild' : 'baseline scan';
+        if (this.hasScanUncertainty(filePath)) {
+            this.recordUnresolvedBaseline(filePath, `File changed during ${phase}; before-image is unknown`);
+            return;
+        }
+        if (state.kind === 'text') {
+            this.unresolvedBaselineFiles.delete(filePath);
+            this.fileSnapshots.set(filePath, state.content);
+            if (state.mode !== undefined) { this.fileModes.set(filePath, state.mode); }
+            this.baselineExistingFiles.add(filePath);
+            return;
+        }
+        if (this.isStableUnsupportedState(state)) {
+            this.recordOpaqueBaseline(filePath, state);
+            return;
+        }
+        this.recordUnresolvedBaseline(filePath, state.kind === 'unavailable'
+            ? state.reason : `File disappeared during ${phase}; before-image is unknown`);
+    }
+
+    private recordOpaqueBaseline(filePath: string, state: Extract<CurrentFileState, { kind: 'unavailable' }>): void {
+        // Acceptance is synchronous and owns its safety checks: new callers must
+        // not be able to erase dirty buffers or historical scan evidence.
+        if (this.hasCapturedBaseline(filePath)) { return; }
+        if (this.hasScanUncertainty(filePath)) {
+            this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
+            return;
+        }
+        if (this.hasDirtyDocument(filePath)) {
+            this.recordUnresolvedBaseline(filePath, 'Unsupported file has unsaved editor changes; save or discard them before clearing the baseline');
+            return;
+        }
+        if (!this.isStableUnsupportedState(state)) {
+            this.recordUnresolvedBaseline(filePath, state.reason);
+            return;
+        }
+        this.postBaselineUnknownFiles.delete(filePath);
+        this.unresolvedBaselineFiles.delete(filePath);
+        this.fileSnapshots.delete(filePath);
+        this.fileModes.delete(filePath);
+        this.baselineExistingFiles.delete(filePath);
+        this.opaqueBaselineFiles.set(filePath, {
+            reason: state.reason,
+            size: state.size,
+            mtime: state.mtime,
+            fingerprint: state.fingerprint
+        });
+        this.deleteTrackedChange(filePath);
+        this.lineChanges.delete(filePath);
+        this.markLineChangesUpdated(filePath);
+        this.inlineViews.delete(filePath);
+        this.schedulePersistState();
+    }
+
+    private opaqueBaselineMatches(baseline: OpaqueBaselineState, state: CurrentFileState): boolean {
+        if (!this.isStableUnsupportedState(state) || baseline.reason !== state.reason) { return false; }
+        return baseline.fingerprint !== undefined && state.fingerprint !== undefined &&
+            baseline.size === state.size && baseline.fingerprint === state.fingerprint;
+    }
+
+    private reconcileOpaqueBaseline(filePath: string, state: CurrentFileState): boolean {
+        const baseline = this.opaqueBaselineFiles.get(filePath);
+        if (!baseline) { return false; }
+        if (this.hasDirtyDocument(filePath)) {
+            this.markFileUnavailable(filePath, 'Disk notification while editor has unsaved content; reconcile disk and buffer before review');
+            return true;
+        }
+        if (this.opaqueBaselineMatches(baseline, state)) {
+            if (this.trackedChanges.has(filePath) || this.lineChanges.has(filePath) || this.inlineViews.has(filePath)) {
+                this.clearFileReview(filePath);
+            }
+            return true;
+        }
+        const reason = state.kind === 'missing'
+            ? 'File was deleted after an unsupported baseline was accepted; original content is unavailable'
+            : state.kind === 'text'
+                ? 'File changed from an unsupported baseline; original content is unavailable'
+                : this.isStableUnsupportedState(state)
+                    ? 'Unsupported file changed since the baseline; content cannot be reviewed'
+                    : state.reason;
+        this.markFileUnavailable(filePath, reason);
+        return true;
+    }
+
     private recordUnresolvedBaseline(filePath: string, reason: string): void {
+        this.opaqueBaselineFiles.delete(filePath);
         this.postBaselineUnknownFiles.delete(filePath);
         this.unresolvedBaselineFiles.set(filePath, reason);
         this.markFileUnavailable(filePath, reason);
@@ -2198,10 +2374,10 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch)) { return; }
             const filePath = uri.fsPath;
             if (uri.scheme !== 'file' || this.isPathIgnored(uri) ||
-                this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath)) { continue; }
+                this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath)) { continue; }
             if (await this.isUntrackedDirectory(uri)) { continue; }
             if (!this.isCurrentEpoch(epoch)) { return; }
-            if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath)) { continue; }
+            if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath)) { continue; }
             const observedCreation = this.hasObservedCreation(filePath);
             if (observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)) {
                 this.fileSnapshots.set(filePath, '');
@@ -2243,6 +2419,15 @@ export class DiffTracker {
             } else if (currentState.kind === 'unavailable') {
                 this.markFileUnavailable(filePath, currentState.reason);
             }
+        });
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        const opaquePaths = Array.from(this.opaqueBaselineFiles.keys());
+        await this.runWithConcurrency(opaquePaths, 8, async (filePath) => {
+            const uri = vscode.Uri.file(filePath);
+            if (this.isPathIgnored(uri)) { return; }
+            const currentState = await this.readCurrentFileState(filePath);
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            this.reconcileOpaqueBaseline(filePath, currentState);
         });
         if (!this.isCurrentEpoch(epoch)) { return; }
         for (const [filePath, reason] of this.unresolvedBaselineFiles) {
@@ -2320,7 +2505,7 @@ export class DiffTracker {
     }
 
     private markScanEvent(filePath: string): boolean {
-        if (this.snapshotInitialized || this.fileSnapshots.has(filePath)) { return false; }
+        if (this.snapshotInitialized || this.hasCapturedBaseline(filePath)) { return false; }
         // Register before any await so scanners and editor opens cannot adopt
         // these bytes. Keep directory markers too, to protect their children.
         this.scanUncertainFiles.add(filePath);
@@ -2329,7 +2514,7 @@ export class DiffTracker {
 
     private async isUntrackedDirectory(uri: vscode.Uri): Promise<boolean> {
         // A tracked file replaced with a directory must still report a conflict.
-        if (this.baselineExistingFiles.has(uri.fsPath)) { return false; }
+        if (this.baselineExistingFiles.has(uri.fsPath) || this.opaqueBaselineFiles.has(uri.fsPath)) { return false; }
         try {
             return !!((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
         } catch {
@@ -2394,7 +2579,7 @@ export class DiffTracker {
     private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number, refreshVersion?: number): Promise<void> {
         const isCurrent = () => this.isCurrentEpoch(epoch) && (refreshVersion === undefined || refreshVersion === this.ignoreRefreshVersion);
         if (!isCurrent()) { return; }
-        if (!duringScan && !this.fileSnapshots.has(filePath) &&
+        if (!duringScan && !this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
             (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
             // Persist proven absence, so deleting this new tree clears its
             // unavailable marker even after restoring the session. Scan-time
@@ -2423,7 +2608,7 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
-        const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.fileSnapshots.has(filePath));
+        const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.hasCapturedBaseline(filePath));
         // Capture creation evidence before stat/ignore discovery can yield. A
         // concurrent refresh must not classify this directory's children as old.
         const creation = { duringScan: scanEvent };
@@ -2472,11 +2657,15 @@ export class DiffTracker {
             }
             const state = await this.readFileSnapshot(uri);
             if (!this.isCurrentEpoch(epoch)) { return; }
-            if (!this.fileSnapshots.has(filePath) && (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+            if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
+                (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
                 if (!await this.completeBaseline(epoch)) { return; }
+            }
+            if (this.reconcileOpaqueBaseline(filePath, state)) {
+                return;
             }
             if (state.kind === 'unavailable') {
                 this.markFileUnavailable(filePath, state.reason);
@@ -2498,7 +2687,8 @@ export class DiffTracker {
         if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
         if (this.isPathIgnored(uri)) { return; }
         // A delete notification may race an atomic replacement; confirm actual state.
-        const targets = new Set([uri.fsPath, ...[...this.fileSnapshots.keys()].filter(filePath => {
+        const baselinePaths = new Set([...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys()]);
+        const targets = new Set([uri.fsPath, ...[...baselinePaths].filter(filePath => {
             const relative = path.relative(uri.fsPath, filePath);
             return !!relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
         })]);
@@ -2522,6 +2712,9 @@ export class DiffTracker {
         const document = vscode.workspace.textDocuments.find(doc => doc.uri.fsPath === filePath);
         if (document?.isDirty && !this.activeWriteFiles.has(filePath)) {
             this.markFileUnavailable(filePath, 'Disk notification while editor has unsaved content; reconcile disk and buffer before review');
+            return;
+        }
+        if (this.reconcileOpaqueBaseline(filePath, state)) {
             return;
         }
         if (state.kind === 'unavailable') {
@@ -2778,6 +2971,7 @@ export class DiffTracker {
             inlineViews: new Map(this.inlineViews),
             revertHistory: [...this.revertHistory],
             unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             baselineGitContexts: new Map(this.baselineGitContexts),
             pausedGitRepositories: new Map(this.pausedGitRepositories),
             snapshotInitialized: this.snapshotInitialized,
@@ -2786,6 +2980,9 @@ export class DiffTracker {
         };
         let transaction: BaselineTransaction;
         const restoreMemory = (): void => {
+            // Roll back the baseline candidate, not observations made while it
+            // was being built. Editor-only changes need not emit a watcher event.
+            const observedReviewPaths = [...this.trackedChanges.keys()].filter(ownsPath);
             this.fileSnapshots = previous.fileSnapshots;
             this.fileModes = previous.fileModes;
             this.baselineExistingFiles = previous.baselineExistingFiles;
@@ -2794,6 +2991,7 @@ export class DiffTracker {
             this.inlineViews = previous.inlineViews;
             this.revertHistory = previous.revertHistory;
             this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
+            this.opaqueBaselineFiles = previous.opaqueBaselineFiles;
             this.baselineGitContexts = previous.baselineGitContexts;
             // Pauses observed during the transaction belong to the live Git
             // context and must survive rollback of the baseline candidate.
@@ -2801,6 +2999,14 @@ export class DiffTracker {
             this.snapshotInitialized = previous.snapshotInitialized;
             this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
             this.baselineBuilding = previous.baselineBuilding;
+            for (const filePath of observedReviewPaths) {
+                if (this.isPathIgnored(vscode.Uri.file(filePath))) { continue; }
+                // Preserve a visible conflict synchronously even when Stop or
+                // disposal cancels the remaining async reconciliation. When the
+                // session stays active, reread against the restored before-image.
+                this.markFileUnavailable(filePath, 'Baseline rebuild was interrupted; reconcile current file and editor changes before review');
+                this.pendingExternalChanges.add(filePath);
+            }
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
@@ -2844,7 +3050,8 @@ export class DiffTracker {
         try {
             const repositoryBaselinePaths = new Set([
                 ...this.fileSnapshots.keys(),
-                ...this.unresolvedBaselineFiles.keys()
+                ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys()
             ]);
             for (const filePath of repositoryBaselinePaths) {
                 if (!ownsPath(filePath)) { continue; }
@@ -2852,6 +3059,7 @@ export class DiffTracker {
                 this.fileModes.delete(filePath);
                 this.baselineExistingFiles.delete(filePath);
                 this.unresolvedBaselineFiles.delete(filePath);
+                this.opaqueBaselineFiles.delete(filePath);
                 this.deleteTrackedChange(filePath);
                 this.lineChanges.delete(filePath);
                 this.inlineViews.delete(filePath);
@@ -2866,22 +3074,7 @@ export class DiffTracker {
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
-                if (state.kind !== 'text') {
-                    // An unsupported or unreadable resource is a file-level
-                    // uncertainty, not a failure of the entire repository rebuild.
-                    this.recordUnresolvedBaseline(uri.fsPath, state.kind === 'unavailable'
-                        ? state.reason
-                        : 'File disappeared during baseline rebuild; before-image is unknown');
-                    return;
-                }
-                if (this.hasScanUncertainty(uri.fsPath)) {
-                    this.recordUnresolvedBaseline(uri.fsPath, 'File changed during repository baseline rebuild; before-image is unknown');
-                    return;
-                }
-                this.unresolvedBaselineFiles.delete(uri.fsPath);
-                this.fileSnapshots.set(uri.fsPath, state.content);
-                if (state.mode !== undefined) { this.fileModes.set(uri.fsPath, state.mode); }
-                this.baselineExistingFiles.add(uri.fsPath);
+                this.recordScannedBaseline(uri.fsPath, state, 'repository');
             });
 
             if (!contextStillCurrent()) { throw new Error('Git context changed during baseline rebuild'); }
@@ -4254,8 +4447,18 @@ export class DiffTracker {
         // We do this immediately (before debounce) to avoid autosave overwriting
         // the on-disk content and erasing the true baseline.
         if (!this.fileSnapshots.has(filePath)) {
+            if (this.opaqueBaselineFiles.has(filePath)) {
+                this.processDocumentChange(doc);
+                return;
+            }
             this.ensureSnapshotForDocument(doc);
-            if (!this.fileSnapshots.has(filePath)) { return; }
+            if (!this.fileSnapshots.has(filePath)) {
+                if (!this.snapshotInitialized) {
+                    this.scanUncertainFiles.add(filePath);
+                    this.recordUnresolvedBaseline(filePath, 'Document changed during baseline scan; before-image is unknown');
+                }
+                return;
+            }
         }
 
         const existingTimer = this.documentChangeTimers.get(filePath);
@@ -4291,6 +4494,16 @@ export class DiffTracker {
         }
 
         if (this.pendingWriteFiles.has(filePath)) { return; }
+        if (this.opaqueBaselineFiles.has(filePath)) {
+            if (doc.isDirty) {
+                this.markFileUnavailable(filePath, 'Document changed from an unsupported baseline; original content is unavailable');
+            } else {
+                // Save/reload/Undo may return an opaque document to its baseline.
+                // Verify bytes instead of feeding undecodable content to text diff.
+                void this.readFileAndUpdate(filePath, uri).catch(() => undefined);
+            }
+            return;
+        }
         try {
             fs.statSync(filePath);
         } catch (error) {
@@ -4357,7 +4570,7 @@ export class DiffTracker {
         }
 
         const filePath = doc.uri.fsPath;
-        if (this.fileSnapshots.has(filePath)) {
+        if (this.hasCapturedBaseline(filePath)) {
             return;
         }
 
@@ -4369,7 +4582,8 @@ export class DiffTracker {
             this.recordUnresolvedBaseline(filePath, 'File or parent changed during baseline scan; before-image is unknown');
             return;
         }
-        if (this.unresolvedBaselineFiles.has(filePath) ||
+        const unresolvedReason = this.unresolvedBaselineFiles.get(filePath);
+        if (unresolvedReason ||
             (this.snapshotInitialized && (!this.scanCoverage || this.scanCoverage !== this.ignoreFingerprint))) {
             this.recordUnresolvedBaseline(filePath, 'Path was not covered by the baseline scan; before-image is unknown');
             return;
