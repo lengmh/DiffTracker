@@ -4,10 +4,11 @@
 
 - Make **Clear Diffs** accept stable unsupported resources as an opaque baseline instead of immediately recreating an unavailable review.
 - Persist opaque baseline identity for oversized, UTF-8 BOM, unsupported UTF-8, and binary resources, while preserving transient read/scan uncertainty as unresolved review state.
-- Revalidate opaque baselines after restart so offline deletion, replacement, or format changes surface as unavailable reviews instead of being silently hidden.
+- Revalidate opaque baselines after restart so offline deletion, replacement, format changes, and file-to-directory replacements surface as unavailable reviews instead of being silently hidden.
+- Use streaming SHA-256 identity for oversized files so same-size, timestamp-preserving rewrites are still detected without loading the full file into memory.
 - Keep an unchanged opaque-baseline file quiet when it is opened; later file changes or actual document edits still surface it for explicit review.
 - Ensure **Stop Recording** followed by **Clear Diffs** removes unavailable reviews, unresolved markers, and opaque baseline state and persists an empty stopped session.
-- Add regression coverage for Clear/reset, session reload, offline replacement/deletion, document edits, later file events, and stopped-session clearing of unsupported resources.
+- Add regression coverage for Clear/reset, session reload, offline replacement/deletion, file-to-directory replacement, timestamp-preserving large-file rewrites, document edits, later file events, and stopped-session clearing of unsupported resources.
 
 ## 0.7.1
 
@@ -26,7 +27,7 @@
 - Add bounded **Undo Last Revert** recovery for file, hunk, creation, deletion, and batch reverts.
 - Pause review writes when a Git branch, detached HEAD, worktree, or conflict context changes; add explicit archive-and-rebuild recovery.
 - Recognize VS Code file-creation events so new text files receive an explicit absent baseline, exclude binary additions from text review counts, and explain that dirty files must be saved before Keep/Revert.
-- Add Linux and Windows quality gates, real VS Code Stable Extension Host tests, temporary-repository Git tests, and workspace performance measurements.
+- Add Linux and Windows CI, real VS Code Stable Extension Host coverage, and performance measurements.
 
 ## 0.6.0
 
