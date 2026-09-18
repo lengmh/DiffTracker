@@ -74,6 +74,18 @@ module.exports = async function runExtensionHostScenario() {
         assert.ok(['multi-diff', 'single-diff-fallback'].includes(multiResult.mode), `unexpected native review mode: ${multiResult.mode}`);
         assert.ok(multiResult.count >= 1);
         const multiDiffInitialActiveUri = vscode.window.activeTextEditor?.document.uri.toString();
+        if (multiResult.mode === 'multi-diff') {
+            await until('multi-diff modified child becomes active text editor', () =>
+                vscode.window.activeTextEditor?.document.uri.scheme === 'file' &&
+                vscode.window.activeTextEditor.document.uri.fsPath === nativePath);
+            const multiEditor = vscode.window.activeTextEditor;
+            assert.ok(multiEditor, 'multi-diff exposes the focused modified child through activeTextEditor');
+            multiEditor.selection = new vscode.Selection(1, 0, 1, multiEditor.document.lineAt(1).text.length);
+            const multiProbe = await vscode.commands.executeCommand('diffTracker._testNativeSelectionProbe');
+            assert.deepEqual(multiProbe.selections, [{ startLine: 2, endLine: 2 }]);
+            assert.equal(multiProbe.exactBlockIds.length, 1, 'multi-diff child selection maps to the tracker block');
+            assert.equal(multiProbe.partialBlockIds.length, 0);
+        }
 
         const quickKeep = await vscode.commands.executeCommand(
             'diffTracker._testNativeQuickDiffAction',

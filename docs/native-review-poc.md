@@ -78,3 +78,21 @@ lookup of `workspace.textDocuments` by `fsPath` alone can therefore select the b
 of the working file. The spike hardens those lookups with `uri.scheme === 'file'`.
 
 This is a backend correctness requirement for native review surfaces, not a renderer limitation.
+
+
+## Runtime result matrix
+
+| Question | VS Code Stable | VS Code 1.80.2 | Result |
+| --- | --- | --- | --- |
+| Native multi-file rendering via `vscode.changes` | Multi Diff | Single Diff fallback | usable with compatibility fallback |
+| Quick Diff baseline via SCM provider | yes | yes | stable API |
+| Quick Diff hunk -> existing block Keep/Revert | yes | yes | stable API |
+| Modified side exposed through `window.activeTextEditor` | yes | yes | stable API |
+| Focused Multi Diff child selection visible to extension | yes | n/a (fallback) | stable on current VS Code |
+| Exact complete-block selection -> Keep/Revert | yes | yes | stable API |
+| Partial-block line selection observable | yes | yes | frontend is sufficient |
+| Partial-block arbitrary-line mutation | backend API missing | backend API missing | no custom renderer required; add range action if desired |
+| Git-like diff gutter hunk/selection toolbar contribution | proposed only | proposed only | do not use in Marketplace build |
+
+The current VS Code Stable host test asserts the focused Multi Diff modified child through
+`window.activeTextEditor` and maps an actual selected line to the current tracker block.
