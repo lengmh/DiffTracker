@@ -73,6 +73,7 @@ module.exports = async function runExtensionHostScenario() {
         const multiResult = await vscode.commands.executeCommand('diffTracker.nativeReviewPoc.openChanges');
         assert.ok(['multi-diff', 'single-diff-fallback'].includes(multiResult.mode), `unexpected native review mode: ${multiResult.mode}`);
         assert.ok(multiResult.count >= 1);
+        const multiDiffInitialActiveUri = vscode.window.activeTextEditor?.document.uri.toString();
 
         const quickKeep = await vscode.commands.executeCommand(
             'diffTracker._testNativeQuickDiffAction',
@@ -86,6 +87,11 @@ module.exports = async function runExtensionHostScenario() {
             }
         );
         assert.equal(quickKeep.status, 'success', quickKeep.reason);
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testNativeBaselineContent', nativePath),
+            'one\nTWO\nthree\nfour\nfive\n',
+            'Quick Diff Keep updates the authoritative tracker baseline'
+        );
         await until('native baseline document refresh after Keep', () =>
             originalDocument.getText() === 'one\nTWO\nthree\nfour\nfive\n');
         await untilStable('second native hunk remains pending', async () => {
@@ -93,8 +99,13 @@ module.exports = async function runExtensionHostScenario() {
             return change?.currentContent === 'one\nTWO\nthree\nFOUR\nfive\n';
         });
 
-        const nativeDocument = await vscode.workspace.openTextDocument(uri('native-poc.txt'));
-        const nativeEditor = await vscode.window.showTextDocument(nativeDocument);
+        await vscode.commands.executeCommand('diffTracker.nativeReviewPoc.openFile', nativePath);
+        await until('native diff modified side becomes active text editor', () =>
+            vscode.window.activeTextEditor?.document.uri.scheme === 'file' &&
+            vscode.window.activeTextEditor.document.uri.fsPath === nativePath);
+        const nativeEditor = vscode.window.activeTextEditor;
+        assert.ok(nativeEditor, 'native diff exposes its modified side through activeTextEditor');
+        const nativeDocument = nativeEditor.document;
         nativeEditor.selection = new vscode.Selection(3, 0, 3, nativeDocument.lineAt(3).text.length);
         const exactProbe = await vscode.commands.executeCommand('diffTracker._testNativeSelectionProbe');
         assert.deepEqual(exactProbe.selections, [{ startLine: 4, endLine: 4 }]);
@@ -127,7 +138,7 @@ module.exports = async function runExtensionHostScenario() {
         const cleanupSelection = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('native-selection.txt').fsPath);
         assert.equal(cleanupSelection.status, 'success', cleanupSelection.reason);
         await untilStable('native partial-selection cleanup', async () => !(await pending('native-selection.txt')));
-        console.log(`PASS HOST-NATIVE-REVIEW mode=${multiResult.mode} exact-selection=yes partial-selection-visible=yes`);
+        console.log(`PASS HOST-NATIVE-REVIEW mode=${multiResult.mode} exact-selection=yes partial-selection-visible=yes multi-initial-active=${multiDiffInitialActiveUri ?? 'none'}`);
 
         // Whole-file WorkspaceEdit/save participates in native editor Undo/Redo.
         await write('existing.txt', 'whole changed\n');

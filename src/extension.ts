@@ -207,7 +207,11 @@ export async function activate(context: vscode.ExtensionContext) {
         return result;
     };
 
-    nativeReviewPoc = new NativeReviewPoc(diffTracker, reportAction);
+    nativeReviewPoc = new NativeReviewPoc(
+        diffTracker,
+        reportAction,
+        filePath => originalContentProvider.refresh(filePath)
+    );
     context.subscriptions.push(nativeReviewPoc);
 
     if (runningExtensionTests) {
@@ -216,6 +220,8 @@ export async function activate(context: vscode.ExtensionContext) {
                 nativeReviewPoc?.getResourcePaths() ?? []),
             vscode.commands.registerCommand('diffTracker._testNativeOriginalResource', (filePath: string) =>
                 nativeReviewPoc?.provideOriginalResource(vscode.Uri.file(filePath))?.toString()),
+            vscode.commands.registerCommand('diffTracker._testNativeBaselineContent', (filePath: string) =>
+                diffTracker.getOriginalContent(filePath)),
             vscode.commands.registerCommand(
                 'diffTracker._testNativeQuickDiffAction',
                 (filePath: string, action: 'keep' | 'revert', change: {

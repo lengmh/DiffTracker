@@ -50,6 +50,10 @@ export class OriginalContentProvider implements vscode.TextDocumentContentProvid
         });
     }
 
+    public refresh(filePath: string): void {
+        this._onDidChange.fire(vscode.Uri.file(filePath).with({ scheme: 'diff-tracker-original' }));
+    }
+
     provideTextDocumentContent(uri: vscode.Uri): string {
         // URI format: diff-tracker-original:///<file-path>
         const filePath = uri.fsPath || decodeURIComponent(uri.path);

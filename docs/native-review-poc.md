@@ -12,6 +12,7 @@ This spike tests whether Code Diff Tracker can keep its current baseline/review 
 - Native multi-file review via `vscode.changes`, with a single-diff/webview fallback for older hosts
 - Quick Diff hunk actions through the stable `scm/change/title` menu
 - Modified-side selection capture through the stable `editor/context` menu and `window.activeTextEditor.selections`
+- An explicit post-Keep baseline refresh hook for native diff models, while the tracker remains the authoritative baseline
 - Existing `DiffTracker.keepBlock()` / `revertBlock()` are reused; no second patch engine is introduced
 
 No proposed API is enabled.
@@ -50,7 +51,7 @@ not a VS Code frontend-access gap.
 5. Run **Native Review PoC: Open All Changes**:
    - current VS Code should open the native multi-diff editor
    - older hosts may fall back to one native diff
-6. In the modified side of a diff, select all lines belonging to one tracker block and use the editor context menu:
+6. In the modified side of a native diff, select all lines belonging to one tracker block and use the editor context menu:
    - **Keep Selected Block**
    - **Revert Selected Block**
 7. Create a multi-line tracker block, select only one line, and run **Probe Selected Lines**:
