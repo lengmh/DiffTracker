@@ -286,6 +286,41 @@
         "command": "diffTracker.editWatchExcludes",
         "title": "Edit Watch Ignores",
         "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.openChanges",
+        "title": "Native Review PoC: Open All Changes",
+        "category": "Code Diff Tracker",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.keepChange",
+        "title": "Keep Change",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.revertChange",
+        "title": "Revert Change",
+        "category": "Code Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.keepSelectedBlock",
+        "title": "Native Review PoC: Keep Selected Block",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.revertSelectedBlock",
+        "title": "Native Review PoC: Revert Selected Block",
+        "category": "Code Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "diffTracker.nativeReviewPoc.probeSelection",
+        "title": "Native Review PoC: Probe Selected Lines",
+        "category": "Code Diff Tracker"
       }
     ],
     "menus": {
@@ -361,6 +396,42 @@
           "when": "resourceScheme == file && diffTracker.isRecording",
           "group": "navigation"
         }
+      ],
+      "scm/change/title": [
+        {
+          "command": "diffTracker.nativeReviewPoc.keepChange",
+          "when": "originalResourceScheme == diff-tracker-original",
+          "group": "navigation@1"
+        },
+        {
+          "command": "diffTracker.nativeReviewPoc.revertChange",
+          "when": "originalResourceScheme == diff-tracker-original",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "diffTracker.nativeReviewPoc.keepSelectedBlock",
+          "when": "isInDiffEditor && editorHasSelection && resourceScheme == file && diffTracker.isRecording",
+          "group": "1_modification@1"
+        },
+        {
+          "command": "diffTracker.nativeReviewPoc.revertSelectedBlock",
+          "when": "isInDiffEditor && editorHasSelection && resourceScheme == file && diffTracker.isRecording",
+          "group": "1_modification@2"
+        },
+        {
+          "command": "diffTracker.nativeReviewPoc.probeSelection",
+          "when": "isInDiffEditor && editorHasSelection && resourceScheme == file && diffTracker.isRecording",
+          "group": "z_commands@99"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "diffTracker.nativeReviewPoc.openChanges",
+          "when": "scmProvider == diffTrackerReview",
+          "group": "navigation@1"
+        }
       ]
     },
     "keybindings": [
@@ -390,7 +461,8 @@
     "test:performance": "node test/performance.mjs",
     "test:stage2-probes": "node test/known-p0.mjs",
     "test:legacy-manual-policy": "node test/legacy-manual-policy.mjs",
-    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories"
+    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories && npm run test:native-review-poc",
+    "test:native-review-poc": "node test/native-review-poc.mjs"
   },
   "devDependencies": {
     "@pierre/diffs": "1.0.10",

@@ -58,6 +58,77 @@ module.exports = async function runExtensionHostScenario() {
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
 
+        // Native-review PoC: VS Code Quick Diff/Multi Diff are fed by the existing tracker baseline.
+        await write('native-poc.txt', 'one\nTWO\nthree\nFOUR\nfive\n');
+        await untilStable('native PoC pending review', () => reviewablePending('native-poc.txt'));
+        const nativePath = uri('native-poc.txt').fsPath;
+        const nativeResources = await vscode.commands.executeCommand('diffTracker._testNativeResourcePaths');
+        assert.ok(nativeResources.includes(nativePath), 'native SCM provider exposes pending tracker files');
+
+        const originalUriString = await vscode.commands.executeCommand('diffTracker._testNativeOriginalResource', nativePath);
+        assert.ok(originalUriString?.startsWith('diff-tracker-original:'), 'Quick Diff uses tracker baseline URI');
+        const originalDocument = await vscode.workspace.openTextDocument(vscode.Uri.parse(originalUriString));
+        assert.equal(originalDocument.getText(), 'one\ntwo\nthree\nfour\nfive\n');
+
+        const multiResult = await vscode.commands.executeCommand('diffTracker.nativeReviewPoc.openChanges');
+        assert.ok(['multi-diff', 'single-diff-fallback'].includes(multiResult.mode), `unexpected native review mode: ${multiResult.mode}`);
+        assert.ok(multiResult.count >= 1);
+
+        const quickKeep = await vscode.commands.executeCommand(
+            'diffTracker._testNativeQuickDiffAction',
+            nativePath,
+            'keep',
+            {
+                originalStartLineNumber: 2,
+                originalEndLineNumber: 2,
+                modifiedStartLineNumber: 2,
+                modifiedEndLineNumber: 2
+            }
+        );
+        assert.equal(quickKeep.status, 'success', quickKeep.reason);
+        await until('native baseline document refresh after Keep', () =>
+            originalDocument.getText() === 'one\nTWO\nthree\nfour\nfive\n');
+        await untilStable('second native hunk remains pending', async () => {
+            const change = await reviewablePending('native-poc.txt');
+            return change?.currentContent === 'one\nTWO\nthree\nFOUR\nfive\n';
+        });
+
+        const nativeDocument = await vscode.workspace.openTextDocument(uri('native-poc.txt'));
+        const nativeEditor = await vscode.window.showTextDocument(nativeDocument);
+        nativeEditor.selection = new vscode.Selection(3, 0, 3, nativeDocument.lineAt(3).text.length);
+        const exactProbe = await vscode.commands.executeCommand('diffTracker._testNativeSelectionProbe');
+        assert.deepEqual(exactProbe.selections, [{ startLine: 4, endLine: 4 }]);
+        assert.equal(exactProbe.exactBlockIds.length, 1);
+        assert.equal(exactProbe.partialBlockIds.length, 0);
+
+        const selectedRevert = await vscode.commands.executeCommand('diffTracker.nativeReviewPoc.revertSelectedBlock');
+        assert.equal(selectedRevert.status, 'success', selectedRevert.reason);
+        assert.equal(nativeDocument.getText(), 'one\nTWO\nthree\nfour\nfive\n');
+        assert.equal(nativeDocument.isDirty, true);
+        await nativeDocument.save();
+        await untilStable('native PoC review cleared', async () => !(await pending('native-poc.txt')));
+
+        // A partial selection proves the frontend exposes exact selected lines while the
+        // current backend intentionally refuses to widen that selection to a whole block.
+        await write('native-selection.txt', 'a\nB\nC\nd\n');
+        await untilStable('native partial-selection review', () => reviewablePending('native-selection.txt'));
+        const selectionDocument = await vscode.workspace.openTextDocument(uri('native-selection.txt'));
+        const selectionEditor = await vscode.window.showTextDocument(selectionDocument);
+        selectionEditor.selection = new vscode.Selection(1, 0, 1, selectionDocument.lineAt(1).text.length);
+        const partialProbe = await vscode.commands.executeCommand('diffTracker._testNativeSelectionProbe');
+        assert.deepEqual(partialProbe.selections, [{ startLine: 2, endLine: 2 }]);
+        assert.equal(partialProbe.touchedBlocks.length, 1);
+        assert.equal(partialProbe.exactBlockIds.length, 0);
+        assert.equal(partialProbe.partialBlockIds.length, 1);
+        const partialKeep = await vscode.commands.executeCommand('diffTracker.nativeReviewPoc.keepSelectedBlock');
+        assert.equal(partialKeep.status, 'conflict');
+        assert.match(partialKeep.reason, /line-granular Keep\/Revert/);
+        assert.equal(selectionDocument.getText(), 'a\nB\nC\nd\n');
+        const cleanupSelection = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('native-selection.txt').fsPath);
+        assert.equal(cleanupSelection.status, 'success', cleanupSelection.reason);
+        await untilStable('native partial-selection cleanup', async () => !(await pending('native-selection.txt')));
+        console.log(`PASS HOST-NATIVE-REVIEW mode=${multiResult.mode} exact-selection=yes partial-selection-visible=yes`);
+
         // Whole-file WorkspaceEdit/save participates in native editor Undo/Redo.
         await write('existing.txt', 'whole changed\n');
         await untilStable('whole-file pending review', () => pending('existing.txt'));

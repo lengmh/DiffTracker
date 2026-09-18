@@ -28,6 +28,8 @@ try {
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
         ['audit-recovery.txt', 'base\n'],
+        ['native-poc.txt', 'one\ntwo\nthree\nfour\nfive\n'],
+        ['native-selection.txt', 'a\nb\nc\nd\n'],
         ['node_modules/audit-ignored.txt', 'ignored dependency\n'],
         ['out/audit-ignored.txt', 'ignored output\n'],
         ['audit-parent-file/nested/child.txt', 'parent baseline\n'],

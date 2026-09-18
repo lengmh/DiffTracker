@@ -13,6 +13,7 @@ import { WebviewDiffPanel } from './webviewDiffPanel';
 import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
 import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
+import { NativeReviewPoc } from './nativeReviewPoc';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -24,6 +25,7 @@ let settingsTreeDataProvider: SettingsTreeDataProvider;
 let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
 let gitContextMonitor: GitContextMonitor | undefined;
+let nativeReviewPoc: NativeReviewPoc | undefined;
 
 type DefaultOpenMode = 'webview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
@@ -204,6 +206,29 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         return result;
     };
+
+    nativeReviewPoc = new NativeReviewPoc(diffTracker, reportAction);
+    context.subscriptions.push(nativeReviewPoc);
+
+    if (runningExtensionTests) {
+        context.subscriptions.push(
+            vscode.commands.registerCommand('diffTracker._testNativeResourcePaths', () =>
+                nativeReviewPoc?.getResourcePaths() ?? []),
+            vscode.commands.registerCommand('diffTracker._testNativeOriginalResource', (filePath: string) =>
+                nativeReviewPoc?.provideOriginalResource(vscode.Uri.file(filePath))?.toString()),
+            vscode.commands.registerCommand(
+                'diffTracker._testNativeQuickDiffAction',
+                (filePath: string, action: 'keep' | 'revert', change: {
+                    originalStartLineNumber?: number;
+                    originalEndLineNumber?: number;
+                    modifiedStartLineNumber?: number;
+                    modifiedEndLineNumber?: number;
+                }) => nativeReviewPoc?.handleQuickDiffAction(vscode.Uri.file(filePath), [change], 0, action)
+            ),
+            vscode.commands.registerCommand('diffTracker._testNativeSelectionProbe', () =>
+                nativeReviewPoc?.probeSelection())
+        );
+    }
 
     const missingReview = (filePath: string): ActionResult => reportAction({
         filePath, status: 'conflict', reason: 'Review version is unavailable; reopen or refresh the review before acting'
@@ -848,5 +873,8 @@ export async function deactivate(): Promise<void> {
     }
     if (diffTreeDataProvider) {
         diffTreeDataProvider.dispose();
+    }
+    if (nativeReviewPoc) {
+        nativeReviewPoc.dispose();
     }
 }
