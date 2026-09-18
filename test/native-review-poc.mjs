@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const source = fs.readFileSync(path.join(root, 'src', 'nativeReviewPoc.ts'), 'utf8');
+const trackerSource = fs.readFileSync(path.join(root, 'src', 'diffTracker.ts'), 'utf8');
 
 const commands = new Set(pkg.contributes.commands.map(command => command.command));
 for (const command of [
@@ -53,3 +54,10 @@ for (const marker of [
 }
 
 console.log('PASS native-review PoC uses stable SCM/Quick Diff/editor selection APIs only');
+
+assert.ok(
+    !/textDocuments\.find\((?:d|doc) => (?:d|doc)\.uri\.fsPath === filePath\)/.test(trackerSource),
+    'unfiltered textDocuments lookup can confuse file: working documents with virtual baseline documents'
+);
+
+console.log('PASS native-review backend document lookup distinguishes file: from virtual baselines');

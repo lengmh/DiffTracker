@@ -207,11 +207,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return result;
     };
 
-    nativeReviewPoc = new NativeReviewPoc(
-        diffTracker,
-        reportAction,
-        filePath => originalContentProvider.refresh(filePath)
-    );
+    nativeReviewPoc = new NativeReviewPoc(diffTracker, reportAction);
     context.subscriptions.push(nativeReviewPoc);
 
     if (runningExtensionTests) {

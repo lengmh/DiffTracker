@@ -28,8 +28,7 @@ export class NativeReviewPoc implements vscode.Disposable, vscode.QuickDiffProvi
 
     constructor(
         private readonly diffTracker: DiffTracker,
-        private readonly reportAction: (result: ActionResult) => ActionResult,
-        private readonly refreshOriginal?: (filePath: string) => void
+        private readonly reportAction: (result: ActionResult) => ActionResult
     ) {
         this.sourceControl = vscode.scm.createSourceControl(
             'diffTrackerReview',
@@ -189,11 +188,6 @@ export class NativeReviewPoc implements vscode.Disposable, vscode.QuickDiffProvi
         const result = action === 'keep'
             ? await this.diffTracker.keepBlock(filePath, block.blockId, token)
             : await this.diffTracker.revertBlock(filePath, block.blockId, token);
-        if (action === 'keep' && result.status === 'success') {
-            // The tracker already emits baselineChanged. Re-fire after the Keep
-            // promise settles so a native diff model cannot miss the committed version.
-            this.refreshOriginal?.(filePath);
-        }
         return this.reportAction(result);
     }
 
@@ -279,11 +273,6 @@ export class NativeReviewPoc implements vscode.Disposable, vscode.QuickDiffProvi
         const result = action === 'keep'
             ? await this.diffTracker.keepBlock(filePath, block.blockId, token)
             : await this.diffTracker.revertBlock(filePath, block.blockId, token);
-        if (action === 'keep' && result.status === 'success') {
-            // The tracker already emits baselineChanged. Re-fire after the Keep
-            // promise settles so a native diff model cannot miss the committed version.
-            this.refreshOriginal?.(filePath);
-        }
         return this.reportAction(result);
     }
 

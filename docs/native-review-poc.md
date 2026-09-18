@@ -12,7 +12,6 @@ This spike tests whether Code Diff Tracker can keep its current baseline/review 
 - Native multi-file review via `vscode.changes`, with a single-diff/webview fallback for older hosts
 - Quick Diff hunk actions through the stable `scm/change/title` menu
 - Modified-side selection capture through the stable `editor/context` menu and `window.activeTextEditor.selections`
-- An explicit post-Keep baseline refresh hook for native diff models, while the tracker remains the authoritative baseline
 - Existing `DiffTracker.keepBlock()` / `revertBlock()` are reused; no second patch engine is introduced
 
 No proposed API is enabled.
@@ -69,3 +68,13 @@ If the runtime tests pass on current VS Code:
 - add a backend line-action API later only if true partial-block Keep/Revert is still required
 
 The PoC should not be merged into a release branch as-is; it is an architectural spike.
+
+
+## Backend compatibility finding
+
+Native/side-by-side diff opens the baseline as a virtual `diff-tracker-original:` text document.
+Virtual baseline documents share the same `fsPath` as the real `file:` document. Any backend
+lookup of `workspace.textDocuments` by `fsPath` alone can therefore select the baseline instead
+of the working file. The spike hardens those lookups with `uri.scheme === 'file'`.
+
+This is a backend correctness requirement for native review surfaces, not a renderer limitation.
