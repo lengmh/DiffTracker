@@ -58,6 +58,38 @@ module.exports = async function runExtensionHostScenario() {
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
 
+        // A native/virtual baseline document shares fsPath with the real working
+        // file. Review actions must never treat the virtual document as current
+        // workspace content merely because the paths match.
+        await write('virtual-baseline.txt', 'alpha\nchanged\nomega\n');
+        await untilStable('virtual baseline review', () => reviewablePending('virtual-baseline.txt'));
+        const virtualPath = uri('virtual-baseline.txt').fsPath;
+        const originalUri = uri('virtual-baseline.txt').with({ scheme: 'diff-tracker-original' });
+        const originalDocument = await vscode.workspace.openTextDocument(originalUri);
+        assert.equal(originalDocument.getText(), 'alpha\nbeta\nomega\n');
+        assert.ok(vscode.workspace.textDocuments.some(document =>
+            document.uri.scheme === 'diff-tracker-original' && document.uri.fsPath === virtualPath));
+
+        const virtualKeep = await vscode.commands.executeCommand('diffTracker._testKeepBlock', virtualPath);
+        assert.equal(virtualKeep.status, 'success', virtualKeep.reason);
+        await untilStable('virtual baseline keep clears review', async () => !(await pending('virtual-baseline.txt')));
+
+        await write('virtual-baseline.txt', 'alpha\nchanged again\nomega\n');
+        const secondVirtualReview = await untilStable(
+            'post-keep virtual baseline review',
+            () => reviewablePending('virtual-baseline.txt')
+        );
+        assert.equal(
+            secondVirtualReview.originalContent,
+            'alpha\nchanged\nomega\n',
+            'Keep must advance the real tracker baseline, not preserve the virtual document contents'
+        );
+        const virtualRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', virtualPath);
+        assert.equal(virtualRevert.status, 'success', virtualRevert.reason);
+        assert.equal(await read('virtual-baseline.txt'), 'alpha\nchanged\nomega\n');
+        await untilStable('virtual baseline review cleared', async () => !(await pending('virtual-baseline.txt')));
+        console.log('PASS HOST-NATIVE-BASELINE virtual baseline documents cannot impersonate file: working documents');
+
         // Whole-file WorkspaceEdit/save participates in native editor Undo/Redo.
         await write('existing.txt', 'whole changed\n');
         await untilStable('whole-file pending review', () => pending('existing.txt'));

@@ -21,6 +21,7 @@ try {
     mkdirSync(workspacePath, { recursive: true });
     for (const [name, content] of [
         ['existing.txt', 'base\n'],
+        ['virtual-baseline.txt', 'alpha\nbeta\nomega\n'],
         ['crlf.txt', 'one\r\ntwo\r\n'],
         ['deleted.txt', 'delete baseline\n'],
         ['batch-a.txt', 'batch a\n'],
