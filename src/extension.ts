@@ -315,6 +315,11 @@ export async function activate(context: vscode.ExtensionContext) {
                 const block = diffTracker.getChangeBlocks(filePath)[0];
                 return token && block ? diffTracker.revertBlock(filePath, block.blockId, token) : undefined;
             }),
+            vscode.commands.registerCommand('diffTracker._testKeepBlock', (filePath: string) => {
+                const token = diffTracker.getReviewToken(filePath);
+                const block = diffTracker.getChangeBlocks(filePath)[0];
+                return token && block ? diffTracker.keepBlock(filePath, block.blockId, token) : undefined;
+            }),
             vscode.commands.registerCommand('diffTracker._testRevertAll', () => {
                 return diffTracker.revertAllChanges(diffTracker.getReviewTokens());
             }),
