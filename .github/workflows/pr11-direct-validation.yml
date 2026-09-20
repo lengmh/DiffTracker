@@ -1,0 +1,73 @@
+name: PR11 direct patch validation
+on:
+  push:
+    branches: [work/pr11-review-e3e5a23]
+permissions:
+  contents: write
+jobs:
+  validate-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patches
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: e3e5a23a7b22173ea0679ca3c2488a4df9cf56f6
+          fetch-depth: 0
+          path: candidate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: candidate/package-lock.json
+      - name: Apply exact locally tested changes
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e3e5a23a7b22173ea0679ca3c2488a4df9cf56f6
+          sed 's/^ diff --git/diff --git/' ../patches/.pr11/production.patch > /tmp/production.patch
+          sed 's/^ diff --git/diff --git/' ../patches/.pr11/tests.patch > /tmp/tests.patch
+          git apply --unidiff-zero --check /tmp/production.patch /tmp/tests.patch
+          git apply --unidiff-zero /tmp/production.patch /tmp/tests.patch
+          sha256sum --check <<'HASHES'
+          6afe4bd928ca032c86f29ed61ad72b7e51d5ea6675fbb7d803f9cbe717421ee8  src/diffTracker.ts
+          0317bbe096e39b9d2d3f31f73454917eeb8fd6357b38cddb93a30ac9b088f17f  src/extension.ts
+          98d1edf85915389fc9eaa0480aaea63ffa96f5b90bce409d758148d82cb0982a  src/monitoringScope.ts
+          0546a1e874f312de36b177e496b5d54438ac1479e6063036740348fe08ae4eec  src/monitoringScopeController.ts
+          992e15e697fc50a9deee62cac1ceae63f8cbe01f91489db83d53534d364929ca  test/monitoring-scope.mjs
+          a58512e3b14b53fd46e6d4449bd6338852ae2f0ee07126a3b05e91c7dd2be6a8  test/pr11-review-regressions.mjs
+          ad9c4c8b6a60c4aa50dd9dec88d62d63ddec063c9c7c5ceccb32595ec0c9f144  test/tracker-safety.mjs
+          HASHES
+          git diff --check
+      - run: npm ci
+        working-directory: candidate
+      - run: npm run lint
+        working-directory: candidate
+      - run: npm test
+        working-directory: candidate
+      - run: npm run test:performance
+        working-directory: candidate
+      - name: Publish tested candidate only, not the PR branch
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/diffTracker.ts src/extension.ts src/monitoringScope.ts src/monitoringScopeController.ts test/monitoring-scope.mjs test/pr11-review-regressions.mjs test/tracker-safety.mjs
+          test "$(git diff --cached --name-only | wc -l)" -eq 7
+          git config user.name lengmh
+          git config user.email 47114200+lengmh@users.noreply.github.com
+          git commit -m "fix: harden S3 scope transactions, retention and legacy identity"
+          test "$(git rev-parse HEAD^)" = e3e5a23a7b22173ea0679ca3c2488a4df9cf56f6
+          git push origin HEAD:refs/heads/work/pr11-validated-e3e5a23
+          git rev-parse HEAD | tee ../candidate-commit.txt
+          git show --stat --oneline HEAD >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr11-direct-candidate-commit
+          path: candidate-commit.txt
+          retention-days: 3
+          if-no-files-found: error
