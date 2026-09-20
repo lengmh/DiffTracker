@@ -812,6 +812,8 @@ export class DiffTracker {
         const preResetCreations = new Map(
             [...this.activeCreations].map(([filePath, creation]) => [filePath, creation.duringScan] as const)
         );
+        const preResetStartupEvents = new Map(this.initialIgnoreEvents);
+        const previousScanUncertainFiles = new Set(this.scanUncertainFiles);
         const preResetObservedPaths = new Set<string>([
             ...this.pendingExternalChanges,
             ...this.externalChangeTimers.keys(),
@@ -850,7 +852,8 @@ export class DiffTracker {
             workspaceContextChanged: this.workspaceContextChanged,
             scanCoverage: this.scanCoverage,
             pendingExternalChanges: new Set(this.pendingExternalChanges),
-            postBaselineUnknownFiles: previousPostBaselineUnknownFiles
+            postBaselineUnknownFiles: previousPostBaselineUnknownFiles,
+            scanUncertainFiles: previousScanUncertainFiles
         };
         const previousReviewPaths = [...previous.trackedChanges.keys()];
         let transaction!: BaselineTransaction;
@@ -881,16 +884,46 @@ export class DiffTracker {
                 ...observedPaths
             ].filter(filePath => !preResetCreations.has(filePath)));
             this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
+            this.scanUncertainFiles = new Set(previous.scanUncertainFiles);
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
         };
         const rollback = async (): Promise<void> => {
             if (!this.isCurrentEpoch(epoch)) { return; }
+            // Events queued while the replacement baseline is in its startup-ignore
+            // phase belong to the failed transaction. Freeze them before restoring
+            // memory, then end that phase so replay cannot be deferred again.
+            const startupEvents = new Map<string, StartupEvent>();
+            const appendStartupEvent = (event: StartupEvent): void => {
+                const existing = startupEvents.get(event.uri.fsPath);
+                startupEvents.set(event.uri.fsPath, {
+                    uri: event.uri,
+                    firstKind: existing?.firstKind ?? event.firstKind,
+                    kind: event.kind
+                });
+            };
+            preResetStartupEvents.forEach(appendStartupEvent);
+            if (this.initialIgnoreEpoch === epoch) {
+                this.initialIgnoreEvents.forEach(appendStartupEvent);
+            }
+            this.initialIgnoreEpoch = undefined;
+            this.initialIgnoreEvents.clear();
+
             this.endBaselineTransaction(transaction, false);
             for (const [filePath, duringScan] of preResetCreations) {
                 if (!this.isCurrentEpoch(epoch)) { return; }
                 await this.onExternalFileCreated(vscode.Uri.file(filePath), duringScan);
+            }
+            for (const event of startupEvents.values()) {
+                if (!this.isCurrentEpoch(epoch)) { return; }
+                if (event.kind === 'delete') {
+                    await this.onExternalFileDeleted(event.uri);
+                } else if (event.kind === 'create' || event.firstKind === 'create') {
+                    await this.onExternalFileCreated(event.uri);
+                } else {
+                    this.pendingExternalChanges.add(event.uri.fsPath);
+                }
             }
             await this.processPendingExternalChanges();
             await this.flushPendingPersistence();

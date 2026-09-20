@@ -1110,6 +1110,50 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed recording Clear Diffs replays startup events queued during replacement ignore refresh',async()=>{
+    const p=file('clear-startup-event.txt'),storage=file('storage');
+    seed(p,'before','before');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const originalRefresh=tracker.refreshIgnoreMatchers.bind(tracker);
+    const entered=deferred(),release=deferred();let refreshCalls=0;
+    tracker.refreshIgnoreMatchers=async()=>{
+        refreshCalls++;
+        if(refreshCalls===2){entered.resolve();await release.promise;throw error('NoPermissions');}
+        return originalRefresh();
+    };
+    listedFiles=[Uri.file(p)];
+    const reset=tracker.resetBaselineToCurrentState();
+    await entered.promise;
+    fs.writeFileSync(p,'changed during failed clear');
+    emitWatcher('change',Uri.file(p));
+    assert.equal(tracker.initialIgnoreEvents.get(p)?.kind,'change','replacement watcher event must be queued in startup phase');
+    release.resolve();
+    assert.equal(await reset,false);
+    assert.equal(tracker.initialIgnoreEpoch,undefined,'failed Clear Diffs must end replacement startup phase');
+    assert.equal(tracker.initialIgnoreEvents.size,0,'queued startup events must be consumed by rollback');
+    assert.equal(tracker.getOriginalContent(p),'before');
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.currentContent,'changed during failed clear');
+    fs.writeFileSync(p,'changed after rollback');
+    emitWatcher('change',Uri.file(p));
+    await waitUntil(()=>pending(p)?.currentContent==='changed after rollback',2000);
+});
+test('S2 failed recording Clear Diffs restores prior scan uncertainty',async()=>{
+    const dir=file('clear-scan-uncertain'),child=path.join(dir,'child.txt'),storage=file('storage');
+    tracker.storageUri=Uri.file(storage);listedFiles=[];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    fs.mkdirSync(dir);fs.writeFileSync(child,'current child');
+    tracker.scanUncertainFiles.add(dir);
+    const oldCoverage=tracker.scanCoverage;
+    listedFiles=[Uri.file(child)];
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    assert.equal(await tracker.resetBaselineToCurrentState(),false);
+    faults.delete(path.join(storage,'session-state.tmp.json'));
+    assert.equal(tracker.scanCoverage,oldCoverage);
+    assert.ok(tracker.scanUncertainFiles.has(dir),'failed Clear Diffs must restore ancestor scan uncertainty');
+    tracker.onDocumentOpened(document(child));
+    assert.equal(tracker.getOriginalContent(child),undefined,'uncertain descendant must not be silently accepted as baseline');
+    assert.equal(pending(child)?.reviewKind,'unknown');
+});
 test('S2 failed recording Clear Diffs replays an in-flight file creation with create provenance',async()=>{
     const p=file('clear-inflight-create.txt'),storage=file('storage');
     tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
