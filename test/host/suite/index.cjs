@@ -6,9 +6,14 @@ exports.run = async () => {
         await Promise.race([
             runExtensionHostScenario(),
             new Promise((_, reject) => {
+                // S3 adds real-host scope preparation, confirmation-race and
+                // pending-exclusion coverage flows before the existing review,
+                // watcher and recovery matrix. Keep per-assertion deadlines
+                // unchanged; only give the full Windows scenario enough total
+                // wall-clock budget on slower hosted runners.
                 timeout = setTimeout(
                     () => reject(new Error('Code Diff Tracker Extension Host scenario timed out')),
-                    90_000
+                    150_000
                 );
             })
         ]);
