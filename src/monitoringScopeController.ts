@@ -146,9 +146,15 @@ export class MonitoringScopeController implements vscode.Disposable {
             };
         }
 
+        const expectedRevision = scope.scopeRevision;
+        const requestStillCurrent = (): boolean => {
+            const latest = this.getRequestedScope();
+            return latest.ok && latest.scope?.scopeRevision === expectedRevision;
+        };
         const applied = await this.tracker.applyConfiguredMonitoringScope(
             scope,
-            options?.discardExplicitlyExcludedReviews === true
+            options?.discardExplicitlyExcludedReviews === true,
+            requestStillCurrent
         );
         if (applied.status === 'applied') {
             await this.clearDismissedConsent();

@@ -1994,13 +1994,17 @@ export class DiffTracker {
 
     public async applyConfiguredMonitoringScope(
         scope: CanonicalMonitoringScope,
-        discardExplicitlyExcludedReviews = false
+        discardExplicitlyExcludedReviews = false,
+        requestStillCurrent: () => boolean = () => true
     ): Promise<MonitoringScopeApplyResult> {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
         });
         if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
             return empty('conflict', 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
+        }
+        if (!requestStillCurrent()) {
+            return empty('conflict', 'Monitoring scope request changed before preparation started.');
         }
         if (scope.mode === 'wholeWorkspace') {
             return empty('requiresS4', 'Whole Workspace preparation and coverage belong to S4-W.');
@@ -2063,6 +2067,7 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        transaction.valid = () => this.isCurrentEpoch(epoch) && requestStillCurrent();
         const result = empty('failed');
         let committed = false;
         try {
@@ -2073,7 +2078,9 @@ export class DiffTracker {
             this.scanCoverage = undefined;
             this.ignoreResultCache.clear();
             await this.refreshIgnoreMatchers();
-            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during scope preparation'); }
+            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
+                throw new Error('Monitoring scope request changed during preparation');
+            }
 
             const explicitlyExcludedReviews = new Set(this.getExplicitlyExcludedPendingReviewPaths(scope));
             for (const filePath of [...this.trackedChanges.keys()]) {
@@ -2107,12 +2114,16 @@ export class DiffTracker {
             }
 
             result.capturedBaselines = await this.captureConfiguredIncludeBaselines(scope, epoch);
-            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during scope preparation'); }
+            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
+                throw new Error('Monitoring scope request changed during preparation');
+            }
             this.scanCoverage = this.ignoreFingerprint;
             if (!await this.flushPersistState(true, transaction)) {
                 throw new Error('Configured monitoring scope could not be persisted');
             }
-            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed after scope persistence'); }
+            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
+                throw new Error('Monitoring scope request changed after persistence');
+            }
             committed = true;
             this.endBaselineTransaction(transaction, true);
             result.status = 'applied';
