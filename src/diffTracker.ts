@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { createLegacyEffectiveScope, EffectiveMonitoringScope, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
+import { CanonicalMonitoringScope, createLegacyEffectiveScope, EffectiveMonitoringScope, evaluateConfiguredScope, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -473,6 +473,7 @@ export class DiffTracker {
     private effectiveMonitoringScope: EffectiveMonitoringScope;
     private retainedReviewPaths = new Set<string>();
     private coverageGaps = new Map<string, string>();
+    private coverageGeneration = 0;
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
     private externalWatcherEnabled = false;
@@ -1309,6 +1310,7 @@ export class DiffTracker {
 
     private activateExternalWatchers(watchers: vscode.FileSystemWatcher[]): void {
         const previousWatchers = this.fileWatchers;
+        this.coverageGeneration++;
         this.fileWatchers = watchers;
         this.externalWatcherEnabled = watchers.length > 0;
         previousWatchers.forEach(watcher => watcher.dispose());
@@ -1889,6 +1891,10 @@ export class DiffTracker {
         return [...this.coverageGaps.entries()].sort(([left], [right]) => left.localeCompare(right));
     }
 
+    public getPolicyFingerprint(): string | undefined { return this.ignoreFingerprint; }
+
+    public getCoverageGeneration(): number { return this.coverageGeneration; }
+
     public getPersistenceIssue(): string | undefined { return this.persistenceIssue; }
 
     public isRecoveryBlocked(): boolean { return this.recoveryBlocked; }
@@ -2230,10 +2236,12 @@ export class DiffTracker {
     }
 
     private getWatchExcludePatterns(_resource: vscode.Uri): string[] {
-        // Legacy V3 compatibility mode reads only the old Global string rules.
-        // Structured Workspace rules stay requested-only until S3 publishes an
-        // effective configured scope transaction.
-        return this.getLegacyGlobalWatchExcludePatterns();
+        // Compatibility sessions preserve the old Global matcher exactly.
+        // Once a configured effective scope is published, Global watchExclude
+        // no longer participates in Policy Fingerprint or Rules Mode matching.
+        return this.effectiveMonitoringScope.kind === 'legacyV3'
+            ? this.getLegacyGlobalWatchExcludePatterns()
+            : [];
     }
 
     private async buildIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
@@ -2352,9 +2360,25 @@ export class DiffTracker {
             return { ignored: false, reason: 'Ignore rules not initialized yet' };
         }
 
-        const ignored = matcher.ignores(relPath);
-        const result = { ignored, reason: ignored ? 'Matched ignore rules' : 'Not ignored' };
-        return result;
+        const ordinaryIgnored = matcher.ignores(relPath);
+        if (this.effectiveMonitoringScope.kind === 'configured') {
+            const decision = evaluateConfiguredScope(
+                this.effectiveMonitoringScope as CanonicalMonitoringScope,
+                targetFolder.name,
+                relPath,
+                ordinaryIgnored,
+                false
+            );
+            const reason = decision.source === 'explicitExclude'
+                ? 'Matched explicit DiffTracker exclusion'
+                : decision.source === 'explicitInclude'
+                    ? 'Explicit DiffTracker inclusion overrides ordinary ignore policy'
+                    : decision.source === 'wholeWorkspace'
+                        ? 'Whole Workspace target scope'
+                        : decision.monitored ? 'Not ignored' : 'Matched ordinary ignore policy';
+            return { ignored: !decision.monitored, reason };
+        }
+        return { ignored: ordinaryIgnored, reason: ordinaryIgnored ? 'Matched legacy ignore rules' : 'Not ignored' };
     }
 
     private isPathIgnored(uri: vscode.Uri, directory = false): boolean {
@@ -2369,19 +2393,35 @@ export class DiffTracker {
             return true;
         }
 
+        // Retained Review is outside the current target scope but remains
+        // minimally observable until its pending review is resolved.
+        if (this.retainedReviewPaths.has(uri.fsPath)) { return false; }
+
         const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
         if (!matcher) {
             return false;
         }
 
         const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
-        const cacheKey = `${folder.uri.fsPath}::${relPath}`;
+        const scopeKey = this.effectiveMonitoringScope.kind === 'configured'
+            ? this.effectiveMonitoringScope.scopeRevision
+            : this.effectiveMonitoringScope.scopeRevision;
+        const cacheKey = `${scopeKey}::${folder.uri.fsPath}::${relPath}`;
         const cached = this.ignoreResultCache.get(cacheKey);
         if (cached !== undefined) {
             return cached;
         }
 
-        const ignored = matcher.ignores(relPath);
+        const ordinaryIgnored = matcher.ignores(relPath);
+        const ignored = this.effectiveMonitoringScope.kind === 'configured'
+            ? !evaluateConfiguredScope(
+                this.effectiveMonitoringScope as CanonicalMonitoringScope,
+                folder.name,
+                relPath,
+                ordinaryIgnored,
+                directory
+            ).monitored
+            : ordinaryIgnored;
         this.setIgnoreResultCache(cacheKey, ignored);
         return ignored;
     }
