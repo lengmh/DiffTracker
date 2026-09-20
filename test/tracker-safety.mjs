@@ -1920,7 +1920,12 @@ for(const kind of ['dirty','binary','unreadable']) test(`RESTORE-OFFLINE ${kind}
     if(kind==='unreadable')faults.set(q,{read:error('EACCES')});
     tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
     assert.equal(tracker.getOriginalContent(q),'');
-    if(kind==='binary')assert.equal(pending(q),undefined);else assert.ok(pending(q)?.unavailableReason);
+    if(kind==='binary'){
+        assert.equal(pending(q)?.reviewKind,'opaque');
+        assert.equal(pending(q)?.baselineExists,false);
+        assert.equal(pending(q)?.currentExists,true);
+        assert.equal(tracker.getReviewToken(q),undefined);
+    } else assert.ok(pending(q)?.unavailableReason);
     assert.equal(tracker.baselineExistingFiles.has(q),false);
     assert.equal((await tracker.revertFile(q)).status,'conflict');if(kind==='dirty')assert.equal(document(q).text,'unsaved');
 });
