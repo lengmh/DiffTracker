@@ -1,0 +1,100 @@
+name: PR11 spelling validation
+on:
+  push:
+    branches: [work/pr11-review-e3e5a23]
+    paths: ['.github/workflows/pr11-spelling-validation.yml', '.pr11/spelling.patch']
+permissions:
+  contents: read
+jobs:
+  validate:
+    name: Spelling regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patches
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: c64ee059d6d4a72d252808a03b57bf1f16600100
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: candidate/package-lock.json
+      - name: Apply and verify exact source bytes
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = c64ee059d6d4a72d252808a03b57bf1f16600100
+          git config core.autocrlf false
+          git checkout-index --all --force
+          git -C ../patches show HEAD:.pr11/spelling.patch > ../spelling.patch
+          git apply --unidiff-zero --check ../spelling.patch
+          git apply --unidiff-zero ../spelling.patch
+          sha256sum --check <<'HASHES'
+          211ce2c7a1b88ca250c8e0a9d40219e0e81fdbf7c18c4847df034a548c6e1ade  src/diffTracker.ts
+          4cffad8ef56720e92fce12916173571bddccb46b79b9d8a912d04f1edddd7e36  test/pr11-review-regressions.mjs
+          HASHES
+          git diff --check
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+  publish:
+    name: Publish cross-platform validated source commit
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patches
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: c64ee059d6d4a72d252808a03b57bf1f16600100
+          fetch-depth: 0
+          path: candidate
+      - name: Publish only the two validated source and test files
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = c64ee059d6d4a72d252808a03b57bf1f16600100
+          git -C ../patches show HEAD:.pr11/spelling.patch > ../spelling.patch
+          git apply --unidiff-zero --check ../spelling.patch
+          git apply --unidiff-zero ../spelling.patch
+          sha256sum --check <<'HASHES'
+          211ce2c7a1b88ca250c8e0a9d40219e0e81fdbf7c18c4847df034a548c6e1ade  src/diffTracker.ts
+          4cffad8ef56720e92fce12916173571bddccb46b79b9d8a912d04f1edddd7e36  test/pr11-review-regressions.mjs
+          HASHES
+          git diff --check
+          git add src/diffTracker.ts test/pr11-review-regressions.mjs
+          test "$(git diff --cached --name-only | wc -l)" -eq 2
+          git config user.name lengmh
+          git config user.email 47114200+lengmh@users.noreply.github.com
+          git commit -m "fix: resolve case-insensitive baseline spelling from directory entries"
+          test "$(git rev-parse HEAD^)" = c64ee059d6d4a72d252808a03b57bf1f16600100
+          git push origin HEAD:refs/heads/work/pr11-spelling-c64ee05
+          git rev-parse HEAD > ../candidate-commit.txt
+          git show --stat --oneline HEAD >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr11-spelling-candidate-commit
+          path: candidate-commit.txt
+          retention-days: 3
+          if-no-files-found: error
