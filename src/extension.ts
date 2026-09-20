@@ -337,8 +337,16 @@ export async function activate(context: vscode.ExtensionContext) {
                 opaqueReviewTokens: diffTracker.getOpaqueReviewTokens(),
                 unknownReviewPaths: diffTracker.getUnknownReviewPaths(),
                 trackedChanges: diffTracker.getTrackedChanges(),
-                gitPauses: diffTracker.getPausedGitRepositories()
+                gitPauses: diffTracker.getPausedGitRepositories(),
+                effectiveMonitoringScope: diffTracker.getEffectiveMonitoringScope(),
+                retainedReviewPaths: diffTracker.getRetainedReviewPaths(),
+                coverageGaps: diffTracker.getCoverageGaps(),
+                policyFingerprint: diffTracker.getPolicyFingerprint(),
+                coverageGeneration: diffTracker.getCoverageGeneration()
             })),
+            vscode.commands.registerCommand('diffTracker._testOriginalContent', (filePath: string) =>
+                diffTracker.getOriginalContent(filePath)
+            ),
             vscode.commands.registerCommand('diffTracker._testRevertFile', (filePath: string) => {
                 const token = diffTracker.getReviewToken(filePath);
                 return token ? diffTracker.revertFile(filePath, token) : undefined;

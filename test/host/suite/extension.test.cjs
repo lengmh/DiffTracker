@@ -60,6 +60,61 @@ module.exports = async function runExtensionHostScenario() {
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
 
+        // S3: migrate the legacy Global rules into an explicit workspace scope,
+        // then publish an ordinary Rules-mode effective scope through the real
+        // activation/controller command path.
+        const initialScope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+        assert.equal(initialScope.effective.kind, 'legacyV3');
+        const migration = await vscode.commands.executeCommand('diffTracker._testMigrateLegacyScope');
+        assert.equal(migration.status, 'migrated', JSON.stringify(migration));
+        const initialApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true,
+            discardExplicitlyExcludedReviews: true
+        });
+        assert.equal(initialApply.status, 'applied', JSON.stringify(initialApply));
+        const configuredScope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+        assert.equal(configuredScope.effective.kind, 'configured');
+        assert.equal(configuredScope.effective.mode, 'rules');
+        assert.equal(configuredScope.requested.scope.scopeRevision, configuredScope.effective.scopeRevision);
+        console.log('PASS HOST-S3 legacy scope migrates and Rules scope becomes effective');
+
+        // Explicit includes must baseline existing resources hidden by ordinary
+        // default exclusions. Do not require subsequent watcher events here:
+        // supplemental observation coverage for host-excluded subtrees is S4-W.
+        const privateDir = path.join(workspacePath, 'node_modules', 's3-private');
+        const privatePath = path.join(privateDir, 'existing.txt');
+        fs.mkdirSync(privateDir, { recursive: true });
+        fs.writeFileSync(privatePath, 's3 private baseline\n');
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privatePath),
+            undefined,
+            'ordinary excluded path must not already have a baseline'
+        );
+        const scopeConfig = vscode.workspace.getConfiguration('diffTracker');
+        await scopeConfig.update('watchInclude', [{ scope: 'all', path: 'node_modules/s3-private' }],
+            vscode.ConfigurationTarget.Workspace);
+        const includeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(includeApply.status, 'applied', JSON.stringify(includeApply));
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privatePath),
+            's3 private baseline\n',
+            'explicit include must capture the existing ignored resource as its current baseline'
+        );
+        console.log('PASS HOST-S3 explicit include baselines resources hidden by ordinary exclusions');
+
+        // Whole Workspace is a valid request in S3 but cannot become effective
+        // until S4-W can atomically establish preparation and observation coverage.
+        await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
+        const wholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(wholeApply.status, 'requiresS4', JSON.stringify(wholeApply));
+        assert.equal((await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')).effective.mode, 'rules');
+        await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 Whole Workspace request stays pending until S4-W coverage exists');
+
         // Stable watcher contract used by S0/W1 planning:
         // recursive RelativePattern watchers inherit files.watcherExclude, while
         // a non-recursive RelativePattern can subscribe to otherwise excluded
