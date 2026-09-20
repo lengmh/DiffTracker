@@ -2701,7 +2701,7 @@ export class DiffTracker {
     private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (this.pendingWriteFiles.has(filePath) && !this.activeWriteFiles.has(filePath)) {
-            const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+            const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
         }
         if (this.isPathIgnored(uri)) { return; }
@@ -3728,7 +3728,7 @@ export class DiffTracker {
     }
 
     private async deleteFileForMissingBaseline(uri: vscode.Uri, filePath: string, review?: ReviewToken): Promise<ActionResult> {
-        const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
         if (doc?.isDirty) {
             return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; file skipped');
         }
@@ -4540,7 +4540,7 @@ export class DiffTracker {
             return tracked.currentContent;
         }
 
-        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.scheme === 'file' && textDoc.uri.fsPath === filePath);
         return doc?.getText();
     }
 

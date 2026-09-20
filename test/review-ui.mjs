@@ -325,4 +325,18 @@ for(const recording of [false,true])for(const success of [false,true])await test
     const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
     assert.equal(h.state.info.length,success?1:0);assert.equal(h.state.warnings.length,success?0:1);
 });
+await test('workspace document lookups distinguish file working documents from virtual documents',()=>{
+    const sourceText=fs.readFileSync('src/diffTracker.ts','utf8');
+    const sourceFile=ts.createSourceFile('diffTracker.ts',sourceText,ts.ScriptTarget.Latest,true);
+    const offenders=[];
+    const visit=node=>{
+        if(ts.isCallExpression(node)&&node.expression.getText(sourceFile)==='vscode.workspace.textDocuments.find'){
+            const callback=node.arguments[0]?.getText(sourceFile)??'';
+            if(callback.includes('.uri.fsPath')&&!callback.includes('.uri.scheme'))offenders.push(callback);
+        }
+        ts.forEachChild(node,visit);
+    };
+    visit(sourceFile);
+    assert.deepEqual(offenders,[]);
+});
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);
