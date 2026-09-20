@@ -67,9 +67,31 @@ jobs:
           DIFF_TRACKER_VSCODE_VERSION: 1.80.2
         run: xvfb-run -a npm run test:host
 
+  downgrade-compatibility:
+    name: Released 0.7.2 rejects Session V4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Verify released 0.7.2 blocks V4 without overwriting it
+        shell: bash
+        env:
+          RELEASE_072_SHA: 8b57373d89f3649754eada0b924c0ff593ee6839
+          DT_EXPECT_LEGACY_REJECTION: "1"
+        run: |
+          git show "${RELEASE_072_SHA}:src/diffTracker.ts" > "${RUNNER_TEMP}/diffTracker-0.7.2.ts"
+          DT_SOURCE="${RUNNER_TEMP}/diffTracker-0.7.2.ts" node test/tracker-safety.mjs
+
   package:
     name: VSIX package
-    needs: [quality, extension-host, minimum-extension-host]
+    needs: [quality, extension-host, minimum-extension-host, downgrade-compatibility]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

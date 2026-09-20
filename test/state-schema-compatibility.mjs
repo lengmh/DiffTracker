@@ -1,6 +1,6 @@
 /** Persisted-schema migration and downgrade safety, using the production tracker.
  * DT_EXPECT_LEGACY_REJECTION=1 runs the downgrade subset with DT_SOURCE pointing
- * to a released pre-V4 tracker; normal npm test exercises the current writer.
+ * to the released 0.7.2 tracker; normal npm test exercises the current writer.
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -38,7 +38,7 @@ export function registerStateSchemaCompatibility(harness) {
 
     if (process.env.DT_EXPECT_LEGACY_REJECTION === '1') {
         for (const layout of ['primary', 'both', 'backup', 'interrupted-upgrade']) {
-            test(`SCHEMA-DOWNGRADE released pre-V4 version preserves ${layout} V3 state`, async () => {
+            test(`SCHEMA-DOWNGRADE released 0.7.2 preserves ${layout} V3 state`, async () => {
                 const tracker = getTracker();
                 const { target, state } = fixture();
                 assert.equal(tracker.parsePersistedState(state), undefined,
