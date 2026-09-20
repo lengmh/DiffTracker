@@ -1877,6 +1877,18 @@ export class DiffTracker {
         return records;
     }
 
+    public getEffectiveMonitoringScope(): EffectiveMonitoringScope {
+        return JSON.parse(JSON.stringify(this.effectiveMonitoringScope)) as EffectiveMonitoringScope;
+    }
+
+    public getRetainedReviewPaths(): string[] {
+        return [...this.retainedReviewPaths].sort((left, right) => left.localeCompare(right));
+    }
+
+    public getCoverageGaps(): Array<[string, string]> {
+        return [...this.coverageGaps.entries()].sort(([left], [right]) => left.localeCompare(right));
+    }
+
     public getPersistenceIssue(): string | undefined { return this.persistenceIssue; }
 
     public isRecoveryBlocked(): boolean { return this.recoveryBlocked; }

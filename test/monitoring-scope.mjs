@@ -6,7 +6,11 @@ import {
     canonicalizeExcludePattern,
     canonicalizeIncludePath,
     createLegacyEffectiveScope,
+    createScopeConsentRecord,
+    createScopeMigrationRecord,
     parseEffectiveMonitoringScope,
+    scopeConsentMatches,
+    scopeMigrationMatches,
     detectScopeExpansion,
     validateAndCanonicalizeScope
 } from '../out/monitoringScope.js';
@@ -153,4 +157,19 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     }), roots, 'linux').scope;
     const persisted = { kind: 'configured', ...configured };
     assert.deepEqual(parseEffectiveMonitoringScope(persisted), persisted);
+}
+
+{
+    const requested = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'folder', folder: 'frontend', path: 'private' }]
+    }), roots, 'linux').scope;
+    const consent = createScopeConsentRecord(requested);
+    assert.equal(scopeConsentMatches(consent, requested), true);
+    assert.equal(scopeConsentMatches({ ...consent, scopeRevision: '0'.repeat(64) }, requested), false);
+    assert.equal(scopeConsentMatches({ ...consent, roots: [{ name: 'renamed', uri: roots[0].uri }, roots[1]] }, requested), false);
+}
+{
+    const migration = createScopeMigrationRecord(roots);
+    assert.equal(scopeMigrationMatches(migration, roots), true);
+    assert.equal(scopeMigrationMatches(migration, [{ ...roots[0], name: 'renamed' }, roots[1]]), false);
 }

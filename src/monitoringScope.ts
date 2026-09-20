@@ -49,6 +49,17 @@ export interface ScopeExpansionResult {
     reasons: string[];
 }
 
+export interface ScopeConsentRecord {
+    model: 1;
+    scopeRevision: string;
+    roots: WorkspaceRootIdentity[];
+}
+
+export interface ScopeMigrationRecord {
+    model: 1;
+    roots: WorkspaceRootIdentity[];
+}
+
 export interface LegacyEffectiveMonitoringScope {
     kind: 'legacyV3';
     roots: WorkspaceRootIdentity[];
@@ -285,6 +296,42 @@ function includeCovers(effective: MonitoringIncludeRule, requested: MonitoringIn
     const base = effective.path.split('/');
     const target = requested.path.split('/');
     return base.length <= target.length && base.every((part, index) => part === target[index]);
+}
+
+export function createScopeConsentRecord(scope: CanonicalMonitoringScope): ScopeConsentRecord {
+    return {
+        model: 1,
+        scopeRevision: scope.scopeRevision,
+        roots: scope.roots.map(root => ({ ...root }))
+    };
+}
+
+export function scopeConsentMatches(raw: unknown, scope: CanonicalMonitoringScope): boolean {
+    if (!raw || typeof raw !== 'object') { return false; }
+    const value = raw as Partial<ScopeConsentRecord>;
+    if (value.model !== 1 || value.scopeRevision !== scope.scopeRevision || !Array.isArray(value.roots)) { return false; }
+    if (value.roots.length !== scope.roots.length) { return false; }
+    const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}`;
+    const left = value.roots
+        .filter((root): root is WorkspaceRootIdentity => !!root && typeof root.name === 'string' && typeof root.uri === 'string')
+        .map(key).sort(compareText);
+    const right = scope.roots.map(key).sort(compareText);
+    return left.length === value.roots.length && left.every((item, index) => item === right[index]);
+}
+
+export function createScopeMigrationRecord(roots: readonly WorkspaceRootIdentity[]): ScopeMigrationRecord {
+    return {
+        model: 1,
+        roots: roots.map(root => ({ ...root })).sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name))
+    };
+}
+
+export function scopeMigrationMatches(raw: unknown, roots: readonly WorkspaceRootIdentity[]): boolean {
+    if (!raw || typeof raw !== 'object') { return false; }
+    const value = raw as Partial<ScopeMigrationRecord>;
+    if (value.model !== 1 || !Array.isArray(value.roots)) { return false; }
+    const expected = createScopeMigrationRecord(roots);
+    return JSON.stringify(value.roots) === JSON.stringify(expected.roots);
 }
 
 function rootKey(root: WorkspaceRootIdentity): string {
