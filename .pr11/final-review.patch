@@ -1,0 +1,215 @@
+diff --git a/src/diffTracker.ts b/src/diffTracker.ts
+--- a/src/diffTracker.ts
++++ b/src/diffTracker.ts
+@@ -491,0 +492 @@
++    private readonly rootIdentityUnavailableReason = 'Workspace root identity is unverified; prior review is preserved until identity and current state can be reconciled';
+@@ -2165,0 +2167,13 @@
++    public getExplicitlyExcludedReviewRevision(scope: CanonicalMonitoringScope): string {
++        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope).map(filePath => [
++            filePath,
++            { ...this.trackedChanges.get(filePath), timestamp: undefined },
++            this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
++            this.opaqueBaselineFiles.get(filePath), this.unresolvedBaselineFiles.get(filePath),
++            this.coverageGaps.get(filePath)
++        ]);
++        return createHash('sha256').update(JSON.stringify({
++            epoch: this.sessionEpoch, scopeRevision: scope.scopeRevision, entries
++        })).digest('hex');
++    }
++
+@@ -2267 +2281,2 @@
+-        requestStillCurrent: () => boolean = () => true
++        requestStillCurrent: () => boolean = () => true,
++        expectedAffectedReviewRevision?: string
+@@ -2306,0 +2322,10 @@
++        const approvedDiscardRevision = discardExplicitlyExcludedReviews
++            ? expectedAffectedReviewRevision ?? this.getExplicitlyExcludedReviewRevision(scope) : undefined;
++        let approvedReviewsDiscarded = false;
++        const discardApprovalStillCurrent = (): boolean => !discardExplicitlyExcludedReviews ||
++            (approvedReviewsDiscarded
++                ? this.getExplicitlyExcludedPendingReviewPaths(scope).length === 0
++                : this.getExplicitlyExcludedReviewRevision(scope) === approvedDiscardRevision);
++        if (!discardApprovalStillCurrent()) {
++            return empty('conflict', 'Affected review changed after discard approval; confirm the current review set again.');
++        }
+@@ -2359,0 +2385 @@
++            discardApprovalStillCurrent() &&
+@@ -2399,0 +2426,5 @@
++            // Only this synchronous discard step may consume the approved set.
++            // Later excluded reviews invalidate publication rather than sharing
++            // the earlier user's approval.
++            approvedReviewsDiscarded = discardExplicitlyExcludedReviews;
++
+@@ -2726,0 +2758,13 @@
++        // Identity can recover without any rule text/fingerprint changing.
++        // Reconcile only already-retained review resources, never discover new
++        // paths or bypass pending explicit exclusions and hard boundaries.
++        if (!this.baselineTransaction && this.restoringEpoch === undefined &&
++            !this.baselineBuilding && this.snapshotInitialized) {
++            for (const change of [...this.trackedChanges.values()]) {
++                if (change.unavailableReason !== this.rootIdentityUnavailableReason) { continue; }
++                const uri = vscode.Uri.file(change.filePath);
++                if (this.isPathIgnored(uri)) { continue; }
++                await this.readFileAndUpdate(change.filePath, uri);
++                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
++            }
++        }
+@@ -3294,0 +3339,12 @@
++    private preserveUnverifiedRootReview(filePath: string): boolean {
++        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
++        if (!folder || folder.uri.scheme !== 'file' ||
++            typeof this.workspaceRootIdentityForFolder(folder).caseSensitive === 'boolean' ||
++            (!this.trackedChanges.has(filePath) && !this.retainedReviewPaths.has(filePath))) { return false; }
++        // Unproven identity blocks resource I/O, not preservation of evidence.
++        // Retained paths plus their existing baselines are durable in Session V4.
++        this.retainedReviewPaths.add(filePath);
++        this.markFileUnavailable(filePath, this.rootIdentityUnavailableReason);
++        return true;
++    }
++
+@@ -3301,0 +3358,4 @@
++            if (this.preserveUnverifiedRootReview(filePath)) {
++                retainedFiles.push(filePath);
++                continue;
++            }
+@@ -3795,0 +3856,3 @@
++        for (const filePath of this.retainedReviewPaths) {
++            if (this.preserveUnverifiedRootReview(filePath)) { restoredGapReviewPaths.add(filePath); }
++        }
+@@ -3796,0 +3860 @@
++            if (restoredGapReviewPaths.has(filePath)) { continue; }
+diff --git a/src/monitoringScopeController.ts b/src/monitoringScopeController.ts
+--- a/src/monitoringScopeController.ts
++++ b/src/monitoringScopeController.ts
+@@ -41,0 +42 @@
++    affectedReviewRevision?: string;
+@@ -187,0 +189 @@
++        expectedAffectedReviewRevision?: string;
+@@ -214 +216,8 @@
+-        if (status.explicitlyExcludedPendingReviews.length > 0 && !options?.discardExplicitlyExcludedReviews) {
++        const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
++        const affectedReviewRevision = this.tracker.getExplicitlyExcludedReviewRevision(scope);
++        if (options?.discardExplicitlyExcludedReviews &&
++            options.expectedAffectedReviewRevision !== affectedReviewRevision) {
++            return { status: 'conflict', scopeRevision: scope.scopeRevision,
++                reason: 'Affected review changed or discard approval is unbound; confirm the current review set again.' };
++        }
++        if (affectedReviewPaths.length > 0 && !options?.discardExplicitlyExcludedReviews) {
+@@ -217 +226,2 @@
+-                affectedReviewPaths: status.explicitlyExcludedPendingReviews,
++                affectedReviewPaths,
++                affectedReviewRevision,
+@@ -231 +241,2 @@
+-            requestStillCurrent
++            requestStillCurrent,
++            options?.expectedAffectedReviewRevision
+diff --git a/src/watchExcludePanel.ts b/src/watchExcludePanel.ts
+--- a/src/watchExcludePanel.ts
++++ b/src/watchExcludePanel.ts
+@@ -179,0 +180 @@
++            const promptedReviewRevision = outcome.affectedReviewRevision;
+@@ -190 +191,2 @@
+-                expectedScopeRevision: promptedRevision
++                expectedScopeRevision: promptedRevision,
++                expectedAffectedReviewRevision: promptedReviewRevision
+diff --git a/test/pr11-review-regressions.mjs b/test/pr11-review-regressions.mjs
+--- a/test/pr11-review-regressions.mjs
++++ b/test/pr11-review-regressions.mjs
+@@ -229,0 +230,86 @@
++
++    for(const change of ['added','revised','stable','unbound','modal']) test(`PR11 final discard confirmation binds affected reviews (${change})`,async()=>{
++        const t=h.getTracker(),dir=file('discard-set');fs.mkdirSync(dir);
++        const p=path.join(dir,'shown.txt'),q=path.join(dir,'unshown.txt');
++        assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
++        const originalScope=t.getEffectiveMonitoringScope();
++        fs.writeFileSync(p,'shown current');t.fileSnapshots.set(p,'shown baseline');t.baselineExistingFiles.add(p);
++        t.updateTrackedDiff(p,'shown current');
++        const excludes=[{scope:'all',pattern:relative(dir)+'/**'}];
++        const oldConfig=vscode.workspace.getConfiguration,oldWarning=vscode.window.showWarningMessage;
++        const oldInfo=vscode.window.showInformationMessage;
++        vscode.workspace.getConfiguration=(section,resource)=>{
++            const old=oldConfig(section,resource);
++            return {...old,inspect:key=>key==='watchExclude'?{workspaceValue:excludes}:undefined};
++        };
++        const state=new Map();
++        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
++        const mutate=()=>{
++            if(change==='revised')t.updateTrackedDiff(p,'new unapproved projection');
++            else{
++                fs.writeFileSync(q,'unshown current');t.fileSnapshots.set(q,'unshown baseline');t.baselineExistingFiles.add(q);
++                t.updateTrackedDiff(q,'unshown current');
++            }
++        };
++        try{
++            if(change==='modal'){
++                let prompted=false;
++                vscode.window.showInformationMessage=async()=>undefined;
++                vscode.window.showWarningMessage=async(message,_options,...answers)=>{
++                    if(answers.includes('Discard Reviews and Apply')){prompted=true;mutate();return 'Discard Reviews and Apply';}
++                    return undefined;
++                };
++                await h.createScopePanel(controller).applyInteractively();
++                assert.equal(prompted,true);assert.ok(pending(p));assert.ok(pending(q));
++                assert.equal(t.getEffectiveMonitoringScope().scopeRevision,originalScope.scopeRevision);
++                return;
++            }
++            const prompt=await controller.applyPendingScope();assert.equal(prompt.status,'needsDiscardConfirmation');
++            assert.equal(typeof prompt.affectedReviewRevision,'string');
++            if(change==='added'||change==='revised')mutate();
++            const result=await controller.applyPendingScope({
++                discardExplicitlyExcludedReviews:true,expectedScopeRevision:prompt.scopeRevision,
++                expectedAffectedReviewRevision:change==='unbound'?undefined:prompt.affectedReviewRevision
++            });
++            if(change==='stable'){
++                assert.equal(result.status,'applied',JSON.stringify(result));assert.equal(pending(p),undefined);
++            }else{
++                assert.equal(result.status,'conflict',JSON.stringify(result));assert.ok(pending(p));
++                if(change==='added')assert.ok(pending(q));
++                assert.equal(t.getEffectiveMonitoringScope().scopeRevision,originalScope.scopeRevision);
++            }
++        }finally{
++            controller.dispose();vscode.workspace.getConfiguration=oldConfig;
++            vscode.window.showWarningMessage=oldWarning;vscode.window.showInformationMessage=oldInfo;
++        }
++    });
++
++    for(const kind of ['text','opaque','unknown']) test(`PR11 final unverified identity preserves ${kind} review through same-policy recovery and reload`,async()=>{
++        let t=h.getTracker();const storage=file('identity-review-storage');t.storageUri=Uri.file(storage);
++        assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
++        const p=file('identity-review.txt');fs.writeFileSync(p,kind==='opaque'?Buffer.from([0,1,2]):'current');
++        t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
++        if(kind==='unknown')t.coverageGaps.set(p,'prior coverage uncertainty');
++        await t.readFileAndUpdate(p,Uri.file(p));assert.equal(pending(p)?.reviewKind,kind);
++        await t.refreshIgnoreMatchers();const fingerprint=t.getPolicyFingerprint();
++        const identify=t.workspaceRootIdentityForFolder;
++        t.workspaceRootIdentityForFolder=folder=>({...identify.call(t,folder),caseSensitive:undefined});
++        await t.refreshIgnoreMatchers();
++        assert.ok(pending(p),'unverified identity must not erase pending review');
++        assert.equal(pending(p).reviewKind,'unknown');assert.ok(t.getRetainedReviewPaths().includes(p));
++        assert.equal(t.getReviewToken(p),undefined);
++        await t.flushPendingPersistence();await t.dispose();
++        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
++        const restoredIdentify=t.workspaceRootIdentityForFolder;
++        t.workspaceRootIdentityForFolder=folder=>({...restoredIdentify.call(t,folder),caseSensitive:undefined});
++        const read=vscode.workspace.fs.readFile;let unsafeReads=0;
++        vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===p)unsafeReads++;return read(uri);};
++        try{
++            assert.equal(await t.restorePersistedState(),'restored');
++            assert.ok(pending(p));assert.equal(pending(p).reviewKind,'unknown');assert.equal(unsafeReads,0);
++            t.workspaceRootIdentityForFolder=restoredIdentify;
++            await t.refreshIgnoreMatchers();assert.equal(t.getPolicyFingerprint(),fingerprint);
++            assert.ok(pending(p));assert.equal(pending(p).reviewKind,kind);
++            assert.equal(t.getOriginalContent(p),'baseline');
++        }finally{vscode.workspace.fs.readFile=read;}
++    });
+diff --git a/test/tracker-safety.mjs b/test/tracker-safety.mjs
+--- a/test/tracker-safety.mjs
++++ b/test/tracker-safety.mjs
+@@ -3240,0 +3241,7 @@
++    createScopePanel: controller => {
++        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
++        try {
++            const { WatchExcludePanel }=require('../out/watchExcludePanel.js');
++            return Object.assign(Object.create(WatchExcludePanel.prototype),{scopeController:controller});
++        } finally {Module._load=originalLoad;}
++    },
