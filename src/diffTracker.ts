@@ -2475,7 +2475,17 @@ export class DiffTracker {
             if (currentState.kind === 'missing' && this.baselineExistingFiles.has(filePath)) {
                 this.updateTrackedDiff(filePath, '', { currentExists: false });
             } else if (currentState.kind === 'unavailable') {
-                this.markFileUnavailable(filePath, currentState.reason);
+                if (this.isStableUnsupportedState(currentState)) {
+                    this.markOpaqueReview(
+                        filePath,
+                        currentState,
+                        this.baselineExistingFiles.has(filePath)
+                            ? 'Text baseline changed to a read-only unsupported file'
+                            : 'Read-only unsupported file was created after the baseline'
+                    );
+                } else {
+                    this.markFileUnavailable(filePath, currentState.reason);
+                }
             }
         });
         if (!this.isCurrentEpoch(epoch)) { return; }
@@ -3441,15 +3451,30 @@ export class DiffTracker {
             return result;
         }
         // Verify persisted state, including existence, before removing this item.
+        // Our own save can race a watcher that observes the restored baseline and
+        // clears the pending review before this continuation resumes. Treat that
+        // as success only when the session, baseline revision and current bytes
+        // still prove the exact reviewed target was restored.
         const current = await this.readCurrentFileState(filePath);
         const finalTargetError = this.validateActionTarget(filePath);
-        if (finalTargetError || !this.matchesReview(review)) {
-            return this.actionResult(filePath, 'conflict', finalTargetError ?? 'Session or review changed during revert', result.bufferChanged);
+        if (finalTargetError) {
+            return this.actionResult(filePath, 'conflict', finalTargetError, result.bufferChanged);
         }
+        const baseline = this.fileSnapshots.get(filePath);
         const baselineExists = this.baselineExistingFiles.has(filePath);
-        if ((baselineExists && (current.kind !== 'text' || current.content !== change.originalContent)) ||
-            (!baselineExists && current.kind !== 'missing')) {
+        if (!this.isCurrentEpoch(review.epoch) || baseline === undefined ||
+            this.revision(baseline, baselineExists) !== review.baselineRevision) {
+            return this.actionResult(filePath, 'conflict', 'Session or baseline changed during revert', result.bufferChanged);
+        }
+        const currentMatchesBaseline = baselineExists
+            ? current.kind === 'text' && current.content === baseline
+            : current.kind === 'missing';
+        if (!currentMatchesBaseline) {
             return this.actionResult(filePath, 'conflict', 'File does not match the baseline after revert; review retained', result.bufferChanged);
+        }
+        const latestReview = this.getReviewToken(filePath);
+        if (latestReview && !this.matchesReview(review)) {
+            return this.actionResult(filePath, 'conflict', 'Review changed during revert', result.bufferChanged);
         }
         this.clearFileReview(filePath);
         this.schedulePersistState();

@@ -275,16 +275,21 @@ test('DT-02 clean cached document cannot hide disk deletion',async()=>{
     const p=file(); seed(p,'old\n'); document(p); fs.unlinkSync(p);
     assert.equal((await tracker.readCurrentFileState(p)).kind,'missing');
 });
-for(const [label,inject] of [
-    ['permission',p=>faults.set(p,{read:error('NoPermissions')})],
-    ['binary',p=>fs.writeFileSync(p,Buffer.from([65,0,66]))],
-    ['invalid UTF-8',p=>fs.writeFileSync(p,Buffer.from([0xc3,0x28]))],
-    ['size limit',p=>faults.set(p,{size:6*1024*1024})]
-]) test(`DT-03 ${label} retains baseline and pending with reason on change/create`,async()=>{
+for(const [label,inject,kind] of [
+    ['permission',p=>faults.set(p,{read:error('NoPermissions')}),'unknown'],
+    ['binary',p=>fs.writeFileSync(p,Buffer.from([65,0,66])),'opaque'],
+    ['invalid UTF-8',p=>fs.writeFileSync(p,Buffer.from([0xc3,0x28])),'opaque'],
+    ['size limit',p=>faults.set(p,{size:6*1024*1024}),'opaque']
+]) test(`DT-03 ${label} retains baseline and pending as ${kind} on change/create`,async()=>{
     const p=file(); seed(p,'baseline\n','pending\n'); await scan(p); inject(p);
     assert.equal((await tracker.readCurrentFileState(p)).kind,'unavailable');
-    await scan(p); assert.equal(tracker.getOriginalContent(p),'baseline\n'); assert.ok(pending(p)); assert.ok(pending(p).unavailableReason);
-    await tracker.onExternalFileCreated(Uri.file(p)); assert.equal(tracker.getOriginalContent(p),'baseline\n'); assert.ok(tracker.baselineExistingFiles.has(p)); assert.ok(pending(p));
+    await scan(p);
+    assert.equal(tracker.getOriginalContent(p),'baseline\n');
+    assert.equal(pending(p)?.reviewKind,kind);
+    if(kind==='unknown') assert.ok(pending(p)?.unavailableReason);
+    else { assert.equal(pending(p)?.unavailableReason,undefined); assert.ok(pending(p)?.reviewReason); }
+    await tracker.onExternalFileCreated(Uri.file(p));
+    assert.equal(tracker.getOriginalContent(p),'baseline\n'); assert.ok(tracker.baselineExistingFiles.has(p)); assert.equal(pending(p)?.reviewKind,kind);
     assert.equal(succeeded(await tracker.keepAllChangesInFile(p)),false); assert.equal(succeeded(await tracker.revertFile(p)),false); assert.ok(pending(p));
 });
 for(const save of [false,error('NoPermissions')]) test(`DT-03 save ${save===false?'false':'throws'} keeps pending and baseline; no write fallback`,async()=>{
@@ -295,6 +300,24 @@ for(const save of [false,error('NoPermissions')]) test(`DT-03 save ${save===fals
     assert.equal(counters.write,before); assert.equal(tracker.getOriginalContent(p),'baseline\n'); assert.ok(pending(p));
     assert.equal(tracker.revertHistory.length,1,'a partial buffer mutation must retain its durable recovery record');
     tracker.processDocumentChange(document(p)); await scan(p); assert.ok(pending(p), 'save failure pending survives buffer and watcher refresh');
+});
+test('S1 Revert succeeds when its own write observation clears the old review after reaching baseline',async()=>{
+    const p=file('own-write-clear.m');seed(p,'baseline\n','changed\n');await scan(p);
+    const token=tracker.getReviewToken(p);assert.ok(token);
+    const restore=tracker.restoreFileToContent.bind(tracker);
+    tracker.restoreFileToContent=async(...args)=>{
+        const result=await restore(...args);
+        if(result.status==='success') tracker.clearFileReview(p);
+        return result;
+    };
+    try {
+        const result=await tracker.revertFile(p,token);
+        assert.equal(result.status,'success',result.reason);
+        assert.equal(disk(p),'baseline\n');
+        assert.equal(pending(p),undefined);
+    } finally {
+        tracker.restoreFileToContent=restore;
+    }
 });
 test('DT-09 save failure retains its recovery record in durable session state',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); faults.set(p,{save:false});
@@ -723,7 +746,7 @@ test('DT-02 Keep hunk after new file vanishes cannot accept existence',async()=>
 test('DT-03 UTF-8 BOM is explicitly unsupported without stripping bytes',async()=>{
     const p=file(); seed(p,'baseline','pending'); await scan(p);
     const bytes=Buffer.from([0xef,0xbb,0xbf,0x61]); fs.writeFileSync(p,bytes); await scan(p);
-    assert.equal((await tracker.readCurrentFileState(p)).kind,'unavailable'); assert.ok(pending(p)?.unavailableReason);
+    assert.equal((await tracker.readCurrentFileState(p)).kind,'unavailable'); assert.equal(pending(p)?.reviewKind,'opaque'); assert.ok(pending(p)?.reviewReason);
     assert.equal(succeeded(await tracker.revertFile(p)),false); assert.deepEqual(fs.readFileSync(p),bytes);
     assert.equal(tracker.getOriginalContent(p),'baseline');
 });
@@ -918,7 +941,7 @@ for(const transition of ['stop','restart','dispose'])test(`AUDIT-21 ${transition
 test('AUDIT-21 stopped clear handles empty, missing, unknown and dirty resources without disk mutation',async()=>{
     const empty=file(),deleted=file(),dirty=file(),unknown=file();seed(empty,'');seed(deleted,'gone');seed(dirty,'before','saved');
     fs.unlinkSync(deleted);await tracker.onExternalFileDeleted(Uri.file(deleted));const doc=document(dirty);doc.text='unsaved';doc.isDirty=true;tracker.processDocumentChange(doc);
-    fs.writeFileSync(unknown,Buffer.from([0,1]));await tracker.onExternalFileCreated(Uri.file(unknown));assert.equal(pending(unknown),undefined);
+    fs.writeFileSync(unknown,Buffer.from([0,1]));await tracker.onExternalFileCreated(Uri.file(unknown));assert.equal(pending(unknown)?.reviewKind,'opaque');
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.equal(disk(empty),'');assert.equal(fs.existsSync(deleted),false);assert.equal(disk(dirty),'saved');assert.equal(doc.getText(),'unsaved');assert.equal(doc.isDirty,true);
     const saved=JSON.parse(disk(path.join(storage,'session-state.json')));assert.equal(saved.unresolvedBaselineFiles.length,0);assert.equal(saved.fileSnapshots.length,0);
@@ -952,7 +975,7 @@ for(const kind of ['oversized','bom','invalid-utf8']) test(`DT-08 clear/reset ac
     if(kind==='oversized') faults.set(p,{size:6*1024*1024});
     else if(kind==='bom') fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
     else fs.writeFileSync(p,Buffer.from([0xc3,0x28]));
-    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    await scan(p);assert.equal(pending(p)?.reviewKind,'opaque');assert.ok(pending(p)?.reviewReason);
     tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];
     assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.equal(tracker.getBaselineState(),'ready');assert.equal(pending(p),undefined);
@@ -963,7 +986,7 @@ for(const kind of ['oversized','bom','invalid-utf8']) test(`DT-08 clear/reset ac
     if(kind==='oversized') fs.writeFileSync(p,'changed-after-clear');
     else if(kind==='bom') fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61,0x62]));
     else fs.writeFileSync(p,Buffer.from([0xc3,0x28,0x41]));
-    await scan(p);assert.ok(pending(p)?.unavailableReason,'a changed opaque baseline must surface for review');
+    await scan(p);assert.equal(pending(p)?.reviewKind,'opaque','a changed opaque baseline must surface as read-only review');
     faults.delete(p);
 });
 for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unavailable ${kind} review and unresolved baseline`,async()=>{
@@ -971,7 +994,7 @@ for(const kind of ['oversized','bom']) test(`AUDIT-21 stopped Clear removes unav
     seed(p,'baseline','pending');await scan(p);
     if(kind==='oversized') faults.set(p,{size:6*1024*1024});
     else fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
-    await scan(p);assert.ok(pending(p)?.unavailableReason);
+    await scan(p);assert.equal(pending(p)?.reviewKind,'opaque');assert.ok(pending(p)?.reviewReason);
     tracker.storageUri=Uri.file(storage);tracker.stopRecording();
     assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(p),false);assert.equal(tracker.opaqueBaselineFiles.has(p),false);
@@ -997,7 +1020,7 @@ test('DT-08 oversized opaque baseline detects same-size same-mtime rewrite',asyn
     assert.equal(await tracker.resetBaselineToCurrentState(),true);const baseline=tracker.opaqueBaselineFiles.get(p);assert.ok(baseline?.fingerprint);
     fs.writeFileSync(p,Buffer.alloc(size,0x42));fs.utimesSync(p,stamp,stamp);
     const currentStat=fs.statSync(p);assert.equal(currentStat.size,size);assert.equal(currentStat.mtimeMs,stamp.getTime());
-    await scan(p);assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+    await scan(p);assert.equal(pending(p)?.reviewKind,'opaque');assert.match(pending(p)?.reviewReason??'',/Unsupported file changed since the baseline/i);
 });
 test('DT-08 restored oversized opaque baseline detects timestamp-preserving offline rewrite',async()=>{
     const p=file('opaque-large-offline-rewrite.bin'),storage=file('storage');
@@ -1006,7 +1029,7 @@ test('DT-08 restored oversized opaque baseline detects timestamp-preserving offl
     assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.get(p)?.fingerprint);
     assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
     fs.writeFileSync(p,Buffer.alloc(size,0x32));fs.utimesSync(p,stamp,stamp);tracker=new DiffTracker(Uri.file(storage));
-    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/Unsupported file changed since the baseline/i);
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p)?.reviewKind,'opaque');assert.match(pending(p)?.reviewReason??'',/Unsupported file changed since the baseline/i);
 });
 test('DT-08 identical opaque create event stays quiet after delete-create replacement',async()=>{
     const p=file('opaque-identical-create-bom.txt'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
@@ -1039,20 +1062,20 @@ test('DT-08 deleting an accepted opaque baseline surfaces an unavailable review'
     const p=file('opaque-delete-bom.txt');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));listedFiles=[Uri.file(p)];
     assert.equal(await tracker.resetBaselineToCurrentState(),true);assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(pending(p),undefined);
     fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
-    assert.match(pending(p)?.unavailableReason??'',/deleted.*unsupported baseline/i);
+    assert.equal(pending(p)?.reviewKind,'opaque');assert.match(pending(p)?.reviewReason??'',/deleted.*unsupported baseline/i);
 });
 test('DT-08 restored opaque baseline detects offline replacement with ordinary text',async()=>{
     const p=file('opaque-offline-replace.txt'),storage=file('storage');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
     tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.ok(tracker.opaqueBaselineFiles.has(p));assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
     fs.writeFileSync(p,'ordinary text after restart');tracker=new DiffTracker(Uri.file(storage));
-    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/unsupported baseline/i);
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p)?.reviewKind,'opaque');assert.match(pending(p)?.reviewReason??'',/unsupported baseline/i);
 });
 test('DT-08 restored opaque baseline detects offline deletion',async()=>{
     const p=file('opaque-offline-delete.txt'),storage=file('storage');fs.writeFileSync(p,Buffer.from([0xef,0xbb,0xbf,0x61]));
     tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
     assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();fs.unlinkSync(p);tracker=new DiffTracker(Uri.file(storage));
-    assert.equal(await tracker.restorePersistedState(),'restored');assert.match(pending(p)?.unavailableReason??'',/deleted.*unsupported baseline/i);
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p)?.reviewKind,'opaque');assert.match(pending(p)?.reviewReason??'',/deleted.*unsupported baseline/i);
 });
 test('DT-08 explicit baseline reset accepts the current dirty editor content',async()=>{
     const p=file('dirty-reset.m');seed(p,'old baseline','saved disk');const doc=document(p);
@@ -1691,10 +1714,12 @@ test('AUDIT-4 restored watcher covers writes during reconciliation',async()=>{
     fs.writeFileSync(p,'external');emitWatcher('change',Uri.file(p));gate.release();assert.equal(await restore,'restored');
     await new Promise(r=>setTimeout(r,180));assert.equal(pending(p)?.currentContent,'external');
 });
-test('AUDIT-5 binary new file remains excluded from text review after restart',async()=>{
-    const p=file(),q=file();seed(p,'base');fs.writeFileSync(q,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(q));assert.equal(pending(q),undefined);
+test('S1 binary new file remains read-only opaque after restart without text token',async()=>{
+    const p=file(),q=file();seed(p,'base');fs.writeFileSync(q,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(q));
+    assert.equal(pending(q)?.reviewKind,'opaque');assert.equal(tracker.getReviewToken(q),undefined);
     const storage=file('storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();await tracker.dispose();
-    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(q),undefined);
+    tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(pending(q)?.reviewKind,'opaque');assert.equal(tracker.getReviewToken(q),undefined);
 });
 test('AUDIT-6 failed old recovery preparation cannot resurrect old history',async()=>{
     const p=file(),q=file();for(const f of [p,q]){seed(f,'base','edit');await scan(f);}await tracker.revertFile(q);
