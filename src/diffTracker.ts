@@ -115,6 +115,7 @@ interface ImportedDirectoryWatch {
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
+    observedCreations?: Set<string>;
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
@@ -857,6 +858,7 @@ export class DiffTracker {
         };
         const previousReviewPaths = [...previous.trackedChanges.keys()];
         let transaction!: BaselineTransaction;
+        let replacementCreations = new Set<string>();
         const restoreMemory = (): void => {
             const observedPaths = new Set([
                 ...this.trackedChanges.keys(),
@@ -882,7 +884,7 @@ export class DiffTracker {
                 ...previous.pendingExternalChanges,
                 ...preResetObservedPaths,
                 ...observedPaths
-            ].filter(filePath => !preResetCreations.has(filePath)));
+            ].filter(filePath => !preResetCreations.has(filePath) && !replacementCreations.has(filePath)));
             this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
             this.scanUncertainFiles = new Set(previous.scanUncertainFiles);
             this.resetChangeBlocksCaches();
@@ -904,8 +906,27 @@ export class DiffTracker {
                 });
             };
             preResetStartupEvents.forEach(appendStartupEvent);
+            if (previous.baselineBuilding) {
+                for (const [filePath] of preResetCreations) {
+                    appendStartupEvent({
+                        uri: vscode.Uri.file(filePath),
+                        firstKind: 'create',
+                        kind: 'create'
+                    });
+                }
+            }
             if (this.initialIgnoreEpoch === epoch) {
                 this.initialIgnoreEvents.forEach(appendStartupEvent);
+            }
+            replacementCreations = new Set(transaction.observedCreations ?? []);
+            if (previous.baselineBuilding) {
+                for (const filePath of replacementCreations) {
+                    appendStartupEvent({
+                        uri: vscode.Uri.file(filePath),
+                        firstKind: 'create',
+                        kind: 'create'
+                    });
+                }
             }
             this.initialIgnoreEpoch = undefined;
             this.initialIgnoreEvents.clear();
@@ -919,13 +940,6 @@ export class DiffTracker {
                 // evidence. Treat all creation/startup events seen across the
                 // handoff as scan-time evidence; they must not establish a fresh
                 // post-baseline absence while the prior baseline was incomplete.
-                for (const [filePath] of preResetCreations) {
-                    appendStartupEvent({
-                        uri: vscode.Uri.file(filePath),
-                        firstKind: 'create',
-                        kind: 'create'
-                    });
-                }
                 this.initialIgnoreEpoch = epoch;
                 this.initialIgnoreEvents = startupEvents;
                 try {
@@ -939,7 +953,11 @@ export class DiffTracker {
                     }
                 }
             } else {
-                for (const [filePath, duringScan] of preResetCreations) {
+                const replayCreations = new Map<string, boolean>(preResetCreations);
+                for (const filePath of replacementCreations) {
+                    replayCreations.set(filePath, false);
+                }
+                for (const [filePath, duringScan] of replayCreations) {
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     await this.onExternalFileCreated(vscode.Uri.file(filePath), duringScan);
                 }
@@ -964,6 +982,7 @@ export class DiffTracker {
         };
 
         transaction = this.beginBaselineTransaction(restoreMemory);
+        transaction.observedCreations = new Set();
         transaction.valid = () => this.isRecording && !this.recoveryBlocked &&
             !this.workspaceContextChanged && !this.gitContextPending;
 
@@ -2923,6 +2942,7 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        this.baselineTransaction?.observedCreations?.add(filePath);
         const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.hasCapturedBaseline(filePath));
         // Capture creation evidence before stat/ignore discovery can yield. A
         // concurrent refresh must not classify this directory's children as old.
@@ -3735,6 +3755,10 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) {
             return this.actionResult(filePath, 'success', 'Acknowledge was saved before the session changed');
         }
+        // The accepted identity is now the baseline even when the follow-up read
+        // merely clears the old review. Notify original-content providers
+        // explicitly so already-open diff editors cannot retain the old baseline.
+        this.emitTrackChangesEvent({ changedFiles: [filePath], baselineChanged: true });
         await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
         return this.actionResult(filePath, 'success');
     }

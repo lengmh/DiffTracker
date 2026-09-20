@@ -318,6 +318,19 @@ test('S2 Acknowledge accepts a reliable binary identity without writing workspac
     assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
     assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
 });
+test('S2 Acknowledge notifies baseline-backed original views when text baseline becomes opaque',async()=>{
+    const p=file('ack-text-to-opaque-view.bin'),storage=file('storage'),baseline='old text baseline';
+    seed(p,baseline,baseline);tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,Buffer.from([0x41,0x00,0x42]));await scan(p);
+    assert.equal(pending(p)?.reviewKind,'opaque');
+    const events=[];tracker._onDidTrackChanges.fire=event=>events.push(event);
+    const result=await tracker.acknowledgeOpaqueChange(p);
+    assert.equal(result.status,'success',result.reason);
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.ok(tracker.opaqueBaselineFiles.has(p));
+    assert.ok(events.some(event=>event.baselineChanged&&event.changedFiles.includes(p)),
+        'Acknowledge must invalidate existing original-content views for the accepted baseline');
+});
 test('S2 Acknowledge deletion advances an opaque baseline to known absence without deleting anything',async()=>{
     const p=file('ack-deleted-opaque.dat'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
     fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
@@ -1109,6 +1122,73 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(tracker.getOriginalContent(p),beforeOriginal);assert.ok(pending(p));
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
+});
+test('S2 failed Clear Diffs preserves file create provenance observed after replacement startup',async()=>{
+    const stable=file('clear-replacement-stable.txt'),created=file('clear-replacement-created.txt'),storage=file('storage');
+    seed(stable,'stable','stable');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    listedFiles=[Uri.file(stable)];
+    const originalFindFiles=vscode.workspace.findFiles,scanEntered=deferred(),scanRelease=deferred();
+    let heldWorkspaceScan=false;
+    vscode.workspace.findFiles=async pattern=>{
+        if(!heldWorkspaceScan&&pattern.pattern==='**/*'){heldWorkspaceScan=true;scanEntered.resolve();await scanRelease.promise;}
+        return originalFindFiles(pattern);
+    };
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    try {
+        const reset=tracker.resetBaselineToCurrentState();
+        await scanEntered.promise;
+        assert.equal(tracker.initialIgnoreEpoch,undefined,'create must occur after replacement startup deferral ends');
+        fs.writeFileSync(created,'created during replacement scan');
+        await tracker.onExternalFileCreated(Uri.file(created));
+        assert.ok(tracker.baselineTransaction?.observedCreations?.has(created));
+        scanRelease.resolve();
+        assert.equal(await reset,false);
+        assert.equal(pending(created)?.reviewKind,'text');
+        assert.equal(pending(created)?.unavailableReason,undefined);
+        assert.equal(tracker.getOriginalContent(created),'');
+        assert.equal(tracker.baselineExistingFiles.has(created),false);
+    } finally {
+        scanRelease.resolve();vscode.workspace.findFiles=originalFindFiles;vscode.workspace.fs.writeFile=originalWriteFile;
+    }
+});
+test('S2 failed Clear Diffs preserves populated directory create provenance observed after replacement startup',async()=>{
+    const stable=file('clear-replacement-dir-stable.txt'),dir=file('clear-replacement-dir'),child=path.join(dir,'child.txt'),storage=file('storage');
+    seed(stable,'stable','stable');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    listedFiles=[Uri.file(stable)];
+    const originalFindFiles=vscode.workspace.findFiles,scanEntered=deferred(),scanRelease=deferred();
+    let heldWorkspaceScan=false;
+    vscode.workspace.findFiles=async pattern=>{
+        if(!heldWorkspaceScan&&pattern.pattern==='**/*'){heldWorkspaceScan=true;scanEntered.resolve();await scanRelease.promise;}
+        return originalFindFiles(pattern);
+    };
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    try {
+        const reset=tracker.resetBaselineToCurrentState();
+        await scanEntered.promise;
+        assert.equal(tracker.initialIgnoreEpoch,undefined);
+        fs.mkdirSync(dir);fs.writeFileSync(child,'new child');listedFiles=[Uri.file(stable),Uri.file(child)];
+        await tracker.onExternalFileCreated(Uri.file(dir));
+        assert.ok(tracker.baselineTransaction?.observedCreations?.has(dir));
+        assert.ok(tracker.baselineTransaction?.observedCreations?.has(child));
+        scanRelease.resolve();
+        assert.equal(await reset,false);
+        assert.equal(pending(child)?.reviewKind,'text');
+        assert.equal(pending(child)?.unavailableReason,undefined);
+        assert.equal(tracker.getOriginalContent(child),'');
+        assert.equal(tracker.baselineExistingFiles.has(child),false);
+    } finally {
+        scanRelease.resolve();vscode.workspace.findFiles=originalFindFiles;vscode.workspace.fs.writeFile=originalWriteFile;
+    }
 });
 test('S2 failed Clear Diffs resumes an interrupted prior baseline scan to Ready',async()=>{
     const p=file('clear-resume-building.txt'),storage=file('storage');
