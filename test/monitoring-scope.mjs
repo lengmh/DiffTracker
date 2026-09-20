@@ -144,6 +144,17 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
         excludes: [{ scope: 'all', pattern: '**/*.pem' }]
     }), roots, 'linux').scope;
     assert.equal(detectScopeExpansion(effective, broaderInclude).expands, true);
+
+    const removedRootEffective = validateAndCanonicalizeScope(valid({
+        excludes: [{ scope: 'folder', folder: 'frontend', pattern: 'private/**' }]
+    }), roots, 'linux').scope;
+    const reducedRoots = [roots[0]];
+    const removedRootRequested = validateAndCanonicalizeScope(valid(), reducedRoots, 'linux').scope;
+    assert.equal(
+        detectScopeExpansion(removedRootEffective, removedRootRequested).expands,
+        false,
+        'dropping rules that only applied to a removed root is a contraction'
+    );
 }
 
 console.log('monitoring scope canonicalization and expansion tests passed');

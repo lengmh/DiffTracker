@@ -568,14 +568,18 @@ export class DiffTracker {
 
         this.disposables.push(
             vscode.workspace.onDidChangeConfiguration(e => {
+                const watcherCoverageChanged = e.affectsConfiguration('files.watcherExclude');
                 if (
                     e.affectsConfiguration('diffTracker.onlyTrackAutomatedChanges') ||
                     e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges') ||
                     e.affectsConfiguration('diffTracker.watchExclude') ||
-                    e.affectsConfiguration('files.watcherExclude') ||
+                    watcherCoverageChanged ||
                     e.affectsConfiguration('search.exclude') ||
                     e.affectsConfiguration('files.exclude')
                 ) {
+                    if (watcherCoverageChanged) {
+                        this.invalidateConfiguredScopeForWatcherCoverage();
+                    }
                     this.scanCoverage = undefined;
                     this.schedulePersistState();
                     this.refreshIgnoreMatchers().catch(() => undefined);
@@ -659,9 +663,14 @@ export class DiffTracker {
         );
         const wholeWorkspaceNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
             state.effectiveMonitoringScope.mode === 'wholeWorkspace';
-        const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch || wholeWorkspaceNeedsS4;
-        this.isRecording = incomplete ? false : state.isRecording;
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
+        const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
+            state.effectiveMonitoringScope.mode === 'rules'
+            ? this.explicitIncludeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
+            : undefined;
+        const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
+            wholeWorkspaceNeedsS4 || !!watcherCoverageNeedsS4;
+        this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
         this.fileSnapshots = new Map(state.fileSnapshots);
@@ -703,6 +712,15 @@ export class DiffTracker {
             return 'blocked';
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+        if (watcherCoverageNeedsS4 && state.baselineState !== 'building') {
+            // Persist the pause so removing the setting before a later restart
+            // cannot silently resurrect a baseline that had an observation gap.
+            if (!await this.flushPersistState()) {
+                this.recoveryBlocked = true;
+                this.persistenceIssue = 'Cannot persist the watcher-coverage pause; saved review is preserved.';
+                return 'blocked';
+            }
+        }
 
         // Discover offline additions before rebuilding diffs. An existing empty
         // file and an absent baseline are distinct, including across reloads.
@@ -741,13 +759,15 @@ export class DiffTracker {
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
-            this.persistenceIssue = state.baselineState === 'building'
-                ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
-                : !rootsMatch
-                    ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
-                    : !scopeRootsMatch
-                        ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
-                        : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
+            this.persistenceIssue = watcherCoverageNeedsS4
+                ? `Effective include ${watcherCoverageNeedsS4} intersects files.watcherExclude; review is paused until the scope is narrowed or S4-W coverage exists, then the baseline is rebuilt.`
+                : state.baselineState === 'building'
+                    ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
+                    : !rootsMatch
+                        ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
+                        : !scopeRootsMatch
+                            ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
+                            : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
@@ -771,6 +791,15 @@ export class DiffTracker {
         if (this.effectiveMonitoringScope.kind === 'configured' && this.effectiveMonitoringScope.mode === 'wholeWorkspace') {
             vscode.window.showWarningMessage('Code Diff Tracker: Whole Workspace preparation requires the S4-W coverage path before recording can start.');
             return;
+        }
+        if (this.effectiveMonitoringScope.kind === 'configured') {
+            const watcherCoverageIssue = this.explicitIncludeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
+            if (watcherCoverageIssue) {
+                vscode.window.showWarningMessage(
+                    `Code Diff Tracker: Effective include ${watcherCoverageIssue} intersects files.watcherExclude. Narrow the scope or wait for S4-W supplemental coverage before rebuilding.`
+                );
+                return;
+            }
         }
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
         if (this.effectiveMonitoringScope.kind === 'legacyV3') {
@@ -1501,6 +1530,24 @@ export class DiffTracker {
             : undefined;
     }
 
+    private workspaceRootIdentityKey(root: WorkspaceRootIdentity): string {
+        const caseKey = root.caseSensitive === true ? 'cs' : root.caseSensitive === false ? 'ci' : 'unknown';
+        return `${root.name}\0${root.uri}\0${caseKey}`;
+    }
+
+    private canReconcileRemovedWorkspaceRoots(scope: CanonicalMonitoringScope): boolean {
+        if (!this.workspaceContextChanged || this.effectiveMonitoringScope.kind !== 'configured') { return false; }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) { return false; }
+        const effectiveKeys = new Set(
+            this.effectiveMonitoringScope.roots.map(root => this.workspaceRootIdentityKey(root))
+        );
+        const requestedKeys = scope.roots.map(root => this.workspaceRootIdentityKey(root));
+        if (requestedKeys.length >= effectiveKeys.size || !requestedKeys.every(key => effectiveKeys.has(key))) {
+            return false;
+        }
+        return !detectScopeExpansion(this.effectiveMonitoringScope, scope).expands;
+    }
+
     private createLegacyEffectiveScopeForRoots(roots: readonly string[]): EffectiveMonitoringScope {
         return createLegacyEffectiveScope(this.workspaceRootIdentitiesForPaths(roots), this.getLegacyGlobalWatchExcludePatterns());
     }
@@ -2159,9 +2206,10 @@ export class DiffTracker {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
         });
-        if (this.disposed || this.recoveryBlocked || this.baselineTransaction || this.baselineBuilding) {
+        const activeBaselineScan = this.baselineBuilding && this.isRecording;
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction || activeBaselineScan) {
             return empty('conflict',
-                this.baselineBuilding
+                activeBaselineScan
                     ? 'Monitoring scope cannot change while a baseline scan is still building.'
                     : 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
         }
@@ -2192,6 +2240,7 @@ export class DiffTracker {
                 return empty('requiresS4', 'This scope expansion requires broader bounded preparation in S4-W.');
             }
         }
+        const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
 
         const epoch = this.sessionEpoch;
         const previous = {
@@ -2241,7 +2290,7 @@ export class DiffTracker {
         const scopeContextStillCurrent = (): boolean =>
             this.isCurrentEpoch(epoch) &&
             requestStillCurrent() &&
-            !this.workspaceContextChanged &&
+            (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
         transaction.valid = scopeContextStillCurrent;
@@ -2251,6 +2300,7 @@ export class DiffTracker {
         }
         const result = empty('failed');
         let committed = false;
+        let requiresS4Reason: string | undefined;
         try {
             this.effectiveMonitoringScope = { kind: 'configured', ...(JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope) };
             // Protect all pending reviews from matcher pruning until each path is
@@ -2295,10 +2345,18 @@ export class DiffTracker {
             }
 
             result.capturedBaselines = await this.captureConfiguredIncludeBaselines(scope, epoch);
+            const lateWatcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
+            if (lateWatcherExcludedInclude) {
+                requiresS4Reason =
+                    `Explicit include ${lateWatcherExcludedInclude} now intersects files.watcherExclude and requires S4-W supplemental observation coverage.`;
+                throw new Error(requiresS4Reason);
+            }
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }
-            this.scanCoverage = this.ignoreFingerprint;
+            this.scanCoverage = this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+                ? undefined
+                : this.ignoreFingerprint;
             if (!await this.flushPersistState(true, transaction)) {
                 throw new Error('Configured monitoring scope could not be persisted');
             }
@@ -2323,8 +2381,9 @@ export class DiffTracker {
             }
             await this.processPendingExternalChanges();
             await this.flushPendingPersistence();
-            result.status = 'failed';
-            result.reason = error instanceof Error ? error.message : 'Monitoring scope preparation failed';
+            result.status = requiresS4Reason ? 'requiresS4' : 'failed';
+            result.reason = requiresS4Reason ??
+                (error instanceof Error ? error.message : 'Monitoring scope preparation failed');
             return result;
         } finally {
             if (!committed && this.baselineTransaction === transaction) { this.endBaselineTransaction(transaction, false); }
@@ -2721,6 +2780,81 @@ export class DiffTracker {
             this.expandSimpleBraceGlob(pattern.slice(0, match.index!) + value + pattern.slice(match.index! + match[0].length)));
     }
 
+    private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
+        const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').split('/');
+        return segments.some(segment =>
+            segment === '.git' || segment.startsWith('.difftracker-restore-'));
+    }
+
+    private watcherGlobSegmentMatches(patternSegment: string, value: string, caseSensitive: boolean): boolean {
+        let source = '^';
+        for (let index = 0; index < patternSegment.length; index++) {
+            const char = patternSegment[index];
+            if (char === '*') {
+                source += '.*';
+            } else if (char === '?') {
+                source += '.';
+            } else if (char === '[') {
+                const close = patternSegment.indexOf(']', index + 1);
+                if (close > index + 1) {
+                    // One-character wildcard is conservative for intersection
+                    // proof and avoids trusting arbitrary character-class syntax.
+                    source += '.';
+                    index = close;
+                } else {
+                    source += '\\[';
+                }
+            } else {
+                source += '\\^$.*+?(){}|[]'.includes(char) ? `\\${char}` : char;
+            }
+        }
+        try {
+            return new RegExp(source + '$', caseSensitive ? '' : 'i').test(value);
+        } catch {
+            return true;
+        }
+    }
+
+    private watcherPatternMayMatchWithinInclude(
+        pattern: string,
+        includePath: string,
+        caseSensitive: boolean
+    ): boolean {
+        if (this.watcherPatternOnlyTargetsHardBoundary(pattern)) { return false; }
+        const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const include = includePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const patternSegments = normalized.split('/').filter(Boolean);
+        const includeSegments = include.split('/').filter(Boolean);
+        if (patternSegments.length === 0) { return false; }
+
+        const memo = new Map<string, boolean>();
+        const visit = (patternIndex: number, includeIndex: number): boolean => {
+            const key = `${patternIndex}:${includeIndex}`;
+            const cached = memo.get(key);
+            if (cached !== undefined) { return cached; }
+
+            let result: boolean;
+            if (includeIndex === includeSegments.length) {
+                // The fixed include prefix is consumed. Any remaining valid glob
+                // can choose a descendant witness, so disjointness is unproven.
+                result = true;
+            } else if (patternIndex === patternSegments.length) {
+                result = false;
+            } else if (patternSegments[patternIndex] === '**') {
+                result = visit(patternIndex + 1, includeIndex) || visit(patternIndex, includeIndex + 1);
+            } else {
+                result = this.watcherGlobSegmentMatches(
+                    patternSegments[patternIndex],
+                    includeSegments[includeIndex],
+                    caseSensitive
+                ) && visit(patternIndex + 1, includeIndex + 1);
+            }
+            memo.set(key, result);
+            return result;
+        };
+        return visit(0, 0);
+    }
+
     private explicitIncludeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
         const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
         for (const rule of scope.includes) {
@@ -2733,15 +2867,59 @@ export class DiffTracker {
                 const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
                     .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
                 if (patterns.length === 0) { continue; }
+
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
                 const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
-                const probes = [rel, `${rel}/__difftracker_probe__`, `${rel}/__difftracker_probe__/file.txt`];
-                if (probes.some(probe => matcher.ignores(probe))) {
+                if (matcher.ignores(rel)) {
+                    return `${folder.name}:${rule.path}`;
+                }
+
+                let mayHaveDescendants = true;
+                try {
+                    mayHaveDescendants = !fs.lstatSync(path.join(folder.uri.fsPath, ...rel.split('/'))).isFile();
+                } catch (error) {
+                    if (!this.isFileNotFound(error)) { return `${folder.name}:${rule.path}`; }
+                }
+                if (!mayHaveDescendants) { continue; }
+
+                const directProbes = [
+                    `${rel}/__difftracker_probe__`,
+                    `${rel}/__difftracker_probe__/file.txt`
+                ];
+                if (directProbes.some(probe => matcher.ignores(probe)) ||
+                    patterns.some(pattern =>
+                        this.watcherPatternMayMatchWithinInclude(pattern, rel, identity.caseSensitive!))) {
                     return `${folder.name}:${rule.path}`;
                 }
             }
         }
         return undefined;
+    }
+
+    private invalidateConfiguredScopeForWatcherCoverage(): void {
+        if (this.effectiveMonitoringScope.kind !== 'configured' ||
+            this.effectiveMonitoringScope.mode !== 'rules') { return; }
+        const issue = this.explicitIncludeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
+        if (!issue) { return; }
+
+        const alreadyPaused = !this.isRecording && this.baselineBuilding && !this.snapshotInitialized;
+        if (this.isRecording) {
+            this.stopRecording();
+        } else {
+            this.disposeFileWatchers();
+        }
+        this.snapshotInitialized = false;
+        this.baselineBuilding = true;
+        this.scanCoverage = undefined;
+        this.schedulePersistState();
+        this._onDidChangeBaselineState.fire('building');
+        this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+
+        if (!alreadyPaused) {
+            void vscode.window.showWarningMessage(
+                `Code Diff Tracker: Effective include ${issue} now intersects files.watcherExclude. Review is paused; narrow the scope or restore watcher coverage, then rebuild the baseline.`
+            );
+        }
     }
 
     private getVsCodeExcludePatterns(resource: vscode.Uri): string[] {
@@ -2998,6 +3176,12 @@ export class DiffTracker {
 
         for (const filePath of this.trackedChanges.keys()) {
             const uri = vscode.Uri.file(filePath);
+            const folder = vscode.workspace.getWorkspaceFolder(uri);
+            if (this.workspaceContextChanged && (!folder || folder.uri.scheme !== 'file')) {
+                // A removed workspace root is intentionally retained in the
+                // paused review until the user explicitly rebuilds the baseline.
+                continue;
+            }
             if (this.isPathIgnored(uri, false, true, false)) {
                 this.deleteTrackedChange(filePath);
                 this.lineChanges.delete(filePath);

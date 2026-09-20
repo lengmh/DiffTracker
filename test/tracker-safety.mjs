@@ -24,6 +24,7 @@ let listedFiles=[];
 let listedIgnores=[];
 let vscodeExcludes={};
 let workspaceChanged;
+let configurationChanged;
 let workspaceFilesCreated;
 const docs = [];
 const watcherInstances = [];
@@ -141,7 +142,7 @@ const vscode = {
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidCreateFiles:handler=>{workspaceFilesCreated=handler;return {dispose(){}};},
-        onDidChangeConfiguration:noopEvent,
+        onDidChangeConfiguration:handler=>{configurationChanged=handler;return {dispose(){}};},
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
         findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:pattern.pattern==='**/.gitignore'?listedIgnores:[];},
         createFileSystemWatcher:createWatcher,
@@ -3024,6 +3025,146 @@ test('S3 scope apply rolls back when Git context pauses during include preparati
     assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
     assert.equal(tracker.getOriginalContent(p),undefined);
     tracker.pausedGitRepositories.clear();
+});
+
+
+test('S3 broad include defers when watcherExclude can hide a descendant',async()=>{
+    const includeDir=file('scope-descendant');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    vscodeExcludes['files.watcherExclude']={'**/generated/**':true};
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'descendant-watch-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+});
+
+test('S3 watcherExclude change pauses an already-effective include and persists the gap',async()=>{
+    const includeFile=file('scope-dynamic.txt');
+    fs.writeFileSync(includeFile,'baseline');
+    const storage=file('scope-dynamic-storage');
+    tracker.storageUri=Uri.file(storage);
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeFile).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+
+    vscodeExcludes['files.watcherExclude']={'**/scope-dynamic.txt':true};
+    configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
+    await waitUntil(()=>!tracker.getIsRecording()&&tracker.baselineBuilding&&!tracker.snapshotInitialized);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.equal(saved.isRecording,false);
+    assert.equal(saved.baselineState,'building');
+
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'incomplete');
+    assert.equal(tracker.getIsRecording(),false);
+});
+
+test('S3 watcherExclude changing during scope preparation cannot publish the candidate',async()=>{
+    const includeFile=file('scope-race.txt');
+    fs.writeFileSync(includeFile,'candidate baseline');
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeFile).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'race-watch-gap'
+    };
+    const before=tracker.getEffectiveMonitoringScope();
+    const gate=pause(includeFile,'read');
+    const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    await gate.entered;
+    vscodeExcludes['files.watcherExclude']={'**/scope-race.txt':true};
+    configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
+    gate.release();
+    const result=await applying;
+    assert.notEqual(result.status,'applied',JSON.stringify(result));
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+});
+
+test('S3 pure workspace-root removal can publish a configured contraction without clearing pending review',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=path.join(root,'scope-root-a'),rootB=path.join(root,'scope-root-b');
+    fs.mkdirSync(rootA,{recursive:true});fs.mkdirSync(rootB,{recursive:true});
+    const folders=[{uri:Uri.file(rootA),name:'a'},{uri:Uri.file(rootB),name:'b'}];
+    const getFolder=uri=>(vscode.workspace.workspaceFolders??[]).find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative);
+    });
+    try{
+        vscode.workspace.workspaceFolders=folders;
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+
+        const caseSensitive=process.platform!=='win32'&&process.platform!=='darwin';
+        const initial={
+            kind:'configured',mode:'rules',
+            roots:folders.map(folder=>({name:folder.name,uri:folder.uri.toString(),caseSensitive})),
+            includes:[],excludes:[{scope:'folder',folder:'b',pattern:'private/**'}],
+            scopeRevision:''
+        };
+        initial.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:initial.mode,roots:initial.roots,includes:initial.includes,excludes:initial.excludes
+        })).digest('hex');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(initial,false,()=>true)).status,'applied');
+
+        const removedPending=path.join(rootB,'pending.txt');
+        fs.writeFileSync(removedPending,'changed');
+        tracker.fileSnapshots.set(removedPending,'baseline');
+        tracker.baselineExistingFiles.add(removedPending);
+        tracker.updateTrackedDiff(removedPending,'changed');
+        assert.ok(pending(removedPending));
+
+        vscode.workspace.workspaceFolders=[folders[0]];
+        workspaceChanged({added:[],removed:[folders[1]]});
+        const reduced={
+            kind:'configured',mode:'rules',
+            roots:[{name:'a',uri:folders[0].uri.toString(),caseSensitive}],
+            includes:[],excludes:[],scopeRevision:''
+        };
+        reduced.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:reduced.mode,roots:reduced.roots,includes:reduced.includes,excludes:reduced.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(reduced,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,reduced.scopeRevision);
+        assert.equal(tracker.workspaceContextChanged,true,'review remains paused until explicit rebuild');
+        assert.ok(pending(removedPending),'scope reconciliation itself must not destructively clear pending review');
+
+        tracker.startRecording();
+        await waitUntil(()=>tracker.getBaselineState()==='ready');
+        assert.equal(tracker.getIsRecording(),true,'explicit rebuild can resume recording after the contraction is applied');
+        assert.equal(tracker.workspaceContextChanged,false);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
 });
 
 registerStateSchemaCompatibility({

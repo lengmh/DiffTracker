@@ -628,7 +628,10 @@ function excludeRuleCovers(
     roots: readonly WorkspaceRootIdentity[]
 ): boolean {
     const affectedRoots = roots.filter(root => ruleAppliesToRoot(effectiveRule, root.name));
-    if (affectedRoots.length === 0 || !affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) {
+    // A rule scoped only to a removed root has no remaining monitored
+    // population, so dropping it is a contraction rather than an expansion.
+    if (affectedRoots.length === 0) { return true; }
+    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) {
         return false;
     }
     if (sameRule(candidate, effectiveRule)) { return true; }
