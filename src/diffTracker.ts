@@ -2035,7 +2035,10 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch) || this.hasCapturedBaseline(filePath) ||
                 this.unresolvedBaselineFiles.has(filePath) || this.trackedChanges.has(filePath) ||
                 this.isPathIgnored(vscode.Uri.file(filePath), false, false)) { return; }
-            if (this.validateResourceTarget(filePath)) { return; }
+            const targetError = this.isRecording
+                ? this.validateSnapshotTarget(filePath)
+                : this.validateResourceTarget(filePath);
+            if (targetError) { return; }
             const state = await this.readCurrentFileState(filePath);
             if (!this.isCurrentEpoch(epoch)) { return; }
             this.recordScannedBaseline(filePath, state, 'workspace');
@@ -2158,7 +2161,17 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
-        transaction.valid = () => this.isCurrentEpoch(epoch) && requestStillCurrent();
+        const scopeContextStillCurrent = (): boolean =>
+            this.isCurrentEpoch(epoch) &&
+            requestStillCurrent() &&
+            !this.workspaceContextChanged &&
+            !this.recoveryBlocked &&
+            (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
+        transaction.valid = scopeContextStillCurrent;
+        if (!scopeContextStillCurrent()) {
+            this.endBaselineTransaction(transaction, false);
+            return empty('conflict', 'Monitoring scope preparation is blocked by the current workspace or Git context.');
+        }
         const result = empty('failed');
         let committed = false;
         try {
@@ -2169,8 +2182,8 @@ export class DiffTracker {
             this.scanCoverage = undefined;
             this.ignoreResultCache.clear();
             await this.refreshIgnoreMatchers();
-            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
-                throw new Error('Monitoring scope request changed during preparation');
+            if (!scopeContextStillCurrent()) {
+                throw new Error('Monitoring scope or workspace context changed during preparation');
             }
 
             const explicitlyExcludedReviews = new Set(this.getExplicitlyExcludedPendingReviewPaths(scope));
@@ -2205,15 +2218,15 @@ export class DiffTracker {
             }
 
             result.capturedBaselines = await this.captureConfiguredIncludeBaselines(scope, epoch);
-            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
-                throw new Error('Monitoring scope request changed during preparation');
+            if (!scopeContextStillCurrent()) {
+                throw new Error('Monitoring scope or workspace context changed during preparation');
             }
             this.scanCoverage = this.ignoreFingerprint;
             if (!await this.flushPersistState(true, transaction)) {
                 throw new Error('Configured monitoring scope could not be persisted');
             }
-            if (!this.isCurrentEpoch(epoch) || !requestStillCurrent()) {
-                throw new Error('Monitoring scope request changed after persistence');
+            if (!scopeContextStillCurrent()) {
+                throw new Error('Monitoring scope or workspace context changed after persistence');
             }
             committed = true;
             this.endBaselineTransaction(transaction, true);

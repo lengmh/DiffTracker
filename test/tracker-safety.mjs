@@ -2974,6 +2974,37 @@ registerOpaqueBaselineInvariants({
     setListedFiles: value => { listedFiles = value; }
 });
 
+
+test('S3 scope apply rolls back when Git context pauses during include preparation',async()=>{
+    const includeDir=file('scope-git-include');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const p=path.join(includeDir,'captured.txt');
+    fs.writeFileSync(p,'candidate baseline');
+    const roots=[{name:'test',uri:Uri.file(root).toString()}];
+    const scope={
+        kind:'configured',
+        mode:'rules',
+        roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],
+        scopeRevision:''
+    };
+    const identity={model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes};
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+
+    const before=tracker.getEffectiveMonitoringScope();
+    const gate=pause(p,'read');
+    const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    await gate.entered;
+    tracker.pausedGitRepositories.set(root,'Git context changed during scope preparation');
+    gate.release();
+    const result=await applying;
+    assert.notEqual(result.status,'applied',JSON.stringify(result));
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    tracker.pausedGitRepositories.clear();
+});
+
 registerStateSchemaCompatibility({
     test, root, Uri, DiffTracker, faults, file, pending,
     getTracker: () => tracker,
