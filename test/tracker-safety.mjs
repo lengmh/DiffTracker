@@ -1110,6 +1110,34 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed Clear Diffs resumes an interrupted prior baseline scan to Ready',async()=>{
+    const p=file('clear-resume-building.txt'),storage=file('storage');
+    fs.writeFileSync(p,'baseline under construction');tracker.storageUri=Uri.file(storage);
+    tracker.baselineBuilding=true;tracker.snapshotInitialized=false;tracker.initialIgnoreEpoch=tracker.sessionEpoch;
+    listedFiles=[Uri.file(p)];
+    const oldRead=pause(p,'read'),oldScan=tracker.initializeWorkspaceSnapshots();
+    await oldRead.entered;
+
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    await persistGate.entered;
+    oldRead.release();await oldScan;
+    tracker.setGitContextPending(true);
+    persistGate.release();
+
+    assert.equal(await reset,false);
+    tracker.setGitContextPending(false);
+    assert.equal(tracker.getBaselineState(),'ready','rollback must restart the cancelled prior baseline scan');
+    assert.equal(tracker.snapshotInitialized,true);
+    assert.equal(tracker.baselineBuilding,false);
+    assert.equal(tracker.initialIgnoreEpoch,undefined);
+    assert.equal(tracker.getOriginalContent(p),'baseline under construction');
+
+    fs.writeFileSync(p,'later change');await scan(p);
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.originalContent,'baseline under construction');
+    assert.equal(pending(p)?.currentContent,'later change');
+});
 test('S2 failed recording Clear Diffs replays startup events queued during replacement ignore refresh',async()=>{
     const p=file('clear-startup-event.txt'),storage=file('storage');
     seed(p,'before','before');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();

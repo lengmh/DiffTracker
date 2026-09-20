@@ -911,21 +911,53 @@ export class DiffTracker {
             this.initialIgnoreEvents.clear();
 
             this.endBaselineTransaction(transaction, false);
-            for (const [filePath, duringScan] of preResetCreations) {
-                if (!this.isCurrentEpoch(epoch)) { return; }
-                await this.onExternalFileCreated(vscode.Uri.file(filePath), duringScan);
-            }
-            for (const event of startupEvents.values()) {
-                if (!this.isCurrentEpoch(epoch)) { return; }
-                if (event.kind === 'delete') {
-                    await this.onExternalFileDeleted(event.uri);
-                } else if (event.kind === 'create' || event.firstKind === 'create') {
-                    await this.onExternalFileCreated(event.uri);
-                } else {
-                    this.pendingExternalChanges.add(event.uri.fsPath);
+
+            if (previous.baselineBuilding && this.isRecording) {
+                // advanceEpoch() cancelled the previous scan. Restoring only its
+                // flags would strand the session in "Starting..." forever, so
+                // resume discovery in the current epoch from the restored partial
+                // evidence. Treat all creation/startup events seen across the
+                // handoff as scan-time evidence; they must not establish a fresh
+                // post-baseline absence while the prior baseline was incomplete.
+                for (const [filePath] of preResetCreations) {
+                    appendStartupEvent({
+                        uri: vscode.Uri.file(filePath),
+                        firstKind: 'create',
+                        kind: 'create'
+                    });
                 }
+                this.initialIgnoreEpoch = epoch;
+                this.initialIgnoreEvents = startupEvents;
+                try {
+                    await this.initializeWorkspaceSnapshots();
+                } catch (error) {
+                    if (this.isCurrentEpoch(epoch)) {
+                        this.reportPersistenceIssue(
+                            'Failed to resume the interrupted baseline after Clear Diffs rollback.',
+                            error
+                        );
+                    }
+                }
+            } else {
+                for (const [filePath, duringScan] of preResetCreations) {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    await this.onExternalFileCreated(vscode.Uri.file(filePath), duringScan);
+                }
+                if ([...startupEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
+                    await this.refreshIgnoreMatchers();
+                }
+                for (const event of startupEvents.values()) {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (event.kind === 'delete') {
+                        await this.onExternalFileDeleted(event.uri);
+                    } else if (event.kind === 'create' || event.firstKind === 'create') {
+                        await this.onExternalFileCreated(event.uri);
+                    } else {
+                        this.pendingExternalChanges.add(event.uri.fsPath);
+                    }
+                }
+                await this.processPendingExternalChanges();
             }
-            await this.processPendingExternalChanges();
             await this.flushPendingPersistence();
             this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');
             this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
