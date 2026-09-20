@@ -121,14 +121,16 @@ export class MonitoringScopeController implements vscode.Disposable {
                     ...canonical.includes.map(rule => `Explicit include requires local authorization: ${rule.scope === 'folder' ? rule.folder + ':' : ''}${rule.path}`)
                 ]
             : [];
+        const legacyGlobalRules = this.getLegacyGlobalRules();
         return {
             requested,
             rawRequested: this.getRequestedRawScope(),
             effective,
             consented: !!canonical && scopeConsentMatches(this.context.workspaceState.get(CONSENT_KEY), canonical),
             dismissed: !!canonical && dismissedRevision === canonical.scopeRevision,
-            legacyMigrationComplete: scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots()),
-            legacyGlobalRules: this.getLegacyGlobalRules(),
+            legacyMigrationComplete: legacyGlobalRules.length === 0 ||
+                scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots()),
+            legacyGlobalRules,
             expansionReasons,
             explicitlyExcludedPendingReviews: canonical ? this.tracker.getExplicitlyExcludedPendingReviewPaths(canonical) : []
         };
@@ -210,6 +212,16 @@ export class MonitoringScopeController implements vscode.Disposable {
         // canonical scope as locally authorized on this host.
         await this.grantConsent(validated.scope);
         return { status: 'migrated' };
+    }
+
+    public async completeLegacyMigrationUsingCurrentScope(): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
+        const requested = this.getRequestedScope();
+        if (!requested.ok || !requested.scope) {
+            return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
+        }
+        await this.markLegacyMigrationComplete();
+        this.syncPendingScopeGate();
+        return { status: 'completed' };
     }
 
     public async restoreEffectiveScopeConfiguration(): Promise<void> {

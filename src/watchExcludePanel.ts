@@ -100,6 +100,22 @@ export class WatchExcludePanel {
             return;
         }
 
+        if (message.command === 'completeLegacyMigration') {
+            const answer = await vscode.window.showWarningMessage(
+                'Confirm that the current Workspace monitoring-scope settings already represent the legacy Global watch rules you want to preserve?',
+                { modal: true, detail: 'This does not delete or modify the old Global setting. It only marks this workspace migration as reviewed.' },
+                'Mark Migration Complete'
+            );
+            if (answer === 'Mark Migration Complete') {
+                const outcome = await this.scopeController.completeLegacyMigrationUsingCurrentScope();
+                if (outcome.status !== 'completed') {
+                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Current scope is invalid.'}`);
+                }
+            }
+            await this.postStatus();
+            return;
+        }
+
         if (message.command === 'restoreEffective') {
             const answer = await vscode.window.showWarningMessage(
                 'Restore Workspace Settings to the currently effective DiffTracker monitoring scope?',
@@ -128,7 +144,7 @@ export class WatchExcludePanel {
         }
     }
 
-    private async applyInteractively(): Promise<void> {
+    public async applyInteractively(): Promise<void> {
         let outcome = await this.scopeController.applyPendingScope();
 
         if (outcome.status === 'needsMigration') {
@@ -244,6 +260,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeB
 </div>
 <div class="actions">
 <button id="migrate" class="secondary">Migrate Legacy Watch Rules</button>
+<button id="complete-migration" class="secondary">Mark Manual Migration Complete</button>
 <button id="restore" class="secondary">Restore Effective Configuration</button>
 <button id="dismiss" class="secondary">Dismiss Consent Prompt</button>
 </div>

@@ -28,6 +28,7 @@
   document.getElementById('apply').addEventListener('click', () => vscode.postMessage({ command: 'apply' }));
   document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ command: 'reload' }));
   document.getElementById('migrate').addEventListener('click', () => vscode.postMessage({ command: 'migrateLegacy' }));
+  document.getElementById('complete-migration').addEventListener('click', () => vscode.postMessage({ command: 'completeLegacyMigration' }));
   document.getElementById('restore').addEventListener('click', () => vscode.postMessage({ command: 'restoreEffective' }));
   document.getElementById('dismiss').addEventListener('click', () => vscode.postMessage({ command: 'dismissConsent' }));
   document.getElementById('test-btn').addEventListener('click', () => {

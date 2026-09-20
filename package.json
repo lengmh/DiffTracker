@@ -370,6 +370,26 @@
         "command": "diffTracker.manageMonitoringScope",
         "title": "Manage Monitoring Scope",
         "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.applyPendingScope",
+        "title": "Apply Pending Scope",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.retryScopePreparation",
+        "title": "Retry Scope Preparation",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.migrateLegacyWatchRules",
+        "title": "Migrate Legacy Watch Rules",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.restoreEffectiveScopeConfiguration",
+        "title": "Restore Effective Scope Configuration",
+        "category": "Code Diff Tracker"
       }
     ],
     "menus": {

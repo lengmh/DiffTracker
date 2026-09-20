@@ -898,7 +898,39 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.manageMonitoringScope', openMonitoringScopeManager),
         // Compatibility alias retained for existing keybindings/scripts.
-        vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager)
+        vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager),
+        vscode.commands.registerCommand('diffTracker.applyPendingScope', async () => {
+            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+            await panel.applyInteractively();
+        }),
+        vscode.commands.registerCommand('diffTracker.retryScopePreparation', async () => {
+            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+            await panel.applyInteractively();
+        }),
+        vscode.commands.registerCommand('diffTracker.migrateLegacyWatchRules', async () => {
+            const outcome = await monitoringScopeController.migrateLegacyWatchRules();
+            if (outcome.status === 'migrated') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Legacy Global watch rules migrated into this workspace request.');
+            } else {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`);
+                openMonitoringScopeManager();
+            }
+            settingsTreeDataProvider.refresh();
+            return outcome;
+        }),
+        vscode.commands.registerCommand('diffTracker.restoreEffectiveScopeConfiguration', async () => {
+            const answer = await vscode.window.showWarningMessage(
+                'Restore Workspace Settings to the currently effective DiffTracker monitoring scope?',
+                { modal: true },
+                'Restore Effective Scope'
+            );
+            if (answer === 'Restore Effective Scope') {
+                await monitoringScopeController.restoreEffectiveScopeConfiguration();
+                settingsTreeDataProvider.refresh();
+                return true;
+            }
+            return false;
+        })
     );
 
     // Update decorations when switching editors
