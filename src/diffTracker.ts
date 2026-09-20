@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { CanonicalMonitoringScope, createLegacyEffectiveScope, EffectiveMonitoringScope, evaluateConfiguredScope, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
+import { CanonicalMonitoringScope, createLegacyEffectiveScope, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -2369,7 +2369,9 @@ export class DiffTracker {
                 ordinaryIgnored,
                 false
             );
-            const reason = decision.source === 'explicitExclude'
+            const reason = decision.source === 'hardBoundary'
+                ? 'Matched an unmonitorable DiffTracker hard boundary'
+                : decision.source === 'explicitExclude'
                 ? 'Matched explicit DiffTracker exclusion'
                 : decision.source === 'explicitInclude'
                     ? 'Explicit DiffTracker inclusion overrides ordinary ignore policy'
@@ -3693,6 +3695,10 @@ export class DiffTracker {
         };
         if (!isWithin(folder.uri.fsPath, filePath)) {
             return 'Resource is outside the workspace or is its root; action blocked';
+        }
+        const relativePath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
+        if (isHardUnmonitorableRelativePath(relativePath)) {
+            return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';
         }
         try {
             const realRoot = fs.realpathSync(folder.uri.fsPath);

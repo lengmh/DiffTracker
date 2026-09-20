@@ -225,3 +225,23 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     assert.equal(evaluateConfiguredScope(whole, 'frontend', 'node_modules/a.js', true).monitored, true);
     assert.equal(evaluateConfiguredScope(whole, 'frontend', 'secret/a.txt', false).monitored, false);
 }
+
+
+{
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [
+            { scope: 'all', path: '.git/objects' },
+            { scope: 'all', path: '.difftracker-restore-probe' }
+        ]
+    }), roots, 'linux').scope;
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', '.git/objects/pack.bin', true),
+        { monitored: false, source: 'hardBoundary' },
+        'hard monitoring boundaries cannot be overridden by explicit include'
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', '.difftracker-restore-probe/temp.txt', false),
+        { monitored: false, source: 'hardBoundary' },
+        'restore staging paths must remain unmonitorable'
+    );
+}

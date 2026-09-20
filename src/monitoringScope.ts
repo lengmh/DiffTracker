@@ -70,7 +70,7 @@ export interface LegacyRuleMigrationPreview {
 
 export interface ConfiguredScopeDecision {
     monitored: boolean;
-    source: 'explicitExclude' | 'explicitInclude' | 'wholeWorkspace' | 'ordinaryPolicy';
+    source: 'hardBoundary' | 'explicitExclude' | 'explicitInclude' | 'wholeWorkspace' | 'ordinaryPolicy';
 }
 
 export interface LegacyEffectiveMonitoringScope {
@@ -357,6 +357,11 @@ function explicitPatternForIgnore(pattern: string): string {
     return value;
 }
 
+export function isHardUnmonitorableRelativePath(relativePath: string): boolean {
+    const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
+    return parts.some(part => part === '.git' || part.startsWith('.difftracker-restore-'));
+}
+
 export function evaluateConfiguredScope(
     scope: CanonicalMonitoringScope,
     rootName: string,
@@ -365,6 +370,9 @@ export function evaluateConfiguredScope(
     directory = false
 ): ConfiguredScopeDecision {
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
+    if (isHardUnmonitorableRelativePath(rel)) {
+        return { monitored: false, source: 'hardBoundary' };
+    }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
         const matcher = ignore().add(explicitPatternForIgnore(rule.pattern));
