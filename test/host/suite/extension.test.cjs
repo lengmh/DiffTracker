@@ -1,9 +1,11 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 const vscode = require('vscode');
 
 const workspacePath = process.env.DIFF_TRACKER_HOST_WORKSPACE;
+const secondRoot = process.env.DIFF_TRACKER_HOST_SECOND_ROOT;
 const uri = name => vscode.Uri.file(path.join(workspacePath, name));
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const until = async (description, predicate, timeout = 30_000) => {
@@ -57,6 +59,52 @@ module.exports = async function runExtensionHostScenario() {
         await extension.activate();
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
+
+        // Stable watcher contract used by S0/W1 planning:
+        // recursive RelativePattern watchers inherit files.watcherExclude, while
+        // a non-recursive RelativePattern can subscribe to otherwise excluded
+        // direct children. The latter is observable supplemental coverage; it
+        // does not prove that a separate recursive/default watcher took over.
+        assert.ok(secondRoot, 'second host workspace root is required');
+        const excludedTree = path.join(secondRoot, 'excluded-tree');
+        fs.mkdirSync(excludedTree, { recursive: true });
+
+        const recursiveEvents = [];
+        const recursiveWatcher = vscode.workspace.createFileSystemWatcher(
+            new vscode.RelativePattern(excludedTree, '**/*')
+        );
+        recursiveWatcher.onDidCreate(event => recursiveEvents.push(event.fsPath));
+        recursiveWatcher.onDidChange(event => recursiveEvents.push(event.fsPath));
+        try {
+            await delay(750);
+            const recursiveProbe = path.join(excludedTree, 'recursive-probe.txt');
+            fs.writeFileSync(recursiveProbe, 'recursive excluded probe\n');
+            await delay(1000);
+            assert.equal(
+                recursiveEvents.some(filePath => filePath === recursiveProbe),
+                false,
+                'recursive RelativePattern must not silently bypass files.watcherExclude'
+            );
+        } finally {
+            recursiveWatcher.dispose();
+        }
+
+        const directEvents = [];
+        const directWatcher = vscode.workspace.createFileSystemWatcher(
+            new vscode.RelativePattern(excludedTree, '*')
+        );
+        directWatcher.onDidCreate(event => directEvents.push(event.fsPath));
+        directWatcher.onDidChange(event => directEvents.push(event.fsPath));
+        try {
+            await delay(750);
+            const directProbe = path.join(excludedTree, 'direct-probe.txt');
+            fs.writeFileSync(directProbe, 'non-recursive supplemental probe\n');
+            await until('non-recursive watcher coverage for watcherExclude subtree', () =>
+                directEvents.some(filePath => filePath === directProbe), 10_000);
+        } finally {
+            directWatcher.dispose();
+        }
+        console.log('PASS HOST-WATCH-CONTRACT watcherExclude requires explicit supplemental coverage');
 
         // A native/virtual baseline document shares fsPath with the real working
         // file. Review actions must never treat the virtual document as current

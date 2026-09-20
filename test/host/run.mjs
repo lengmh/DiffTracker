@@ -46,7 +46,10 @@ try {
     }
     writeFileSync(path.join(secondRoot, '.vscode', 'settings.json'), JSON.stringify({
         'files.exclude': { 'scope-files.txt': true },
-        'files.watcherExclude': { 'scope-watcher.txt': true },
+        'files.watcherExclude': {
+            'scope-watcher.txt': true,
+            'excluded-tree/**': true
+        },
         'search.exclude': { 'scope-search.txt': true }
     }));
     writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: workspacePath }, { path: secondRoot }] }));
