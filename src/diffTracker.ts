@@ -2815,6 +2815,44 @@ export class DiffTracker {
         }
     }
 
+    private watcherPatternMatchesPath(
+        pattern: string,
+        relativePath: string,
+        caseSensitive: boolean
+    ): boolean {
+        const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const target = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const patternSegments = normalized.split('/').filter(Boolean);
+        const targetSegments = target.split('/').filter(Boolean);
+        if (patternSegments.length === 0) { return false; }
+
+        const memo = new Map<string, boolean>();
+        const visit = (patternIndex: number, targetIndex: number): boolean => {
+            const key = `${patternIndex}:${targetIndex}`;
+            const cached = memo.get(key);
+            if (cached !== undefined) { return cached; }
+
+            let result: boolean;
+            if (patternIndex === patternSegments.length) {
+                result = targetIndex === targetSegments.length;
+            } else if (patternSegments[patternIndex] === '**') {
+                result = visit(patternIndex + 1, targetIndex) ||
+                    (targetIndex < targetSegments.length && visit(patternIndex, targetIndex + 1));
+            } else if (targetIndex === targetSegments.length) {
+                result = false;
+            } else {
+                result = this.watcherGlobSegmentMatches(
+                    patternSegments[patternIndex],
+                    targetSegments[targetIndex],
+                    caseSensitive
+                ) && visit(patternIndex + 1, targetIndex + 1);
+            }
+            memo.set(key, result);
+            return result;
+        };
+        return visit(0, 0);
+    }
+
     private watcherPatternMayMatchWithinInclude(
         pattern: string,
         includePath: string,
@@ -2870,7 +2908,8 @@ export class DiffTracker {
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
                 const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
-                if (matcher.ignores(rel)) {
+                if (matcher.ignores(rel) || patterns.some(pattern =>
+                    this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
                     return `${folder.name}:${rule.path}`;
                 }
 
