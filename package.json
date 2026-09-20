@@ -367,8 +367,8 @@
         "category": "Code Diff Tracker"
       },
       {
-        "command": "diffTracker.editWatchExcludes",
-        "title": "Edit Watch Ignores",
+        "command": "diffTracker.manageMonitoringScope",
+        "title": "Manage Monitoring Scope",
         "category": "Code Diff Tracker"
       }
     ],

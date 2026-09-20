@@ -129,10 +129,10 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
         if (group.id === 'tools') {
             return [
                 new SettingActionItem(
-                    'Edit Watch Ignores',
+                    'Manage Monitoring Scope',
                     {
-                        command: 'diffTracker.editWatchExcludes',
-                        title: 'Edit Watch Ignores'
+                        command: 'diffTracker.manageMonitoringScope',
+                        title: 'Manage Monitoring Scope'
                     },
                     'filter'
                 )

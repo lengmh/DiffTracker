@@ -13,6 +13,7 @@ import { WebviewDiffPanel } from './webviewDiffPanel';
 import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
 import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
+import { MonitoringScopeController } from './monitoringScopeController';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -74,6 +75,8 @@ export async function activate(context: vscode.ExtensionContext) {
     inlineContentProvider = new InlineContentProvider(diffTracker);
     codeLensProvider = new DiffCodeLensProvider(diffTracker);
     settingsTreeDataProvider = new SettingsTreeDataProvider();
+    const monitoringScopeController = new MonitoringScopeController(context, diffTracker);
+    context.subscriptions.push(monitoringScopeController);
 
     // Register tree view provider for activity bar
     diffTreeDataProvider = new DiffTreeDataProvider(diffTracker);
@@ -113,6 +116,13 @@ export async function activate(context: vscode.ExtensionContext) {
         // a late context onto snapshots that might predate a checkout.
         if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
         if (request !== recordingRequest) { return false; }
+        const scopeStatus = monitoringScopeController.getStatus();
+        if (scopeStatus.requested.ok && scopeStatus.expansionReasons.length > 0 && !scopeStatus.consented) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: The requested monitoring scope expands local access and is not authorized on this host. Apply it from Manage Monitoring Scope before starting recording.'
+            );
+            return false;
+        }
         if (diffTracker.isRecoveryBlocked()) {
             const answer = await vscode.window.showErrorMessage(
                 'Code Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
@@ -361,7 +371,16 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
                 const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
                 return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
-            })
+            }),
+            vscode.commands.registerCommand('diffTracker._testMonitoringScopeStatus', () =>
+                monitoringScopeController.getStatus()
+            ),
+            vscode.commands.registerCommand('diffTracker._testApplyMonitoringScope', (options?: { grantConsent?: boolean; discardExplicitlyExcludedReviews?: boolean }) =>
+                monitoringScopeController.applyPendingScope(options)
+            ),
+            vscode.commands.registerCommand('diffTracker._testMigrateLegacyScope', () =>
+                monitoringScopeController.migrateLegacyWatchRules()
+            )
         );
     }
 
@@ -864,10 +883,14 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    const openMonitoringScopeManager = () => {
+        WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+    };
+
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.editWatchExcludes', () => {
-            WatchExcludePanel.createOrShow(context.extensionUri, diffTracker);
-        })
+        vscode.commands.registerCommand('diffTracker.manageMonitoringScope', openMonitoringScopeManager),
+        // Compatibility alias retained for existing keybindings/scripts.
+        vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager)
     );
 
     // Update decorations when switching editors
