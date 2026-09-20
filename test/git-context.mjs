@@ -132,6 +132,33 @@ for(const dispose of [false,true]) test(`delayed Git readiness releases fresh-st
     if(dispose)monitor.dispose();else{gitApi.state='initialized';apiState.fire('initialized');}
     assert.equal(await waiter,!dispose);monitor.dispose();
 });
+test('production start blocks invalid monitoring scope configuration',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    const sandbox={
+        recordingRequest:0,
+        restoreOutcome:'absent',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:false,errors:[{message:'invalid'}]},
+            expansionReasons:[],
+            consented:false
+        })},
+        diffTracker:{
+            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,[]);
+});
+
 for(const scenario of ['fresh','stopped','restored']) test(`production activation coordinates late Git readiness (${scenario})`,async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
     const names=new Set(['startRecordingFlow','stopRecordingFlow','handleGitContextEvent']),declarations=[];

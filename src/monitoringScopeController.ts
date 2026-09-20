@@ -215,10 +215,10 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (preview.manual.length > 0) {
             return { status: 'manual', manual: preview.manual, reason: 'Some legacy negation rules require manual migration.' };
         }
-        const existing = this.getRequestedRawScope();
-        const hasWorkspaceRules = (Array.isArray(existing.includes) && existing.includes.length > 0) ||
-            (Array.isArray(existing.excludes) && existing.excludes.length > 0) ||
-            this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined;
+        const hasWorkspaceRules =
+            this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined ||
+            this.inspectWorkspaceValue<unknown>('watchInclude') !== undefined ||
+            this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined;
         if (hasWorkspaceRules) {
             return { status: 'conflict', reason: 'Workspace monitoring-scope settings already exist; migration will not overwrite them automatically.' };
         }

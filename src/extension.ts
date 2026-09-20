@@ -126,7 +126,13 @@ export async function activate(context: vscode.ExtensionContext) {
         if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
         if (request !== recordingRequest) { return false; }
         const scopeStatus = monitoringScopeController.getStatus();
-        if (scopeStatus.requested.ok && scopeStatus.expansionReasons.length > 0 && !scopeStatus.consented) {
+        if (!scopeStatus.requested.ok) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: The requested monitoring scope is invalid. Recording remains paused until the Workspace settings are corrected or the effective scope configuration is restored.'
+            );
+            return false;
+        }
+        if (scopeStatus.expansionReasons.length > 0 && !scopeStatus.consented) {
             void vscode.window.showWarningMessage(
                 'Code Diff Tracker: The requested monitoring scope expands local access and is not authorized on this host. Apply it from Manage Monitoring Scope before starting recording.'
             );
