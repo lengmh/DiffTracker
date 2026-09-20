@@ -810,28 +810,86 @@ export class DiffTracker {
         if (!this.isRecording) {
             return this.clearStoppedBaseline(epoch);
         }
+
+        const previous = {
+            fileSnapshots: new Map(this.fileSnapshots),
+            fileModes: new Map(this.fileModes),
+            baselineExistingFiles: new Set(this.baselineExistingFiles),
+            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
+            trackedChanges: new Map(this.trackedChanges),
+            lineChanges: new Map(this.lineChanges),
+            inlineViews: new Map(this.inlineViews),
+            revertHistory: this.revertHistory.map(record => ({
+                ...record,
+                items: record.items.map(item => ({ ...item, before: { ...item.before }, after: { ...item.after } }))
+            })),
+            baselineGitContexts: new Map(this.baselineGitContexts),
+            pausedGitRepositories: new Map(this.pausedGitRepositories),
+            sessionWorkspaceRoots: [...this.sessionWorkspaceRoots],
+            snapshotInitialized: this.snapshotInitialized,
+            baselineBuilding: this.baselineBuilding,
+            workspaceContextChanged: this.workspaceContextChanged,
+            scanCoverage: this.scanCoverage,
+            pendingExternalChanges: new Set(this.pendingExternalChanges)
+        };
+        const previousReviewPaths = [...previous.trackedChanges.keys()];
+        let transaction!: BaselineTransaction;
+        const restoreMemory = (): void => {
+            const observedPaths = new Set([
+                ...this.trackedChanges.keys(),
+                ...this.pendingExternalChanges
+            ]);
+            this.fileSnapshots = previous.fileSnapshots;
+            this.fileModes = previous.fileModes;
+            this.baselineExistingFiles = previous.baselineExistingFiles;
+            this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
+            this.opaqueBaselineFiles = previous.opaqueBaselineFiles;
+            this.trackedChanges = previous.trackedChanges;
+            this.lineChanges = previous.lineChanges;
+            this.inlineViews = previous.inlineViews;
+            this.revertHistory = previous.revertHistory;
+            this.baselineGitContexts = previous.baselineGitContexts;
+            this.pausedGitRepositories = previous.pausedGitRepositories;
+            this.sessionWorkspaceRoots = previous.sessionWorkspaceRoots;
+            this.snapshotInitialized = previous.snapshotInitialized;
+            this.baselineBuilding = previous.baselineBuilding;
+            this.workspaceContextChanged = previous.workspaceContextChanged;
+            this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            this.pendingExternalChanges = new Set([...previous.pendingExternalChanges, ...observedPaths]);
+            this.resetChangeBlocksCaches();
+            this.trackedChangesVersion++;
+            this.trackedChangesCacheVersion = -1;
+        };
+        const rollback = async (): Promise<void> => {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            this.endBaselineTransaction(transaction, false);
+            await this.processPendingExternalChanges();
+            await this.flushPendingPersistence();
+            this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');
+            this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+        };
+
+        transaction = this.beginBaselineTransaction(restoreMemory);
+        transaction.valid = () => this.isRecording && !this.recoveryBlocked &&
+            !this.workspaceContextChanged && !this.gitContextPending;
+
         this.workspaceContextChanged = false;
-
-        const removedFiles = Array.from(this.trackedChanges.keys());
-
-        // Recovery records belong to the baseline being explicitly replaced.
         this.revertHistory = [];
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
-
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
-
         this.pendingWriteFiles.clear();
-        this.fileSnapshots.clear();
-        this.fileModes.clear();
-        this.baselineExistingFiles.clear();
-        this.unresolvedBaselineFiles.clear();
-        this.opaqueBaselineFiles.clear();
+        this.fileSnapshots = new Map();
+        this.fileModes = new Map();
+        this.baselineExistingFiles = new Set();
+        this.unresolvedBaselineFiles = new Map();
+        this.opaqueBaselineFiles = new Map();
         this.clearTrackedChanges();
-        this.lineChanges.clear();
+        this.lineChanges = new Map();
         this.resetChangeBlocksCaches();
-        this.inlineViews.clear();
-        this.pendingExternalChanges.clear();
+        this.inlineViews = new Map();
+        this.pendingExternalChanges = new Set();
         this.snapshotInitialized = false;
         this.scanCoverage = undefined;
         this.baselineBuilding = true;
@@ -839,20 +897,31 @@ export class DiffTracker {
 
         try {
             this.initialIgnoreEpoch = epoch;
-            await this.initializeWorkspaceSnapshots();
-        } catch (error) {
-            console.error('Failed to reset baseline to current state:', error);
-        } finally {
-            if (!this.isCurrentEpoch(epoch)) { return false; }
-            // A failed/partial scan remains Building; only the scanner can publish Ready.
+            await this.initializeWorkspaceSnapshots(transaction);
+            const committed = this.isCurrentEpoch(epoch) && this.baselineTransaction === transaction &&
+                this.snapshotInitialized && !this.baselineBuilding && (!transaction.valid || transaction.valid());
+            if (!committed) {
+                await rollback();
+                return false;
+            }
+            this.endBaselineTransaction(transaction, true);
             this.emitTrackChangesEvent({
-                removedFiles,
+                removedFiles: previousReviewPaths,
                 fullRefresh: true,
                 baselineChanged: true
             });
-            this.schedulePersistState();
+            return true;
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) {
+                this.reportPersistenceIssue('Clear Diffs baseline rebuild failed; prior review retained.', error);
+                await rollback();
+            }
+            return false;
+        } finally {
+            if (this.baselineTransaction === transaction) {
+                await rollback();
+            }
         }
-        return this.snapshotInitialized && !this.baselineBuilding;
     }
 
     private async clearStoppedBaseline(epoch: number): Promise<boolean> {
@@ -2082,7 +2151,7 @@ export class DiffTracker {
         }
     }
 
-    private async initializeWorkspaceSnapshots(): Promise<void> {
+    private async initializeWorkspaceSnapshots(transaction?: BaselineTransaction): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
         const initialDocuments = new Set(vscode.workspace.textDocuments.filter(doc => doc.uri.scheme === 'file').map(doc => doc.uri.fsPath));
@@ -2188,7 +2257,7 @@ export class DiffTracker {
         }
 
         this.scanCoverage = scanIgnoreVersion === this.ignoreRefreshVersion ? scanFingerprint : undefined;
-        await this.completeBaseline(epoch);
+        await this.completeBaseline(epoch, transaction);
     }
 
     private async completeBaseline(epoch: number, transaction?: BaselineTransaction): Promise<boolean> {

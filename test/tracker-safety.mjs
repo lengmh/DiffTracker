@@ -1093,6 +1093,31 @@ test('DT-06 removed workspace roots preserve a reloadable paused session',async(
         assert.equal(tracker.getOriginalContent(p),'preserved');
     } finally { vscode.workspace.workspaceFolders=folders; }
 });
+test('S2 recording Clear Diffs persistence failure rolls back the previous review and recovery history',async()=>{
+    const p=file('clear-recording.txt'),q=file('clear-history.txt'),storage=file('storage');
+    seed(p,'before','current');seed(q,'q before','q current');await scan(p);await scan(q);
+    assert.equal((await tracker.revertFile(q)).status,'success');
+    tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    const beforeHistory=JSON.stringify(tracker.revertHistory),beforeOriginal=tracker.getOriginalContent(p);
+    listedFiles=[Uri.file(p),Uri.file(q)];
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    const result=await tracker.resetBaselineToCurrentState();
+    assert.equal(result,false);assert.equal(tracker.getIsRecording(),true);
+    assert.equal(tracker.getOriginalContent(p),beforeOriginal);assert.ok(pending(p));
+    assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
+    faults.clear();
+});
+test('S2 successful recording Clear Diffs rebuilds current text and opaque baselines without workspace writes',async()=>{
+    const textFile=file('clear-current.txt'),opaqueFile=file('clear-current.bin'),storage=file('storage');
+    seed(textFile,'old','current');await scan(textFile);
+    fs.writeFileSync(opaqueFile,Buffer.from([0,1,2,3]));await tracker.onExternalFileCreated(Uri.file(opaqueFile));
+    tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(textFile),Uri.file(opaqueFile)];
+    const textBefore=disk(textFile),opaqueBefore=fs.readFileSync(opaqueFile),writes=counters.write;
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    assert.equal(disk(textFile),textBefore);assert.deepEqual(fs.readFileSync(opaqueFile),opaqueBefore);assert.equal(counters.write,writes);
+    assert.equal(tracker.getOriginalContent(textFile),'current');assert.ok(tracker.opaqueBaselineFiles.has(opaqueFile));
+    assert.equal(tracker.getTrackedChanges().length,0);assert.equal(tracker.revertHistory.length,0);
+});
 test('AUDIT-21 stopped clear persists empty baseline and history without resuming recording',async()=>{
     const p=file(),q=file();seed(p,'before','current');seed(q,'q before','q current');await scan(p);await scan(q);assert.ok(succeeded(await tracker.revertFile(q)));
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();await tracker.flushPendingPersistence();
