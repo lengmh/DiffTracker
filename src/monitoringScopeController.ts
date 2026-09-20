@@ -95,7 +95,26 @@ export class MonitoringScopeController implements vscode.Disposable {
     private hasWorkspaceScopeRequest(): boolean {
         return this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined ||
             this.inspectWorkspaceValue<unknown>('watchInclude') !== undefined ||
-            this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined;
+            (this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined &&
+                !this.isLegacyStringArray(this.inspectWorkspaceValue<unknown>('watchExclude')));
+    }
+
+    private isLegacyStringArray(value: unknown): value is string[] {
+        return Array.isArray(value) && value.length > 0 && value.every(entry => typeof entry === 'string');
+    }
+
+    public getLegacyWatchRules(): string[] {
+        // This aggregate is only for migration UI/gating. Matching itself uses
+        // each resource's merged configuration, never this union.
+        const rules = new Set(this.getLegacyGlobalRules());
+        const workspace = this.inspectWorkspaceValue<unknown>('watchExclude');
+        if (this.isLegacyStringArray(workspace)) { workspace.forEach(rule => rules.add(rule)); }
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+            const config = vscode.workspace.getConfiguration('diffTracker', folder.uri);
+            const value = typeof config.inspect === 'function' ? config.inspect<unknown>('watchExclude')?.workspaceFolderValue : undefined;
+            if (this.isLegacyStringArray(value)) { value.forEach(rule => rules.add(rule)); }
+        }
+        return [...rules];
     }
 
     public getRequestedRawScope(): { mode: unknown; includes: unknown; excludes: unknown } {
@@ -105,7 +124,9 @@ export class MonitoringScopeController implements vscode.Disposable {
         return {
             mode: mode === undefined ? 'rules' : mode,
             includes: includes === undefined ? [] : includes,
-            excludes: excludes === undefined ? [] : excludes
+            excludes: excludes === undefined ||
+                (this.tracker.getEffectiveMonitoringScope().kind === 'legacyV3' && this.isLegacyStringArray(excludes))
+                ? [] : excludes
         };
     }
 
@@ -134,7 +155,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                     ...canonical.includes.map(rule => `Explicit include requires local authorization: ${rule.scope === 'folder' ? rule.folder + ':' : ''}${rule.path}`)
                 ]
             : [];
-        const legacyGlobalRules = this.getLegacyGlobalRules();
+        const legacyGlobalRules = this.getLegacyWatchRules();
         return {
             requested,
             rawRequested: this.getRequestedRawScope(),
@@ -178,7 +199,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             };
         }
         if (status.effective.kind === 'legacyV3' && !status.legacyMigrationComplete) {
-            return { status: 'needsMigration', reason: 'Legacy Global watch rules must be migrated before configured scope can become effective.' };
+            return { status: 'needsMigration', reason: 'Legacy watch rules must be migrated before configured scope can become effective.' };
         }
         if (status.expansionReasons.length > 0 && !status.consented) {
             if (!options?.grantConsent) {
@@ -219,7 +240,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
-        const preview = previewLegacyWatchExcludeMigration(this.getLegacyGlobalRules());
+        const preview = previewLegacyWatchExcludeMigration(this.getLegacyWatchRules());
         if (preview.manual.length > 0) {
             return { status: 'manual', manual: preview.manual, reason: 'Some legacy watch rules require manual migration to preserve downstream policy semantics.' };
         }
@@ -267,7 +288,9 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
         await config.update('monitoringScope', undefined, vscode.ConfigurationTarget.Workspace);
         await config.update('watchInclude', undefined, vscode.ConfigurationTarget.Workspace);
-        await config.update('watchExclude', undefined, vscode.ConfigurationTarget.Workspace);
+        if (!this.isLegacyStringArray(this.inspectWorkspaceValue<unknown>('watchExclude'))) {
+            await config.update('watchExclude', undefined, vscode.ConfigurationTarget.Workspace);
+        }
         await this.clearLegacyMigration();
     }
 

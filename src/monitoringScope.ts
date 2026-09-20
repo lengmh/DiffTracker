@@ -628,30 +628,52 @@ function excludeRuleCovers(
     roots: readonly WorkspaceRootIdentity[]
 ): boolean {
     const affectedRoots = roots.filter(root => ruleAppliesToRoot(effectiveRule, root.name));
-    // A rule scoped only to a removed root has no remaining monitored
-    // population, so dropping it is a contraction rather than an expansion.
     if (affectedRoots.length === 0) { return true; }
-    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) {
-        return false;
-    }
-    if (sameRule(candidate, effectiveRule)) { return true; }
+    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) { return false; }
+    if (candidate.pattern === effectiveRule.pattern) { return true; }
 
-    // General glob-subset proofs are intentionally not guessed. We can safely
-    // recognize broader exclusions when the effective rule is a literal path
-    // and the candidate matcher excludes that exact resource (and, for a
-    // directory rule, a representative descendant) on every affected root.
-    const raw = effectiveRule.pattern;
-    if (/[*?[]/.test(raw)) { return false; }
-    const trimmed = raw.replace(/^\/+/, '').replace(/\/+$/, '');
-    if (!trimmed) { return false; }
-    const directoryRule = /\/$/.test(raw);
+    // Containment is structural, not inferred from finite path probes. In
+    // particular, a slashless rule matches at arbitrary depths whereas /name
+    // matches only at the root. Unproved glob relationships remain expansions.
+    const literal = (pattern: string): { parts: string[]; anchored: boolean; directory: boolean } | undefined => {
+        const body = pattern.replace(/^\//, '').replace(/\/$/, '');
+        if (!body || /[\\*?\[\]{}\s]/.test(body)) { return undefined; }
+        return { parts: body.split('/'), anchored: pattern.startsWith('/') || body.includes('/'),
+            directory: pattern.endsWith('/') };
+    };
+    const effective = literal(effectiveRule.pattern);
+    if (!effective) { return false; }
+    const raw = candidate.pattern;
+    const recursive = raw.startsWith('**/') ? literal(raw.slice(3)) : undefined;
+    const ordinary = literal(raw);
+    const subtree = raw.endsWith('/**') ? literal(raw.slice(0, -3)) : undefined;
     return affectedRoots.every(root => {
         if (typeof root.caseSensitive !== 'boolean') { return false; }
-        const matcher = ignore({ ignorecase: !root.caseSensitive }).add(explicitPatternForIgnore(candidate.pattern));
-        if (directoryRule) {
-            return matcher.ignores(`${trimmed}/`) && matcher.ignores(`${trimmed}/__difftracker_probe__`);
+        const equal = (left: string, right: string) => root.caseSensitive
+            ? left === right : left.toLowerCase() === right.toLowerCase();
+        if (!effective.anchored) {
+            const name = ordinary && !ordinary.anchored ? ordinary :
+                recursive && !recursive.anchored ? recursive : undefined;
+            return !!name && equal(name.parts[0], effective.parts[0]) &&
+                (!name.directory || effective.directory);
         }
-        return matcher.ignores(trimmed);
+        if (ordinary) {
+            if (!ordinary.anchored) {
+                return effective.parts.some((part, index) => equal(part, ordinary.parts[0]) &&
+                    (index < effective.parts.length - 1 || !ordinary.directory || effective.directory));
+            }
+            return ordinary.parts.length <= effective.parts.length &&
+                ordinary.parts.every((part, index) => equal(part, effective.parts[index])) &&
+                (ordinary.parts.length < effective.parts.length || !ordinary.directory || effective.directory);
+        }
+        if (recursive && !recursive.anchored) {
+            return effective.parts.some((part, index) => equal(part, recursive.parts[0]) &&
+                (index < effective.parts.length - 1 || !recursive.directory || effective.directory));
+        }
+        // prefix/** covers every resource strictly below a literal prefix,
+        // but cannot cover a file at that prefix itself.
+        return !!subtree && subtree.parts.length < effective.parts.length &&
+            subtree.parts.every((part, index) => equal(part, effective.parts[index]));
     });
 }
 

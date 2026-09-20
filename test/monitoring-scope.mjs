@@ -405,3 +405,41 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         fs.rmSync(parent, { recursive: true, force: true });
     }
 }
+
+for (const [before,after,expands] of [
+    ['secret','/secret',true], ['secret/','/secret/',true], ['secret','**/secret',false],
+    ['secret/','secret',false], ['secret','secret/',true],
+    ['secret/a.txt','secret/**',false], ['/secret/a.txt','/secret',false],
+    ['secret/a.txt','secret/a.txt/**',true]
+]) {
+    const effective=validateAndCanonicalizeScope(valid({excludes:[{scope:'all',pattern:before}]}),roots).scope;
+    const requested=validateAndCanonicalizeScope(valid({excludes:[{scope:'all',pattern:after}]}),roots).scope;
+    assert.equal(detectScopeExpansion(effective,requested).expands,expands,`PR11 containment ${before} -> ${after}`);
+}
+
+// Validate every claimed contraction over a bounded exhaustive witness set.
+// This is a regression oracle, not the production containment proof.
+{
+    const patterns=['secret','secret/','/secret','/secret/','**/secret','**/secret/','secret/a','secret/**','/secret/a',
+        'a','a/','/a','a/secret','a/secret/**','**/a','**','**/*','*.txt','**/secret/*','secret/a/**'];
+    let paths=['secret','a','other','a.txt'];
+    const components=[...paths];
+    for(let depth=1,level=[...paths];depth<4;depth++){
+        level=level.flatMap(prefix=>components.map(component=>`${prefix}/${component}`));paths.push(...level);
+    }
+    const testRoots=[{name:'proof',uri:'file:///proof',caseSensitive:true}];
+    const make=pattern=>validateAndCanonicalizeScope(valid({excludes:[{scope:'all',pattern}]}),testRoots).scope;
+    let proofs=0;
+    for(const before of patterns)for(const after of patterns){
+        const effective=make(before),requested=make(after);
+        if(detectScopeExpansion(effective,requested).expands)continue;
+        proofs++;
+        for(const target of paths)for(const directory of [false,true]){
+            if(evaluateConfiguredScope(effective,testRoots[0],target,false,directory).source==='explicitExclude'){
+                assert.equal(evaluateConfiguredScope(requested,testRoots[0],target,false,directory).source,'explicitExclude',
+                    `unsound contraction ${before} -> ${after} at ${target} directory=${directory}`);
+            }
+        }
+    }
+    console.log(`PR11 checked ${proofs} structural contractions against ${paths.length*2} file/directory witnesses each`);
+}

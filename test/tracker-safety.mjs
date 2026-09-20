@@ -1,3 +1,4 @@
+import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
 /** Production regression tests. Only the VS Code API boundary is faked.
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
  * DT_SOURCE may point at an archived baseline source for red/green comparison.
@@ -120,6 +121,7 @@ function document(p) {
 }
 const vscode = {
     EventEmitter: Emitter, Uri, Range, Position, WorkspaceEdit,
+    ConfigurationTarget: { Global:1, Workspace:2, WorkspaceFolder:3 },
     RelativePattern:class {
         constructor(base,pattern){
             if (base instanceof Uri) throw new Error('VS Code 1.80 RelativePattern does not accept Uri');
@@ -3224,6 +3226,20 @@ registerStateSchemaCompatibility({
     getTracker: () => tracker,
     setTracker: value => { tracker = value; },
     setListedFiles: value => { listedFiles = value; }
+});
+
+registerPR11ReviewRegressions({
+    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode,
+    getTracker: () => tracker, setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; },
+    setListedIgnores: value => { listedIgnores = value; },
+    createScopeController: context => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try { const { MonitoringScopeController }=require('../out/monitoringScopeController.js'); return new MonitoringScopeController(context,tracker); }
+        finally { Module._load=originalLoad; }
+    },
+    setVsCodeExcludes: value => { vscodeExcludes = value; },
+    fireConfigurationChanged: key => configurationChanged({affectsConfiguration: name => name === key})
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

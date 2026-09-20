@@ -83,7 +83,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // A fresh workspace with no legacy Global rules can safely adopt the default
     // Rules scope before recording starts. Restored V1/V2/V3 sessions remain in
     // compatibility mode until the user explicitly migrates/applies them.
-    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyGlobalRules().length === 0) {
+    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyWatchRules().length === 0) {
         await monitoringScopeController.applyPendingScope();
     }
 
