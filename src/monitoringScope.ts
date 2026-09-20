@@ -7,6 +7,7 @@ export type MonitoringRuleScope = 'all' | 'folder';
 export interface WorkspaceRootIdentity {
     name: string;
     uri: string;
+    caseSensitive: boolean;
 }
 
 export interface MonitoringIncludeRule {
@@ -101,8 +102,9 @@ function normalizeRoots(roots: readonly WorkspaceRootIdentity[], errors: ScopeVa
     const normalized: WorkspaceRootIdentity[] = [];
     for (const root of roots) {
         if (!root || typeof root.name !== 'string' || root.name.length === 0 ||
-            typeof root.uri !== 'string' || root.uri.length === 0) {
-            errors.push({ field: 'roots', message: 'Workspace roots require non-empty name and URI values.' });
+            typeof root.uri !== 'string' || root.uri.length === 0 ||
+            typeof root.caseSensitive !== 'boolean') {
+            errors.push({ field: 'roots', message: 'Workspace roots require non-empty name/URI values and explicit case-sensitivity identity.' });
             continue;
         }
         if (seenUris.has(root.uri)) {
@@ -110,7 +112,7 @@ function normalizeRoots(roots: readonly WorkspaceRootIdentity[], errors: ScopeVa
             continue;
         }
         seenUris.add(root.uri);
-        normalized.push({ name: root.name, uri: root.uri });
+        normalized.push({ name: root.name, uri: root.uri, caseSensitive: root.caseSensitive });
     }
     return normalized.sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name));
 }
@@ -245,10 +247,19 @@ export function validateAndCanonicalizeScope(
             const includePath = canonicalizeIncludePath(value.path, platform);
             if (!includePath) {
                 errors.push({ field: 'include', index, message: 'Include path must be a non-root workspace-relative literal path using "/" separators.' });
-            } else if (isHardUnmonitorableRelativePath(includePath)) {
+            }
+            const targetRoots = target
+                ? target.scope === 'all'
+                    ? roots
+                    : roots.filter(root => root.name === target.folder)
+                : [];
+            const hardBoundary = !!includePath && targetRoots.some(root =>
+                isHardUnmonitorableRelativePath(includePath, root.caseSensitive)
+            );
+            if (hardBoundary) {
                 errors.push({ field: 'include', index, message: 'Include path targets a DiffTracker hard monitoring boundary.' });
             }
-            if (target && includePath && !isHardUnmonitorableRelativePath(includePath)) {
+            if (target && includePath && !hardBoundary) {
                 includes.push({ ...target, path: includePath });
             }
         });
@@ -304,13 +315,20 @@ function sameRule(left: MonitoringExcludeRule, right: MonitoringExcludeRule): bo
     return canonicalRuleKey(left) === canonicalRuleKey(right);
 }
 
-function includeCovers(effective: MonitoringIncludeRule, requested: MonitoringIncludeRule): boolean {
+function includeCovers(
+    effective: MonitoringIncludeRule,
+    requested: MonitoringIncludeRule,
+    roots: readonly WorkspaceRootIdentity[]
+): boolean {
     if (effective.scope === 'folder') {
         if (requested.scope !== 'folder' || effective.folder !== requested.folder) { return false; }
     }
-    const base = effective.path.split('/');
-    const target = requested.path.split('/');
-    return base.length <= target.length && base.every((part, index) => part === target[index]);
+    const affectedRoots = requested.scope === 'folder'
+        ? roots.filter(root => root.name === requested.folder)
+        : roots;
+    return affectedRoots.length > 0 && affectedRoots.every(root =>
+        includeCoversRelativePath(effective.path, requested.path, false, root.caseSensitive)
+    );
 }
 
 export function createScopeConsentRecord(scope: CanonicalMonitoringScope): ScopeConsentRecord {
@@ -326,9 +344,10 @@ export function scopeConsentMatches(raw: unknown, scope: CanonicalMonitoringScop
     const value = raw as Partial<ScopeConsentRecord>;
     if (value.model !== 1 || value.scopeRevision !== scope.scopeRevision || !Array.isArray(value.roots)) { return false; }
     if (value.roots.length !== scope.roots.length) { return false; }
-    const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}`;
+    const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
     const left = value.roots
-        .filter((root): root is WorkspaceRootIdentity => !!root && typeof root.name === 'string' && typeof root.uri === 'string')
+        .filter((root): root is WorkspaceRootIdentity => !!root && typeof root.name === 'string' &&
+            typeof root.uri === 'string' && typeof root.caseSensitive === 'boolean')
         .map(key).sort(compareText);
     const right = scope.roots.map(key).sort(compareText);
     return left.length === value.roots.length && left.every((item, index) => item === right[index]);
@@ -338,9 +357,19 @@ function ruleAppliesToRoot(rule: { scope: MonitoringRuleScope; folder?: string }
     return rule.scope === 'all' || (rule.scope === 'folder' && rule.folder === rootName);
 }
 
-function includeCoversRelativePath(includePath: string, relativePath: string, directory: boolean): boolean {
-    const includeParts = includePath.split('/');
-    const targetParts = relativePath.replace(/\/$/, '').split('/').filter(Boolean);
+function identityPart(value: string, caseSensitive: boolean): string {
+    return caseSensitive ? value : value.toLowerCase();
+}
+
+function includeCoversRelativePath(
+    includePath: string,
+    relativePath: string,
+    directory: boolean,
+    caseSensitive: boolean
+): boolean {
+    const includeParts = includePath.split('/').map(part => identityPart(part, caseSensitive));
+    const targetParts = relativePath.replace(/\/$/, '').split('/').filter(Boolean)
+        .map(part => identityPart(part, caseSensitive));
     if (targetParts.length >= includeParts.length &&
         includeParts.every((part, index) => targetParts[index] === part)) {
         return true;
@@ -359,8 +388,9 @@ function explicitPatternForIgnore(pattern: string): string {
     return value;
 }
 
-export function isHardUnmonitorableRelativePath(relativePath: string): boolean {
-    const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
+export function isHardUnmonitorableRelativePath(relativePath: string, caseSensitive = true): boolean {
+    const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean)
+        .map(part => identityPart(part, caseSensitive));
     return parts.some(part => part === '.git' || part.startsWith('.difftracker-restore-'));
 }
 
@@ -372,19 +402,21 @@ export function evaluateConfiguredScope(
     directory = false
 ): ConfiguredScopeDecision {
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
-    if (isHardUnmonitorableRelativePath(rel)) {
+    const root = scope.roots.find(candidate => candidate.name === rootName);
+    const caseSensitive = root?.caseSensitive ?? true;
+    if (isHardUnmonitorableRelativePath(rel, caseSensitive)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        const matcher = ignore().add(explicitPatternForIgnore(rule.pattern));
+        const matcher = ignore({ ignorecase: !caseSensitive }).add(explicitPatternForIgnore(rule.pattern));
         if (matcher.ignores(rel + (directory && rel && !rel.endsWith('/') ? '/' : ''))) {
             return { monitored: false, source: 'explicitExclude' };
         }
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (includeCoversRelativePath(rule.path, rel, directory)) {
+        if (includeCoversRelativePath(rule.path, rel, directory, caseSensitive)) {
             return { monitored: true, source: 'explicitInclude' };
         }
     }
@@ -463,7 +495,7 @@ export function scopeMigrationMatches(raw: unknown, roots: readonly WorkspaceRoo
 }
 
 function rootKey(root: WorkspaceRootIdentity): string {
-    return `${root.name}\0${root.uri}`;
+    return `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
 }
 
 function normalizeLegacyPatterns(patterns: readonly unknown[]): string[] {
@@ -514,10 +546,11 @@ export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoring
     const roots: WorkspaceRootIdentity[] = [];
     for (const root of candidate.roots) {
         if (!root || typeof root !== 'object') { return undefined; }
-        const value = root as { name?: unknown; uri?: unknown };
+        const value = root as { name?: unknown; uri?: unknown; caseSensitive?: unknown };
         if (typeof value.name !== 'string' || value.name.length === 0 ||
-            typeof value.uri !== 'string' || value.uri.length === 0) { return undefined; }
-        roots.push({ name: value.name, uri: value.uri });
+            typeof value.uri !== 'string' || value.uri.length === 0 ||
+            typeof value.caseSensitive !== 'boolean') { return undefined; }
+        roots.push({ name: value.name, uri: value.uri, caseSensitive: value.caseSensitive });
     }
 
     if (candidate.kind === 'legacyV3') {
@@ -555,7 +588,7 @@ export function detectScopeExpansion(
 
     if (effective.mode !== 'wholeWorkspace') {
         for (const include of requested.includes) {
-            if (!effective.includes.some(existing => includeCovers(existing, include))) {
+            if (!effective.includes.some(existing => includeCovers(existing, include, requested.roots))) {
                 reasons.push(`New or broader explicit include: ${include.scope === 'folder' ? include.folder + ':' : ''}${include.path}`);
             }
         }

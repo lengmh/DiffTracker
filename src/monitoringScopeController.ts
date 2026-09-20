@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { DiffTracker } from './diffTracker';
+import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
     createScopeConsentRecord,
@@ -37,6 +38,7 @@ export interface MonitoringScopeApplyOutcome {
     reason?: string;
     expansionReasons?: string[];
     affectedReviewPaths?: string[];
+    scopeRevision?: string;
 }
 
 export class MonitoringScopeController implements vscode.Disposable {
@@ -75,7 +77,11 @@ export class MonitoringScopeController implements vscode.Disposable {
     public getWorkspaceRoots(): WorkspaceRootIdentity[] {
         return (vscode.workspace.workspaceFolders ?? [])
             .filter(folder => folder.uri.scheme === 'file')
-            .map(folder => ({ name: folder.name, uri: folder.uri.toString() }))
+            .map(folder => ({
+                name: folder.name,
+                uri: folder.uri.toString(),
+                caseSensitive: detectLocalPathCaseSensitivity(folder.uri.fsPath)
+            }))
             .sort((a, b) => a.uri.localeCompare(b.uri) || a.name.localeCompare(b.name));
     }
 
@@ -85,14 +91,14 @@ export class MonitoringScopeController implements vscode.Disposable {
         return inspected?.workspaceValue;
     }
 
-    public getRequestedRawScope(): MonitoringScopeRequest {
-        const mode = this.inspectWorkspaceValue<unknown>('monitoringScope') ?? 'rules';
-        const includes = this.inspectWorkspaceValue<unknown>('watchInclude') ?? [];
-        const excludes = this.inspectWorkspaceValue<unknown>('watchExclude') ?? [];
+    public getRequestedRawScope(): { mode: unknown; includes: unknown; excludes: unknown } {
+        const mode = this.inspectWorkspaceValue<unknown>('monitoringScope');
+        const includes = this.inspectWorkspaceValue<unknown>('watchInclude');
+        const excludes = this.inspectWorkspaceValue<unknown>('watchExclude');
         return {
-            mode: mode === 'wholeWorkspace' ? 'wholeWorkspace' : 'rules',
-            includes: Array.isArray(includes) ? includes as MonitoringScopeRequest['includes'] : [],
-            excludes: Array.isArray(excludes) ? excludes as MonitoringScopeRequest['excludes'] : []
+            mode: mode === undefined ? 'rules' : mode,
+            includes: includes === undefined ? [] : includes,
+            excludes: excludes === undefined ? [] : excludes
         };
     }
 
@@ -146,18 +152,33 @@ export class MonitoringScopeController implements vscode.Disposable {
         return validated;
     }
 
-    public async applyPendingScope(options?: { grantConsent?: boolean; discardExplicitlyExcludedReviews?: boolean }): Promise<MonitoringScopeApplyOutcome> {
+    public async applyPendingScope(options?: {
+        grantConsent?: boolean;
+        discardExplicitlyExcludedReviews?: boolean;
+        expectedScopeRevision?: string;
+    }): Promise<MonitoringScopeApplyOutcome> {
         const status = this.getStatus();
         const scope = status.requested.scope;
         if (!status.requested.ok || !scope) {
             return { status: 'invalid', reason: status.requested.errors.map(error => error.message).join('; ') };
+        }
+        if (options?.expectedScopeRevision && options.expectedScopeRevision !== scope.scopeRevision) {
+            return {
+                status: 'conflict',
+                scopeRevision: scope.scopeRevision,
+                reason: 'Monitoring scope request changed after the confirmation was shown; review the new request before applying.'
+            };
         }
         if (status.effective.kind === 'legacyV3' && !status.legacyMigrationComplete) {
             return { status: 'needsMigration', reason: 'Legacy Global watch rules must be migrated before configured scope can become effective.' };
         }
         if (status.expansionReasons.length > 0 && !status.consented) {
             if (!options?.grantConsent) {
-                return { status: 'needsConsent', expansionReasons: status.expansionReasons };
+                return {
+                    status: 'needsConsent',
+                    expansionReasons: status.expansionReasons,
+                    scopeRevision: scope.scopeRevision
+                };
             }
             await this.grantConsent(scope);
         }
@@ -165,6 +186,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             return {
                 status: 'needsDiscardConfirmation',
                 affectedReviewPaths: status.explicitlyExcludedPendingReviews,
+                scopeRevision: scope.scopeRevision,
                 reason: 'Explicit exclusions would discard pending review for these paths.'
             };
         }
@@ -182,7 +204,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (applied.status === 'applied') {
             await this.clearDismissedConsent();
             this.reconcileRequestedScope();
-            return { status: 'applied' };
+            return { status: 'applied', scopeRevision: scope.scopeRevision };
         }
         if (applied.status === 'requiresS4') { return { status: 'requiresS4', reason: applied.reason }; }
         return { status: applied.status === 'conflict' ? 'conflict' : 'failed', reason: applied.reason };
@@ -194,7 +216,8 @@ export class MonitoringScopeController implements vscode.Disposable {
             return { status: 'manual', manual: preview.manual, reason: 'Some legacy negation rules require manual migration.' };
         }
         const existing = this.getRequestedRawScope();
-        const hasWorkspaceRules = existing.includes.length > 0 || existing.excludes.length > 0 ||
+        const hasWorkspaceRules = (Array.isArray(existing.includes) && existing.includes.length > 0) ||
+            (Array.isArray(existing.excludes) && existing.excludes.length > 0) ||
             this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined;
         if (hasWorkspaceRules) {
             return { status: 'conflict', reason: 'Workspace monitoring-scope settings already exist; migration will not overwrite them automatically.' };

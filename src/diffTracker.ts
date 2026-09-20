@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
+import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import { CanonicalMonitoringScope, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
@@ -1444,13 +1445,29 @@ export class DiffTracker {
 
     private workspaceRootIdentitiesForPaths(roots: readonly string[]): WorkspaceRootIdentity[] {
         const current = new Map(this.getSupportedWorkspaceFolders()
-            .map(folder => [path.resolve(folder.uri.fsPath), { name: folder.name, uri: folder.uri.toString() }] as const));
+            .map(folder => [path.resolve(folder.uri.fsPath), {
+                name: folder.name,
+                uri: folder.uri.toString(),
+                caseSensitive: detectLocalPathCaseSensitivity(folder.uri.fsPath)
+            }] as const));
         return [...roots]
             .map(root => {
                 const normalized = path.resolve(root);
-                return current.get(normalized) ?? { name: path.basename(normalized) || normalized, uri: vscode.Uri.file(normalized).toString() };
+                return current.get(normalized) ?? {
+                    name: path.basename(normalized) || normalized,
+                    uri: vscode.Uri.file(normalized).toString(),
+                    caseSensitive: detectLocalPathCaseSensitivity(normalized)
+                };
             })
             .sort((left, right) => left.uri.localeCompare(right.uri) || left.name.localeCompare(right.name));
+    }
+
+    private workspaceRootIdentityForFolder(folder: vscode.WorkspaceFolder): WorkspaceRootIdentity {
+        return {
+            name: folder.name,
+            uri: folder.uri.toString(),
+            caseSensitive: detectLocalPathCaseSensitivity(folder.uri.fsPath)
+        };
     }
 
     private currentWorkspaceRootIdentities(): WorkspaceRootIdentity[] {
@@ -1459,7 +1476,8 @@ export class DiffTracker {
 
     private sameWorkspaceRootIdentities(left: readonly WorkspaceRootIdentity[], right: readonly WorkspaceRootIdentity[]): boolean {
         if (left.length !== right.length) { return false; }
-        const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}`;
+        const key = (root: WorkspaceRootIdentity) =>
+            `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
         const a = [...left].map(key).sort((x, y) => x.localeCompare(y));
         const b = [...right].map(key).sort((x, y) => x.localeCompare(y));
         return a.every((value, index) => value === b[index]);
@@ -2024,7 +2042,7 @@ export class DiffTracker {
             const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
-            if (isHardUnmonitorableRelativePath(relative)) { continue; }
+            if (isHardUnmonitorableRelativePath(relative, this.workspaceRootIdentityForFolder(folder).caseSensitive)) { continue; }
 
             let entries: fs.Dirent[];
             try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
@@ -2038,7 +2056,10 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return files; }
                 const child = path.join(current, entry.name);
                 const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                if (isHardUnmonitorableRelativePath(childRelative) || entry.isSymbolicLink()) { continue; }
+                if (isHardUnmonitorableRelativePath(
+                    childRelative,
+                    this.workspaceRootIdentityForFolder(folder).caseSensitive
+                ) || entry.isSymbolicLink()) { continue; }
                 if (entry.isDirectory()) {
                     pending.push(child);
                 } else if (entry.isFile()) {
@@ -2074,7 +2095,7 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return captured; }
                 const target = path.join(folder.uri.fsPath, ...rule.path.split('/'));
                 const targetError = this.validateResourceTarget(target);
-                if (targetError && fs.existsSync(target)) { throw new Error(targetError); }
+                if (targetError) { throw new Error(targetError); }
                 let stat: fs.Stats | undefined;
                 try { stat = fs.lstatSync(target); }
                 catch (error) {
@@ -2605,7 +2626,10 @@ export class DiffTracker {
                 const folder = vscode.workspace.getWorkspaceFolder(uri);
                 if (!folder || folder.uri.scheme !== 'file') { continue; }
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
-                if (!isHardUnmonitorableRelativePath(relative)) { candidates.set(uri.fsPath, uri); }
+                if (!isHardUnmonitorableRelativePath(
+                    relative,
+                    this.workspaceRootIdentityForFolder(folder).caseSensitive
+                )) { candidates.set(uri.fsPath, uri); }
             }
         };
 
@@ -2844,7 +2868,10 @@ export class DiffTracker {
             return true;
         }
         const hardBoundaryPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
-        if (isHardUnmonitorableRelativePath(hardBoundaryPath)) { return true; }
+        if (isHardUnmonitorableRelativePath(
+            hardBoundaryPath,
+            this.workspaceRootIdentityForFolder(folder).caseSensitive
+        )) { return true; }
         if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory)) { return true; }
 
         // Retained Review is outside the current target scope but remains
@@ -4147,7 +4174,10 @@ export class DiffTracker {
             return 'Resource is outside the workspace or is its root; action blocked';
         }
         const relativePath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
-        if (isHardUnmonitorableRelativePath(relativePath)) {
+        if (isHardUnmonitorableRelativePath(
+            relativePath,
+            this.workspaceRootIdentityForFolder(folder).caseSensitive
+        )) {
             return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';
         }
         try {

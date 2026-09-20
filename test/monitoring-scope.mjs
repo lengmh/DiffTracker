@@ -18,8 +18,8 @@ import {
 } from '../out/monitoringScope.js';
 
 const roots = [
-    { name: 'backend', uri: 'file:///workspace/backend' },
-    { name: 'frontend', uri: 'file:///workspace/frontend' }
+    { name: 'backend', uri: 'file:///workspace/backend', caseSensitive: true },
+    { name: 'frontend', uri: 'file:///workspace/frontend', caseSensitive: true }
 ];
 
 function valid(overrides = {}) {
@@ -90,8 +90,8 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
 
 {
     const ambiguousRoots = [
-        { name: 'app', uri: 'file:///a' },
-        { name: 'app', uri: 'file:///b' }
+        { name: 'app', uri: 'file:///a', caseSensitive: true },
+        { name: 'app', uri: 'file:///b', caseSensitive: true }
     ];
     const result = validateAndCanonicalizeScope(valid({
         includes: [{ scope: 'folder', folder: 'app', path: 'private' }]
@@ -245,5 +245,25 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         evaluateConfiguredScope(defensive, 'frontend', '.git/objects/pack.bin', true),
         { monitored: false, source: 'hardBoundary' },
         'hard monitoring boundaries cannot be overridden even by a malformed pre-canonicalized scope'
+    );
+}
+
+
+{
+    const insensitiveRoots = [
+        { name: 'workspace', uri: 'file:///workspace', caseSensitive: false }
+    ];
+    const hard = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: '.GIT/objects' }]
+    }), insensitiveRoots, 'win32');
+    assert.equal(hard.ok, false, 'case-equivalent .GIT must remain a hard boundary');
+
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: 'node_modules/private' }]
+    }), insensitiveRoots, 'win32').scope;
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'workspace', 'Node_Modules/PRIVATE/file.txt', true),
+        { monitored: true, source: 'explicitInclude' },
+        'include matching must follow case-insensitive root identity'
     );
 }

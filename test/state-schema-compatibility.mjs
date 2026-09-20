@@ -24,7 +24,7 @@ export function registerStateSchemaCompatibility(harness) {
                 fileSnapshots: [], fileModes: [], baselineExistingFiles: [],
                 unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
                 effectiveMonitoringScope: createLegacyEffectiveScope(
-                    [{ name: 'test', uri: Uri.file(root).toString() }], []
+                    [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
                 ),
                 retainedReviewPaths: [], coverageGaps: [],
                 opaqueBaselineFiles: [[target, {
@@ -87,7 +87,7 @@ export function registerStateSchemaCompatibility(harness) {
                 unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
                 scanCoverage: 'a'.repeat(64),
                 effectiveMonitoringScope: createLegacyEffectiveScope(
-                    [{ name: 'test', uri: Uri.file(root).toString() }], []
+                    [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
                 ),
                 retainedReviewPaths: [], coverageGaps: []
             };
