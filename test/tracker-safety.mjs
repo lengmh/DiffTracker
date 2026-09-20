@@ -582,7 +582,7 @@ test('existing V1 persistence preserves absent versus empty baseline and paused 
     const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage); tracker.isRecording=false;
     await tracker.flushPersistState();
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
-    assert.equal(saved.version,3); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
+    assert.equal(saved.version,4); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
     const loaded=await tracker.loadPersistedState(); assert.equal(loaded.isRecording,false);
     assert.ok(loaded.baselineExistingFiles.includes(empty)); assert.equal(loaded.baselineExistingFiles.includes(absent),false);
     assert.ok(loaded.fileSnapshots.some(([p,t])=>p===absent&&t===''));
@@ -594,7 +594,7 @@ test('DT-06 atomic persistence keeps a last-good state and recovers a corrupted 
     const primary=path.join(storage,'session-state.json');
     const backup=path.join(storage,'session-state.last-good.json');
     assert.equal(fs.existsSync(backup),true);
-    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,3);
+    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,4);
     fs.writeFileSync(primary,'{"version":2,');
 
     tracker=new DiffTracker(Uri.file(storage));
@@ -711,7 +711,7 @@ test('DT-08 queued Undo calls cannot mutate after the recording session stops',a
     assert.equal(results.reduce((total,result)=>total+result.succeeded,0),0);
     assert.equal(disk(p),'baseline');assert.equal(tracker.revertHistory.length,1);
 });
-test('DT-06 valid V1 state migrates in memory and the next durable write is strict V3',async()=>{
+test('DT-06 valid V1 state migrates in memory and the next durable write is strict V4',async()=>{
     const p=file(); fs.writeFileSync(p,'changed');
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
     fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
@@ -720,7 +720,7 @@ test('DT-06 valid V1 state migrates in memory and the next durable write is stri
     tracker.storageUri=Uri.file(storage); assert.equal(await tracker.restorePersistedState(),'restored');
     assert.equal(tracker.getOriginalContent(p),'baseline'); assert.ok(pending(p));
     assert.equal(await tracker.flushPendingPersistence(),true);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,3);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,4);
 });
 test('DT-06 explicit discard is required before a blocked session can start',async()=>{
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
