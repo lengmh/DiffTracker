@@ -1,6 +1,6 @@
 # S0 foundation findings
 
-- 状态：S0 实施记录
+- 状态：S0 complete（最终 head 仍需 PR 验证通过后合并）
 - 基线：`main@60928fad6209c2cf1198fac6eff8b338b9e1bffb`
 - 实施分支：`feat/0.8-s0-native-review-foundation`
 - 目标：冻结 0.8.x 剩余实现范围，不进入 S1 功能开发
@@ -30,10 +30,10 @@ PR #6（`spike/native-review-poc`）已作为架构 spike 关闭而未合并。R
 | Clear Diffs 新说明与混合资源语义 | 底层 baseline reset 已有，0.8 文案/范围语义未完成 | S2 |
 | Scope Revision / Policy Fingerprint / Coverage Generation | 未实现 | S3 |
 | `monitoringScope` / `watchInclude` / 新结构化 `watchExclude` | 未实现 | S3 |
-| Workspace Trust 显式产品契约 | 设计已接受，manifest 尚未完成 | S3 |
+| Workspace Trust 显式产品契约 | 设计已接受，当前 manifest 没有 `capabilities.untrustedWorkspaces` | S3 |
 | Session V4、V1/V2/V3→V4、0.7.2 downgrade blocking | 未实现；当前 writer 为 V3 | S3 |
 | Requested / Consent / Effective Scope / Runtime Coverage 四层状态 | 未实现 | S3 |
-| whole-workspace bounded preview/preparation | 未实现 | S4 |
+| whole-workspace bounded preview/preparation | 未实现；现有 5 处 `workspace.findFiles` 中 4 处仍使用固定默认目录排除 | S4 统一到 scope matcher |
 | `files.watcherExclude` 盲区补充覆盖与 coverage gap | 未实现为产品状态 | S4 |
 | imported directory direct watcher bridge | 已有；逐目录 `fs.watch`、256 hard cap、失败/ignore/reconciliation 回归已存在 | S4-W1 在其上实现可证明 handoff 与回收 |
 | imported bridge 自动 handoff | 未实现 | S4-W1 |
@@ -85,7 +85,9 @@ S0 对 VS Code watcher 的源码与真实 Host 探测得到以下约束：
 3. 普通稳定 API watcher 的事件是非关联的；扩展没有可用的 request ownership/ready 证据来证明“这个新 watcher 已接管该事件”。
 4. recursive RelativePattern 会遵守 `files.watcherExclude`，不能用来证明排除子树已恢复覆盖。
 5. Run #203 在 Stable Linux、Stable Windows、VS Code 1.80 Linux 上均证明：简单 non-recursive RelativePattern 也不能作为本项目该 `files.watcherExclude` 子树的可靠补充覆盖方案。
-6. 因此 handoff 不能以“watcher 对象已创建”“扫描成功”或“listener 收到一次事件”为充分条件。
+6. Run #207 使用独立 `fs.watch` 作为正向控制，在 Stable Linux、Stable Windows 和 VS Code 1.80 Linux 上均收到被宿主排除子树的后续变化；三个 Host 同时通过 `PASS HOST-WATCH-CONTRACT` 与 `PASS HOST-NATIVE-BASELINE`。
+7. 这证明“DiffTracker 明确拥有的直接 watcher”可以作为当前支持平台上的 supplemental coverage 基础，但 S4 仍必须处理 unnamed event、OS quota、目录替换、epoch、ignore revision、ownership 与 reconciliation，不能把这次单目录探针直接等同于完整 handoff 实现。
+8. 因此 handoff 不能以“watcher 对象已创建”“扫描成功”或“未关联 listener 收到一次事件”为充分条件。
 
 ADR-0020 据此要求 S4 区分：
 
@@ -105,3 +107,16 @@ ADR-0020 据此要求 S4 区分：
 5. **S5**：真实 native review 入口、stale view、hunk/block 映射、多文件 Multi Diff、跨平台/最低版本、迁移、性能和 VSIX 发布候选验收。
 
 S0 不启动 S1，也不提高最低 VS Code 版本、不放宽容量、不依赖 proposed API。
+
+
+## 7. S0 verification summary
+
+S0 最终冻结前的真实验证证据：
+
+- Run #202：PR #6 提取后的最小 native-review foundation 在 Linux/Windows quality、Stable Host、VS Code 1.80.2 Host 和 VSIX 打包通过。
+- Run #203：故意失败的 watcher capability probe 证明简单 VS Code RelativePattern 不能恢复 `files.watcherExclude` 子树覆盖；该失败作为设计证据保留。
+- Run #207：修订后的契约探针在 Stable Linux、Stable Windows、VS Code 1.80.2 Linux 上通过；Linux/Windows quality 与 VSIX 打包均通过。
+- production tracker 的 working-document lookup 已完成全量 AST 审计并加回归，避免虚拟 URI 再次通过相同 `fsPath` 冒充真实文件。
+- S0 没有实现 Acknowledge、V4、范围配置、whole-workspace、handoff 或生产 native review UI，因此没有跨入 S1—S4 的功能边界。
+
+`docs/roadmap.md` 中旧的 0.7.0/二进制状态描述已在 S0 校准；后续产品契约仍以 `CONTEXT.md`、`docs/monitoring-scope-0.8.md` 和 ADR 为准。
