@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     canonicalizeExcludePattern,
     canonicalizeIncludePath,
@@ -121,3 +124,15 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
 }
 
 console.log('monitoring scope canonicalization and expansion tests passed');
+
+{
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
+    assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
+    assert.equal(manifest.contributes.configuration.properties['diffTracker.monitoringScope'].scope, 'window');
+    assert.deepEqual(manifest.contributes.configuration.properties['diffTracker.monitoringScope'].enum, ['rules', 'wholeWorkspace']);
+    assert.equal(manifest.contributes.configuration.properties['diffTracker.watchInclude'].scope, 'window');
+    const excludeItems = manifest.contributes.configuration.properties['diffTracker.watchExclude'].items.oneOf;
+    assert.ok(excludeItems.some(item => item.type === 'string'), 'legacy Global string rules must remain schema-readable during migration');
+    assert.ok(excludeItems.some(item => item.type === 'object'), 'structured Workspace exclusions must be expressible');
+}

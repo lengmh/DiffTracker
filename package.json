@@ -124,10 +124,39 @@
         "diffTracker.watchExclude": {
           "type": "array",
           "default": [],
+          "scope": "window",
           "items": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Legacy Global watch-ignore entry retained for migration compatibility."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "scope",
+                  "pattern"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "all",
+                      "folder"
+                    ]
+                  },
+                  "folder": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
           },
-          "description": "Additional ignore patterns for file watching (one pattern per entry, gitignore-style)"
+          "description": "Requested explicit exclusions for this workspace. Structured entries use restricted gitignore-style patterns without ! negation. Legacy Global string entries remain protected until migration."
         },
         "diffTracker.onlyTrackVSCodeChanges": {
           "type": "boolean",
@@ -139,6 +168,49 @@
           "type": "boolean",
           "default": false,
           "description": "Track external and tagged automation changes. Editor changes without reliable source information remain visible for review; saving does not automatically accept them."
+        },
+        "diffTracker.monitoringScope": {
+          "type": "string",
+          "enum": [
+            "rules",
+            "wholeWorkspace"
+          ],
+          "default": "rules",
+          "scope": "window",
+          "enumDescriptions": [
+            "Use ordinary ignore policy, with explicit DiffTracker includes/excludes applied by the monitoring-scope manager.",
+            "Request monitoring of all monitorable workspace resources except explicit DiffTracker exclusions."
+          ],
+          "description": "Requested monitoring scope for this workspace. Scope expansion requires local confirmation before it becomes effective."
+        },
+        "diffTracker.watchInclude": {
+          "type": "array",
+          "default": [],
+          "scope": "window",
+          "items": {
+            "type": "object",
+            "required": [
+              "scope",
+              "path"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "folder"
+                ]
+              },
+              "folder": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Requested explicit workspace-relative paths to include. Folder-scoped entries require a unique workspace folder name."
         }
       }
     },

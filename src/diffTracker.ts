@@ -2117,10 +2117,19 @@ export class DiffTracker {
 
     private getWatchExcludePatterns(resource: vscode.Uri): string[] {
         const config = vscode.workspace.getConfiguration('diffTracker', resource);
-        const raw = config.get<string[]>('watchExclude', []) ?? [];
+        // S3 separates the new Workspace request from the legacy Global policy.
+        // Until an explicit migration publishes a new effective scope, the
+        // existing matcher must keep the old Global string rules verbatim and
+        // must never interpret structured Workspace entries as legacy strings.
+        const inspected = typeof config.inspect === 'function'
+            ? config.inspect<unknown[]>('watchExclude')
+            : undefined;
+        const raw = inspected?.globalValue ?? config.get<unknown[]>('watchExclude', []) ?? [];
+        if (!Array.isArray(raw)) { return []; }
         const ignoreRules: string[] = [];
 
         raw.forEach(line => {
+            if (typeof line !== 'string') { return; }
             const trimmed = line.trim();
             if (!trimmed) {
                 return;
