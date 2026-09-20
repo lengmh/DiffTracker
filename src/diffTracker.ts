@@ -480,6 +480,8 @@ export class DiffTracker {
     private ignoreFingerprint?: string;
     private scanCoverage?: string;
     private effectiveMonitoringScope: EffectiveMonitoringScope;
+    private pendingMonitoringScope?: CanonicalMonitoringScope;
+    private pendingScopeSuspendedPaths = new Set<string>();
     private retainedReviewPaths = new Set<string>();
     private coverageGaps = new Map<string, string>();
     private coverageGeneration = 0;
@@ -1921,6 +1923,38 @@ export class DiffTracker {
         this.schedulePersistState();
     }
 
+    private pendingScopeExplicitlyExcludes(uri: vscode.Uri, directory = false): boolean {
+        const scope = this.pendingMonitoringScope;
+        if (!scope || uri.scheme !== 'file') { return false; }
+        const folder = vscode.workspace.getWorkspaceFolder(uri);
+        if (!folder || folder.uri.scheme !== 'file') { return false; }
+        const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
+        return evaluateConfiguredScope(scope, folder.name, relPath, false, directory).source === 'explicitExclude';
+    }
+
+    private deferPendingScopeEvent(uri: vscode.Uri, directory = false): boolean {
+        if (!this.pendingScopeExplicitlyExcludes(uri, directory)) { return false; }
+        this.pendingScopeSuspendedPaths.add(uri.fsPath);
+        return true;
+    }
+
+    public setPendingMonitoringScope(scope?: CanonicalMonitoringScope): void {
+        this.pendingMonitoringScope = scope
+            ? JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope
+            : undefined;
+        for (const filePath of [...this.pendingScopeSuspendedPaths]) {
+            const uri = vscode.Uri.file(filePath);
+            if (this.pendingScopeExplicitlyExcludes(uri)) { continue; }
+            this.pendingScopeSuspendedPaths.delete(filePath);
+            if (this.isRecording && !this.isPathIgnored(uri, false, true, false)) {
+                this.markFileUnavailable(
+                    filePath,
+                    'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review'
+                );
+            }
+        }
+    }
+
     public getExplicitlyExcludedPendingReviewPaths(scope: CanonicalMonitoringScope): string[] {
         const results: string[] = [];
         for (const filePath of this.trackedChanges.keys()) {
@@ -2707,7 +2741,7 @@ export class DiffTracker {
         return { ignored: ordinaryIgnored, reason: ordinaryIgnored ? 'Matched legacy ignore rules' : 'Not ignored' };
     }
 
-    private isPathIgnored(uri: vscode.Uri, directory = false, respectRetainedReview = true): boolean {
+    private isPathIgnored(uri: vscode.Uri, directory = false, respectRetainedReview = true, respectPendingScope = true): boolean {
         if (uri.scheme !== 'file') { return true; }
         // Lookup cost depends on path depth, not the number of recent recoveries.
         for (let current = uri.fsPath; ; current = path.dirname(current)) {
@@ -2718,10 +2752,12 @@ export class DiffTracker {
         if (!folder || folder.uri.scheme !== 'file') {
             return true;
         }
+        const hardBoundaryPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
+        if (isHardUnmonitorableRelativePath(hardBoundaryPath)) { return true; }
+        if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory)) { return true; }
 
         // Retained Review is outside the current target scope but remains
-        // minimally observable until its pending review is resolved. Hard
-        // boundaries and temporary restore staging still win above this point.
+        // minimally observable until its pending review is resolved.
         if (respectRetainedReview && this.retainedReviewPaths.has(uri.fsPath)) { return false; }
 
         const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
@@ -2758,7 +2794,7 @@ export class DiffTracker {
 
         for (const filePath of this.trackedChanges.keys()) {
             const uri = vscode.Uri.file(filePath);
-            if (this.isPathIgnored(uri)) {
+            if (this.isPathIgnored(uri, false, true, false)) {
                 this.deleteTrackedChange(filePath);
                 this.lineChanges.delete(filePath);
                 this.markLineChangesUpdated(filePath);
@@ -3080,6 +3116,7 @@ export class DiffTracker {
     }
 
     private recordScannedBaseline(filePath: string, state: CurrentFileState, scope: 'workspace' | 'repository'): void {
+        if (this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) { return; }
         // Recheck after the scanner's await. An editor may have captured a valid
         // before-image in the meantime; neither scanner may overwrite it.
         if (this.hasCapturedBaseline(filePath) || this.isPathIgnored(vscode.Uri.file(filePath))) { return; }
@@ -3371,6 +3408,7 @@ export class DiffTracker {
         }
 
         if (this.deferInitialIgnoreEvent(uri)) { return; }
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -3453,6 +3491,7 @@ export class DiffTracker {
         }
 
         if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -3543,6 +3582,7 @@ export class DiffTracker {
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) { return; }
         this.recordBaselineTransactionEvent(uri, 'delete');
         const operationId = this.beginExternalOperation(uri, 'delete');
@@ -3566,6 +3606,7 @@ export class DiffTracker {
 
     private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.pendingWriteFiles.has(filePath) && !this.activeWriteFiles.has(filePath)) {
             const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
@@ -5552,6 +5593,7 @@ export class DiffTracker {
             return;
         }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
@@ -5606,6 +5648,7 @@ export class DiffTracker {
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
         if (this.deferInitialIgnoreEvent(uri)) { return; }
+        if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }

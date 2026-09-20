@@ -45,7 +45,28 @@ export class MonitoringScopeController implements vscode.Disposable {
     constructor(
         private readonly context: vscode.ExtensionContext,
         private readonly tracker: DiffTracker
-    ) {}
+    ) {
+        this.syncPendingScopeGate();
+        this.disposables.push(vscode.workspace.onDidChangeConfiguration(event => {
+            if (
+                event.affectsConfiguration('diffTracker.monitoringScope') ||
+                event.affectsConfiguration('diffTracker.watchInclude') ||
+                event.affectsConfiguration('diffTracker.watchExclude')
+            ) {
+                this.syncPendingScopeGate();
+            }
+        }));
+    }
+
+    private syncPendingScopeGate(): void {
+        const requested = this.getRequestedScope();
+        const effective = this.tracker.getEffectiveMonitoringScope();
+        const scope = requested.ok ? requested.scope : undefined;
+        const pending = scope && (effective.kind !== 'configured' || effective.scopeRevision !== scope.scopeRevision)
+            ? scope
+            : undefined;
+        this.tracker.setPendingMonitoringScope(pending);
+    }
 
     public dispose(): void {
         for (const disposable of this.disposables.splice(0)) { disposable.dispose(); }
@@ -158,6 +179,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         );
         if (applied.status === 'applied') {
             await this.clearDismissedConsent();
+            this.syncPendingScopeGate();
             return { status: 'applied' };
         }
         if (applied.status === 'requiresS4') { return { status: 'requiresS4', reason: applied.reason }; }
