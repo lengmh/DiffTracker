@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
     canonicalizeExcludePattern,
@@ -16,6 +17,7 @@ import {
     evaluateConfiguredScope,
     validateAndCanonicalizeScope
 } from '../out/monitoringScope.js';
+import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 const roots = [
     { name: 'backend', uri: 'file:///workspace/backend', caseSensitive: true },
@@ -362,4 +364,29 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     }), roots, 'linux').scope;
     assert.equal(detectScopeExpansion(redundantEffective, requested).expands, false,
         'removing a redundant narrow exclusion after a broader one remains a contraction');
+}
+
+
+{
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-path-identity-'));
+    const numericRoot = path.join(parent, '1234567890');
+    fs.mkdirSync(numericRoot);
+    try {
+        assert.equal(
+            detectLocalPathCaseSensitivity(numericRoot, 'win32'),
+            undefined,
+            'path identity detection must return unknown when no existing component can prove case semantics'
+        );
+        const unresolvedRoot = [{
+            name: 'workspace',
+            uri: 'file:///workspace',
+            caseSensitive: undefined
+        }];
+        const result = validateAndCanonicalizeScope(valid(), unresolvedRoot, 'win32');
+        assert.equal(result.ok, false,
+            'configured scope must fail closed when root case semantics are unverified');
+        assert.match(result.errors.map(error => error.message).join(' '), /case-sensitivity/i);
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
 }

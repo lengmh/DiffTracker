@@ -287,7 +287,11 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public async markLegacyMigrationComplete(): Promise<void> {
-        await this.context.workspaceState.update(MIGRATION_KEY, createScopeMigrationRecord(this.getWorkspaceRoots()));
+        const requested = this.getRequestedScope();
+        if (!requested.ok || !requested.scope) {
+            throw new Error('Cannot mark legacy migration complete while workspace path identity is unverified.');
+        }
+        await this.context.workspaceState.update(MIGRATION_KEY, createScopeMigrationRecord(requested.scope.roots));
     }
 
     public async clearLegacyMigration(): Promise<void> {

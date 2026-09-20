@@ -44,13 +44,13 @@ function probeExistingPath(existingPath: string): boolean | undefined {
 
 /**
  * Determine the local root's path-case semantics without writing probe files.
- * If an existing component cannot prove the answer, fall back conservatively:
- * Windows/macOS are treated case-insensitive; other platforms case-sensitive.
+ * If existing resource identity cannot prove the answer, return undefined.
+ * Callers must fail closed rather than guessing from the operating system.
  */
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
-    platform: NodeJS.Platform = process.platform
-): boolean {
+    _platform: NodeJS.Platform = process.platform
+): boolean | undefined {
     const rootProbe = probeExistingPath(rootPath);
     if (rootProbe !== undefined) { return rootProbe; }
     try {
@@ -64,7 +64,7 @@ export function detectLocalPathCaseSensitivity(
         // The caller separately validates root accessibility. Identity detection
         // must never broaden a hard boundary because a probe could not run.
     }
-    return platform !== 'win32' && platform !== 'darwin';
+    return undefined;
 }
 
 export function pathIdentityText(value: string, caseSensitive: boolean): string {

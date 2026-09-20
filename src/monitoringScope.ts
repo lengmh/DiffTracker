@@ -7,6 +7,10 @@ export type MonitoringRuleScope = 'all' | 'folder';
 export interface WorkspaceRootIdentity {
     name: string;
     uri: string;
+    caseSensitive?: boolean;
+}
+
+export interface CanonicalWorkspaceRootIdentity extends WorkspaceRootIdentity {
     caseSensitive: boolean;
 }
 
@@ -29,7 +33,7 @@ export interface MonitoringScopeRequest {
 }
 
 export interface CanonicalMonitoringScope extends MonitoringScopeRequest {
-    roots: WorkspaceRootIdentity[];
+    roots: CanonicalWorkspaceRootIdentity[];
     scopeRevision: string;
 }
 
@@ -54,7 +58,7 @@ export interface ScopeExpansionResult {
 export interface ScopeConsentRecord {
     model: 1;
     scopeRevision: string;
-    roots: WorkspaceRootIdentity[];
+    roots: CanonicalWorkspaceRootIdentity[];
 }
 
 export interface ScopeMigrationRecord {
@@ -71,12 +75,12 @@ export interface LegacyRuleMigrationPreview {
 
 export interface ConfiguredScopeDecision {
     monitored: boolean;
-    source: 'hardBoundary' | 'explicitExclude' | 'explicitInclude' | 'wholeWorkspace' | 'ordinaryPolicy';
+    source: 'identityUnknown' | 'hardBoundary' | 'explicitExclude' | 'explicitInclude' | 'wholeWorkspace' | 'ordinaryPolicy';
 }
 
 export interface LegacyEffectiveMonitoringScope {
     kind: 'legacyV3';
-    roots: WorkspaceRootIdentity[];
+    roots: CanonicalWorkspaceRootIdentity[];
     legacyWatchExclude: string[];
     scopeRevision: string;
 }
@@ -97,9 +101,12 @@ function compareText(left: string, right: string): number {
     return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function normalizeRoots(roots: readonly WorkspaceRootIdentity[], errors: ScopeValidationError[]): WorkspaceRootIdentity[] {
+function normalizeRoots(
+    roots: readonly WorkspaceRootIdentity[],
+    errors: ScopeValidationError[]
+): CanonicalWorkspaceRootIdentity[] {
     const seenUris = new Set<string>();
-    const normalized: WorkspaceRootIdentity[] = [];
+    const normalized: CanonicalWorkspaceRootIdentity[] = [];
     for (const root of roots) {
         if (!root || typeof root.name !== 'string' || root.name.length === 0 ||
             typeof root.uri !== 'string' || root.uri.length === 0 ||
@@ -414,7 +421,10 @@ export function evaluateConfiguredScope(
         ? scope.roots.find(candidate => candidate.name === rootIdentity)
         : rootIdentity;
     const rootName = typeof rootIdentity === 'string' ? rootIdentity : rootIdentity.name;
-    const caseSensitive = root?.caseSensitive ?? true;
+    if (!root || typeof root.caseSensitive !== 'boolean') {
+        return { monitored: false, source: 'identityUnknown' };
+    }
+    const caseSensitive = root.caseSensitive;
     if (isHardUnmonitorableRelativePath(rel, caseSensitive, directory)) {
         return { monitored: false, source: 'hardBoundary' };
     }
@@ -511,7 +521,7 @@ export function previewLegacyWatchExcludeMigration(
     return { excludes, includes, manual, ignoredNoops };
 }
 
-export function createScopeMigrationRecord(roots: readonly WorkspaceRootIdentity[]): ScopeMigrationRecord {
+export function createScopeMigrationRecord(roots: readonly CanonicalWorkspaceRootIdentity[]): ScopeMigrationRecord {
     return {
         model: 1,
         roots: roots.map(root => ({ ...root })).sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name))
@@ -522,12 +532,16 @@ export function scopeMigrationMatches(raw: unknown, roots: readonly WorkspaceRoo
     if (!raw || typeof raw !== 'object') { return false; }
     const value = raw as Partial<ScopeMigrationRecord>;
     if (value.model !== 1 || !Array.isArray(value.roots)) { return false; }
-    const expected = createScopeMigrationRecord(roots);
+    const errors: ScopeValidationError[] = [];
+    const canonicalRoots = normalizeRoots(roots, errors);
+    if (errors.length > 0) { return false; }
+    const expected = createScopeMigrationRecord(canonicalRoots);
     return JSON.stringify(value.roots) === JSON.stringify(expected.roots);
 }
 
 function rootKey(root: WorkspaceRootIdentity): string {
-    return `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
+    const caseKey = root.caseSensitive === true ? 'cs' : root.caseSensitive === false ? 'ci' : 'unknown';
+    return `${root.name}\0${root.uri}\0${caseKey}`;
 }
 
 function normalizeLegacyPatterns(patterns: readonly unknown[]): string[] {
@@ -575,7 +589,7 @@ export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoring
         !/^[a-f0-9]{64}$/.test(candidate.scopeRevision)) {
         return undefined;
     }
-    const roots: WorkspaceRootIdentity[] = [];
+    const roots: CanonicalWorkspaceRootIdentity[] = [];
     for (const root of candidate.roots) {
         if (!root || typeof root !== 'object') { return undefined; }
         const value = root as { name?: unknown; uri?: unknown; caseSensitive?: unknown };

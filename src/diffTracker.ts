@@ -763,6 +763,11 @@ export class DiffTracker {
 
     public startRecording() {
         if (this.disposed || this.recoveryBlocked) { return; }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) {
+            vscode.window.showWarningMessage(`Code Diff Tracker: ${identityIssue}. Recording remains paused.`);
+            return;
+        }
         if (this.effectiveMonitoringScope.kind === 'configured' && this.effectiveMonitoringScope.mode === 'wholeWorkspace') {
             vscode.window.showWarningMessage('Code Diff Tracker: Whole Workspace preparation requires the S4-W coverage path before recording can start.');
             return;
@@ -1478,11 +1483,22 @@ export class DiffTracker {
 
     private sameWorkspaceRootIdentities(left: readonly WorkspaceRootIdentity[], right: readonly WorkspaceRootIdentity[]): boolean {
         if (left.length !== right.length) { return false; }
-        const key = (root: WorkspaceRootIdentity) =>
-            `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
+        const key = (root: WorkspaceRootIdentity) => {
+            const caseKey = root.caseSensitive === true ? 'cs' : root.caseSensitive === false ? 'ci' : 'unknown';
+            return `${root.name}\0${root.uri}\0${caseKey}`;
+        };
         const a = [...left].map(key).sort((x, y) => x.localeCompare(y));
         const b = [...right].map(key).sort((x, y) => x.localeCompare(y));
         return a.every((value, index) => value === b[index]);
+    }
+
+    private getPathIdentityIssue(): string | undefined {
+        const unresolved = this.currentWorkspaceRootIdentities()
+            .filter(root => typeof root.caseSensitive !== 'boolean')
+            .map(root => root.name);
+        return unresolved.length > 0
+            ? `Cannot verify path case-sensitivity for workspace root(s): ${unresolved.join(', ')}`
+            : undefined;
     }
 
     private createLegacyEffectiveScopeForRoots(roots: readonly string[]): EffectiveMonitoringScope {
@@ -2047,11 +2063,9 @@ export class DiffTracker {
             const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
-            if (isHardUnmonitorableRelativePath(
-                relative,
-                this.workspaceRootIdentityForFolder(folder).caseSensitive,
-                true
-            )) { continue; }
+            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof rootIdentity.caseSensitive !== 'boolean' ||
+                isHardUnmonitorableRelativePath(relative, rootIdentity.caseSensitive, true)) { continue; }
 
             let entries: fs.Dirent[];
             try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
@@ -2065,11 +2079,10 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return files; }
                 const child = path.join(current, entry.name);
                 const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                if (isHardUnmonitorableRelativePath(
-                    childRelative,
-                    this.workspaceRootIdentityForFolder(folder).caseSensitive,
-                    entry.isDirectory()
-                ) || entry.isSymbolicLink()) { continue; }
+                const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+                if (typeof rootIdentity.caseSensitive !== 'boolean' ||
+                    isHardUnmonitorableRelativePath(childRelative, rootIdentity.caseSensitive, entry.isDirectory()) ||
+                    entry.isSymbolicLink()) { continue; }
                 if (entry.isDirectory()) {
                     pending.push(child);
                 } else if (entry.isFile()) {
@@ -2157,6 +2170,10 @@ export class DiffTracker {
         }
         if (scope.mode === 'wholeWorkspace') {
             return empty('requiresS4', 'Whole Workspace preparation and coverage belong to S4-W.');
+        }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) {
+            return empty('conflict', identityIssue);
         }
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
             return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
@@ -2644,10 +2661,9 @@ export class DiffTracker {
                 const folder = vscode.workspace.getWorkspaceFolder(uri);
                 if (!folder || folder.uri.scheme !== 'file') { continue; }
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
-                if (!isHardUnmonitorableRelativePath(
-                    relative,
-                    this.workspaceRootIdentityForFolder(folder).caseSensitive
-                )) { candidates.set(uri.fsPath, uri); }
+                const identity = this.workspaceRootIdentityForFolder(folder);
+                if (typeof identity.caseSensitive !== 'boolean') { continue; }
+                if (!isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) { candidates.set(uri.fsPath, uri); }
             }
         };
 
@@ -2713,6 +2729,7 @@ export class DiffTracker {
                 : this.getSupportedWorkspaceFolders();
             for (const folder of folders) {
                 const identity = this.workspaceRootIdentityForFolder(folder);
+                if (typeof identity.caseSensitive !== 'boolean') { return `${folder.name}:unverified-path-identity`; }
                 const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
                     .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
                 if (patterns.length === 0) { continue; }
@@ -2899,7 +2916,9 @@ export class DiffTracker {
                 ordinaryIgnored,
                 false
             );
-            const reason = decision.source === 'hardBoundary'
+            const reason = decision.source === 'identityUnknown'
+                ? 'Workspace path case-sensitivity could not be verified'
+                : decision.source === 'hardBoundary'
                 ? 'Matched an unmonitorable DiffTracker hard boundary'
                 : decision.source === 'explicitExclude'
                 ? 'Matched explicit DiffTracker exclusion'
@@ -2926,6 +2945,7 @@ export class DiffTracker {
         }
         const hardBoundaryPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
         const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+        if (typeof rootIdentity.caseSensitive !== 'boolean') { return true; }
         let hardBoundaryDirectory = directory;
         if (!hardBoundaryDirectory &&
             !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity.caseSensitive, false) &&
@@ -4255,12 +4275,16 @@ export class DiffTracker {
             return 'Resource is outside the workspace or is its root; action blocked';
         }
         const relativePath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
+        const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+        if (typeof rootIdentity.caseSensitive !== 'boolean') {
+            return 'Cannot verify workspace path case-sensitivity; action blocked';
+        }
         let targetIsDirectory = false;
         try { targetIsDirectory = fs.lstatSync(filePath).isDirectory(); }
         catch (error) { if (!this.isFileNotFound(error)) { return 'Cannot verify the resource workspace boundary; action blocked'; } }
         if (isHardUnmonitorableRelativePath(
             relativePath,
-            this.workspaceRootIdentityForFolder(folder).caseSensitive,
+            rootIdentity.caseSensitive,
             targetIsDirectory
         )) {
             return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';
