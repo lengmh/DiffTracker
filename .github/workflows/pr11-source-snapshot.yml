@@ -1,0 +1,30 @@
+name: PR11 source snapshot
+on:
+  push:
+    branches: [work/pr11-review-e3e5a23]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Export tracked sources and installed test dependencies
+        shell: bash
+        run: |
+          mkdir -p /tmp/pr11-source
+          git archive HEAD | tar -x -C /tmp/pr11-source
+          cp -a node_modules /tmp/pr11-source/node_modules
+          git rev-parse HEAD > /tmp/pr11-source/SNAPSHOT_COMMIT
+          tar -czf pr11-source.tar.gz -C /tmp/pr11-source .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr11-source
+          path: pr11-source.tar.gz
+          retention-days: 3
+          if-no-files-found: error
