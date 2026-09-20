@@ -127,8 +127,12 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal(await vscode.workspace.applyEdit(excludedEdit), true);
         assert.equal(await pendingExcludeDoc.save(), true);
         await delay(500);
-        assert.equal(await pending('existing.txt'), undefined,
-            'pending explicit exclusion must pause new review reads before confirmation');
+        const pausedReview = await pending('existing.txt');
+        assert.equal(pausedReview?.reviewKind, 'unknown',
+            'pending explicit exclusion must preserve the prior baseline as unverified review');
+        assert.match(pausedReview?.unavailableReason ?? '', /pending explicit exclusion|paused.*exclusion/i);
+        assert.equal((await state()).reviewTokens.some(token => token.filePath === uri('existing.txt').fsPath), false,
+            'unverified pending-exclusion review must not expose a text action token');
 
         await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
         const gapReview = await untilStable(

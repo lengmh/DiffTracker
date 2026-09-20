@@ -2980,7 +2980,11 @@ test('S3 scope apply rolls back when Git context pauses during include preparati
     fs.mkdirSync(includeDir,{recursive:true});
     const p=path.join(includeDir,'captured.txt');
     fs.writeFileSync(p,'candidate baseline');
-    const roots=[{name:'test',uri:Uri.file(root).toString()}];
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
     const scope={
         kind:'configured',
         mode:'rules',
