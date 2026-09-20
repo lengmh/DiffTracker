@@ -400,3 +400,4 @@ V3 恢复后进入范围兼容模式，继续使用旧 Global `watchExclude` 的
 | [0017](./adr/0017-unified-monitoring-scope-management-and-diagnostics.md) | 统一范围管理和诊断 |
 | [0018](./adr/0018-distinct-monitoring-scope-recovery-commands.md) | 独立恢复命令 |
 | [0019](./adr/0019-native-review-as-stable-api-adapter.md) | 原生文本审阅作为稳定 API 适配层 |
+| [0020](./adr/0020-provable-watcher-handoff-coverage.md) | watcher handoff 必须基于可证明的替代覆盖 |
