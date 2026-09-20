@@ -198,7 +198,8 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     ], 'linux');
     assert.ok(preview.manual.includes('!secret/keep.txt'),
         'overlapping legacy negation must require manual migration');
-    assert.ok(!preview.includes.some(rule => rule.path === 'secret/keep.txt'));
+    assert.ok(preview.includes.some(rule => rule.path === 'secret/keep.txt'),
+        'manual legacy negations remain available as explicit-include suggestions');
     assert.ok(preview.includes.some(rule => rule.path === 'private-data'),
         'simple negation remains available as an explicit-include suggestion');
     assert.ok(preview.manual.includes('!private-data/'),

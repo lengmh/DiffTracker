@@ -72,7 +72,7 @@ module.exports = async function runExtensionHostScenario() {
         // Explicit includes must baseline existing resources hidden by ordinary
         // default exclusions. Do not require subsequent watcher events here:
         // supplemental observation coverage for host-excluded subtrees is S4-W.
-        const privateDir = path.join(workspacePath, 'node_modules', 's3-private');
+        const privateDir = path.join(workspacePath, 'dist', 's3-private');
         const privatePath = path.join(privateDir, 'existing.txt');
         const privateTrackedPath = vscode.Uri.file(privatePath).fsPath;
         fs.mkdirSync(privateDir, { recursive: true });
