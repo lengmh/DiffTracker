@@ -309,6 +309,16 @@
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
           "group": "inline"
+        },
+        {
+          "command": "diffTracker.showWebviewDiff",
+          "when": "view == diffTracker.changesView && viewItem == opaqueFile",
+          "group": "inline"
+        },
+        {
+          "command": "diffTracker.showWebviewDiff",
+          "when": "view == diffTracker.changesView && viewItem == unknownFile",
+          "group": "inline"
         }
       ],
       "explorer/context": [

@@ -7,6 +7,8 @@ import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
 
+export type ReviewKind = 'text' | 'opaque' | 'unknown';
+
 export interface FileDiff {
     sourceNote?: string;
     filePath: string;
@@ -14,7 +16,15 @@ export interface FileDiff {
     originalContent: string;
     currentContent: string;
     isDeleted: boolean;
+    reviewKind: ReviewKind;
+    reviewReason?: string;
     unavailableReason?: string;
+    baselineExists?: boolean;
+    currentExists?: boolean;
+    baselineSize?: number;
+    currentSize?: number;
+    baselineFingerprint?: string;
+    currentFingerprint?: string;
     changes: Diff.Change[];
     timestamp: Date;
 }
@@ -243,7 +253,7 @@ export class DiffTracker {
     public getReviewToken(filePath: string): ReviewToken | undefined {
         const change = this.trackedChanges.get(filePath);
         const baseline = this.fileSnapshots.get(filePath);
-        if (!change || baseline === undefined || this.disposed) { return undefined; }
+        if (!change || change.reviewKind !== 'text' || change.unavailableReason || baseline === undefined || this.disposed) { return undefined; }
         return {
             filePath, epoch: this.sessionEpoch,
             baselineRevision: this.revision(baseline, this.baselineExistingFiles.has(filePath)),
@@ -2185,29 +2195,6 @@ export class DiffTracker {
             !this.isBinaryUnavailableReason(existingUnresolvedReason)
             ? existingUnresolvedReason
             : undefined;
-        if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath) &&
-            !this.opaqueBaselineFiles.has(filePath) && !preservedUncertaintyReason) {
-            // Code Diff Tracker is text-oriented. Retain an internal unresolved marker
-            // when the before-image is unknown, but do not count a binary-only
-            // path as an actionable text review. A known-absent baseline remains
-            // available so a later text incarnation can still be reviewed.
-            if (!this.fileSnapshots.has(filePath)) {
-                this.unresolvedBaselineFiles.set(filePath, existingUnresolvedReason ?? reason);
-                this.schedulePersistState();
-            }
-            const wasTracked = this.trackedChanges.has(filePath);
-            const hadLineChanges = this.lineChanges.has(filePath);
-            const hadInlineView = this.inlineViews.has(filePath);
-            this.deleteTrackedChange(filePath);
-            this.lineChanges.delete(filePath);
-            this.inlineViews.delete(filePath);
-            this.invalidateChangeBlocksCache(filePath);
-            if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
-            if (wasTracked || hadLineChanges || hadInlineView) {
-                this.emitTrackChangesEvent({ removedFiles: [filePath] });
-            }
-            return;
-        }
         // Unknown paths must survive restart too. A later create notification may
         // establish an absent baseline, but unavailable bytes are never accepted.
         if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
@@ -2226,6 +2213,8 @@ export class DiffTracker {
             originalContent: this.fileSnapshots.get(filePath) ?? '',
             currentContent: previous?.currentContent ?? '',
             isDeleted: previous?.isDeleted ?? false,
+            reviewKind: 'unknown',
+            reviewReason: effectiveReason,
             changes: previous?.changes ?? [], timestamp: new Date(), unavailableReason: effectiveReason
         });
         this.emitTrackChangesEvent({ changedFiles: [filePath] });
@@ -2242,6 +2231,53 @@ export class DiffTracker {
         return state.kind === 'unavailable' && this.isStableUnsupportedBaselineReason(state.reason) &&
             typeof state.size === 'number' && Number.isFinite(state.size) &&
             typeof state.mtime === 'number' && Number.isFinite(state.mtime);
+    }
+
+    private getCurrentStateSize(state: CurrentFileState): number | undefined {
+        if (this.isStableUnsupportedState(state)) { return state.size; }
+        if (state.kind === 'text') { return Buffer.byteLength(state.content, 'utf8'); }
+        return undefined;
+    }
+
+    private markOpaqueReview(filePath: string, state: CurrentFileState, reason: string): void {
+        const opaqueBaseline = this.opaqueBaselineFiles.get(filePath);
+        const textBaseline = this.fileSnapshots.get(filePath);
+        const baselineExists = opaqueBaseline ? true : this.baselineExistingFiles.has(filePath);
+        const currentExists = state.kind !== 'missing';
+        const previous = this.trackedChanges.get(filePath);
+        const hadLineChanges = this.lineChanges.has(filePath);
+
+        this.setTrackedChange(filePath, {
+            filePath,
+            fileName: displayFileName(filePath),
+            originalContent: textBaseline ?? '',
+            currentContent: state.kind === 'text' ? state.content : '',
+            isDeleted: !currentExists,
+            reviewKind: 'opaque',
+            reviewReason: reason,
+            sourceNote: previous?.sourceNote,
+            baselineExists,
+            currentExists,
+            baselineSize: opaqueBaseline?.size ??
+                (baselineExists && textBaseline !== undefined ? Buffer.byteLength(textBaseline, 'utf8') : undefined),
+            currentSize: this.getCurrentStateSize(state),
+            baselineFingerprint: opaqueBaseline?.fingerprint ??
+                (baselineExists && textBaseline !== undefined
+                    ? createHash('sha256').update(textBaseline, 'utf8').digest('hex')
+                    : undefined),
+            currentFingerprint: this.isStableUnsupportedState(state)
+                ? state.fingerprint
+                : state.kind === 'text'
+                    ? createHash('sha256').update(state.content, 'utf8').digest('hex')
+                    : undefined,
+            changes: [],
+            timestamp: new Date()
+        });
+        this.lineChanges.delete(filePath);
+        this.inlineViews.delete(filePath);
+        this.invalidateChangeBlocksCache(filePath);
+        if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
+        this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
 
     private hasCapturedBaseline(filePath: string): boolean {
@@ -2335,9 +2371,13 @@ export class DiffTracker {
             : state.kind === 'text'
                 ? 'File changed from an unsupported baseline; original content is unavailable'
                 : this.isStableUnsupportedState(state)
-                    ? 'Unsupported file changed since the baseline; content cannot be reviewed'
+                    ? 'Unsupported file changed since the baseline; content is available only as a file identity'
                     : state.reason;
-        this.markFileUnavailable(filePath, reason);
+        if (state.kind === 'missing' || state.kind === 'text' || this.isStableUnsupportedState(state)) {
+            this.markOpaqueReview(filePath, state, reason);
+        } else {
+            this.markFileUnavailable(filePath, reason);
+        }
         return true;
     }
 
@@ -2417,7 +2457,17 @@ export class DiffTracker {
             if (currentState.kind === 'missing' && this.baselineExistingFiles.has(filePath)) {
                 this.updateTrackedDiff(filePath, '', { currentExists: false });
             } else if (currentState.kind === 'unavailable') {
-                this.markFileUnavailable(filePath, currentState.reason);
+                if (this.isStableUnsupportedState(currentState)) {
+                    this.markOpaqueReview(
+                        filePath,
+                        currentState,
+                        this.baselineExistingFiles.has(filePath)
+                            ? 'Text baseline changed to a read-only unsupported file'
+                            : 'Read-only unsupported file was created after the baseline'
+                    );
+                } else {
+                    this.markFileUnavailable(filePath, currentState.reason);
+                }
             }
         });
         if (!this.isCurrentEpoch(epoch)) { return; }
@@ -2668,7 +2718,17 @@ export class DiffTracker {
                 return;
             }
             if (state.kind === 'unavailable') {
-                this.markFileUnavailable(filePath, state.reason);
+                if (this.isStableUnsupportedState(state) && this.fileSnapshots.has(filePath)) {
+                    this.markOpaqueReview(
+                        filePath,
+                        state,
+                        this.baselineExistingFiles.has(filePath)
+                            ? 'Text baseline changed to a read-only unsupported file'
+                            : 'Read-only unsupported file was created after the baseline'
+                    );
+                } else {
+                    this.markFileUnavailable(filePath, state.reason);
+                }
                 return;
             }
             await this.readFileAndUpdate(filePath, uri);
@@ -2718,7 +2778,17 @@ export class DiffTracker {
             return;
         }
         if (state.kind === 'unavailable') {
-            this.markFileUnavailable(filePath, state.reason);
+            if (this.isStableUnsupportedState(state) && this.fileSnapshots.has(filePath)) {
+                this.markOpaqueReview(
+                    filePath,
+                    state,
+                    this.baselineExistingFiles.has(filePath)
+                        ? 'Text baseline changed to a read-only unsupported file'
+                        : 'Read-only unsupported file changed after creation'
+                );
+            } else {
+                this.markFileUnavailable(filePath, state.reason);
+            }
         } else if (state.kind === 'text') {
             this.updateTrackedDiff(filePath, state.content);
         } else if (this.fileSnapshots.has(filePath)) {
@@ -2786,6 +2856,9 @@ export class DiffTracker {
             originalContent,
             currentContent,
             isDeleted,
+            reviewKind: 'text',
+            baselineExists: this.baselineExistingFiles.has(filePath),
+            currentExists,
             changes,
             timestamp: new Date()
         });
@@ -3360,16 +3433,33 @@ export class DiffTracker {
             return result;
         }
         // Verify persisted state, including existence, before removing this item.
+        // Our own save can race a watcher that observes the restored baseline and
+        // clears the pending review before this continuation resumes. Treat that
+        // as success only when the session, baseline revision and current bytes
+        // still prove the exact reviewed target was restored.
         const current = await this.readCurrentFileState(filePath);
         const finalTargetError = this.validateActionTarget(filePath);
-        if (finalTargetError || !this.matchesReview(review)) {
-            return this.actionResult(filePath, 'conflict', finalTargetError ?? 'Session or review changed during revert', result.bufferChanged);
+        if (finalTargetError) {
+            return this.actionResult(filePath, 'conflict', finalTargetError, result.bufferChanged);
         }
+        const baseline = this.fileSnapshots.get(filePath);
         const baselineExists = this.baselineExistingFiles.has(filePath);
-        if ((baselineExists && (current.kind !== 'text' || current.content !== change.originalContent)) ||
-            (!baselineExists && current.kind !== 'missing')) {
+        if (!this.isCurrentEpoch(review.epoch) || baseline === undefined ||
+            this.revision(baseline, baselineExists) !== review.baselineRevision) {
+            return this.actionResult(filePath, 'conflict', 'Session or baseline changed during revert', result.bufferChanged);
+        }
+        const currentMatchesBaseline = baselineExists
+            ? current.kind === 'text' && current.content === baseline
+            : current.kind === 'missing';
+        if (!currentMatchesBaseline) {
             return this.actionResult(filePath, 'conflict', 'File does not match the baseline after revert; review retained', result.bufferChanged);
         }
+        // Any pending projection left here is stale with respect to the
+        // authoritative resource state we just verified. This includes late
+        // watcher/document events from our own write. A genuinely newer state
+        // (dirty, unreadable, deleted, binary, or different text) cannot reach
+        // this branch because readCurrentFileState/currentMatchesBaseline above
+        // rejects it.
         this.clearFileReview(filePath);
         this.schedulePersistState();
         return result;

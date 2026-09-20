@@ -57,7 +57,13 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         getOriginalContent: () => '',
         getChangeBlocks: () => [],
         getBaselineState: () => 'ready'
-        ,getReviewToken:()=>reviewToken,getReviewTokens:()=>[reviewToken],getIsRecording:()=>true,
+        ,getReviewToken:()=> {
+            const change = state.changes[0];
+            return change && change.reviewKind && change.reviewKind !== 'text' ? undefined : reviewToken;
+        },getReviewTokens:()=> {
+            const change = state.changes[0];
+            return change && change.reviewKind && change.reviewKind !== 'text' ? [] : [reviewToken];
+        },getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
     const panel = Object.create(load('webviewDiffPanel.ts').WebviewDiffPanel.prototype);
@@ -203,23 +209,63 @@ for (const isDeleted of [false, true]) {
     });
 }
 
-await test('unavailable state is visible in generated DOM, tree and incremental payload', async () => {
+await test('unknown state is visible in generated DOM, tree and incremental payload', async () => {
     const reason = 'Permission denied <restricted>';
     const h = harness({ filePath, fileName: 'empty.m', originalContent: '', currentContent: '', unavailableReason: reason });
     h.panel.sendDataUpdate();
     assert.equal(h.messages[0].unavailableReason, reason);
     const ui = runInline(h.panel.getHtmlContent());
-    assert.equal(ui.notice(), `Review unavailable: ${reason}`);
+    assert.equal(ui.notice(), `Review status unknown: ${reason}`);
     assert.equal(ui.elements.get('btn-keep-all').disabled, true);
     assert.equal(ui.elements.get('btn-reject-all').disabled, true);
     const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
     const leaf = (await tree.getChildren()).find(item => item.filePath === filePath);
-    assert.match(leaf.description, /Unavailable: Permission denied/);
+    assert.match(leaf.description, /Unknown · Permission denied/);
     assert.ok(leaf.tooltip.includes(reason));
     // Recovery comes from authoritative updateData and re-enables file actions.
-    ui.receive({ ...h.messages[0], unavailableReason: undefined });
+    ui.receive({ ...h.messages[0], reviewKind: 'text', reviewReason: undefined, unavailableReason: undefined });
     assert.match(ui.notice(), /Empty file created/);
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+});
+
+await test('opaque file review is visible, read-only and carries identity metadata', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const h = harness({
+        filePath,
+        fileName: 'image.png',
+        originalContent: '',
+        currentContent: '',
+        isDeleted: false,
+        reviewKind: 'opaque',
+        reviewReason: 'Read-only unsupported file was created after the baseline',
+        baselineExists: false,
+        currentExists: true,
+        currentSize: 6,
+        currentFingerprint: fingerprint,
+        changes: []
+    });
+    h.panel.sendDataUpdate();
+    const payload = h.messages[0];
+    assert.equal(payload.reviewKind, 'opaque');
+    assert.equal(payload.reviewToken, undefined);
+    assert.equal(payload.currentSize, 6);
+    assert.equal(payload.currentFingerprint, fingerprint);
+
+    const ui = runInline(h.panel.getHtmlContent());
+    assert.match(ui.notice(), /Read-only file change:/);
+    assert.match(ui.notice(), /Baseline: missing/);
+    assert.match(ui.notice(), /Current: exists \(6 B\)/);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+    assert.equal(ui.rendererCalls(), 0);
+
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const root = await tree.getChildren();
+    const leaf = root.find(item => item.filePath === filePath);
+    assert.match(leaf.description, /Read-only · Added · 6 B/);
+    assert.equal(leaf.contextValue, 'opaqueFile');
+    assert.ok(leaf.tooltip.includes(fingerprint));
+    assert.equal(leaf.reviewToken, undefined);
 });
 
 await test('failed acknowledgement unlocks the generated UI while pending file remains reviewable', () => {
@@ -338,5 +384,16 @@ await test('workspace document lookups distinguish file working documents from v
     };
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
+});
+await test('opaque and unknown tree items expose only the read-only inspection action',()=>{
+    const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+    const items=manifest.contributes.menus['view/item/context'];
+    for(const contextValue of ['opaqueFile','unknownFile']){
+        const commands=items
+            .filter(item=>(item.when??'').includes(`viewItem == ${contextValue}`))
+            .map(item=>item.command)
+            .sort();
+        assert.deepEqual(commands,['diffTracker.showWebviewDiff']);
+    }
 });
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);

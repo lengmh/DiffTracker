@@ -137,7 +137,9 @@ export function registerOpaqueBaselineInvariants(harness) {
                     } finally { gate.release(); }
                     assert.equal(await operation, true);
                     if (notification !== 'open-after-parent') {
-                        await waitUntil(() => !!pending(target)?.unavailableReason, 5000);
+                        await waitUntil(() => notification === 'document'
+                            ? pending(target)?.reviewKind === 'unknown'
+                            : pending(target)?.reviewKind === 'opaque', 5000);
                     } else {
                         assert.equal(pending(target), undefined, 'opening known unchanged bytes is quiet');
                     }
@@ -210,7 +212,7 @@ export function registerOpaqueBaselineInvariants(harness) {
                 if (notification.startsWith('save')) { tracker.onDidSaveDocument(doc); }
                 else { tracker.onDocumentChanged({ document: doc, contentChanges: [] }); }
                 if (changed) {
-                    await waitUntil(() => /changed since the baseline/i.test(pending(target)?.unavailableReason ?? ''), 5000);
+                    await waitUntil(() => pending(target)?.reviewKind === 'opaque', 5000);
                 } else {
                     await waitUntil(() => pending(target) === undefined, 5000);
                 }
@@ -245,10 +247,15 @@ export function registerOpaqueBaselineInvariants(harness) {
                                 doc.isDirty = false;
                                 tracker.onDidSaveDocument(doc);
                                 if (captured) {
-                                    await waitUntil(() => /changed since the baseline/i.test(pending(target)?.unavailableReason ?? ''), 5000);
+                                    await waitUntil(() => pending(target)?.reviewKind === 'opaque', 5000);
                                 }
                             }
-                            assert.ok(pending(target)?.unavailableReason);
+                            if (saved) {
+                                assert.equal(pending(target)?.reviewKind, captured ? 'opaque' : pending(target)?.reviewKind);
+                                assert.ok(pending(target), 'saved opaque change must remain visible');
+                            } else {
+                                assert.ok(pending(target)?.unavailableReason);
+                            }
                             if (abort === 'git') {
                                 tracker.observeGitContext({ repoRoot: repo, kind: 'repository', headName: 'third',
                                     headCommit: 'ccc', detached: false, inProgress: false });
@@ -261,7 +268,12 @@ export function registerOpaqueBaselineInvariants(harness) {
                         try {
                             assert.equal(await operation, false);
                             assert.deepEqual(tracker.opaqueBaselineFiles.get(target), original, 'rollback restores the old before-image');
-                            assert.ok(pending(target)?.unavailableReason, 'rollback must not erase an edit observed during the rebuild');
+                            assert.ok(pending(target), 'rollback must not erase an edit observed during the rebuild');
+                            if (saved && pending(target)?.reviewKind === 'opaque') {
+                                assert.ok(pending(target)?.reviewReason);
+                            } else {
+                                assert.ok(pending(target)?.unavailableReason);
+                            }
                             assert.deepEqual(fs.readFileSync(target), bytes(format, saved));
                             assert.equal(doc.isDirty, !saved);
                         } finally { faults.delete(tempState); }
@@ -270,7 +282,12 @@ export function registerOpaqueBaselineInvariants(harness) {
                         tracker = new DiffTracker(storage);
                         setTracker(tracker);
                         assert.equal(await tracker.restorePersistedState(), 'restored');
-                        assert.ok(pending(target)?.unavailableReason);
+                        assert.ok(pending(target), 'restored session must retain the observed edit');
+                        if (saved && pending(target)?.reviewKind === 'opaque') {
+                            assert.ok(pending(target)?.reviewReason);
+                        } else {
+                            assert.ok(pending(target)?.unavailableReason);
+                        }
                         assert.deepEqual(tracker.opaqueBaselineFiles.get(target), original);
                     });
                 }

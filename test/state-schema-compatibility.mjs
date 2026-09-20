@@ -149,7 +149,8 @@ export function registerStateSchemaCompatibility(harness) {
             setTracker(tracker);
             assert.equal(await tracker.restorePersistedState(), layout === 'recover-backup' ? 'recovered' : 'restored');
             assert.ok(tracker.opaqueBaselineFiles.has(target));
-            assert.match(pending(target)?.unavailableReason ?? '', /deleted.*unsupported baseline/i);
+            assert.equal(pending(target)?.reviewKind, 'opaque');
+            assert.match(pending(target)?.reviewReason ?? '', /deleted.*unsupported baseline/i);
             assert.equal(await tracker.flushPendingPersistence(), true);
             const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
             assert.equal(saved.version, 3);
