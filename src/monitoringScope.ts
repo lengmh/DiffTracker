@@ -680,6 +680,12 @@ export function detectScopeExpansion(
     }
 
     for (const exclude of effective.excludes) {
+        const affectsRemainingRoot = requested.roots.some(root => ruleAppliesToRoot(exclude, root.name));
+        if (!affectsRemainingRoot) {
+            // The exclusion applied only to roots that no longer exist in the
+            // requested workspace, so removing it cannot broaden remaining scope.
+            continue;
+        }
         if (!requested.excludes.some(candidate => excludeRuleCovers(candidate, exclude, requested.roots))) {
             reasons.push(`Explicit exclude removed or changed: ${exclude.scope === 'folder' ? exclude.folder + ':' : ''}${exclude.pattern}`);
         }
