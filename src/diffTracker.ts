@@ -2459,6 +2459,10 @@ export class DiffTracker {
 
     private async findScopeFilesUnderDirectory(rootPath: string): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
+        const normalizedRootPath = path.resolve(rootPath);
+        const workspaceRoot = this.getSupportedWorkspaceFolders()
+            .find(folder => path.resolve(folder.uri.fsPath) === normalizedRootPath);
+        const patternBase: vscode.WorkspaceFolder | string = workspaceRoot ?? rootPath;
         const add = (uris: readonly vscode.Uri[]): void => {
             for (const uri of uris) {
                 if (uri.scheme !== 'file' || !this.pathBelongsToRoot(uri.fsPath, rootPath)) { continue; }
@@ -2470,8 +2474,8 @@ export class DiffTracker {
         };
 
         add(await vscode.workspace.findFiles(
-            new vscode.RelativePattern(rootPath, '**/*'),
-            new vscode.RelativePattern(rootPath, '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
+            new vscode.RelativePattern(patternBase, '**/*'),
+            new vscode.RelativePattern(patternBase, '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
         ));
 
         if (this.effectiveMonitoringScope.kind === 'configured') {
