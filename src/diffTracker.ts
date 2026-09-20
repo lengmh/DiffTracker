@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { CanonicalMonitoringScope, createLegacyEffectiveScope, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
+import { CanonicalMonitoringScope, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -192,6 +192,15 @@ export interface OpaqueReviewToken {
     filePath: string;
     epoch: number;
     reviewRevision: string;
+}
+
+export interface MonitoringScopeApplyResult {
+    status: 'applied' | 'failed' | 'conflict' | 'requiresS4';
+    reason?: string;
+    retainedReviews: number;
+    discardedReviews: number;
+    releasedBaselines: number;
+    capturedBaselines: number;
 }
 
 type CurrentFileState =
@@ -1879,6 +1888,242 @@ export class DiffTracker {
         return records;
     }
 
+    private releaseScopeBaselineData(filePath: string): void {
+        this.fileSnapshots.delete(filePath);
+        this.fileModes.delete(filePath);
+        this.baselineExistingFiles.delete(filePath);
+        this.unresolvedBaselineFiles.delete(filePath);
+        this.opaqueBaselineFiles.delete(filePath);
+        this.postBaselineUnknownFiles.delete(filePath);
+        this.retainedReviewPaths.delete(filePath);
+        this.revertHistory = this.revertHistory
+            .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
+            .filter(record => record.items.length > 0);
+    }
+
+    private releaseRetainedReviewBaseline(filePath: string): void {
+        if (!this.retainedReviewPaths.has(filePath) || this.trackedChanges.has(filePath)) { return; }
+        this.releaseScopeBaselineData(filePath);
+        this.schedulePersistState();
+    }
+
+    public getExplicitlyExcludedPendingReviewPaths(scope: CanonicalMonitoringScope): string[] {
+        const results: string[] = [];
+        for (const filePath of this.trackedChanges.keys()) {
+            const uri = vscode.Uri.file(filePath);
+            const folder = vscode.workspace.getWorkspaceFolder(uri);
+            if (!folder || folder.uri.scheme !== 'file') { continue; }
+            const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
+            const decision = evaluateConfiguredScope(scope, folder.name, relPath, false, false);
+            if (decision.source === 'explicitExclude') { results.push(filePath); }
+        }
+        return results.sort((left, right) => left.localeCompare(right));
+    }
+
+    private async captureConfiguredIncludeBaselines(scope: CanonicalMonitoringScope, epoch: number): Promise<number> {
+        let captured = 0;
+        const rootsByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
+        const captureFile = async (filePath: string): Promise<void> => {
+            if (!this.isCurrentEpoch(epoch) || this.hasCapturedBaseline(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) || this.trackedChanges.has(filePath) ||
+                this.isPathIgnored(vscode.Uri.file(filePath), false, false)) { return; }
+            if (this.validateResourceTarget(filePath)) { return; }
+            const state = await this.readCurrentFileState(filePath);
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            this.recordScannedBaseline(filePath, state, 'workspace');
+            captured++;
+        };
+
+        for (const rule of scope.includes) {
+            const folders = rule.scope === 'folder'
+                ? [rootsByName.get(rule.folder ?? '')].filter((value): value is vscode.WorkspaceFolder => !!value)
+                : this.getSupportedWorkspaceFolders();
+            for (const folder of folders) {
+                if (!this.isCurrentEpoch(epoch)) { return captured; }
+                const target = path.join(folder.uri.fsPath, ...rule.path.split('/'));
+                const targetError = this.validateResourceTarget(target);
+                if (targetError && fs.existsSync(target)) { throw new Error(targetError); }
+                let stat: fs.Stats | undefined;
+                try { stat = fs.lstatSync(target); }
+                catch (error) {
+                    if (!this.isFileNotFound(error)) { throw error; }
+                }
+                if (!stat) {
+                    if (!this.hasCapturedBaseline(target) && !this.unresolvedBaselineFiles.has(target)) {
+                        this.fileSnapshots.set(target, '');
+                        this.fileModes.delete(target);
+                        this.baselineExistingFiles.delete(target);
+                        this.opaqueBaselineFiles.delete(target);
+                        captured++;
+                    }
+                    continue;
+                }
+                if (stat.isSymbolicLink()) { throw new Error('Explicit include resolves through a symbolic link'); }
+                if (stat.isFile()) {
+                    await captureFile(target);
+                    continue;
+                }
+                if (!stat.isDirectory()) { continue; }
+                const files = await vscode.workspace.findFiles(
+                    new vscode.RelativePattern(target, '**/*'),
+                    new vscode.RelativePattern(target, '**/{.git,.difftracker-restore-*}/**')
+                );
+                if (!this.isCurrentEpoch(epoch)) { return captured; }
+                for (const uri of files) {
+                    if (uri.scheme !== 'file' || !this.pathBelongsToRoot(uri.fsPath, target)) { continue; }
+                    await captureFile(uri.fsPath);
+                }
+            }
+        }
+        return captured;
+    }
+
+    public async applyConfiguredMonitoringScope(
+        scope: CanonicalMonitoringScope,
+        discardExplicitlyExcludedReviews = false
+    ): Promise<MonitoringScopeApplyResult> {
+        const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
+            status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
+        });
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
+            return empty('conflict', 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
+        }
+        if (scope.mode === 'wholeWorkspace') {
+            return empty('requiresS4', 'Whole Workspace preparation and coverage belong to S4-W.');
+        }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
+            return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
+        }
+        if (this.effectiveMonitoringScope.kind === 'configured') {
+            const expansion = detectScopeExpansion(this.effectiveMonitoringScope, scope);
+            if (expansion.reasons.some(reason =>
+                reason.startsWith('New workspace root:') ||
+                reason.startsWith('Explicit exclude removed or changed:') ||
+                reason.startsWith('Whole Workspace mode'))) {
+                return empty('requiresS4', 'This scope expansion requires broader bounded preparation in S4-W.');
+            }
+        }
+
+        const epoch = this.sessionEpoch;
+        const previous = {
+            effectiveMonitoringScope: this.getEffectiveMonitoringScope(),
+            retainedReviewPaths: new Set(this.retainedReviewPaths),
+            coverageGaps: new Map(this.coverageGaps),
+            fileSnapshots: new Map(this.fileSnapshots),
+            fileModes: new Map(this.fileModes),
+            baselineExistingFiles: new Set(this.baselineExistingFiles),
+            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
+            postBaselineUnknownFiles: new Set(this.postBaselineUnknownFiles),
+            trackedChanges: new Map(this.trackedChanges),
+            lineChanges: new Map([...this.lineChanges].map(([key, value]) => [key, [...value]])),
+            inlineViews: new Map(this.inlineViews),
+            revertHistory: this.revertHistory.map(record => ({
+                ...record,
+                items: record.items.map(item => ({ ...item, before: { ...item.before }, after: { ...item.after } }))
+            })),
+            scanCoverage: this.scanCoverage
+        };
+        const restore = (): void => {
+            this.effectiveMonitoringScope = previous.effectiveMonitoringScope;
+            this.retainedReviewPaths = new Set(previous.retainedReviewPaths);
+            this.coverageGaps = new Map(previous.coverageGaps);
+            this.fileSnapshots = new Map(previous.fileSnapshots);
+            this.fileModes = new Map(previous.fileModes);
+            this.baselineExistingFiles = new Set(previous.baselineExistingFiles);
+            this.unresolvedBaselineFiles = new Map(previous.unresolvedBaselineFiles);
+            this.opaqueBaselineFiles = new Map(previous.opaqueBaselineFiles);
+            this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
+            this.trackedChanges = new Map(previous.trackedChanges);
+            this.lineChanges = new Map([...previous.lineChanges].map(([key, value]) => [key, [...value]]));
+            this.inlineViews = new Map(previous.inlineViews);
+            this.revertHistory = previous.revertHistory;
+            this.scanCoverage = previous.scanCoverage;
+            this.ignoreResultCache.clear();
+            this.resetChangeBlocksCaches();
+            this.trackedChangesVersion++;
+            this.trackedChangesCacheVersion = -1;
+        };
+
+        let transaction: BaselineTransaction;
+        try { transaction = this.beginBaselineTransaction(restore); }
+        catch { return empty('conflict', 'Another baseline transaction is active.'); }
+        transaction.observedEvents = new Map();
+        const result = empty('failed');
+        let committed = false;
+        try {
+            this.effectiveMonitoringScope = { kind: 'configured', ...JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope };
+            // Protect all pending reviews from matcher pruning until each path is
+            // classified against the candidate scope.
+            for (const filePath of this.trackedChanges.keys()) { this.retainedReviewPaths.add(filePath); }
+            this.scanCoverage = undefined;
+            this.ignoreResultCache.clear();
+            await this.refreshIgnoreMatchers();
+            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during scope preparation'); }
+
+            for (const filePath of [...this.trackedChanges.keys()]) {
+                const ignored = this.isPathIgnored(vscode.Uri.file(filePath), false, false);
+                if (!ignored) {
+                    this.retainedReviewPaths.delete(filePath);
+                    continue;
+                }
+                const explicitlyExcluded = this.getExplicitlyExcludedPendingReviewPaths(scope).includes(filePath);
+                if (explicitlyExcluded && discardExplicitlyExcludedReviews) {
+                    this.clearFileReview(filePath);
+                    this.releaseScopeBaselineData(filePath);
+                    result.discardedReviews++;
+                } else {
+                    this.retainedReviewPaths.add(filePath);
+                    result.retainedReviews++;
+                }
+            }
+
+            const baselinePaths = new Set([
+                ...this.fileSnapshots.keys(),
+                ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys()
+            ]);
+            for (const filePath of baselinePaths) {
+                if (this.trackedChanges.has(filePath) || this.retainedReviewPaths.has(filePath)) { continue; }
+                if (this.isPathIgnored(vscode.Uri.file(filePath), false, false)) {
+                    this.releaseScopeBaselineData(filePath);
+                    result.releasedBaselines++;
+                }
+            }
+
+            result.capturedBaselines = await this.captureConfiguredIncludeBaselines(scope, epoch);
+            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during scope preparation'); }
+            this.scanCoverage = this.ignoreFingerprint;
+            if (!await this.flushPersistState(true, transaction)) {
+                throw new Error('Configured monitoring scope could not be persisted');
+            }
+            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed after scope persistence'); }
+            committed = true;
+            this.endBaselineTransaction(transaction, true);
+            result.status = 'applied';
+            result.reason = undefined;
+            this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+            return result;
+        } catch (error) {
+            const observed = new Map(transaction.observedEvents ?? []);
+            this.endBaselineTransaction(transaction, false);
+            try { await this.refreshIgnoreMatchers(); } catch { /* retain previous memory and report failure below */ }
+            for (const event of observed.values()) {
+                if (!this.isCurrentEpoch(epoch)) { break; }
+                if (event.kind === 'delete') { await this.onExternalFileDeleted(event.uri); }
+                else if (event.kind === 'create' || event.firstKind === 'create') { await this.onExternalFileCreated(event.uri); }
+                else { this.pendingExternalChanges.add(event.uri.fsPath); }
+            }
+            await this.processPendingExternalChanges();
+            await this.flushPendingPersistence();
+            result.status = 'failed';
+            result.reason = error instanceof Error ? error.message : 'Monitoring scope preparation failed';
+            return result;
+        } finally {
+            if (!committed && this.baselineTransaction === transaction) { this.endBaselineTransaction(transaction, false); }
+        }
+    }
+
     public getEffectiveMonitoringScope(): EffectiveMonitoringScope {
         return JSON.parse(JSON.stringify(this.effectiveMonitoringScope)) as EffectiveMonitoringScope;
     }
@@ -2383,7 +2628,7 @@ export class DiffTracker {
         return { ignored: ordinaryIgnored, reason: ordinaryIgnored ? 'Matched legacy ignore rules' : 'Not ignored' };
     }
 
-    private isPathIgnored(uri: vscode.Uri, directory = false): boolean {
+    private isPathIgnored(uri: vscode.Uri, directory = false, respectRetainedReview = true): boolean {
         if (uri.scheme !== 'file') { return true; }
         // Lookup cost depends on path depth, not the number of recent recoveries.
         for (let current = uri.fsPath; ; current = path.dirname(current)) {
@@ -2396,8 +2641,9 @@ export class DiffTracker {
         }
 
         // Retained Review is outside the current target scope but remains
-        // minimally observable until its pending review is resolved.
-        if (this.retainedReviewPaths.has(uri.fsPath)) { return false; }
+        // minimally observable until its pending review is resolved. Hard
+        // boundaries and temporary restore staging still win above this point.
+        if (respectRetainedReview && this.retainedReviewPaths.has(uri.fsPath)) { return false; }
 
         const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
         if (!matcher) {
@@ -3312,6 +3558,7 @@ export class DiffTracker {
         // Ignore pure EOL-style / final-EOL toggles and track only logical line changes.
         if (sameLogicalLines && this.baselineExistingFiles.has(filePath) === currentExists) {
             this.deleteTrackedChange(filePath);
+            this.releaseRetainedReviewBaseline(filePath);
             this.lineChanges.delete(filePath);
             this.markLineChangesUpdated(filePath);
             this.inlineViews.delete(filePath);
@@ -3823,6 +4070,7 @@ export class DiffTracker {
 
     private clearFileReview(filePath: string, baselineChanged = false): void {
         this.deleteTrackedChange(filePath);
+        this.releaseRetainedReviewBaseline(filePath);
         this.lineChanges.delete(filePath);
         this.markLineChangesUpdated(filePath);
         this.inlineViews.delete(filePath);
