@@ -334,7 +334,7 @@ module.exports = async function runExtensionHostScenario() {
         await write('batch-a.txt', 'stopped clear preserves disk\n');
         await untilStable('stopped clear pending', () => pending('batch-a.txt'));
         await vscode.commands.executeCommand('diffTracker.stopRecording');
-        assert.equal(await vscode.commands.executeCommand('diffTracker.clearDiffs'), true);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
         assert.equal((await state()).isRecording, false);
         assert.equal((await state()).trackedChanges.length, 0);
         assert.equal((await state()).reviewTokens.length, 0);

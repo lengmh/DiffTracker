@@ -357,6 +357,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 diffTracker.revertAllPendingChanges()
             ),
             vscode.commands.registerCommand('diffTracker._testUndoLastRevert', () => diffTracker.undoLastRevert()),
+            vscode.commands.registerCommand('diffTracker._testClearDiffs', () => diffTracker.resetBaselineToCurrentState()),
             vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
                 const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
                 return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
