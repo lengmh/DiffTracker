@@ -246,6 +246,8 @@ include 和 exclude 分别按顺序无关的集合求值。所有 exclude 的并
 
 现有 imported directory watcher 的 bridge、handoff、容量回收和失败分类属于 S4 专项，必须保留活动 watcher 上限、epoch、ignore refresh、Git context 和未知 before-image 保护。
 
+稳定的 VS Code `FileSystemWatcher` API 不提供可用于证明“某个新 watcher 已独立接管该子树”的事件归属或 ready 信号；相同底层请求还可能被宿主复用。对于 `files.watcherExclude` 路径，S0 的真实 Host 探测也证明不能依赖简单的 RelativePattern watcher 自动恢复事件覆盖。因此 S4 的 bridge 只能在**独立可证明的替代覆盖已经建立并完成子树核对**后释放。临时 imported bridge 和持续所需的 supplemental watcher 必须分别计数；成功 handoff 的目标是临时 bridge 可回收，不要求仍承担有效覆盖的 supplemental watcher 数量归零。
+
 ## 10. 审阅能力
 
 监控范围只决定是否纳入，资源内容能力决定如何审阅。

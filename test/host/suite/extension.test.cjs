@@ -89,22 +89,25 @@ module.exports = async function runExtensionHostScenario() {
             recursiveWatcher.dispose();
         }
 
+        // Run #203 proved that a simple non-recursive VS Code RelativePattern
+        // cannot be relied upon to recover this excluded subtree on Stable,
+        // VS Code 1.80, Linux or Windows. Use an independently owned direct
+        // watcher as the positive control for supplemental coverage instead.
         const directEvents = [];
-        const directWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern(excludedTree, '*')
-        );
-        directWatcher.onDidCreate(event => directEvents.push(event.fsPath));
-        directWatcher.onDidChange(event => directEvents.push(event.fsPath));
+        const directWatcher = fs.watch(excludedTree, { persistent: false }, (kind, filename) => {
+            if (filename) { directEvents.push(filename.toString()); }
+        });
         try {
-            await delay(750);
-            const directProbe = path.join(excludedTree, 'direct-probe.txt');
-            fs.writeFileSync(directProbe, 'non-recursive supplemental probe\n');
-            await until('non-recursive watcher coverage for watcherExclude subtree', () =>
-                directEvents.some(filePath => filePath === directProbe), 10_000);
+            await delay(250);
+            const directProbeName = 'direct-probe.txt';
+            const directProbe = path.join(excludedTree, directProbeName);
+            fs.writeFileSync(directProbe, 'direct supplemental probe\n');
+            await until('direct watcher coverage for watcherExclude subtree', () =>
+                directEvents.includes(directProbeName), 10_000);
         } finally {
-            directWatcher.dispose();
+            directWatcher.close();
         }
-        console.log('PASS HOST-WATCH-CONTRACT watcherExclude requires explicit supplemental coverage');
+        console.log('PASS HOST-WATCH-CONTRACT watcherExclude requires independently owned supplemental coverage');
 
         // A native/virtual baseline document shares fsPath with the real working
         // file. Review actions must never treat the virtual document as current
