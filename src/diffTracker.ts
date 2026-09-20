@@ -1994,6 +1994,40 @@ export class DiffTracker {
         return results.sort((left, right) => left.localeCompare(right));
     }
 
+    private async enumerateExplicitIncludeFiles(rootPath: string, epoch: number): Promise<string[]> {
+        const files: string[] = [];
+        const pending = [rootPath];
+        while (pending.length > 0) {
+            if (!this.isCurrentEpoch(epoch)) { return files; }
+            const current = pending.pop()!;
+            const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
+            if (!folder || folder.uri.scheme !== 'file') { continue; }
+            const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
+            if (isHardUnmonitorableRelativePath(relative)) { continue; }
+
+            let entries: fs.Dirent[];
+            try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
+            catch (error) {
+                if (this.isFileNotFound(error)) { continue; }
+                throw error;
+            }
+            if (!this.isCurrentEpoch(epoch)) { return files; }
+
+            for (const entry of entries) {
+                if (!this.isCurrentEpoch(epoch)) { return files; }
+                const child = path.join(current, entry.name);
+                const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                if (isHardUnmonitorableRelativePath(childRelative) || entry.isSymbolicLink()) { continue; }
+                if (entry.isDirectory()) {
+                    pending.push(child);
+                } else if (entry.isFile()) {
+                    files.push(child);
+                }
+            }
+        }
+        return files;
+    }
+
     private async captureConfiguredIncludeBaselines(scope: CanonicalMonitoringScope, epoch: number): Promise<number> {
         let captured = 0;
         const rootsByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
@@ -2038,14 +2072,11 @@ export class DiffTracker {
                     continue;
                 }
                 if (!stat.isDirectory()) { continue; }
-                const files = await vscode.workspace.findFiles(
-                    new vscode.RelativePattern(target, '**/*'),
-                    new vscode.RelativePattern(target, '**/{.git,.difftracker-restore-*}/**')
-                );
+                const files = await this.enumerateExplicitIncludeFiles(target, epoch);
                 if (!this.isCurrentEpoch(epoch)) { return captured; }
-                for (const uri of files) {
-                    if (uri.scheme !== 'file' || !this.pathBelongsToRoot(uri.fsPath, target)) { continue; }
-                    await captureFile(uri.fsPath);
+                for (const filePath of files) {
+                    if (!this.pathBelongsToRoot(filePath, target)) { continue; }
+                    await captureFile(filePath);
                 }
             }
         }

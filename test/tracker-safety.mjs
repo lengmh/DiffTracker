@@ -2409,7 +2409,11 @@ for(const restart of [false,true]) test(`AUDIT-20 completed staging exclusions e
     for(const dir of roots){assert.equal(fs.existsSync(dir),false);assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),true);}
     if(restart){tracker.stopRecording();tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');}
     await waitUntil(()=>tracker.creationTempRoots.size===0,300);
-    for(const dir of roots)assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),false);
+    for(const dir of roots)assert.equal(
+        tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),
+        true,
+        'ADR-0006 keeps .difftracker-restore-* paths permanently unmonitorable after dynamic staging state expires'
+    );
 });
 test('AUDIT-20 existing parent permissions remain unchanged',async()=>{
     if(process.platform==='win32')return;
@@ -2432,7 +2436,14 @@ for(const ending of ['success','failure','restart','dispose','unexpected-child']
     gate.release();const result=await op;
     assert.equal(succeeded(result),ending==='success'||ending==='unexpected-child');
     await waitUntil(()=>tracker.creationTempRoots.size===0,300);assert.equal(tracker.creationTempExpiryTimers.size,0);
-    if(ending==='unexpected-child'){assert.equal(disk(path.join(staging,'other')),'preserve me');assert.equal(tracker.isPathIgnored(Uri.file(path.join(staging,'other'))),false);}
+    if(ending==='unexpected-child'){
+        assert.equal(disk(path.join(staging,'other')),'preserve me');
+        assert.equal(
+            tracker.isPathIgnored(Uri.file(path.join(staging,'other'))),
+            true,
+            'unexpected staging children remain preserved on disk but permanently outside monitoring per ADR-0006'
+        );
+    }
 });
 test('AUDIT-20 dispose before staging allocation returns cannot resurrect exclusion timers',async()=>{
     const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
