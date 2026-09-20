@@ -115,6 +115,52 @@ module.exports = async function runExtensionHostScenario() {
         await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
         console.log('PASS HOST-S3 Whole Workspace request stays pending until S4-W coverage exists');
 
+        // A directly edited explicit exclusion is only a requested scope until
+        // Apply. Pause new reads for the affected path, and if the request is
+        // withdrawn surface the observed gap conservatively instead of silently
+        // treating it as unchanged.
+        const pendingExcludeDoc = await vscode.workspace.openTextDocument(uri('existing.txt'));
+        await scopeConfig.update('watchExclude', [{ scope: 'all', pattern: 'existing.txt' }],
+            vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        const excludedEdit = new vscode.WorkspaceEdit();
+        excludedEdit.replace(
+            uri('existing.txt'),
+            new vscode.Range(
+                pendingExcludeDoc.positionAt(0),
+                pendingExcludeDoc.positionAt(pendingExcludeDoc.getText().length)
+            ),
+            'pending scope exclusion edit\n'
+        );
+        assert.equal(await vscode.workspace.applyEdit(excludedEdit), true);
+        assert.equal(await pendingExcludeDoc.save(), true);
+        await delay(500);
+        assert.equal(await pending('existing.txt'), undefined,
+            'pending explicit exclusion must pause new review reads before confirmation');
+
+        await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
+        const gapReview = await untilStable(
+            'pending-scope gap becomes visible after request withdrawal',
+            () => pending('existing.txt')
+        );
+        assert.equal(gapReview.reviewKind, 'unknown');
+        assert.match(gapReview.unavailableReason ?? gapReview.reviewReason ?? '', /paused.*exclusion|requires review/i);
+
+        const restoreEdit = new vscode.WorkspaceEdit();
+        restoreEdit.replace(
+            uri('existing.txt'),
+            new vscode.Range(
+                pendingExcludeDoc.positionAt(0),
+                pendingExcludeDoc.positionAt(pendingExcludeDoc.getText().length)
+            ),
+            'base\n'
+        );
+        assert.equal(await vscode.workspace.applyEdit(restoreEdit), true);
+        assert.equal(await pendingExcludeDoc.save(), true);
+        await untilStable('pending-scope gap clears after verified baseline restoration',
+            async () => !(await pending('existing.txt')));
+        console.log('PASS HOST-S3 pending explicit exclusion preserves a conservative evidence gap');
+
         // Stable watcher contract used by S0/W1 planning:
         // recursive RelativePattern watchers inherit files.watcherExclude, while
         // a non-recursive RelativePattern can subscribe to otherwise excluded
