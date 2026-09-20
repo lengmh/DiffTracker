@@ -347,7 +347,8 @@ test('S2 Acknowledge rolls back when the reviewed opaque identity changes during
     fs.writeFileSync(p,Buffer.from([0,1,2]));await scan(p);const token=tracker.getOpaqueReviewToken(p);assert.ok(token);
     const temp=path.join(storage,'session-state.tmp.json'),gate=pause(temp,'write');
     const op=tracker.acknowledgeOpaqueChange(p,token);await gate.entered;
-    fs.writeFileSync(p,Buffer.from([0,9,8]));await tracker.onExternalFileChanged(Uri.file(p));
+    fs.writeFileSync(p,Buffer.from([0,9,8]));await tracker.readFileAndUpdate(p,Uri.file(p));
+    assert.notEqual(tracker.getOpaqueReviewToken(p)?.reviewRevision,token.reviewRevision);
     gate.release();const result=await op;
     assert.equal(result.status,'failed');assert.equal(tracker.getOriginalContent(p),'baseline');
     assert.equal(pending(p)?.reviewKind,'opaque');
@@ -1114,9 +1115,11 @@ test('S2 successful recording Clear Diffs rebuilds current text and opaque basel
     seed(textFile,'old','current');await scan(textFile);
     fs.writeFileSync(opaqueFile,Buffer.from([0,1,2,3]));await tracker.onExternalFileCreated(Uri.file(opaqueFile));
     tracker.storageUri=Uri.file(storage);listedFiles=[Uri.file(textFile),Uri.file(opaqueFile)];
-    const textBefore=disk(textFile),opaqueBefore=fs.readFileSync(opaqueFile),writes=counters.write;
+    const textBefore=disk(textFile),opaqueBefore=fs.readFileSync(opaqueFile),before={...counters};
     assert.equal(await tracker.resetBaselineToCurrentState(),true);
-    assert.equal(disk(textFile),textBefore);assert.deepEqual(fs.readFileSync(opaqueFile),opaqueBefore);assert.equal(counters.write,writes);
+    assert.equal(disk(textFile),textBefore);assert.deepEqual(fs.readFileSync(opaqueFile),opaqueBefore);
+    assert.equal(counters.apply,before.apply);assert.equal(counters.save,before.save);
+    assert.ok(counters.write>before.write,'Clear Diffs must durably persist the replacement baseline');
     assert.equal(tracker.getOriginalContent(textFile),'current');assert.ok(tracker.opaqueBaselineFiles.has(opaqueFile));
     assert.equal(tracker.getTrackedChanges().length,0);assert.equal(tracker.revertHistory.length,0);
 });
