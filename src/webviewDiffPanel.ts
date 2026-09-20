@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, ChangeBlock, DiffTracker, ReviewToken, TrackChangesEvent } from './diffTracker';
+import { ActionResult, ChangeBlock, DiffTracker, OpaqueReviewToken, ReviewToken, TrackChangesEvent } from './diffTracker';
 
 type WebviewChangeBlockPayload = {
     blockId: string;
@@ -19,6 +19,7 @@ type WebviewInboundMessage = {
     requestId?: string;
     filePath?: string;
     reviewToken?: ReviewToken;
+    opaqueReviewToken?: OpaqueReviewToken;
     viewGeneration?: number;
     blockIndex?: number;
     lineNumber?: number;
@@ -192,6 +193,7 @@ export class WebviewDiffPanel {
             filePath: this.filePath,
             viewGeneration: this.viewGeneration,
             reviewToken: this.diffTracker.getReviewToken(this.filePath),
+            opaqueReviewToken: this.diffTracker.getOpaqueReviewToken(this.filePath),
             mutationBusy: !!this.activeRequest,
             fileName,
             hasFileChange: !!fileChange,
@@ -222,7 +224,8 @@ export class WebviewDiffPanel {
             revertBlock: 'diffTracker.revertBlock',
             keepBlock: 'diffTracker.keepBlock',
             keepAll: 'diffTracker.keepAllBlocksInFile',
-            revertAll: 'diffTracker.revertAllBlocksInFile'
+            revertAll: 'diffTracker.revertAllBlocksInFile',
+            acknowledge: 'diffTracker.acknowledgeOpaqueChange'
         };
         const actionCommand = mutationCommands[message.command];
         if (Object.prototype.hasOwnProperty.call(mutationCommands, message.command)) {
@@ -238,7 +241,8 @@ export class WebviewDiffPanel {
             }
             const blockRef = message.changeBlockId ?? message.changeBlockIndex;
             const isBlock = message.command === 'revertBlock' || message.command === 'keepBlock';
-            if (!message.reviewToken ||
+            const actionToken = message.command === 'acknowledge' ? message.opaqueReviewToken : message.reviewToken;
+            if (!actionToken ||
                 !this.diffTracker.getTrackedChanges().some(change => change.filePath === this.filePath) ||
                 (isBlock && typeof blockRef !== 'string' && typeof blockRef !== 'number')) {
                 this.postActionAck(message.requestId, false, 'Review target is unavailable; reopen the file');
@@ -248,7 +252,7 @@ export class WebviewDiffPanel {
             this.activeRequest = message.requestId;
             try {
                 const result = await vscode.commands.executeCommand<ActionResult>(
-                    actionCommand, this.filePath, ...(isBlock ? [blockRef] : []), message.reviewToken
+                    actionCommand, this.filePath, ...(isBlock ? [blockRef] : []), actionToken
                 );
                 if (this.disposed || generation !== this.viewGeneration) { return; }
                 this.postActionAck(message.requestId, result?.status === 'success', result?.reason ?? 'Action did not complete', result);
@@ -568,6 +572,7 @@ export class WebviewDiffPanel {
         let filePath = ${serializedFilePath};
         let viewGeneration = ${this.viewGeneration};
         let reviewToken = ${this.serializeForInlineScript(this.diffTracker.getReviewToken(this.filePath) ?? null)};
+        let opaqueReviewToken = ${this.serializeForInlineScript(this.diffTracker.getOpaqueReviewToken(this.filePath) ?? null)};
         let hasFileChange = ${!!fileChange};
         let isDeleted = ${fileChange?.isDeleted ?? false};
         let reviewKind = ${this.serializeForInlineScript(fileChange?.reviewKind ?? (fileChange?.unavailableReason ? 'unknown' : 'text'))};
@@ -641,9 +646,15 @@ export class WebviewDiffPanel {
         }
 
         function updateToolbarMutationState() {
-            setToolbarButtonsDisabled(
-                isMutationLocked() || reviewKind !== 'text' || !reviewToken || !!unavailableReason || !hasFileChange
-            );
+            const locked = isMutationLocked() || !hasFileChange;
+            const textReady = !locked && reviewKind === 'text' && !!reviewToken && !unavailableReason;
+            const opaqueReady = !locked && reviewKind === 'opaque' && !!opaqueReviewToken && !unavailableReason;
+            btnKeepAll.textContent = reviewKind === 'opaque' ? 'Acknowledge' : 'Keep All';
+            btnKeepAll.title = reviewKind === 'opaque'
+                ? 'Acknowledge this read-only file identity without modifying the workspace file'
+                : 'Accept all text changes in this file';
+            btnKeepAll.disabled = !(textReady || opaqueReady);
+            btnRejectAll.disabled = !textReady;
         }
 
         function formatBytes(value) {
@@ -935,6 +946,7 @@ export class WebviewDiffPanel {
                 filePath: reviewed.filePath,
                 viewGeneration: reviewed.viewGeneration,
                 reviewToken: reviewed.reviewToken,
+                opaqueReviewToken,
                 changeBlockId: blockId,
                 requestId
             });
@@ -953,6 +965,7 @@ export class WebviewDiffPanel {
                 filePath: filePath,
                 viewGeneration,
                 reviewToken,
+                opaqueReviewToken,
                 requestId
             });
         }
@@ -988,7 +1001,7 @@ export class WebviewDiffPanel {
         }
 
         function renderDiff(style) {
-            const reviewed = { filePath, viewGeneration, reviewToken };
+            const reviewed = { filePath, viewGeneration, reviewToken, opaqueReviewToken };
             const sourceNotice = document.getElementById('source-note');
             sourceNotice.textContent = sourceNote;
             sourceNotice.hidden = !sourceNote;
@@ -1089,7 +1102,7 @@ export class WebviewDiffPanel {
             vscode.postMessage({ command: 'setExpandAll', expandAll: currentExpandAll });
         });
         btnKeepAll.addEventListener('click', () => {
-            sendGlobalMutation('keepAll');
+            sendGlobalMutation(reviewKind === 'opaque' ? 'acknowledge' : 'keepAll');
         });
         btnRejectAll.addEventListener('click', () => {
             sendGlobalMutation('revertAll');
@@ -1149,6 +1162,7 @@ export class WebviewDiffPanel {
                 const switchedView = message.viewGeneration !== viewGeneration;
                 viewGeneration = message.viewGeneration;
                 reviewToken = message.reviewToken;
+                opaqueReviewToken = message.opaqueReviewToken;
                 serverMutationBusy = message.mutationBusy === true;
                 // Update data and re-render with current style
                 if (typeof message.filePath === 'string') {

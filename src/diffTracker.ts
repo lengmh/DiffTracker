@@ -153,7 +153,7 @@ interface PersistedTrackerState {
 export type RestoreOutcome = 'absent' | 'restored' | 'recovered' | 'incomplete' | 'blocked';
 
 export interface ActionResult {
-    status: 'success' | 'failed' | 'conflict' | 'cancelled';
+    status: 'success' | 'failed' | 'conflict' | 'cancelled' | 'needsConfirmation' | 'needsAttention';
     filePath: string;
     reason?: string;
     bufferChanged?: boolean;
@@ -165,11 +165,28 @@ export interface BatchActionResult {
     failed: number;
 }
 
+export interface MixedBatchActionResult extends BatchActionResult {
+    accepted: number;
+    acknowledged: number;
+    reverted: number;
+    needsConfirmation: number;
+    needsAttention: number;
+    failures: number;
+    conflicts: number;
+    cancelled: number;
+}
+
 export interface ReviewToken {
     filePath: string;
     epoch: number;
     baselineRevision: string;
     currentRevision: string;
+}
+
+export interface OpaqueReviewToken {
+    filePath: string;
+    epoch: number;
+    reviewRevision: string;
 }
 
 type CurrentFileState =
@@ -264,6 +281,92 @@ export class DiffTracker {
     public getReviewTokens(): ReviewToken[] {
         return [...this.trackedChanges.keys()].map(filePath => this.getReviewToken(filePath))
             .filter((token): token is ReviewToken => !!token);
+    }
+
+    private opaqueReviewRevision(change: FileDiff): string {
+        return createHash('sha256').update(JSON.stringify({
+            reviewKind: change.reviewKind,
+            baselineExists: change.baselineExists ?? null,
+            currentExists: change.currentExists ?? null,
+            baselineSize: change.baselineSize ?? null,
+            currentSize: change.currentSize ?? null,
+            baselineFingerprint: change.baselineFingerprint ?? null,
+            currentFingerprint: change.currentFingerprint ?? null,
+            reviewReason: change.reviewReason ?? null,
+            isDeleted: change.isDeleted
+        })).digest('hex');
+    }
+
+    public getOpaqueReviewToken(filePath: string): OpaqueReviewToken | undefined {
+        const change = this.trackedChanges.get(filePath);
+        if (!change || change.reviewKind !== 'opaque' || change.unavailableReason || this.disposed) { return undefined; }
+        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change) };
+    }
+
+    public getOpaqueReviewTokens(): OpaqueReviewToken[] {
+        return [...this.trackedChanges.keys()].map(filePath => this.getOpaqueReviewToken(filePath))
+            .filter((token): token is OpaqueReviewToken => !!token);
+    }
+
+    public getUnknownReviewPaths(): string[] {
+        return [...this.trackedChanges.values()]
+            .filter(change => change.reviewKind === 'unknown')
+            .map(change => change.filePath);
+    }
+
+    private matchesOpaqueReview(token: OpaqueReviewToken | undefined): token is OpaqueReviewToken {
+        if (!token || !this.isCurrentEpoch(token.epoch)) { return false; }
+        const change = this.trackedChanges.get(token.filePath);
+        return !!change && change.reviewKind === 'opaque' && !change.unavailableReason &&
+            this.opaqueReviewRevision(change) === token.reviewRevision;
+    }
+
+    private currentStateMatchesOpaqueReview(change: FileDiff, state: CurrentFileState): boolean {
+        if (change.currentExists === false) { return state.kind === 'missing'; }
+        if (state.kind === 'text') {
+            if (change.currentExists !== true || !change.currentFingerprint) { return false; }
+            const fingerprint = createHash('sha256').update(state.content, 'utf8').digest('hex');
+            return change.currentFingerprint === fingerprint &&
+                (change.currentSize === undefined || change.currentSize === Buffer.byteLength(state.content, 'utf8'));
+        }
+        if (this.isStableUnsupportedState(state)) {
+            return change.currentExists === true && !!change.currentFingerprint && !!state.fingerprint &&
+                change.currentFingerprint === state.fingerprint &&
+                (change.currentSize === undefined || change.currentSize === state.size);
+        }
+        return false;
+    }
+
+    private async verifyOpaqueReview(token: OpaqueReviewToken | undefined): Promise<CurrentFileState | undefined> {
+        if (!this.matchesOpaqueReview(token)) { return undefined; }
+        const state = await this.readCurrentFileState(token.filePath);
+        if (!this.matchesOpaqueReview(token)) { return undefined; }
+        const change = this.trackedChanges.get(token.filePath);
+        return change && this.currentStateMatchesOpaqueReview(change, state) ? state : undefined;
+    }
+
+    private queueOpaqueFileAction(
+        filePath: string,
+        token: OpaqueReviewToken | undefined,
+        action: (review: OpaqueReviewToken, state: CurrentFileState) => Promise<ActionResult>
+    ): Promise<ActionResult> {
+        const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
+        const task = previous.catch(() => undefined).then(async () => {
+            const state = token?.filePath === filePath ? await this.verifyOpaqueReview(token) : undefined;
+            if (!token || token.filePath !== filePath || !state) {
+                const reason = this.hasDirtyDocument(filePath)
+                    ? 'Save or discard editor changes before acknowledging this read-only review'
+                    : 'Read-only review is stale or unavailable; refresh and review again';
+                if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
+                return this.actionResult(filePath, 'conflict', reason);
+            }
+            return action(token, state);
+        });
+        this.fileActionQueues.set(filePath, task);
+        void task.finally(() => {
+            if (this.fileActionQueues.get(filePath) === task) { this.fileActionQueues.delete(filePath); }
+        }).catch(() => undefined);
+        return task;
     }
 
     private matchesReview(token: ReviewToken | undefined): token is ReviewToken {
@@ -3333,6 +3436,220 @@ export class DiffTracker {
         this.markLineChangesUpdated(filePath);
         this.inlineViews.delete(filePath);
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
+    }
+
+    private beginAcknowledgeTransaction(filePath: string): BaselineTransaction {
+        const previous = {
+            snapshotPresent: this.fileSnapshots.has(filePath),
+            snapshot: this.fileSnapshots.get(filePath),
+            modePresent: this.fileModes.has(filePath),
+            mode: this.fileModes.get(filePath),
+            baselineExists: this.baselineExistingFiles.has(filePath),
+            unresolved: this.unresolvedBaselineFiles.get(filePath),
+            opaque: this.opaqueBaselineFiles.get(filePath),
+            postBaselineUnknown: this.postBaselineUnknownFiles.has(filePath),
+            revertHistory: this.revertHistory,
+            baselineBuilding: this.baselineBuilding,
+            snapshotInitialized: this.snapshotInitialized
+        };
+        const transaction = this.beginBaselineTransaction(() => {
+            if (previous.snapshotPresent) { this.fileSnapshots.set(filePath, previous.snapshot!); }
+            else { this.fileSnapshots.delete(filePath); }
+            if (previous.modePresent) { this.fileModes.set(filePath, previous.mode!); }
+            else { this.fileModes.delete(filePath); }
+            if (previous.baselineExists) { this.baselineExistingFiles.add(filePath); }
+            else { this.baselineExistingFiles.delete(filePath); }
+            if (previous.unresolved !== undefined) { this.unresolvedBaselineFiles.set(filePath, previous.unresolved); }
+            else { this.unresolvedBaselineFiles.delete(filePath); }
+            if (previous.opaque) { this.opaqueBaselineFiles.set(filePath, previous.opaque); }
+            else { this.opaqueBaselineFiles.delete(filePath); }
+            if (previous.postBaselineUnknown) { this.postBaselineUnknownFiles.add(filePath); }
+            else { this.postBaselineUnknownFiles.delete(filePath); }
+            this.revertHistory = previous.revertHistory;
+            this.baselineBuilding = previous.baselineBuilding;
+            this.snapshotInitialized = previous.snapshotInitialized;
+        });
+        transaction.valid = () => !this.validateSnapshotTarget(filePath);
+        this.revertHistory = previous.revertHistory
+            .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
+            .filter(record => record.items.length > 0);
+        return transaction;
+    }
+
+    private applyAcknowledgedStateAsBaseline(filePath: string, state: CurrentFileState): boolean {
+        this.unresolvedBaselineFiles.delete(filePath);
+        this.postBaselineUnknownFiles.delete(filePath);
+        if (state.kind === 'missing') {
+            this.fileSnapshots.set(filePath, '');
+            this.fileModes.delete(filePath);
+            this.baselineExistingFiles.delete(filePath);
+            this.opaqueBaselineFiles.delete(filePath);
+            return true;
+        }
+        if (state.kind === 'text') {
+            this.fileSnapshots.set(filePath, state.content);
+            if (state.mode === undefined) { this.fileModes.delete(filePath); } else { this.fileModes.set(filePath, state.mode); }
+            this.baselineExistingFiles.add(filePath);
+            this.opaqueBaselineFiles.delete(filePath);
+            return true;
+        }
+        if (this.isStableUnsupportedState(state)) {
+            this.fileSnapshots.delete(filePath);
+            this.fileModes.delete(filePath);
+            this.baselineExistingFiles.delete(filePath);
+            this.opaqueBaselineFiles.set(filePath, {
+                reason: state.reason,
+                size: state.size,
+                mtime: state.mtime,
+                fingerprint: state.fingerprint
+            });
+            return true;
+        }
+        return false;
+    }
+
+    private async commitAcknowledgeTransaction(filePath: string, epoch: number, transaction: BaselineTransaction): Promise<boolean> {
+        let committed = false;
+        try {
+            committed = await this.completeBaseline(epoch, transaction) &&
+                this.baselineTransaction === transaction && this.isCurrentEpoch(epoch);
+            return committed;
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) {
+                this.reportPersistenceIssue('Acknowledge transaction failed; prior baseline retained.', error);
+            }
+            return false;
+        } finally {
+            const invalidTarget = this.isCurrentEpoch(epoch) && transaction.valid && !transaction.valid();
+            this.endBaselineTransaction(transaction, committed);
+            if (!committed && invalidTarget) { await this.flushPendingPersistence(); }
+            if (!committed && this.isCurrentEpoch(epoch)) {
+                await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+            }
+        }
+    }
+
+    public acknowledgeOpaqueChange(
+        filePath: string,
+        token = this.getOpaqueReviewToken(filePath)
+    ): Promise<ActionResult> {
+        return this.queueRecoveryAction(() => this.queueOpaqueFileAction(
+            filePath,
+            token,
+            (review, state) => this.acknowledgeOpaqueReviewed(filePath, review, state)
+        ));
+    }
+
+    private async acknowledgeOpaqueReviewed(
+        filePath: string,
+        review: OpaqueReviewToken,
+        state: CurrentFileState
+    ): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+        if (!this.matchesOpaqueReview(review)) {
+            return this.actionResult(filePath, 'conflict', 'Read-only review changed during Acknowledge');
+        }
+        const current = await this.readCurrentFileState(filePath);
+        const change = this.trackedChanges.get(filePath);
+        if (!this.matchesOpaqueReview(review) || !change || !this.currentStateMatchesOpaqueReview(change, current)) {
+            await this.refreshRejectedReview(filePath);
+            return this.actionResult(filePath, 'conflict', 'File changed since this read-only review; review again');
+        }
+        // Prefer the second authoritative read. The first state exists only to
+        // prove the queued action targeted the same review before entering here.
+        void state;
+        const finalTargetError = this.validateActionTarget(filePath);
+        if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
+        const epoch = this.sessionEpoch;
+        const transaction = this.beginAcknowledgeTransaction(filePath);
+        if (!this.applyAcknowledgedStateAsBaseline(filePath, current)) {
+            this.endBaselineTransaction(transaction, false);
+            return this.actionResult(filePath, 'conflict', 'Current resource identity is not reliable enough to acknowledge');
+        }
+        if (!await this.commitAcknowledgeTransaction(filePath, epoch, transaction)) {
+            return this.actionResult(filePath, 'failed', 'Acknowledge could not be saved; read-only review remains pending');
+        }
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'success', 'Acknowledge was saved before the session changed');
+        }
+        await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+        return this.actionResult(filePath, 'success');
+    }
+
+    private mixedBatchResult(
+        results: ActionResult[],
+        acceptedPaths: Set<string>,
+        acknowledgedPaths: Set<string>,
+        revertedPaths: Set<string>
+    ): MixedBatchActionResult {
+        const accepted = results.filter(item => item.status === 'success' && acceptedPaths.has(item.filePath)).length;
+        const acknowledged = results.filter(item => item.status === 'success' && acknowledgedPaths.has(item.filePath)).length;
+        const reverted = results.filter(item => item.status === 'success' && revertedPaths.has(item.filePath)).length;
+        const succeeded = accepted + acknowledged + reverted;
+        return {
+            results,
+            succeeded,
+            failed: results.length - succeeded,
+            accepted,
+            acknowledged,
+            reverted,
+            needsConfirmation: results.filter(item => item.status === 'needsConfirmation').length,
+            needsAttention: results.filter(item => item.status === 'needsAttention').length,
+            failures: results.filter(item => item.status === 'failed').length,
+            conflicts: results.filter(item => item.status === 'conflict').length,
+            cancelled: results.filter(item => item.status === 'cancelled').length
+        };
+    }
+
+    public async acceptAllPendingChanges(
+        textTokens: ReviewToken[] = this.getReviewTokens(),
+        opaqueTokens: OpaqueReviewToken[] = this.getOpaqueReviewTokens(),
+        unknownPaths: string[] = this.getUnknownReviewPaths()
+    ): Promise<MixedBatchActionResult> {
+        const results: ActionResult[] = [];
+        const acceptedPaths = new Set<string>();
+        const acknowledgedPaths = new Set<string>();
+        for (const token of [...textTokens]) {
+            const result = await this.keepAllChangesInFile(token.filePath, token);
+            results.push(result);
+            if (result.status === 'success') { acceptedPaths.add(token.filePath); }
+        }
+        for (const token of [...opaqueTokens]) {
+            const result = await this.acknowledgeOpaqueChange(token.filePath, token);
+            results.push(result);
+            if (result.status === 'success') { acknowledgedPaths.add(token.filePath); }
+        }
+        for (const filePath of [...new Set(unknownPaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'unknown'
+                ? this.actionResult(filePath, 'needsAttention', current.reviewReason ?? current.unavailableReason ?? 'Review evidence is incomplete')
+                : this.actionResult(filePath, 'conflict', 'Review changed before the mixed Accept action completed'));
+        }
+        return this.mixedBatchResult(results, acceptedPaths, acknowledgedPaths, new Set());
+    }
+
+    public async revertAllPendingChanges(
+        textTokens: ReviewToken[] = this.getReviewTokens(),
+        opaquePaths: string[] = this.getOpaqueReviewTokens().map(token => token.filePath),
+        unknownPaths: string[] = this.getUnknownReviewPaths()
+    ): Promise<MixedBatchActionResult> {
+        const textResult = await this.revertAllChanges(textTokens);
+        const results = [...textResult.results];
+        const revertedPaths = new Set(textResult.results.filter(item => item.status === 'success').map(item => item.filePath));
+        for (const filePath of [...new Set(opaquePaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'opaque'
+                ? this.actionResult(filePath, 'needsConfirmation', 'Read-only changes cannot be reverted; acknowledge or inspect them separately')
+                : this.actionResult(filePath, 'conflict', 'Read-only review changed before the mixed Revert action completed'));
+        }
+        for (const filePath of [...new Set(unknownPaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'unknown'
+                ? this.actionResult(filePath, 'needsAttention', current.reviewReason ?? current.unavailableReason ?? 'Review evidence is incomplete')
+                : this.actionResult(filePath, 'conflict', 'Unknown review changed before the mixed Revert action completed'));
+        }
+        return this.mixedBatchResult(results, new Set(), new Set(), revertedPaths);
     }
 
     public revertAllChanges(tokens: ReviewToken[] = this.getReviewTokens()): Promise<BatchActionResult> {

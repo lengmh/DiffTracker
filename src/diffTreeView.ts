@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
-import { DiffTracker, FileDiff, ReviewKind, ReviewToken } from './diffTracker';
+import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -29,6 +29,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         if (!element) {
             const changes = this.diffTracker.getTrackedChanges();
             const reviewTokens = this.diffTracker.getReviewTokens();
+            const opaqueReviewTokens = this.diffTracker.getOpaqueReviewTokens();
             items.push(this.createRecordingItem());
 
             if (changes.length === 0) {
@@ -49,22 +50,22 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 revertButton.command = {
                     command: 'diffTracker.revertAllChanges',
                     title: 'Revert Text Changes',
-                    arguments: [reviewTokens]
                 };
                 revertButton.iconPath = new vscode.ThemeIcon('discard');
                 revertButton.tooltip = `Restore ${reviewTokens.length} text-reviewable file(s); read-only and unknown entries remain pending`;
                 revertButton.description = `${reviewTokens.length} text file(s)`;
                 items.push(revertButton);
 
-                const keepButton = new TreeItem('Accept Text Changes', vscode.TreeItemCollapsibleState.None);
+            }
+            if (reviewTokens.length > 0 || opaqueReviewTokens.length > 0) {
+                const keepButton = new TreeItem('Accept / Acknowledge Changes', vscode.TreeItemCollapsibleState.None);
                 keepButton.command = {
                     command: 'diffTracker.keepAllChanges',
-                    title: 'Accept Text Changes',
-                    arguments: [reviewTokens]
+                    title: 'Accept / Acknowledge Changes'
                 };
                 keepButton.iconPath = new vscode.ThemeIcon('check');
-                keepButton.tooltip = `Accept ${reviewTokens.length} text-reviewable file(s); read-only and unknown entries remain pending`;
-                keepButton.description = `${reviewTokens.length} text file(s)`;
+                keepButton.tooltip = `Accept ${reviewTokens.length} text file(s), acknowledge ${opaqueReviewTokens.length} read-only file(s); unknown entries remain pending`;
+                keepButton.description = `${reviewTokens.length} text · ${opaqueReviewTokens.length} read-only`;
                 items.push(keepButton);
             }
 
@@ -123,6 +124,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         const reviewKind = this.reviewKindOf(fileDiff);
         item.filePath = fileDiff.filePath;
         item.reviewToken = this.diffTracker.getReviewToken(fileDiff.filePath);
+        item.opaqueReviewToken = this.diffTracker.getOpaqueReviewToken(fileDiff.filePath);
         item.isDeleted = fileDiff.isDeleted;
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
         item.tooltip = fileDiff.filePath;
@@ -276,6 +278,7 @@ class TreeItem extends vscode.TreeItem {
     public filePath?: string;
     public isDeleted?: boolean;
     public reviewToken?: ReviewToken;
+    public opaqueReviewToken?: OpaqueReviewToken;
 
     constructor(
         public readonly label: string,

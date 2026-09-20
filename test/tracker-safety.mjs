@@ -304,6 +304,71 @@ test('S1 opaque-to-text review fingerprints both existing identities',async()=>{
     assert.equal(change?.baselineFingerprint,accepted.fingerprint);
     assert.equal(change?.currentFingerprint,createHash('sha256').update(current,'utf8').digest('hex'));
 });
+test('S2 Acknowledge accepts a reliable binary identity without writing workspace bytes or creating Undo',async()=>{
+    const p=file('ack-binary.png'),storage=file('storage'),bytes=Buffer.from([0x89,0x50,0x4e,0x47,0,1,2]);
+    fs.writeFileSync(p,bytes);await tracker.onExternalFileCreated(Uri.file(p));tracker.storageUri=Uri.file(storage);
+    const token=tracker.getOpaqueReviewToken(p);assert.ok(token);
+    const before={...counters},history=tracker.revertHistory.length;
+    const result=await tracker.acknowledgeOpaqueChange(p,token);
+    assert.equal(result.status,'success',result.reason);assert.deepEqual(fs.readFileSync(p),bytes);
+    assert.deepEqual(counters,before);assert.equal(tracker.revertHistory.length,history);
+    assert.equal(pending(p),undefined);assert.equal(tracker.opaqueBaselineFiles.get(p)?.fingerprint,createHash('sha256').update(bytes).digest('hex'));
+    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
+});
+test('S2 Acknowledge deletion advances an opaque baseline to known absence without deleting anything',async()=>{
+    const p=file('ack-deleted-opaque.dat'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));assert.equal(pending(p)?.reviewKind,'opaque');
+    const result=await tracker.acknowledgeOpaqueChange(p);assert.equal(result.status,'success',result.reason);
+    assert.equal(fs.existsSync(p),false);assert.equal(tracker.opaqueBaselineFiles.has(p),false);
+    assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);assert.equal(pending(p),undefined);
+});
+test('S2 Acknowledge opaque-to-text promotes current UTF-8 text to a text baseline',async()=>{
+    const p=file('ack-opaque-to-text.dat'),bytes=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,bytes);listedFiles=[Uri.file(p)];assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    fs.writeFileSync(p,'accepted text\n');await scan(p);assert.equal(pending(p)?.reviewKind,'opaque');
+    assert.equal((await tracker.acknowledgeOpaqueChange(p)).status,'success');
+    assert.equal(tracker.getOriginalContent(p),'accepted text\n');assert.equal(tracker.baselineExistingFiles.has(p),true);
+    fs.writeFileSync(p,'later text\n');await scan(p);assert.equal(pending(p)?.reviewKind,'text');
+});
+test('S2 stale opaque token cannot acknowledge a newer binary identity',async()=>{
+    const p=file('ack-stale.bin');fs.writeFileSync(p,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(p));
+    const token=tracker.getOpaqueReviewToken(p);assert.ok(token);
+    fs.writeFileSync(p,Buffer.from([0,9,8]));await scan(p);
+    const before=tracker.opaqueBaselineFiles.get(p);
+    const result=await tracker.acknowledgeOpaqueChange(p,token);
+    assert.equal(result.status,'conflict');assert.equal(tracker.opaqueBaselineFiles.get(p),before);assert.ok(pending(p));
+});
+test('S2 failed Acknowledge persistence rolls back the prior baseline and keeps review pending',async()=>{
+    const p=file('ack-persist.bin'),storage=file('storage');seed(p,'text baseline','text baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,Buffer.from([0,1,2,3]));await scan(p);const token=tracker.getOpaqueReviewToken(p);assert.ok(token);
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    const result=await tracker.acknowledgeOpaqueChange(p,token);assert.equal(result.status,'failed');
+    faults.clear();assert.equal(tracker.getOriginalContent(p),'text baseline');assert.ok(pending(p));assert.equal(pending(p)?.reviewKind,'opaque');
+});
+test('S2 mixed Accept accepts text, acknowledges opaque, and leaves unknown pending',async()=>{
+    const textFile=file('mixed-text.txt'),opaqueFile=file('mixed.bin'),unknownFile=file('mixed-unknown.txt');
+    seed(textFile,'old','new');await scan(textFile);
+    fs.writeFileSync(opaqueFile,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(opaqueFile));
+    seed(unknownFile,'before','after');await scan(unknownFile);faults.set(unknownFile,{read:error('NoPermissions')});await scan(unknownFile);
+    const result=await tracker.acceptAllPendingChanges();
+    assert.equal(result.accepted,1);assert.equal(result.acknowledged,1);assert.equal(result.needsAttention,1);assert.equal(result.succeeded,2);
+    assert.equal(pending(textFile),undefined);assert.equal(pending(opaqueFile),undefined);assert.equal(pending(unknownFile)?.reviewKind,'unknown');
+    faults.delete(unknownFile);
+});
+test('S2 mixed Revert changes only text and reports opaque and unknown separately',async()=>{
+    const textFile=file('mixed-revert.txt'),opaqueFile=file('mixed-revert.bin'),unknownFile=file('mixed-revert-unknown.txt');
+    seed(textFile,'old','new');await scan(textFile);
+    fs.writeFileSync(opaqueFile,Buffer.from([0,1,2]));await tracker.onExternalFileCreated(Uri.file(opaqueFile));
+    seed(unknownFile,'before','after');await scan(unknownFile);faults.set(unknownFile,{read:error('NoPermissions')});await scan(unknownFile);
+    const opaqueBytes=fs.readFileSync(opaqueFile);
+    const result=await tracker.revertAllPendingChanges();
+    assert.equal(result.reverted,1);assert.equal(result.needsConfirmation,1);assert.equal(result.needsAttention,1);assert.equal(result.succeeded,1);
+    assert.equal(disk(textFile),'old');assert.deepEqual(fs.readFileSync(opaqueFile),opaqueBytes);
+    assert.equal(pending(opaqueFile)?.reviewKind,'opaque');assert.equal(pending(unknownFile)?.reviewKind,'unknown');
+    faults.delete(unknownFile);
+});
 test('DT-02 hunk Keep on a new file establishes existence for later Revert',async()=>{
     const p=file(); fs.writeFileSync(p,'accepted\n'); await tracker.onExternalFileCreated(Uri.file(p));
     const block=tracker.getChangeBlocks(p)[0]; assert.ok(block);
