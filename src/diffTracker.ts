@@ -2195,29 +2195,6 @@ export class DiffTracker {
             !this.isBinaryUnavailableReason(existingUnresolvedReason)
             ? existingUnresolvedReason
             : undefined;
-        if (this.isBinaryUnavailableReason(reason) && !this.baselineExistingFiles.has(filePath) &&
-            !this.opaqueBaselineFiles.has(filePath) && !preservedUncertaintyReason) {
-            // Code Diff Tracker is text-oriented. Retain an internal unresolved marker
-            // when the before-image is unknown, but do not count a binary-only
-            // path as an actionable text review. A known-absent baseline remains
-            // available so a later text incarnation can still be reviewed.
-            if (!this.fileSnapshots.has(filePath)) {
-                this.unresolvedBaselineFiles.set(filePath, existingUnresolvedReason ?? reason);
-                this.schedulePersistState();
-            }
-            const wasTracked = this.trackedChanges.has(filePath);
-            const hadLineChanges = this.lineChanges.has(filePath);
-            const hadInlineView = this.inlineViews.has(filePath);
-            this.deleteTrackedChange(filePath);
-            this.lineChanges.delete(filePath);
-            this.inlineViews.delete(filePath);
-            this.invalidateChangeBlocksCache(filePath);
-            if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
-            if (wasTracked || hadLineChanges || hadInlineView) {
-                this.emitTrackChangesEvent({ removedFiles: [filePath] });
-            }
-            return;
-        }
         // Unknown paths must survive restart too. A later create notification may
         // establish an absent baseline, but unavailable bytes are never accepted.
         if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {

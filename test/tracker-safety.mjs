@@ -244,6 +244,23 @@ test('DT-02 VS Code create event repairs a change-first new text file',async()=>
     assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
     assert.ok(succeeded(await tracker.keepAllChangesInFile(p)));
 });
+test('S1 change-first binary addition stays unknown until create provenance upgrades it to opaque',async()=>{
+    const p=file('change-first-image.png');fs.writeFileSync(p,Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]));
+    await tracker.onExternalFileChanged(Uri.file(p));
+    await waitUntil(()=>pending(p)?.reviewKind==='unknown',2000);
+    assert.ok(tracker.unresolvedBaselineFiles.has(p));
+    assert.equal(tracker.getReviewToken(p),undefined);
+    assert.equal(tracker.fileSnapshots.has(p),false);
+
+    await tracker.onExternalFileCreated(Uri.file(p));
+    await waitUntil(()=>pending(p)?.reviewKind==='opaque',2000);
+    assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(pending(p)?.baselineExists,false);
+    assert.equal(pending(p)?.currentExists,true);
+    assert.equal(tracker.getReviewToken(p),undefined);
+});
 test('S1 newly created binary files remain visible as read-only opaque review',async()=>{
     const p=file('image.png');fs.writeFileSync(p,Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]));
     await tracker.onExternalFileCreated(Uri.file(p));
