@@ -60,6 +60,13 @@ export interface ScopeMigrationRecord {
     roots: WorkspaceRootIdentity[];
 }
 
+export interface LegacyRuleMigrationPreview {
+    excludes: MonitoringExcludeRule[];
+    includes: MonitoringIncludeRule[];
+    manual: string[];
+    ignoredNoops: string[];
+}
+
 export interface LegacyEffectiveMonitoringScope {
     kind: 'legacyV3';
     roots: WorkspaceRootIdentity[];
@@ -317,6 +324,59 @@ export function scopeConsentMatches(raw: unknown, scope: CanonicalMonitoringScop
         .map(key).sort(compareText);
     const right = scope.roots.map(key).sort(compareText);
     return left.length === value.roots.length && left.every((item, index) => item === right[index]);
+}
+
+export function previewLegacyWatchExcludeMigration(
+    input: readonly unknown[],
+    platform: NodeJS.Platform = process.platform
+): LegacyRuleMigrationPreview {
+    const excludes: MonitoringExcludeRule[] = [];
+    const includes: MonitoringIncludeRule[] = [];
+    const manual: string[] = [];
+    const ignoredNoops: string[] = [];
+    const seenExclude = new Set<string>();
+    const seenInclude = new Set<string>();
+
+    for (const raw of input) {
+        if (typeof raw !== 'string') { continue; }
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) {
+            if (line) { ignoredNoops.push(line); }
+            continue;
+        }
+        if (!line.startsWith('!')) {
+            const pattern = canonicalizeExcludePattern(line, platform);
+            if (pattern === undefined) {
+                manual.push(line);
+                continue;
+            }
+            const key = `all\0${pattern}`;
+            if (!seenExclude.has(key)) {
+                seenExclude.add(key);
+                excludes.push({ scope: 'all', pattern });
+            }
+            continue;
+        }
+
+        let literal = line.slice(1);
+        if (!literal || /[*?[]/.test(literal)) {
+            manual.push(line);
+            continue;
+        }
+        literal = literal.replace(/^\/+/, '').replace(/\/+$/, '');
+        const includePath = canonicalizeIncludePath(literal, platform);
+        if (!includePath) {
+            manual.push(line);
+            continue;
+        }
+        const key = `all\0${includePath}`;
+        if (!seenInclude.has(key)) {
+            seenInclude.add(key);
+            includes.push({ scope: 'all', path: includePath });
+        }
+    }
+
+    return { excludes, includes, manual, ignoredNoops };
 }
 
 export function createScopeMigrationRecord(roots: readonly WorkspaceRootIdentity[]): ScopeMigrationRecord {

@@ -9,6 +9,7 @@ import {
     createScopeConsentRecord,
     createScopeMigrationRecord,
     parseEffectiveMonitoringScope,
+    previewLegacyWatchExcludeMigration,
     scopeConsentMatches,
     scopeMigrationMatches,
     detectScopeExpansion,
@@ -172,4 +173,19 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     const migration = createScopeMigrationRecord(roots);
     assert.equal(scopeMigrationMatches(migration, roots), true);
     assert.equal(scopeMigrationMatches(migration, [{ ...roots[0], name: 'renamed' }, roots[1]]), false);
+}
+
+{
+    const preview = previewLegacyWatchExcludeMigration([
+        'node_modules/',
+        '!private-data/',
+        '!src/**/generated',
+        '# old comment',
+        '',
+        'node_modules/'
+    ], 'linux');
+    assert.deepEqual(preview.excludes, [{ scope: 'all', pattern: 'node_modules/' }]);
+    assert.deepEqual(preview.includes, [{ scope: 'all', path: 'private-data' }]);
+    assert.deepEqual(preview.manual, ['!src/**/generated']);
+    assert.deepEqual(preview.ignoredNoops, ['# old comment']);
 }
