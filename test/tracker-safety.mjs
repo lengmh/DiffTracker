@@ -2402,7 +2402,7 @@ for(const entry of ['file','batch','undo']) test(`AUDIT-20 ${entry} recovery cre
         assert.equal(fs.statSync(dir).mode&0o777,0o700);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);assert.equal(fs.statSync(p).mode&0o777,0o644);
     }finally{process.umask(previous);}
 });
-for(const restart of [false,true]) test(`AUDIT-20 completed staging exclusions expire${restart?' across restart':''}`,async()=>{
+for(const restart of [false,true]) test(`AUDIT-20 completed staging ownership expires but reserved path stays hard-excluded${restart?' across restart':''}`,async()=>{
     tracker.creationTempGraceMs=20;
     for(let i=0;i<3;i++){const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));assert.ok(succeeded(await tracker.revertFile(p)));}
     const roots=[...tracker.creationTempRoots];assert.ok(roots.length>0);
@@ -2421,7 +2421,7 @@ test('AUDIT-20 existing parent permissions remain unchanged',async()=>{
     fs.rmSync(path.dirname(p),{recursive:true});await tracker.onExternalFileDeleted(Uri.file(path.dirname(p)));
     assert.ok(succeeded(await tracker.revertFile(p)));assert.equal(fs.statSync(dir).mode&0o777,0o750);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);
 });
-for(const ending of ['success','failure','restart','dispose','unexpected-child']) test(`AUDIT-20 active staging survives grace interval then cleans up on ${ending}`,async()=>{
+for(const ending of ['success','failure','restart','dispose','unexpected-child']) test(`AUDIT-20 active staging ownership survives grace interval then cleans up on ${ending}`,async()=>{
     tracker.creationTempGraceMs=20;
     const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
     const gate=pause(p,'publish'),op=tracker.revertFile(p);await gate.entered;

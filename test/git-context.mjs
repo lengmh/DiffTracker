@@ -144,7 +144,8 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
             setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
             setGitContextPending:()=>calls.push('release')},
         gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},
-        vscode:{commands:{executeCommand:async()=>{}}}};
+        monitoringScopeController:{getStatus:()=>({requested:{ok:true},expansionReasons:[],consented:true})},
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
     vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
     if(scenario==='stopped')sandbox.flows.stopRecordingFlow();
