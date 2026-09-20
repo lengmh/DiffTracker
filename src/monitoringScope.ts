@@ -325,7 +325,7 @@ function sameRule(left: MonitoringExcludeRule, right: MonitoringExcludeRule): bo
 function includeCovers(
     effective: MonitoringIncludeRule,
     requested: MonitoringIncludeRule,
-    roots: readonly WorkspaceRootIdentity[]
+    roots: readonly CanonicalWorkspaceRootIdentity[]
 ): boolean {
     if (effective.scope === 'folder') {
         if (requested.scope !== 'folder' || effective.folder !== requested.folder) { return false; }
@@ -351,9 +351,10 @@ export function scopeConsentMatches(raw: unknown, scope: CanonicalMonitoringScop
     const value = raw as Partial<ScopeConsentRecord>;
     if (value.model !== 1 || value.scopeRevision !== scope.scopeRevision || !Array.isArray(value.roots)) { return false; }
     if (value.roots.length !== scope.roots.length) { return false; }
-    const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
+    const key = (root: CanonicalWorkspaceRootIdentity) =>
+        `${root.name}\0${root.uri}\0${root.caseSensitive ? 'cs' : 'ci'}`;
     const left = value.roots
-        .filter((root): root is WorkspaceRootIdentity => !!root && typeof root.name === 'string' &&
+        .filter((root): root is CanonicalWorkspaceRootIdentity => !!root && typeof root.name === 'string' &&
             typeof root.uri === 'string' && typeof root.caseSensitive === 'boolean')
         .map(key).sort(compareText);
     const right = scope.roots.map(key).sort(compareText);
