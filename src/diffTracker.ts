@@ -2261,8 +2261,15 @@ export class DiffTracker {
             baselineSize: opaqueBaseline?.size ??
                 (baselineExists && textBaseline !== undefined ? Buffer.byteLength(textBaseline, 'utf8') : undefined),
             currentSize: this.getCurrentStateSize(state),
-            baselineFingerprint: opaqueBaseline?.fingerprint,
-            currentFingerprint: this.isStableUnsupportedState(state) ? state.fingerprint : undefined,
+            baselineFingerprint: opaqueBaseline?.fingerprint ??
+                (baselineExists && textBaseline !== undefined
+                    ? createHash('sha256').update(textBaseline, 'utf8').digest('hex')
+                    : undefined),
+            currentFingerprint: this.isStableUnsupportedState(state)
+                ? state.fingerprint
+                : state.kind === 'text'
+                    ? createHash('sha256').update(state.content, 'utf8').digest('hex')
+                    : undefined,
             changes: [],
             timestamp: new Date()
         });

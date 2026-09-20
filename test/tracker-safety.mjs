@@ -5,6 +5,7 @@
 import { registerOpaqueBaselineInvariants } from './opaque-baseline-invariants.mjs';
 import { registerStateSchemaCompatibility } from './state-schema-compatibility.mjs';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
@@ -274,6 +275,34 @@ test('S1 newly created binary files remain visible as read-only opaque review',a
     assert.equal(tracker.getReviewToken(p),undefined);
     assert.equal(tracker.getOriginalContent(p),'');
     assert.equal(tracker.baselineExistingFiles.has(p),false);
+});
+test('S1 text-to-opaque review fingerprints both existing identities',async()=>{
+    const p=file('text-to-opaque.bin'),baseline='baseline text\r\n';
+    seed(p,baseline,baseline);
+    const current=Buffer.from([0x41,0x00,0x42,0x43]);
+    fs.writeFileSync(p,current);await scan(p);
+    const change=pending(p);
+    assert.equal(change?.reviewKind,'opaque');
+    assert.equal(change?.baselineExists,true);
+    assert.equal(change?.currentExists,true);
+    assert.equal(change?.baselineFingerprint,createHash('sha256').update(baseline,'utf8').digest('hex'));
+    assert.equal(change?.currentFingerprint,createHash('sha256').update(current).digest('hex'));
+});
+test('S1 opaque-to-text review fingerprints both existing identities',async()=>{
+    const p=file('opaque-to-text.dat');
+    const baseline=Buffer.from([0xef,0xbb,0xbf,0x61]);
+    fs.writeFileSync(p,baseline);listedFiles=[Uri.file(p)];
+    assert.equal(await tracker.resetBaselineToCurrentState(),true);
+    const accepted=tracker.opaqueBaselineFiles.get(p);assert.ok(accepted?.fingerprint);
+    const current='ordinary text after opaque baseline\n';
+    fs.writeFileSync(p,current);await scan(p);
+    const change=pending(p);
+    assert.equal(change?.reviewKind,'opaque');
+    assert.equal(change?.baselineExists,true);
+    assert.equal(change?.currentExists,true);
+    assert.equal(change?.baselineFingerprint,createHash('sha256').update(baseline).digest('hex'));
+    assert.equal(change?.baselineFingerprint,accepted.fingerprint);
+    assert.equal(change?.currentFingerprint,createHash('sha256').update(current,'utf8').digest('hex'));
 });
 test('DT-02 hunk Keep on a new file establishes existence for later Revert',async()=>{
     const p=file(); fs.writeFileSync(p,'accepted\n'); await tracker.onExternalFileCreated(Uri.file(p));
