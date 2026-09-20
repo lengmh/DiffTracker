@@ -3066,7 +3066,7 @@ test('S3 watcherExclude change pauses an already-effective include and persists 
     })).digest('hex');
     assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
 
-    vscodeExcludes['files.watcherExclude']={'**/scope-dynamic.txt':true};
+    vscodeExcludes['files.watcherExclude']={[`**/${path.basename(includeFile)}`]:true};
     configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
     await waitUntil(()=>!tracker.getIsRecording()&&tracker.baselineBuilding&&!tracker.snapshotInitialized);
     assert.equal(await tracker.flushPendingPersistence(),true);
@@ -3097,7 +3097,7 @@ test('S3 watcherExclude changing during scope preparation cannot publish the can
     const gate=pause(includeFile,'read');
     const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
     await gate.entered;
-    vscodeExcludes['files.watcherExclude']={'**/scope-race.txt':true};
+    vscodeExcludes['files.watcherExclude']={[`**/${path.basename(includeFile)}`]:true};
     configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
     gate.release();
     const result=await applying;
