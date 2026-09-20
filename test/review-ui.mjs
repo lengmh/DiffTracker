@@ -209,7 +209,7 @@ for (const isDeleted of [false, true]) {
     });
 }
 
-await test('unavailable state is visible in generated DOM, tree and incremental payload', async () => {
+await test('unknown state is visible in generated DOM, tree and incremental payload', async () => {
     const reason = 'Permission denied <restricted>';
     const h = harness({ filePath, fileName: 'empty.m', originalContent: '', currentContent: '', unavailableReason: reason });
     h.panel.sendDataUpdate();
@@ -220,10 +220,10 @@ await test('unavailable state is visible in generated DOM, tree and incremental 
     assert.equal(ui.elements.get('btn-reject-all').disabled, true);
     const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
     const leaf = (await tree.getChildren()).find(item => item.filePath === filePath);
-    assert.match(leaf.description, /Unavailable: Permission denied/);
+    assert.match(leaf.description, /Unknown · Permission denied/);
     assert.ok(leaf.tooltip.includes(reason));
     // Recovery comes from authoritative updateData and re-enables file actions.
-    ui.receive({ ...h.messages[0], unavailableReason: undefined });
+    ui.receive({ ...h.messages[0], reviewKind: 'text', reviewReason: undefined, unavailableReason: undefined });
     assert.match(ui.notice(), /Empty file created/);
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
 });
