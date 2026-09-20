@@ -805,11 +805,17 @@ export class DiffTracker {
                 return false;
             }
         }
+        // Creation handlers carry stronger provenance than a generic path read:
+        // they can establish known absence and recursively discover imported
+        // directories. advanceEpoch() cancels handlers from the old epoch, so
+        // retain their kind for an exact rollback replay.
+        const preResetCreations = new Map(
+            [...this.activeCreations].map(([filePath, creation]) => [filePath, creation.duringScan] as const)
+        );
         const preResetObservedPaths = new Set<string>([
             ...this.pendingExternalChanges,
             ...this.externalChangeTimers.keys(),
             ...this.documentChangeTimers.keys(),
-            ...this.activeCreations.keys(),
             ...this.scanUncertainFiles
         ]);
         // advanceEpoch() intentionally clears same-session provenance. Keep a
@@ -873,7 +879,7 @@ export class DiffTracker {
                 ...previous.pendingExternalChanges,
                 ...preResetObservedPaths,
                 ...observedPaths
-            ]);
+            ].filter(filePath => !preResetCreations.has(filePath)));
             this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
@@ -882,6 +888,10 @@ export class DiffTracker {
         const rollback = async (): Promise<void> => {
             if (!this.isCurrentEpoch(epoch)) { return; }
             this.endBaselineTransaction(transaction, false);
+            for (const [filePath, duringScan] of preResetCreations) {
+                if (!this.isCurrentEpoch(epoch)) { return; }
+                await this.onExternalFileCreated(vscode.Uri.file(filePath), duringScan);
+            }
             await this.processPendingExternalChanges();
             await this.flushPendingPersistence();
             this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');

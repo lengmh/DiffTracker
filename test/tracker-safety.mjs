@@ -1110,6 +1110,47 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed recording Clear Diffs replays an in-flight file creation with create provenance',async()=>{
+    const p=file('clear-inflight-create.txt'),storage=file('storage');
+    tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,'new during old session');
+    const createGate=pause(p,'stat'),creating=tracker.onExternalFileCreated(Uri.file(p));
+    await createGate.entered;
+    listedFiles=[];
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    await persistGate.entered;
+    createGate.release();await creating;
+    tracker.setGitContextPending(true);
+    persistGate.release();
+    assert.equal(await reset,false);
+    tracker.setGitContextPending(false);
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.unavailableReason,undefined);
+    assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+});
+test('S2 failed recording Clear Diffs replays in-flight directory creation and discovers children',async()=>{
+    const dir=file('clear-inflight-directory'),child=path.join(dir,'child.txt'),storage=file('storage');
+    tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.mkdirSync(dir);fs.writeFileSync(child,'new child');
+    const createGate=pause(dir,'stat'),creating=tracker.onExternalFileCreated(Uri.file(dir));
+    await createGate.entered;
+    listedFiles=[];
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    await persistGate.entered;
+    listedFiles=[Uri.file(child)];
+    createGate.release();await creating;
+    tracker.setGitContextPending(true);
+    persistGate.release();
+    assert.equal(await reset,false);
+    tracker.setGitContextPending(false);
+    assert.equal(pending(child)?.reviewKind,'text');
+    assert.equal(pending(child)?.unavailableReason,undefined);
+    assert.equal(tracker.getOriginalContent(child),'');
+    assert.equal(tracker.baselineExistingFiles.has(child),false);
+});
 test('S2 failed recording Clear Diffs preserves same-session create provenance for unknown additions',async()=>{
     const p=file('clear-unknown-provenance.txt'),storage=file('storage');
     tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
