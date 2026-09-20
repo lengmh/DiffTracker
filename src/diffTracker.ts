@@ -115,6 +115,7 @@ interface ImportedDirectoryWatch {
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
+    observedEvents?: Map<string, StartupEvent>;
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
@@ -153,7 +154,7 @@ interface PersistedTrackerState {
 export type RestoreOutcome = 'absent' | 'restored' | 'recovered' | 'incomplete' | 'blocked';
 
 export interface ActionResult {
-    status: 'success' | 'failed' | 'conflict' | 'cancelled';
+    status: 'success' | 'failed' | 'conflict' | 'cancelled' | 'needsConfirmation' | 'needsAttention';
     filePath: string;
     reason?: string;
     bufferChanged?: boolean;
@@ -165,11 +166,28 @@ export interface BatchActionResult {
     failed: number;
 }
 
+export interface MixedBatchActionResult extends BatchActionResult {
+    accepted: number;
+    acknowledged: number;
+    reverted: number;
+    needsConfirmation: number;
+    needsAttention: number;
+    failures: number;
+    conflicts: number;
+    cancelled: number;
+}
+
 export interface ReviewToken {
     filePath: string;
     epoch: number;
     baselineRevision: string;
     currentRevision: string;
+}
+
+export interface OpaqueReviewToken {
+    filePath: string;
+    epoch: number;
+    reviewRevision: string;
 }
 
 type CurrentFileState =
@@ -221,7 +239,26 @@ export class DiffTracker {
         return operation;
     }
     private scanUncertainFiles = new Set<string>();
-    private activeCreations = new Map<string, { duringScan: boolean }>();
+    private activeCreations = new Map<string, { duringScan: boolean; cancelled?: boolean }>();
+    private nextExternalOperationId = 1;
+    private activeExternalOperations = new Map<number, { uri: vscode.Uri; kind: 'change' | 'delete' }>();
+
+    private recordBaselineTransactionEvent(uri: vscode.Uri, kind: StartupEvent['kind']): void {
+        const events = this.baselineTransaction?.observedEvents;
+        if (!events) { return; }
+        const previous = events.get(uri.fsPath);
+        events.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
+    }
+
+    private beginExternalOperation(uri: vscode.Uri, kind: 'change' | 'delete'): number {
+        const id = this.nextExternalOperationId++;
+        this.activeExternalOperations.set(id, { uri, kind });
+        return id;
+    }
+
+    private endExternalOperation(id: number): void {
+        this.activeExternalOperations.delete(id);
+    }
 
     private isCurrentEpoch(epoch: number): boolean {
         return !this.disposed && epoch === this.sessionEpoch;
@@ -238,7 +275,9 @@ export class DiffTracker {
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
         this.scanUncertainFiles.clear();
+        for (const creation of this.activeCreations.values()) { creation.cancelled = true; }
         this.activeCreations.clear();
+        this.activeExternalOperations.clear();
         this.pendingImportedDirectoryReconciliation.clear();
         this.importedDirectoryResumePromise = undefined;
         this.activeWriteFiles.clear();
@@ -264,6 +303,92 @@ export class DiffTracker {
     public getReviewTokens(): ReviewToken[] {
         return [...this.trackedChanges.keys()].map(filePath => this.getReviewToken(filePath))
             .filter((token): token is ReviewToken => !!token);
+    }
+
+    private opaqueReviewRevision(change: FileDiff): string {
+        return createHash('sha256').update(JSON.stringify({
+            reviewKind: change.reviewKind,
+            baselineExists: change.baselineExists ?? null,
+            currentExists: change.currentExists ?? null,
+            baselineSize: change.baselineSize ?? null,
+            currentSize: change.currentSize ?? null,
+            baselineFingerprint: change.baselineFingerprint ?? null,
+            currentFingerprint: change.currentFingerprint ?? null,
+            reviewReason: change.reviewReason ?? null,
+            isDeleted: change.isDeleted
+        })).digest('hex');
+    }
+
+    public getOpaqueReviewToken(filePath: string): OpaqueReviewToken | undefined {
+        const change = this.trackedChanges.get(filePath);
+        if (!change || change.reviewKind !== 'opaque' || change.unavailableReason || this.disposed) { return undefined; }
+        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change) };
+    }
+
+    public getOpaqueReviewTokens(): OpaqueReviewToken[] {
+        return [...this.trackedChanges.keys()].map(filePath => this.getOpaqueReviewToken(filePath))
+            .filter((token): token is OpaqueReviewToken => !!token);
+    }
+
+    public getUnknownReviewPaths(): string[] {
+        return [...this.trackedChanges.values()]
+            .filter(change => change.reviewKind === 'unknown')
+            .map(change => change.filePath);
+    }
+
+    private matchesOpaqueReview(token: OpaqueReviewToken | undefined): token is OpaqueReviewToken {
+        if (!token || !this.isCurrentEpoch(token.epoch)) { return false; }
+        const change = this.trackedChanges.get(token.filePath);
+        return !!change && change.reviewKind === 'opaque' && !change.unavailableReason &&
+            this.opaqueReviewRevision(change) === token.reviewRevision;
+    }
+
+    private currentStateMatchesOpaqueReview(change: FileDiff, state: CurrentFileState): boolean {
+        if (change.currentExists === false) { return state.kind === 'missing'; }
+        if (state.kind === 'text') {
+            if (change.currentExists !== true || !change.currentFingerprint) { return false; }
+            const fingerprint = createHash('sha256').update(state.content, 'utf8').digest('hex');
+            return change.currentFingerprint === fingerprint &&
+                (change.currentSize === undefined || change.currentSize === Buffer.byteLength(state.content, 'utf8'));
+        }
+        if (this.isStableUnsupportedState(state)) {
+            return change.currentExists === true && !!change.currentFingerprint && !!state.fingerprint &&
+                change.currentFingerprint === state.fingerprint &&
+                (change.currentSize === undefined || change.currentSize === state.size);
+        }
+        return false;
+    }
+
+    private async verifyOpaqueReview(token: OpaqueReviewToken | undefined): Promise<CurrentFileState | undefined> {
+        if (!this.matchesOpaqueReview(token)) { return undefined; }
+        const state = await this.readCurrentFileState(token.filePath);
+        if (!this.matchesOpaqueReview(token)) { return undefined; }
+        const change = this.trackedChanges.get(token.filePath);
+        return change && this.currentStateMatchesOpaqueReview(change, state) ? state : undefined;
+    }
+
+    private queueOpaqueFileAction(
+        filePath: string,
+        token: OpaqueReviewToken | undefined,
+        action: (review: OpaqueReviewToken, state: CurrentFileState) => Promise<ActionResult>
+    ): Promise<ActionResult> {
+        const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
+        const task = previous.catch(() => undefined).then(async () => {
+            const state = token?.filePath === filePath ? await this.verifyOpaqueReview(token) : undefined;
+            if (!token || token.filePath !== filePath || !state) {
+                const reason = this.hasDirtyDocument(filePath)
+                    ? 'Save or discard editor changes before acknowledging this read-only review'
+                    : 'Read-only review is stale or unavailable; refresh and review again';
+                if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
+                return this.actionResult(filePath, 'conflict', reason);
+            }
+            return action(token, state);
+        });
+        this.fileActionQueues.set(filePath, task);
+        void task.finally(() => {
+            if (this.fileActionQueues.get(filePath) === task) { this.fileActionQueues.delete(filePath); }
+        }).catch(() => undefined);
+        return task;
     }
 
     private matchesReview(token: ReviewToken | undefined): token is ReviewToken {
@@ -702,33 +827,218 @@ export class DiffTracker {
                 return false;
             }
         }
+        // Creation handlers carry stronger provenance than a generic path read:
+        // they can establish known absence and recursively discover imported
+        // directories. advanceEpoch() cancels handlers from the old epoch, so
+        // retain their kind for an exact rollback replay.
+        const preResetCreations = new Map(
+            [...this.activeCreations].map(([filePath, creation]) => [filePath, creation.duringScan] as const)
+        );
+        const preResetStartupEvents = new Map(this.initialIgnoreEvents);
+        const previousScanUncertainFiles = new Set(this.scanUncertainFiles);
+        const preResetExternalEvents = new Map<string, StartupEvent>();
+        for (const { uri, kind } of this.activeExternalOperations.values()) {
+            const previous = preResetExternalEvents.get(uri.fsPath);
+            preResetExternalEvents.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
+        }
+        const preResetObservedPaths = new Set<string>([
+            ...this.pendingExternalChanges,
+            ...this.externalChangeTimers.keys(),
+            ...this.documentChangeTimers.keys(),
+            ...this.scanUncertainFiles
+        ]);
+        preResetExternalEvents.forEach((_event, filePath) => preResetObservedPaths.delete(filePath));
+        // advanceEpoch() intentionally clears same-session provenance. Keep a
+        // copy so a failed replacement baseline can restore the old session
+        // exactly; otherwise a change-first addition can no longer be upgraded
+        // by a later create event after rollback.
+        const previousPostBaselineUnknownFiles = new Set(this.postBaselineUnknownFiles);
         const epoch = this.advanceEpoch();
         if (watchers) { this.activateExternalWatchers(watchers); }
         if (!this.isRecording) {
             return this.clearStoppedBaseline(epoch);
         }
+
+        const previous = {
+            fileSnapshots: new Map(this.fileSnapshots),
+            fileModes: new Map(this.fileModes),
+            baselineExistingFiles: new Set(this.baselineExistingFiles),
+            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
+            trackedChanges: new Map(this.trackedChanges),
+            lineChanges: new Map(this.lineChanges),
+            inlineViews: new Map(this.inlineViews),
+            revertHistory: this.revertHistory.map(record => ({
+                ...record,
+                items: record.items.map(item => ({ ...item, before: { ...item.before }, after: { ...item.after } }))
+            })),
+            baselineGitContexts: new Map(this.baselineGitContexts),
+            pausedGitRepositories: new Map(this.pausedGitRepositories),
+            sessionWorkspaceRoots: [...this.sessionWorkspaceRoots],
+            snapshotInitialized: this.snapshotInitialized,
+            baselineBuilding: this.baselineBuilding,
+            workspaceContextChanged: this.workspaceContextChanged,
+            scanCoverage: this.scanCoverage,
+            pendingExternalChanges: new Set(this.pendingExternalChanges),
+            postBaselineUnknownFiles: previousPostBaselineUnknownFiles,
+            scanUncertainFiles: previousScanUncertainFiles
+        };
+        const previousReviewPaths = [...previous.trackedChanges.keys()];
+        let transaction!: BaselineTransaction;
+        let replacementEvents = new Map<string, StartupEvent>();
+        const restoreMemory = (): void => {
+            const observedPaths = new Set([
+                ...this.trackedChanges.keys(),
+                ...this.pendingExternalChanges
+            ]);
+            this.fileSnapshots = previous.fileSnapshots;
+            this.fileModes = previous.fileModes;
+            this.baselineExistingFiles = previous.baselineExistingFiles;
+            this.unresolvedBaselineFiles = previous.unresolvedBaselineFiles;
+            this.opaqueBaselineFiles = previous.opaqueBaselineFiles;
+            this.trackedChanges = previous.trackedChanges;
+            this.lineChanges = previous.lineChanges;
+            this.inlineViews = previous.inlineViews;
+            this.revertHistory = previous.revertHistory;
+            this.baselineGitContexts = previous.baselineGitContexts;
+            this.pausedGitRepositories = previous.pausedGitRepositories;
+            this.sessionWorkspaceRoots = previous.sessionWorkspaceRoots;
+            this.snapshotInitialized = previous.snapshotInitialized;
+            this.baselineBuilding = previous.baselineBuilding;
+            this.workspaceContextChanged = previous.workspaceContextChanged;
+            this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            this.pendingExternalChanges = new Set([
+                ...previous.pendingExternalChanges,
+                ...preResetObservedPaths,
+                ...observedPaths
+            ].filter(filePath => !preResetCreations.has(filePath) &&
+                !preResetExternalEvents.has(filePath) && !replacementEvents.has(filePath)));
+            this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
+            this.scanUncertainFiles = new Set(previous.scanUncertainFiles);
+            this.resetChangeBlocksCaches();
+            this.trackedChangesVersion++;
+            this.trackedChangesCacheVersion = -1;
+        };
+        const rollback = async (): Promise<void> => {
+            if (!this.isCurrentEpoch(epoch)) { return; }
+            // Events queued while the replacement baseline is in its startup-ignore
+            // phase belong to the failed transaction. Freeze them before restoring
+            // memory, then end that phase so replay cannot be deferred again.
+            const startupEvents = new Map<string, StartupEvent>();
+            const appendStartupEvent = (event: StartupEvent): void => {
+                const existing = startupEvents.get(event.uri.fsPath);
+                startupEvents.set(event.uri.fsPath, {
+                    uri: event.uri,
+                    firstKind: existing?.firstKind ?? event.firstKind,
+                    kind: event.kind
+                });
+            };
+            preResetStartupEvents.forEach(appendStartupEvent);
+            if (previous.baselineBuilding) {
+                for (const [filePath] of preResetCreations) {
+                    appendStartupEvent({
+                        uri: vscode.Uri.file(filePath),
+                        firstKind: 'create',
+                        kind: 'create'
+                    });
+                }
+                preResetExternalEvents.forEach(appendStartupEvent);
+            }
+            if (this.initialIgnoreEpoch === epoch) {
+                this.initialIgnoreEvents.forEach(appendStartupEvent);
+            }
+            replacementEvents = new Map(transaction.observedEvents ?? []);
+            if (previous.baselineBuilding) {
+                replacementEvents.forEach(appendStartupEvent);
+            }
+            this.initialIgnoreEpoch = undefined;
+            this.initialIgnoreEvents.clear();
+
+            // Replacement create handlers captured scanEvent against the candidate
+            // baseline. They must not resume after old memory is restored and
+            // overwrite replayed post-baseline creation evidence.
+            for (const creation of this.activeCreations.values()) { creation.cancelled = true; }
+            this.activeCreations.clear();
+
+            this.endBaselineTransaction(transaction, false);
+
+            if (previous.baselineBuilding && this.isRecording) {
+                // advanceEpoch() cancelled the previous scan. Restoring only its
+                // flags would strand the session in "Starting..." forever, so
+                // resume discovery in the current epoch from the restored partial
+                // evidence. Treat all creation/startup events seen across the
+                // handoff as scan-time evidence; they must not establish a fresh
+                // post-baseline absence while the prior baseline was incomplete.
+                this.initialIgnoreEpoch = epoch;
+                this.initialIgnoreEvents = startupEvents;
+                try {
+                    await this.initializeWorkspaceSnapshots();
+                } catch (error) {
+                    if (this.isCurrentEpoch(epoch)) {
+                        this.reportPersistenceIssue(
+                            'Failed to resume the interrupted baseline after Clear Diffs rollback.',
+                            error
+                        );
+                    }
+                }
+            } else {
+                const replayEvents = new Map<string, StartupEvent>();
+                const appendReplayEvent = (event: StartupEvent): void => {
+                    const existing = replayEvents.get(event.uri.fsPath);
+                    replayEvents.set(event.uri.fsPath, {
+                        uri: event.uri,
+                        firstKind: existing?.firstKind ?? event.firstKind,
+                        kind: event.kind
+                    });
+                };
+                for (const [filePath] of preResetCreations) {
+                    appendReplayEvent({ uri: vscode.Uri.file(filePath), firstKind: 'create', kind: 'create' });
+                }
+                preResetExternalEvents.forEach(appendReplayEvent);
+                startupEvents.forEach(appendReplayEvent);
+                replacementEvents.forEach(appendReplayEvent);
+
+                if ([...replayEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
+                    await this.refreshIgnoreMatchers();
+                }
+                for (const event of replayEvents.values()) {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (event.kind === 'delete') {
+                        await this.onExternalFileDeleted(event.uri);
+                    } else if (event.kind === 'create' || event.firstKind === 'create') {
+                        await this.onExternalFileCreated(event.uri);
+                    } else {
+                        this.pendingExternalChanges.add(event.uri.fsPath);
+                    }
+                }
+                await this.processPendingExternalChanges();
+            }
+            await this.flushPendingPersistence();
+            this._onDidChangeBaselineState.fire(this.baselineBuilding ? 'building' : 'ready');
+            this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+        };
+
+        transaction = this.beginBaselineTransaction(restoreMemory);
+        transaction.observedEvents = new Map();
+        transaction.valid = () => this.isRecording && !this.recoveryBlocked &&
+            !this.workspaceContextChanged && !this.gitContextPending;
+
         this.workspaceContextChanged = false;
-
-        const removedFiles = Array.from(this.trackedChanges.keys());
-
-        // Recovery records belong to the baseline being explicitly replaced.
         this.revertHistory = [];
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
-
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
-
         this.pendingWriteFiles.clear();
-        this.fileSnapshots.clear();
-        this.fileModes.clear();
-        this.baselineExistingFiles.clear();
-        this.unresolvedBaselineFiles.clear();
-        this.opaqueBaselineFiles.clear();
+        this.fileSnapshots = new Map();
+        this.fileModes = new Map();
+        this.baselineExistingFiles = new Set();
+        this.unresolvedBaselineFiles = new Map();
+        this.opaqueBaselineFiles = new Map();
         this.clearTrackedChanges();
-        this.lineChanges.clear();
+        this.lineChanges = new Map();
         this.resetChangeBlocksCaches();
-        this.inlineViews.clear();
-        this.pendingExternalChanges.clear();
+        this.inlineViews = new Map();
+        this.pendingExternalChanges = new Set();
         this.snapshotInitialized = false;
         this.scanCoverage = undefined;
         this.baselineBuilding = true;
@@ -736,20 +1046,31 @@ export class DiffTracker {
 
         try {
             this.initialIgnoreEpoch = epoch;
-            await this.initializeWorkspaceSnapshots();
-        } catch (error) {
-            console.error('Failed to reset baseline to current state:', error);
-        } finally {
-            if (!this.isCurrentEpoch(epoch)) { return false; }
-            // A failed/partial scan remains Building; only the scanner can publish Ready.
+            await this.initializeWorkspaceSnapshots(transaction);
+            const committed = this.isCurrentEpoch(epoch) && this.baselineTransaction === transaction &&
+                this.snapshotInitialized && !this.baselineBuilding && (!transaction.valid || transaction.valid());
+            if (!committed) {
+                await rollback();
+                return false;
+            }
+            this.endBaselineTransaction(transaction, true);
             this.emitTrackChangesEvent({
-                removedFiles,
+                removedFiles: previousReviewPaths,
                 fullRefresh: true,
                 baselineChanged: true
             });
-            this.schedulePersistState();
+            return true;
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) {
+                this.reportPersistenceIssue('Clear Diffs baseline rebuild failed; prior review retained.', error);
+                await rollback();
+            }
+            return false;
+        } finally {
+            if (this.baselineTransaction === transaction) {
+                await rollback();
+            }
         }
-        return this.snapshotInitialized && !this.baselineBuilding;
     }
 
     private async clearStoppedBaseline(epoch: number): Promise<boolean> {
@@ -1979,7 +2300,7 @@ export class DiffTracker {
         }
     }
 
-    private async initializeWorkspaceSnapshots(): Promise<void> {
+    private async initializeWorkspaceSnapshots(transaction?: BaselineTransaction): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
         const initialDocuments = new Set(vscode.workspace.textDocuments.filter(doc => doc.uri.scheme === 'file').map(doc => doc.uri.fsPath));
@@ -2085,7 +2406,7 @@ export class DiffTracker {
         }
 
         this.scanCoverage = scanIgnoreVersion === this.ignoreRefreshVersion ? scanFingerprint : undefined;
-        await this.completeBaseline(epoch);
+        await this.completeBaseline(epoch, transaction);
     }
 
     private async completeBaseline(epoch: number, transaction?: BaselineTransaction): Promise<boolean> {
@@ -2589,37 +2910,50 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
-        const scanEvent = this.markScanEvent(filePath);
-        if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
-        if (scanEvent) {
-            this.pendingExternalChanges.add(filePath);
-            this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
-            return;
-        }
-
-        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
-        if (doc && doc.isDirty) {
-            this.markFileUnavailable(filePath, 'External change while editor has unsaved content; reconcile disk and buffer before review');
-            return;
-        }
-
-        const existingTimer = this.externalChangeTimers.get(filePath);
-        if (existingTimer) {
-            clearTimeout(existingTimer);
-        }
-
-        const timer = setTimeout(() => {
-            this.externalChangeTimers.delete(filePath);
-            if (!this.isRecording || !this.externalWatcherEnabled || !this.isCurrentEpoch(epoch)) {
+        this.recordBaselineTransactionEvent(uri, 'change');
+        const operationId = this.beginExternalOperation(uri, 'change');
+        try {
+            const scanEvent = this.markScanEvent(filePath);
+            if (await this.isUntrackedDirectory(uri) || !this.isCurrentEpoch(epoch)) { return; }
+            if (scanEvent) {
+                this.pendingExternalChanges.add(filePath);
+                this.recordUnresolvedBaseline(filePath, 'File changed during baseline scan; before-image is unknown');
                 return;
             }
-            if (this.isPathIgnored(uri)) {
+
+            const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
+            if (doc && doc.isDirty) {
+                this.markFileUnavailable(filePath, 'External change while editor has unsaved content; reconcile disk and buffer before review');
                 return;
             }
-            this.readFileAndUpdate(filePath, uri).catch(() => undefined);
-        }, 120);
 
-        this.externalChangeTimers.set(filePath, timer);
+            const existingTimer = this.externalChangeTimers.get(filePath);
+            if (existingTimer) {
+                clearTimeout(existingTimer);
+            }
+
+            const timer = setTimeout(() => {
+                this.externalChangeTimers.delete(filePath);
+                const readOperationId = this.beginExternalOperation(uri, 'change');
+                void (async () => {
+                    try {
+                        if (!this.isRecording || !this.externalWatcherEnabled || !this.isCurrentEpoch(epoch)) {
+                            return;
+                        }
+                        if (this.isPathIgnored(uri)) {
+                            return;
+                        }
+                        await this.readFileAndUpdate(filePath, uri);
+                    } finally {
+                        this.endExternalOperation(readOperationId);
+                    }
+                })().catch(() => undefined);
+            }, 120);
+
+            this.externalChangeTimers.set(filePath, timer);
+        } finally {
+            this.endExternalOperation(operationId);
+        }
     }
 
     private onDocumentOpened(doc: vscode.TextDocument): void {
@@ -2658,14 +2992,17 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        this.recordBaselineTransactionEvent(uri, 'create');
         const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.hasCapturedBaseline(filePath));
         // Capture creation evidence before stat/ignore discovery can yield. A
         // concurrent refresh must not classify this directory's children as old.
-        const creation = { duringScan: scanEvent };
+        const creation = { duringScan: scanEvent, cancelled: false };
         this.activeCreations.set(filePath, creation);
+        const creationIsCurrent = () => this.isCurrentEpoch(epoch) && !creation.cancelled &&
+            this.activeCreations.get(filePath) === creation;
         try {
             const directory = await this.isUntrackedDirectory(uri);
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!creationIsCurrent()) { return; }
             if (directory) {
                 if (this.fileSnapshots.has(filePath)) {
                     // An absent baseline no longer has a file at this path.
@@ -2675,27 +3012,27 @@ export class DiffTracker {
                 // directory appears; its nested .gitignore events are not guaranteed.
                 try {
                     await this.refreshIgnoreMatchers();
-                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (!creationIsCurrent()) { return; }
                     let watchFailed = false;
                     try { await this.watchImportedTree(filePath, epoch); }
                     catch { watchFailed = true; }
-                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (!creationIsCurrent()) { return; }
                     const children = await vscode.workspace.findFiles(
                         new vscode.RelativePattern(filePath, '**/*'),
                         new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
                     );
-                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    if (!creationIsCurrent()) { return; }
                     for (const child of children) {
-                        if (!this.isCurrentEpoch(epoch)) { return; }
+                        if (!creationIsCurrent()) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
                             await this.onExternalFileCreated(child, scanEvent);
                         }
                     }
-                    if (watchFailed && this.isCurrentEpoch(epoch)) {
+                    if (watchFailed && creationIsCurrent()) {
                         await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
                     }
                 } catch {
-                    if (this.isCurrentEpoch(epoch)) {
+                    if (creationIsCurrent()) {
                         await this.markCreatedDirectoryUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure', scanEvent, epoch);
                     }
                 }
@@ -2706,7 +3043,7 @@ export class DiffTracker {
                 return;
             }
             const state = await this.readFileSnapshot(uri);
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!creationIsCurrent()) { return; }
             if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
                 (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
                 this.unresolvedBaselineFiles.delete(filePath);
@@ -2743,18 +3080,24 @@ export class DiffTracker {
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
-        // Remove watches only for a confirmed missing subtree.
-        if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
         if (this.isPathIgnored(uri)) { return; }
-        // A delete notification may race an atomic replacement; confirm actual state.
-        const baselinePaths = new Set([...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys()]);
-        const targets = new Set([uri.fsPath, ...[...baselinePaths].filter(filePath => {
-            const relative = path.relative(uri.fsPath, filePath);
-            return !!relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-        })]);
-        for (const filePath of targets) {
-            if (!this.isCurrentEpoch(epoch)) { return; }
-            await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+        this.recordBaselineTransactionEvent(uri, 'delete');
+        const operationId = this.beginExternalOperation(uri, 'delete');
+        try {
+            // Remove watches only for a confirmed missing subtree.
+            if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
+            // A delete notification may race an atomic replacement; confirm actual state.
+            const baselinePaths = new Set([...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys()]);
+            const targets = new Set([uri.fsPath, ...[...baselinePaths].filter(filePath => {
+                const relative = path.relative(uri.fsPath, filePath);
+                return !!relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+            })]);
+            for (const filePath of targets) {
+                if (!this.isCurrentEpoch(epoch)) { return; }
+                await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+            }
+        } finally {
+            this.endExternalOperation(operationId);
         }
     }
 
@@ -3333,6 +3676,224 @@ export class DiffTracker {
         this.markLineChangesUpdated(filePath);
         this.inlineViews.delete(filePath);
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
+    }
+
+    private beginAcknowledgeTransaction(filePath: string, review: OpaqueReviewToken): BaselineTransaction {
+        const previous = {
+            snapshotPresent: this.fileSnapshots.has(filePath),
+            snapshot: this.fileSnapshots.get(filePath),
+            modePresent: this.fileModes.has(filePath),
+            mode: this.fileModes.get(filePath),
+            baselineExists: this.baselineExistingFiles.has(filePath),
+            unresolved: this.unresolvedBaselineFiles.get(filePath),
+            opaque: this.opaqueBaselineFiles.get(filePath),
+            postBaselineUnknown: this.postBaselineUnknownFiles.has(filePath),
+            revertHistory: this.revertHistory,
+            baselineBuilding: this.baselineBuilding,
+            snapshotInitialized: this.snapshotInitialized
+        };
+        const transaction = this.beginBaselineTransaction(() => {
+            if (previous.snapshotPresent) { this.fileSnapshots.set(filePath, previous.snapshot!); }
+            else { this.fileSnapshots.delete(filePath); }
+            if (previous.modePresent) { this.fileModes.set(filePath, previous.mode!); }
+            else { this.fileModes.delete(filePath); }
+            if (previous.baselineExists) { this.baselineExistingFiles.add(filePath); }
+            else { this.baselineExistingFiles.delete(filePath); }
+            if (previous.unresolved !== undefined) { this.unresolvedBaselineFiles.set(filePath, previous.unresolved); }
+            else { this.unresolvedBaselineFiles.delete(filePath); }
+            if (previous.opaque) { this.opaqueBaselineFiles.set(filePath, previous.opaque); }
+            else { this.opaqueBaselineFiles.delete(filePath); }
+            if (previous.postBaselineUnknown) { this.postBaselineUnknownFiles.add(filePath); }
+            else { this.postBaselineUnknownFiles.delete(filePath); }
+            this.revertHistory = previous.revertHistory;
+            this.baselineBuilding = previous.baselineBuilding;
+            this.snapshotInitialized = previous.snapshotInitialized;
+        });
+        transaction.valid = () => !this.validateSnapshotTarget(filePath) && this.matchesOpaqueReview(review);
+        this.revertHistory = previous.revertHistory
+            .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
+            .filter(record => record.items.length > 0);
+        return transaction;
+    }
+
+    private applyAcknowledgedStateAsBaseline(filePath: string, state: CurrentFileState): boolean {
+        this.unresolvedBaselineFiles.delete(filePath);
+        this.postBaselineUnknownFiles.delete(filePath);
+        if (state.kind === 'missing') {
+            this.fileSnapshots.set(filePath, '');
+            this.fileModes.delete(filePath);
+            this.baselineExistingFiles.delete(filePath);
+            this.opaqueBaselineFiles.delete(filePath);
+            return true;
+        }
+        if (state.kind === 'text') {
+            this.fileSnapshots.set(filePath, state.content);
+            if (state.mode === undefined) { this.fileModes.delete(filePath); } else { this.fileModes.set(filePath, state.mode); }
+            this.baselineExistingFiles.add(filePath);
+            this.opaqueBaselineFiles.delete(filePath);
+            return true;
+        }
+        if (this.isStableUnsupportedState(state)) {
+            this.fileSnapshots.delete(filePath);
+            this.fileModes.delete(filePath);
+            this.baselineExistingFiles.delete(filePath);
+            this.opaqueBaselineFiles.set(filePath, {
+                reason: state.reason,
+                size: state.size,
+                mtime: state.mtime,
+                fingerprint: state.fingerprint
+            });
+            return true;
+        }
+        return false;
+    }
+
+    private async commitAcknowledgeTransaction(filePath: string, epoch: number, transaction: BaselineTransaction): Promise<boolean> {
+        let committed = false;
+        try {
+            committed = await this.completeBaseline(epoch, transaction) &&
+                this.baselineTransaction === transaction && this.isCurrentEpoch(epoch);
+            return committed;
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) {
+                this.reportPersistenceIssue('Acknowledge transaction failed; prior baseline retained.', error);
+            }
+            return false;
+        } finally {
+            const invalidTarget = this.isCurrentEpoch(epoch) && transaction.valid && !transaction.valid();
+            this.endBaselineTransaction(transaction, committed);
+            if (!committed && invalidTarget) { await this.flushPendingPersistence(); }
+            if (!committed && this.isCurrentEpoch(epoch)) {
+                await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+            }
+        }
+    }
+
+    public acknowledgeOpaqueChange(
+        filePath: string,
+        token = this.getOpaqueReviewToken(filePath)
+    ): Promise<ActionResult> {
+        return this.queueRecoveryAction(() => this.queueOpaqueFileAction(
+            filePath,
+            token,
+            (review, state) => this.acknowledgeOpaqueReviewed(filePath, review, state)
+        ));
+    }
+
+    private async acknowledgeOpaqueReviewed(
+        filePath: string,
+        review: OpaqueReviewToken,
+        state: CurrentFileState
+    ): Promise<ActionResult> {
+        const targetError = this.validateActionTarget(filePath);
+        if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
+        if (!this.matchesOpaqueReview(review)) {
+            return this.actionResult(filePath, 'conflict', 'Read-only review changed during Acknowledge');
+        }
+        const current = await this.readCurrentFileState(filePath);
+        const change = this.trackedChanges.get(filePath);
+        if (!this.matchesOpaqueReview(review) || !change || !this.currentStateMatchesOpaqueReview(change, current)) {
+            await this.refreshRejectedReview(filePath);
+            return this.actionResult(filePath, 'conflict', 'File changed since this read-only review; review again');
+        }
+        // Prefer the second authoritative read. The first state exists only to
+        // prove the queued action targeted the same review before entering here.
+        void state;
+        const finalTargetError = this.validateActionTarget(filePath);
+        if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
+        const epoch = this.sessionEpoch;
+        const transaction = this.beginAcknowledgeTransaction(filePath, review);
+        if (!this.applyAcknowledgedStateAsBaseline(filePath, current)) {
+            this.endBaselineTransaction(transaction, false);
+            return this.actionResult(filePath, 'conflict', 'Current resource identity is not reliable enough to acknowledge');
+        }
+        if (!await this.commitAcknowledgeTransaction(filePath, epoch, transaction)) {
+            return this.actionResult(filePath, 'failed', 'Acknowledge could not be saved; read-only review remains pending');
+        }
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'success', 'Acknowledge was saved before the session changed');
+        }
+        // The accepted identity is now the baseline even when the follow-up read
+        // merely clears the old review. Notify original-content providers
+        // explicitly so already-open diff editors cannot retain the old baseline.
+        this.emitTrackChangesEvent({ changedFiles: [filePath], baselineChanged: true });
+        await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+        return this.actionResult(filePath, 'success');
+    }
+
+    private mixedBatchResult(
+        results: ActionResult[],
+        acceptedPaths: Set<string>,
+        acknowledgedPaths: Set<string>,
+        revertedPaths: Set<string>
+    ): MixedBatchActionResult {
+        const accepted = results.filter(item => item.status === 'success' && acceptedPaths.has(item.filePath)).length;
+        const acknowledged = results.filter(item => item.status === 'success' && acknowledgedPaths.has(item.filePath)).length;
+        const reverted = results.filter(item => item.status === 'success' && revertedPaths.has(item.filePath)).length;
+        const succeeded = accepted + acknowledged + reverted;
+        return {
+            results,
+            succeeded,
+            failed: results.length - succeeded,
+            accepted,
+            acknowledged,
+            reverted,
+            needsConfirmation: results.filter(item => item.status === 'needsConfirmation').length,
+            needsAttention: results.filter(item => item.status === 'needsAttention').length,
+            failures: results.filter(item => item.status === 'failed').length,
+            conflicts: results.filter(item => item.status === 'conflict').length,
+            cancelled: results.filter(item => item.status === 'cancelled').length
+        };
+    }
+
+    public async acceptAllPendingChanges(
+        textTokens: ReviewToken[] = this.getReviewTokens(),
+        opaqueTokens: OpaqueReviewToken[] = this.getOpaqueReviewTokens(),
+        unknownPaths: string[] = this.getUnknownReviewPaths()
+    ): Promise<MixedBatchActionResult> {
+        const results: ActionResult[] = [];
+        const acceptedPaths = new Set<string>();
+        const acknowledgedPaths = new Set<string>();
+        for (const token of [...textTokens]) {
+            const result = await this.keepAllChangesInFile(token.filePath, token);
+            results.push(result);
+            if (result.status === 'success') { acceptedPaths.add(token.filePath); }
+        }
+        for (const token of [...opaqueTokens]) {
+            const result = await this.acknowledgeOpaqueChange(token.filePath, token);
+            results.push(result);
+            if (result.status === 'success') { acknowledgedPaths.add(token.filePath); }
+        }
+        for (const filePath of [...new Set(unknownPaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'unknown'
+                ? this.actionResult(filePath, 'needsAttention', current.reviewReason ?? current.unavailableReason ?? 'Review evidence is incomplete')
+                : this.actionResult(filePath, 'conflict', 'Review changed before the mixed Accept action completed'));
+        }
+        return this.mixedBatchResult(results, acceptedPaths, acknowledgedPaths, new Set());
+    }
+
+    public async revertAllPendingChanges(
+        textTokens: ReviewToken[] = this.getReviewTokens(),
+        opaquePaths: string[] = this.getOpaqueReviewTokens().map(token => token.filePath),
+        unknownPaths: string[] = this.getUnknownReviewPaths()
+    ): Promise<MixedBatchActionResult> {
+        const textResult = await this.revertAllChanges(textTokens);
+        const results = [...textResult.results];
+        const revertedPaths = new Set(textResult.results.filter(item => item.status === 'success').map(item => item.filePath));
+        for (const filePath of [...new Set(opaquePaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'opaque'
+                ? this.actionResult(filePath, 'needsConfirmation', 'Read-only changes cannot be reverted; acknowledge or inspect them separately')
+                : this.actionResult(filePath, 'conflict', 'Read-only review changed before the mixed Revert action completed'));
+        }
+        for (const filePath of [...new Set(unknownPaths)]) {
+            const current = this.trackedChanges.get(filePath);
+            results.push(current?.reviewKind === 'unknown'
+                ? this.actionResult(filePath, 'needsAttention', current.reviewReason ?? current.unavailableReason ?? 'Review evidence is incomplete')
+                : this.actionResult(filePath, 'conflict', 'Unknown review changed before the mixed Revert action completed'));
+        }
+        return this.mixedBatchResult(results, new Set(), new Set(), revertedPaths);
     }
 
     public revertAllChanges(tokens: ReviewToken[] = this.getReviewTokens()): Promise<BatchActionResult> {

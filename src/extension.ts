@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, BatchActionResult, DiffTracker, ReviewToken, TrackChangesEvent } from './diffTracker';
+import { ActionResult, BatchActionResult, DiffTracker, MixedBatchActionResult, OpaqueReviewToken, ReviewToken, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
 import { DiffTreeDataProvider } from './diffTreeView';
 import { DiffHoverProvider } from './hoverProvider';
@@ -205,6 +205,27 @@ export async function activate(context: vscode.ExtensionContext) {
         return result;
     };
 
+    const reportMixedBatch = (verb: string, result: MixedBatchActionResult): MixedBatchActionResult => {
+        refreshReview();
+        const parts = [
+            result.accepted ? `${result.accepted} accepted` : '',
+            result.acknowledged ? `${result.acknowledged} acknowledged` : '',
+            result.reverted ? `${result.reverted} reverted` : '',
+            result.needsConfirmation ? `${result.needsConfirmation} need confirmation` : '',
+            result.needsAttention ? `${result.needsAttention} need attention` : '',
+            result.failures ? `${result.failures} failed` : '',
+            result.conflicts ? `${result.conflicts} conflict` : '',
+            result.cancelled ? `${result.cancelled} cancelled` : ''
+        ].filter(Boolean).join(' · ');
+        const message = `Code Diff Tracker: ${verb}: ${parts || 'no pending items'}.`;
+        if (result.failures || result.conflicts || result.needsAttention || result.needsConfirmation) {
+            void vscode.window.showWarningMessage(message);
+        } else {
+            void vscode.window.showInformationMessage(message);
+        }
+        return result;
+    };
+
     const missingReview = (filePath: string): ActionResult => reportAction({
         filePath, status: 'conflict', reason: 'Review version is unavailable; reopen or refresh the review before acting'
     });
@@ -303,6 +324,8 @@ export async function activate(context: vscode.ExtensionContext) {
                 isRecording: diffTracker.getIsRecording(),
                 baselineState: diffTracker.getBaselineState(),
                 reviewTokens: diffTracker.getReviewTokens(),
+                opaqueReviewTokens: diffTracker.getOpaqueReviewTokens(),
+                unknownReviewPaths: diffTracker.getUnknownReviewPaths(),
                 trackedChanges: diffTracker.getTrackedChanges(),
                 gitPauses: diffTracker.getPausedGitRepositories()
             })),
@@ -323,7 +346,18 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.commands.registerCommand('diffTracker._testRevertAll', () => {
                 return diffTracker.revertAllChanges(diffTracker.getReviewTokens());
             }),
+            vscode.commands.registerCommand('diffTracker._testAcknowledgeOpaque', (filePath: string) => {
+                const token = diffTracker.getOpaqueReviewToken(filePath);
+                return token ? diffTracker.acknowledgeOpaqueChange(filePath, token) : undefined;
+            }),
+            vscode.commands.registerCommand('diffTracker._testAcceptAllPending', () =>
+                diffTracker.acceptAllPendingChanges()
+            ),
+            vscode.commands.registerCommand('diffTracker._testRevertAllPending', () =>
+                diffTracker.revertAllPendingChanges()
+            ),
             vscode.commands.registerCommand('diffTracker._testUndoLastRevert', () => diffTracker.undoLastRevert()),
+            vscode.commands.registerCommand('diffTracker._testClearDiffs', () => diffTracker.resetBaselineToCurrentState()),
             vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
                 const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
                 return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
@@ -403,40 +437,118 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.revertAllChanges', async (reviewTokens?: ReviewToken[]) => {
-            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
-            const changes = tokens;
-            if (changes.length === 0) {
-                return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
+            // Explicit token callers retain the legacy text-only contract.
+            if (reviewTokens) {
+                if (reviewTokens.length === 0) { return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult; }
+                const answer = await vscode.window.showWarningMessage(
+                    `Revert ${reviewTokens.length} text-reviewable file(s) to their original state?`,
+                    { modal: true, detail: 'Read-only and unknown reviews are not part of this explicit text-only request.' },
+                    'Revert Text Changes',
+                    'Cancel'
+                );
+                return answer === 'Revert Text Changes'
+                    ? reportBatch('Reverted', await diffTracker.revertAllChanges(reviewTokens))
+                    : { results: reviewTokens.map(token => ({ filePath: token.filePath, status: 'cancelled', reason: 'Revert cancelled' } as ActionResult)), succeeded: 0, failed: reviewTokens.length };
             }
 
-            // Confirm with user
+            const textTokens = diffTracker.getReviewTokens();
+            const opaquePaths = diffTracker.getOpaqueReviewTokens().map(token => token.filePath);
+            const unknownPaths = diffTracker.getUnknownReviewPaths();
+            if (textTokens.length === 0) {
+                const result = await diffTracker.revertAllPendingChanges([], opaquePaths, unknownPaths);
+                if (opaquePaths.length || unknownPaths.length) {
+                    void vscode.window.showInformationMessage(
+                        `Code Diff Tracker: No text changes can be reverted. ${opaquePaths.length} read-only change(s) need acknowledgement and ${unknownPaths.length} unknown change(s) need attention.`
+                    );
+                }
+                return result;
+            }
             const answer = await vscode.window.showWarningMessage(
-                `Revert all ${changes.length} file(s) to their original state? Review pending changes and save any dirty editors first.`,
-                { modal: true },
-                'Revert All',
+                `Revert ${textTokens.length} text file(s)? ${opaquePaths.length} read-only and ${unknownPaths.length} unknown item(s) will remain pending.`,
+                { modal: true, detail: 'Only text resources with a reliable before-image are modified. Read-only and unknown resources are never written or deleted.' },
+                'Revert Text Changes',
                 'Cancel'
             );
-
-            if (answer === 'Revert All') {
-                return reportBatch('Reverted', await diffTracker.revertAllChanges(tokens));
+            if (answer !== 'Revert Text Changes') {
+                const result = await diffTracker.revertAllPendingChanges([], opaquePaths, unknownPaths);
+                result.results.unshift(...textTokens.map(token => ({ filePath: token.filePath, status: 'cancelled', reason: 'Revert cancelled' } as ActionResult)));
+                result.cancelled += textTokens.length;
+                result.failed += textTokens.length;
+                return reportMixedBatch('Revert cancelled', result);
             }
-            return {
-                results: changes.map(change => ({ filePath: change.filePath, status: 'cancelled', reason: 'Revert cancelled' })),
-                succeeded: 0,
-                failed: changes.length
-            } satisfies BatchActionResult;
+            return reportMixedBatch('Revert result', await diffTracker.revertAllPendingChanges(textTokens, opaquePaths, unknownPaths));
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.keepAllChanges', async (reviewTokens?: ReviewToken[]) => {
-            const tokens = reviewTokens ?? diffTracker.getReviewTokens();
-            const changes = tokens;
-            if (changes.length === 0) {
-                return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult;
+            // Explicit token callers retain the legacy text-only contract.
+            if (reviewTokens) {
+                if (reviewTokens.length === 0) { return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult; }
+                return reportBatch('Accepted', await diffTracker.keepAllChanges(reviewTokens));
             }
 
-            return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
+            const textTokens = diffTracker.getReviewTokens();
+            const opaqueTokens = diffTracker.getOpaqueReviewTokens();
+            const unknownPaths = diffTracker.getUnknownReviewPaths();
+            if (textTokens.length === 0 && opaqueTokens.length === 0 && unknownPaths.length === 0) {
+                return {
+                    results: [], succeeded: 0, failed: 0,
+                    accepted: 0, acknowledged: 0, reverted: 0,
+                    needsConfirmation: 0, needsAttention: 0,
+                    failures: 0, conflicts: 0, cancelled: 0
+                } satisfies MixedBatchActionResult;
+            }
+            if (opaqueTokens.length > 0 || unknownPaths.length > 0) {
+                const answer = await vscode.window.showWarningMessage(
+                    `Accept ${textTokens.length} text file(s) and acknowledge ${opaqueTokens.length} read-only file(s)? ${unknownPaths.length} unknown item(s) will remain pending.`,
+                    { modal: true, detail: 'Acknowledge advances only the saved file identity. It does not write, delete, restore, or copy read-only file content.' },
+                    'Accept / Acknowledge',
+                    'Cancel'
+                );
+                if (answer !== 'Accept / Acknowledge') {
+                    const results: ActionResult[] = [
+                        ...textTokens.map(token => ({ filePath: token.filePath, status: 'cancelled', reason: 'Accept cancelled' } as ActionResult)),
+                        ...opaqueTokens.map(token => ({ filePath: token.filePath, status: 'cancelled', reason: 'Acknowledge cancelled' } as ActionResult)),
+                        ...unknownPaths.map(filePath => ({ filePath, status: 'needsAttention', reason: 'Review evidence is incomplete' } as ActionResult))
+                    ];
+                    return reportMixedBatch('Accept cancelled', {
+                        results, succeeded: 0, failed: results.length,
+                        accepted: 0, acknowledged: 0, reverted: 0,
+                        needsConfirmation: 0, needsAttention: unknownPaths.length,
+                        failures: 0, conflicts: 0, cancelled: textTokens.length + opaqueTokens.length
+                    });
+                }
+            }
+            return reportMixedBatch('Accept result', await diffTracker.acceptAllPendingChanges(textTokens, opaqueTokens, unknownPaths));
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.acknowledgeOpaqueChange', async (
+            filePathOrItem: string | any,
+            opaqueToken?: OpaqueReviewToken
+        ) => {
+            const filePath = extractFilePath(filePathOrItem);
+            if (!filePath) { return; }
+            const token = opaqueToken ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getOpaqueReviewToken(filePath)
+                : filePathOrItem?.opaqueReviewToken);
+            if (!token) { return missingReview(filePath); }
+            const answer = await vscode.window.showWarningMessage(
+                `Acknowledge the read-only change for ${displayFileName(filePath)}?`,
+                { modal: true, detail: 'This advances only the saved identity baseline. It does not write, delete, restore, or copy the file contents, and it creates no Undo record.' },
+                'Acknowledge',
+                'Cancel'
+            );
+            if (answer !== 'Acknowledge') {
+                return { filePath, status: 'cancelled', reason: 'Acknowledge cancelled' } satisfies ActionResult;
+            }
+            const result = reportAction(await diffTracker.acknowledgeOpaqueChange(filePath, token));
+            if (result.status === 'success') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Read-only change acknowledged.');
+            }
+            return result;
         })
     );
 
@@ -562,15 +674,35 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.clearDiffs', async () => {
             const wasRecording = diffTracker.getIsRecording();
+            const answer = await vscode.window.showWarningMessage(
+                wasRecording
+                    ? 'Clear Diffs by rebuilding the review baseline from the current workspace state?'
+                    : 'Clear the saved review baseline, pending review, and recovery history while keeping recording stopped?',
+                {
+                    modal: true,
+                    detail: wasRecording
+                        ? 'The operation does not modify workspace files. It succeeds only after the replacement baseline is persisted; pending review and recovery history are then cleared.'
+                        : 'Workspace files are not modified. Recording remains stopped. This does not guarantee secure erasure of prior backup or filesystem remnants.'
+                },
+                'Clear Diffs',
+                'Cancel'
+            );
+            if (answer !== 'Clear Diffs') { return false; }
+            if (diffTracker.getIsRecording() !== wasRecording) {
+                void vscode.window.showWarningMessage(
+                    'Code Diff Tracker: Recording state changed while Clear Diffs was awaiting confirmation; nothing was cleared.'
+                );
+                return false;
+            }
             if (!await diffTracker.resetBaselineToCurrentState()) {
-                vscode.window.showWarningMessage('Code Diff Tracker: Baseline reset did not complete. Check the current review and any persistence warnings.');
+                vscode.window.showWarningMessage('Code Diff Tracker: Clear Diffs did not complete. The review remains unavailable or preserved according to the current baseline state; check persistence and coverage warnings.');
                 return false;
             }
             refreshChangesTree();
             decorationManager.clearAllDecorations();
             vscode.window.showInformationMessage(wasRecording
-                ? 'Code Diff Tracker: Baseline reset to current workspace state'
-                : 'Code Diff Tracker: Saved baseline and recovery history cleared; recording remains stopped');
+                ? 'Code Diff Tracker: Review baseline rebuilt from the current workspace state; workspace files were not modified.'
+                : 'Code Diff Tracker: Saved baseline, pending review, and recovery history cleared; recording remains stopped.');
             return true;
         })
     );

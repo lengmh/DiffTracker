@@ -10,6 +10,7 @@ import ts from 'typescript';
 const require = createRequire(import.meta.url);
 const filePath = '/workspace/研究 folder/empty.m';
 const reviewToken={filePath,epoch:1,baselineRevision:'base',currentRevision:'current'};
+const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
@@ -63,6 +64,15 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         },getReviewTokens:()=> {
             const change = state.changes[0];
             return change && change.reviewKind && change.reviewKind !== 'text' ? [] : [reviewToken];
+        },getOpaqueReviewToken:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'opaque' ? opaqueReviewToken : undefined;
+        },getOpaqueReviewTokens:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'opaque' ? [opaqueReviewToken] : [];
+        },getUnknownReviewPaths:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'unknown' ? [filePath] : [];
         },getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
@@ -248,6 +258,7 @@ await test('opaque file review is visible, read-only and carries identity metada
     const payload = h.messages[0];
     assert.equal(payload.reviewKind, 'opaque');
     assert.equal(payload.reviewToken, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(payload.opaqueReviewToken)),opaqueReviewToken);
     assert.equal(payload.currentSize, 6);
     assert.equal(payload.currentFingerprint, fingerprint);
 
@@ -255,9 +266,14 @@ await test('opaque file review is visible, read-only and carries identity metada
     assert.match(ui.notice(), /Read-only file change:/);
     assert.match(ui.notice(), /Baseline: missing/);
     assert.match(ui.notice(), /Current: exists \(6 B\)/);
-    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    assert.equal(ui.elements.get('btn-keep-all').textContent, 'Acknowledge');
     assert.equal(ui.elements.get('btn-reject-all').disabled, true);
     assert.equal(ui.rendererCalls(), 0);
+    ui.click('btn-keep-all');
+    assert.equal(ui.sent[0].command,'acknowledge');
+    assert.equal(ui.sent[0].reviewToken,null);
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[0].opaqueReviewToken)),opaqueReviewToken);
 
     const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
     const root = await tree.getChildren();
@@ -268,6 +284,22 @@ await test('opaque file review is visible, read-only and carries identity metada
     assert.equal(leaf.reviewToken, undefined);
 });
 
+await test('opaque acknowledgement routes through the production command with the captured opaque token',async()=>{
+    const h=harness({
+        filePath,fileName:'image.png',originalContent:'',currentContent:'',isDeleted:false,
+        reviewKind:'opaque',reviewReason:'read-only',baselineExists:false,currentExists:true,
+        currentSize:3,currentFingerprint:'b'.repeat(64),changes:[]
+    });
+    await h.panel.handleMessage({
+        command:'acknowledge',filePath,requestId:'opaque-ack',
+        opaqueReviewToken,viewGeneration:0
+    });
+    assert.equal(h.commands.length,1);
+    assert.equal(h.commands[0][0],'diffTracker.acknowledgeOpaqueChange');
+    assert.equal(h.commands[0][1],filePath);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.commands[0][2])),opaqueReviewToken);
+    assert.deepEqual(h.messages.map(message=>message.command),['actionAck','updateData']);
+});
 await test('failed acknowledgement unlocks the generated UI while pending file remains reviewable', () => {
     const h = harness();
     const ui = runInline(h.panel.getHtmlContent());
@@ -322,7 +354,9 @@ await test('CodeLens and tree carry captured review tokens for block/file/batch 
     for(const lens of lenses.filter(v=>/keep|revert/i.test(v.command.command))) assert.equal(lens.command.arguments.at(-1),reviewToken);
     const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker),items=await tree.getChildren();
     assert.equal(items.find(i=>i.filePath===filePath).reviewToken,reviewToken);
-    for(const item of items.filter(i=>/^(diffTracker.keepAllChanges|diffTracker.revertAllChanges)$/.test(i.command?.command))) assert.equal(item.command.arguments[0][0],reviewToken);
+    for(const item of items.filter(i=>/^(diffTracker.keepAllChanges|diffTracker.revertAllChanges)$/.test(i.command?.command))) {
+        assert.equal(item.command.arguments,undefined,'mixed root actions capture text/opaque/unknown state at invocation');
+    }
 });
 await test('detached old annotation button sends its captured old review token',()=>{
     const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after'});
@@ -334,7 +368,7 @@ await test('detached old annotation button sends its captured old review token',
     assert.equal(ui.sent[0].reviewToken.currentRevision,'current');assert.equal(ui.sent[0].changeBlockId,'old-block');
 });
 function commandHarness(options={}) {
-    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],...options};
+    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
     const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs']);
@@ -348,7 +382,20 @@ function commandHarness(options={}) {
     let sandbox;
     const vscode={Uri,ViewColumn:{One:1,Two:2},
         workspace:{getConfiguration:()=>({get:()=>state.mode}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
-        window:{showTextDocument:async()=>{},showInformationMessage:m=>state.info.push(m),showWarningMessage:m=>state.warnings.push(m)},
+        window:{
+            showTextDocument:async()=>{},
+            showInformationMessage:m=>state.info.push(m),
+            showWarningMessage:(message,...args)=>{
+                const modal=args.find(value=>value&&typeof value==='object'&&value.modal===true);
+                if(modal){
+                    state.prompts.push({message,args});
+                    if(state.toggleRecordingOnConfirm) state.recording=!state.recording;
+                    return state.confirmClear?'Clear Diffs':undefined;
+                }
+                state.warnings.push(message);
+                return undefined;
+            }
+        },
         commands:{executeCommand:async(name,...args)=>sandbox.callbacks[name](...args)}};
     const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
         resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;}};
@@ -367,9 +414,22 @@ await test('current deleted review overrides a stale non-deleted tree item',asyn
 await test('existing file split still opens its editor and panel',async()=>{
     const h=commandHarness({deleted:false});await h.run('diffTracker.showOriginalAndWebviewSplit',filePath);assert.equal(h.state.opened,1);assert.equal(h.state.panels,1);
 });
-for(const recording of [false,true])for(const success of [false,true])await test(`clear command awaits durable result (recording=${recording}, success=${success})`,async()=>{
-    const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
+for(const recording of [false,true])for(const success of [false,true])await test(`clear command confirms and awaits durable result (recording=${recording}, success=${success})`,async()=>{
+    const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
     assert.equal(h.state.info.length,success?1:0);assert.equal(h.state.warnings.length,success?0:1);
+    assert.match(h.state.prompts[0].message,recording?/rebuilding the review baseline/i:/clear the saved review baseline/i);
+});
+await test('clear command aborts when recording mode changes while confirmation is open',async()=>{
+    const h=commandHarness({recording:true,toggleRecordingOnConfirm:true});
+    assert.equal(await h.run('diffTracker.clearDiffs'),false);
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);
+    assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,1);
+    assert.match(h.state.warnings[0],/Recording state changed/i);
+});
+await test('clear command cancellation performs no baseline reset',async()=>{
+    const h=commandHarness({confirmClear:false});assert.equal(await h.run('diffTracker.clearDiffs'),false);
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,0);
 });
 await test('workspace document lookups distinguish file working documents from virtual documents',()=>{
     const sourceText=fs.readFileSync('src/diffTracker.ts','utf8');
@@ -385,15 +445,16 @@ await test('workspace document lookups distinguish file working documents from v
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
 });
-await test('opaque and unknown tree items expose only the read-only inspection action',()=>{
+await test('opaque exposes Acknowledge plus inspection while unknown remains inspection-only',()=>{
     const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
     const items=manifest.contributes.menus['view/item/context'];
-    for(const contextValue of ['opaqueFile','unknownFile']){
-        const commands=items
-            .filter(item=>(item.when??'').includes(`viewItem == ${contextValue}`))
-            .map(item=>item.command)
-            .sort();
-        assert.deepEqual(commands,['diffTracker.showWebviewDiff']);
-    }
+    const opaqueCommands=items
+        .filter(item=>(item.when??'').includes('viewItem == opaqueFile'))
+        .map(item=>item.command).sort();
+    assert.deepEqual(opaqueCommands,['diffTracker.acknowledgeOpaqueChange','diffTracker.showWebviewDiff']);
+    const unknownCommands=items
+        .filter(item=>(item.when??'').includes('viewItem == unknownFile'))
+        .map(item=>item.command).sort();
+    assert.deepEqual(unknownCommands,['diffTracker.showWebviewDiff']);
 });
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);

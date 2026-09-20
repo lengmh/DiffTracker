@@ -167,13 +167,13 @@
       },
       {
         "command": "diffTracker.revertAllChanges",
-        "title": "Revert All Changes",
+        "title": "Revert Text Changes",
         "category": "Code Diff Tracker",
         "icon": "$(discard)"
       },
       {
         "command": "diffTracker.keepAllChanges",
-        "title": "Accept All Changes",
+        "title": "Accept / Acknowledge All Changes",
         "category": "Code Diff Tracker",
         "icon": "$(check)"
       },
@@ -188,6 +188,12 @@
         "title": "Archive and Rebuild Paused Git Baseline",
         "category": "Code Diff Tracker",
         "icon": "$(repo-pull)"
+      },
+      {
+        "command": "diffTracker.acknowledgeOpaqueChange",
+        "title": "Acknowledge Read-only Change",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
       },
       {
         "command": "diffTracker.revertFile",
@@ -308,6 +314,11 @@
         {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
+          "group": "inline"
+        },
+        {
+          "command": "diffTracker.acknowledgeOpaqueChange",
+          "when": "view == diffTracker.changesView && viewItem == opaqueFile",
           "group": "inline"
         },
         {
