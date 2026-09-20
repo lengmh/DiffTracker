@@ -495,15 +495,17 @@ export function previewLegacyWatchExcludeMigration(
         const overlapsExclude = positivePatterns.length > 0 &&
             (positiveCaseSensitive.ignores(candidate.includePath) ||
                 positiveCaseInsensitive.ignores(candidate.includePath));
-        if (overlapsExclude) {
-            manual.push(candidate.raw);
-            continue;
-        }
+        // Even without a Global overlap, later ordinary policy (.gitignore,
+        // Git exclude, files/search excludes) can override a legacy negation.
+        // Keep the explicit-include conversion as a UI suggestion, but require
+        // manual migration rather than claiming semantics are preserved.
+        manual.push(candidate.raw);
         const key = `all\0${candidate.includePath}`;
         if (!seenInclude.has(key)) {
             seenInclude.add(key);
             includes.push({ scope: 'all', path: candidate.includePath });
         }
+        void overlapsExclude;
     }
 
     return { excludes, includes, manual, ignoredNoops };
@@ -600,6 +602,36 @@ export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoring
     return { kind: 'configured', ...validated.scope };
 }
 
+function excludeRuleCovers(
+    candidate: MonitoringExcludeRule,
+    effectiveRule: MonitoringExcludeRule,
+    roots: readonly WorkspaceRootIdentity[]
+): boolean {
+    const affectedRoots = roots.filter(root => ruleAppliesToRoot(effectiveRule, root.name));
+    if (affectedRoots.length === 0 || !affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) {
+        return false;
+    }
+    if (sameRule(candidate, effectiveRule)) { return true; }
+
+    // General glob-subset proofs are intentionally not guessed. We can safely
+    // recognize broader exclusions when the effective rule is a literal path
+    // and the candidate matcher excludes that exact resource (and, for a
+    // directory rule, a representative descendant) on every affected root.
+    const raw = effectiveRule.pattern;
+    if (/[*?[]/.test(raw)) { return false; }
+    const trimmed = raw.replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!trimmed) { return false; }
+    const directoryRule = /\/$/.test(raw);
+    return affectedRoots.every(root => {
+        if (typeof root.caseSensitive !== 'boolean') { return false; }
+        const matcher = ignore({ ignorecase: !root.caseSensitive }).add(explicitPatternForIgnore(candidate.pattern));
+        if (directoryRule) {
+            return matcher.ignores(`${trimmed}/`) && matcher.ignores(`${trimmed}/__difftracker_probe__`);
+        }
+        return matcher.ignores(trimmed);
+    });
+}
+
 export function detectScopeExpansion(
     effective: CanonicalMonitoringScope,
     requested: CanonicalMonitoringScope
@@ -625,7 +657,7 @@ export function detectScopeExpansion(
     }
 
     for (const exclude of effective.excludes) {
-        if (!requested.excludes.some(candidate => sameRule(exclude, candidate))) {
+        if (!requested.excludes.some(candidate => excludeRuleCovers(candidate, exclude, requested.roots))) {
             reasons.push(`Explicit exclude removed or changed: ${exclude.scope === 'folder' ? exclude.folder + ':' : ''}${exclude.pattern}`);
         }
     }

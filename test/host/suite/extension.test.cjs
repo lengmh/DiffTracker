@@ -83,7 +83,7 @@ module.exports = async function runExtensionHostScenario() {
             'ordinary excluded path must not already have a baseline'
         );
         const scopeConfig = vscode.workspace.getConfiguration('diffTracker');
-        await scopeConfig.update('watchInclude', [{ scope: 'all', path: 'node_modules/s3-private' }],
+        await scopeConfig.update('watchInclude', [{ scope: 'all', path: 'dist/s3-private' }],
             vscode.ConfigurationTarget.Workspace);
         const includeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true
@@ -96,19 +96,38 @@ module.exports = async function runExtensionHostScenario() {
         );
         console.log('PASS HOST-S3 explicit include baselines resources hidden by ordinary exclusions');
 
+        // S3 can baseline an ordinary ignored subtree, but it must not publish
+        // an include whose future events are suppressed by files.watcherExclude.
+        const filesConfig = vscode.workspace.getConfiguration('files');
+        const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
+        await filesConfig.update('watcherExclude', { '**/watcher-hidden/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [
+            { scope: 'all', path: 'dist/s3-private' },
+            { scope: 'all', path: 'watcher-hidden/private' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const watcherExcludedApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(watcherExcludedApply.status, 'requiresS4', JSON.stringify(watcherExcludedApply));
+        await scopeConfig.update('watchInclude', [{ scope: 'all', path: 'dist/s3-private' }],
+            vscode.ConfigurationTarget.Workspace);
+        await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 watcher-excluded explicit include remains pending for S4-W');
+
         // Confirmation must be bound to the exact scope revision shown to the
         // user. A settings edit while the modal is open invalidates that approval.
-        const stableIncludes = [{ scope: 'all', path: 'node_modules/s3-private' }];
+        const stableIncludes = [{ scope: 'all', path: 'dist/s3-private' }];
         await scopeConfig.update('watchInclude', [
             ...stableIncludes,
-            { scope: 'all', path: 'node_modules/revision-a' }
+            { scope: 'all', path: 'dist/revision-a' }
         ], vscode.ConfigurationTarget.Workspace);
         const stalePrompt = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
         assert.equal(stalePrompt.status, 'needsConsent', JSON.stringify(stalePrompt));
         assert.ok(stalePrompt.scopeRevision);
         await scopeConfig.update('watchInclude', [
             ...stableIncludes,
-            { scope: 'all', path: 'node_modules/revision-b' }
+            { scope: 'all', path: 'dist/revision-b' }
         ], vscode.ConfigurationTarget.Workspace);
         const staleApproval = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true,

@@ -2146,8 +2146,11 @@ export class DiffTracker {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
         });
-        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
-            return empty('conflict', 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction || this.baselineBuilding) {
+            return empty('conflict',
+                this.baselineBuilding
+                    ? 'Monitoring scope cannot change while a baseline scan is still building.'
+                    : 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
         }
         if (!requestStillCurrent()) {
             return empty('conflict', 'Monitoring scope request changed before preparation started.');
@@ -2157,6 +2160,11 @@ export class DiffTracker {
         }
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
             return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
+        }
+        const watcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
+        if (watcherExcludedInclude) {
+            return empty('requiresS4',
+                `Explicit include ${watcherExcludedInclude} intersects files.watcherExclude and requires S4-W supplemental observation coverage.`);
         }
         if (this.effectiveMonitoringScope.kind === 'configured') {
             const expansion = detectScopeExpansion(this.effectiveMonitoringScope, scope);
@@ -2678,6 +2686,45 @@ export class DiffTracker {
             }
         }
         return [...candidates.values()];
+    }
+
+    private getVsCodeWatcherExcludePatterns(resource: vscode.Uri): string[] {
+        const config = vscode.workspace.getConfiguration(undefined, resource);
+        const raw = config.get<Record<string, boolean>>('files.watcherExclude', {});
+        return Object.entries(raw)
+            .filter(([, enabled]) => enabled)
+            .map(([pattern]) => pattern);
+    }
+
+    private expandSimpleBraceGlob(pattern: string): string[] {
+        const match = pattern.match(/\{([^{}]+)\}/);
+        if (!match) { return [pattern]; }
+        const alternatives = match[1].split(',').map(value => value.trim()).filter(Boolean);
+        if (alternatives.length === 0) { return [pattern]; }
+        return alternatives.flatMap(value =>
+            this.expandSimpleBraceGlob(pattern.slice(0, match.index!) + value + pattern.slice(match.index! + match[0].length)));
+    }
+
+    private explicitIncludeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
+        const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
+        for (const rule of scope.includes) {
+            const folders = rule.scope === 'folder'
+                ? [foldersByName.get(rule.folder ?? '')].filter((value): value is vscode.WorkspaceFolder => !!value)
+                : this.getSupportedWorkspaceFolders();
+            for (const folder of folders) {
+                const identity = this.workspaceRootIdentityForFolder(folder);
+                const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
+                    .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
+                if (patterns.length === 0) { continue; }
+                const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
+                const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+                const probes = [rel, `${rel}/__difftracker_probe__`, `${rel}/__difftracker_probe__/file.txt`];
+                if (probes.some(probe => matcher.ignores(probe))) {
+                    return `${folder.name}:${rule.path}`;
+                }
+            }
+        }
+        return undefined;
     }
 
     private getVsCodeExcludePatterns(resource: vscode.Uri): string[] {

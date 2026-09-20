@@ -200,7 +200,9 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         'overlapping legacy negation must require manual migration');
     assert.ok(!preview.includes.some(rule => rule.path === 'secret/keep.txt'));
     assert.ok(preview.includes.some(rule => rule.path === 'private-data'),
-        'non-overlapping simple negation can still migrate to explicit include');
+        'simple negation remains available as an explicit-include suggestion');
+    assert.ok(preview.manual.includes('!private-data/'),
+        'simple negations require manual confirmation because ordinary policy can override legacy ordering');
 }
 
 {
@@ -214,7 +216,7 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     ], 'linux');
     assert.deepEqual(preview.excludes, [{ scope: 'all', pattern: 'node_modules/' }]);
     assert.deepEqual(preview.includes, [{ scope: 'all', path: 'private-data' }]);
-    assert.deepEqual(preview.manual, ['!src/**/generated']);
+    assert.deepEqual(preview.manual, ['!src/**/generated', '!private-data/']);
     assert.deepEqual(preview.ignoredNoops, ['# old comment']);
 }
 
@@ -338,4 +340,25 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         { monitored: true, source: 'explicitInclude' },
         'all-root evaluation must use the actual root identity, not the first matching display name'
     );
+}
+
+
+{
+    const effective = validateAndCanonicalizeScope(valid({
+        excludes: [{ scope: 'all', pattern: 'secret/a.txt' }]
+    }), roots, 'linux').scope;
+    const requested = validateAndCanonicalizeScope(valid({
+        excludes: [{ scope: 'all', pattern: 'secret/**' }]
+    }), roots, 'linux').scope;
+    assert.equal(detectScopeExpansion(effective, requested).expands, false,
+        'broader requested exclusion is a pure contraction, not an expansion');
+
+    const redundantEffective = validateAndCanonicalizeScope(valid({
+        excludes: [
+            { scope: 'all', pattern: 'secret/**' },
+            { scope: 'all', pattern: 'secret/a.txt' }
+        ]
+    }), roots, 'linux').scope;
+    assert.equal(detectScopeExpansion(redundantEffective, requested).expands, false,
+        'removing a redundant narrow exclusion after a broader one remains a contraction');
 }

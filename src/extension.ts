@@ -139,6 +139,7 @@ export async function activate(context: vscode.ExtensionContext) {
             return false;
         }
         const requestedScope = scopeStatus.requested.scope;
+        const checkedScopeRevision = requestedScope?.scopeRevision;
         const requestedMatchesEffective = requestedScope &&
             scopeStatus.effective.kind === 'configured' &&
             requestedScope.scopeRevision === scopeStatus.effective.scopeRevision;
@@ -165,6 +166,25 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer !== 'Rebuild Baseline') { return false; }
         }
+
+        // A recovery/rebuild confirmation can remain open while Workspace
+        // Settings change. Never let approval for the earlier state rebuild a
+        // baseline under a different or newly pending scope revision.
+        const latestScopeStatus = monitoringScopeController.getStatus();
+        const latestRequestedScope = latestScopeStatus.requested.scope;
+        const latestRequestedMatchesEffective = latestRequestedScope &&
+            latestScopeStatus.effective.kind === 'configured' &&
+            latestRequestedScope.scopeRevision === latestScopeStatus.effective.scopeRevision;
+        if (!latestScopeStatus.requested.ok ||
+            latestRequestedScope?.scopeRevision !== checkedScopeRevision ||
+            (latestScopeStatus.expansionReasons.length > 0 && !latestScopeStatus.consented) ||
+            (latestScopeStatus.workspaceRequestPresent && !latestRequestedMatchesEffective)) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: Monitoring scope changed while recording confirmation was open. Review and apply the current scope before starting.'
+            );
+            return false;
+        }
+
         diffTracker.startRecording();
         if (gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());

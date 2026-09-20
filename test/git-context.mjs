@@ -161,6 +161,48 @@ test('production start blocks invalid monitoring scope configuration',async()=>{
     assert.deepEqual(calls,[]);
 });
 
+test('production start revalidates scope after rebuild confirmation',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    let status={
+        requested:{ok:true,scope:{scopeRevision:'scope-a'}},
+        effective:{kind:'configured',scopeRevision:'scope-a'},
+        workspaceRequestPresent:true,
+        expansionReasons:[],
+        consented:true
+    };
+    const sandbox={
+        restoreOutcome:'restored',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>status},
+        diffTracker:{
+            isRecoveryBlocked:()=>true,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            discardRecoveryState:async()=>{calls.push('discard');return true;},
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{
+            showWarningMessage:async()=>undefined,
+            showErrorMessage:async()=>{
+                status={
+                    requested:{ok:true,scope:{scopeRevision:'scope-b'}},
+                    effective:{kind:'configured',scopeRevision:'scope-a'},
+                    workspaceRequestPresent:true,
+                    expansionReasons:[],
+                    consented:true
+                };
+                return 'Discard Saved Session and Rebuild';
+            }
+        }}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,['discard']);
+});
+
 test('production start blocks an unapplied configured scope revision',async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
     const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);

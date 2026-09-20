@@ -2975,6 +2975,23 @@ registerOpaqueBaselineInvariants({
 });
 
 
+test('S3 scope apply is blocked while baseline scan is building',async()=>{
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const requested={kind:'configured',mode:'rules',roots,includes:[],excludes:[],scopeRevision:'building-test'};
+    tracker.baselineBuilding=true;
+    tracker.isRecording=true;
+    const before=tracker.getEffectiveMonitoringScope();
+    const result=await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal(result.status,'conflict');
+    assert.match(result.reason,/baseline scan.*building/i);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    tracker.baselineBuilding=false;
+});
+
 test('S3 scope apply rolls back when Git context pauses during include preparation',async()=>{
     const includeDir=file('scope-git-include');
     fs.mkdirSync(includeDir,{recursive:true});
