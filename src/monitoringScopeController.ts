@@ -22,7 +22,7 @@ const MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v1';
 
 export interface MonitoringScopeStatus {
     requested: ScopeValidationResult;
-    rawRequested: MonitoringScopeRequest;
+    rawRequested: { mode: unknown; includes: unknown; excludes: unknown };
     effective: EffectiveMonitoringScope;
     consented: boolean;
     dismissed: boolean;
