@@ -177,6 +177,7 @@ export class WatchExcludePanel {
 
         if (outcome.status === 'needsDiscardConfirmation') {
             const promptedRevision = outcome.scopeRevision;
+            const promptedReviewRevision = outcome.affectedReviewRevision;
             const paths = outcome.affectedReviewPaths ?? [];
             const answer = await vscode.window.showWarningMessage(
                 `The requested explicit exclusions would discard ${paths.length} pending review item(s). Workspace files will not be modified.`,
@@ -187,7 +188,8 @@ export class WatchExcludePanel {
             outcome = await this.scopeController.applyPendingScope({
                 grantConsent: true,
                 discardExplicitlyExcludedReviews: true,
-                expectedScopeRevision: promptedRevision
+                expectedScopeRevision: promptedRevision,
+                expectedAffectedReviewRevision: promptedReviewRevision
             });
         }
 

@@ -227,4 +227,90 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(t.getOriginalContent(p),undefined);
         if(transition==='workspace') assert.equal(t.workspaceContextChanged,true);
     });
+
+    for(const change of ['added','revised','stable','unbound','modal']) test(`PR11 final discard confirmation binds affected reviews (${change})`,async()=>{
+        const t=h.getTracker(),dir=file('discard-set');fs.mkdirSync(dir);
+        const p=path.join(dir,'shown.txt'),q=path.join(dir,'unshown.txt');
+        assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
+        const originalScope=t.getEffectiveMonitoringScope();
+        fs.writeFileSync(p,'shown current');t.fileSnapshots.set(p,'shown baseline');t.baselineExistingFiles.add(p);
+        t.updateTrackedDiff(p,'shown current');
+        const excludes=[{scope:'all',pattern:relative(dir)+'/**'}];
+        const oldConfig=vscode.workspace.getConfiguration,oldWarning=vscode.window.showWarningMessage;
+        const oldInfo=vscode.window.showInformationMessage;
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const old=oldConfig(section,resource);
+            return {...old,inspect:key=>key==='watchExclude'?{workspaceValue:excludes}:undefined};
+        };
+        const state=new Map();
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        const mutate=()=>{
+            if(change==='revised')t.updateTrackedDiff(p,'new unapproved projection');
+            else{
+                fs.writeFileSync(q,'unshown current');t.fileSnapshots.set(q,'unshown baseline');t.baselineExistingFiles.add(q);
+                t.updateTrackedDiff(q,'unshown current');
+            }
+        };
+        try{
+            if(change==='modal'){
+                let prompted=false;
+                vscode.window.showInformationMessage=async()=>undefined;
+                vscode.window.showWarningMessage=async(message,_options,...answers)=>{
+                    if(answers.includes('Discard Reviews and Apply')){prompted=true;mutate();return 'Discard Reviews and Apply';}
+                    return undefined;
+                };
+                await h.createScopePanel(controller).applyInteractively();
+                assert.equal(prompted,true);assert.ok(pending(p));assert.ok(pending(q));
+                assert.equal(t.getEffectiveMonitoringScope().scopeRevision,originalScope.scopeRevision);
+                return;
+            }
+            const prompt=await controller.applyPendingScope();assert.equal(prompt.status,'needsDiscardConfirmation');
+            assert.equal(typeof prompt.affectedReviewRevision,'string');
+            if(change==='added'||change==='revised')mutate();
+            const result=await controller.applyPendingScope({
+                discardExplicitlyExcludedReviews:true,expectedScopeRevision:prompt.scopeRevision,
+                expectedAffectedReviewRevision:change==='unbound'?undefined:prompt.affectedReviewRevision
+            });
+            if(change==='stable'){
+                assert.equal(result.status,'applied',JSON.stringify(result));assert.equal(pending(p),undefined);
+            }else{
+                assert.equal(result.status,'conflict',JSON.stringify(result));assert.ok(pending(p));
+                if(change==='added')assert.ok(pending(q));
+                assert.equal(t.getEffectiveMonitoringScope().scopeRevision,originalScope.scopeRevision);
+            }
+        }finally{
+            controller.dispose();vscode.workspace.getConfiguration=oldConfig;
+            vscode.window.showWarningMessage=oldWarning;vscode.window.showInformationMessage=oldInfo;
+        }
+    });
+
+    for(const kind of ['text','opaque','unknown']) test(`PR11 final unverified identity preserves ${kind} review through same-policy recovery and reload`,async()=>{
+        let t=h.getTracker();const storage=file('identity-review-storage');t.storageUri=Uri.file(storage);
+        assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
+        const p=file('identity-review.txt');fs.writeFileSync(p,kind==='opaque'?Buffer.from([0,1,2]):'current');
+        t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
+        if(kind==='unknown')t.coverageGaps.set(p,'prior coverage uncertainty');
+        await t.readFileAndUpdate(p,Uri.file(p));assert.equal(pending(p)?.reviewKind,kind);
+        await t.refreshIgnoreMatchers();const fingerprint=t.getPolicyFingerprint();
+        const identify=t.workspaceRootIdentityForFolder;
+        t.workspaceRootIdentityForFolder=folder=>({...identify.call(t,folder),caseSensitive:undefined});
+        await t.refreshIgnoreMatchers();
+        assert.ok(pending(p),'unverified identity must not erase pending review');
+        assert.equal(pending(p).reviewKind,'unknown');assert.ok(t.getRetainedReviewPaths().includes(p));
+        assert.equal(t.getReviewToken(p),undefined);
+        await t.flushPendingPersistence();await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+        const restoredIdentify=t.workspaceRootIdentityForFolder;
+        t.workspaceRootIdentityForFolder=folder=>({...restoredIdentify.call(t,folder),caseSensitive:undefined});
+        const read=vscode.workspace.fs.readFile;let unsafeReads=0;
+        vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===p)unsafeReads++;return read(uri);};
+        try{
+            assert.equal(await t.restorePersistedState(),'restored');
+            assert.ok(pending(p));assert.equal(pending(p).reviewKind,'unknown');assert.equal(unsafeReads,0);
+            t.workspaceRootIdentityForFolder=restoredIdentify;
+            await t.refreshIgnoreMatchers();assert.equal(t.getPolicyFingerprint(),fingerprint);
+            assert.ok(pending(p));assert.equal(pending(p).reviewKind,kind);
+            assert.equal(t.getOriginalContent(p),'baseline');
+        }finally{vscode.workspace.fs.readFile=read;}
+    });
 }

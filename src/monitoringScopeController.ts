@@ -39,6 +39,7 @@ export interface MonitoringScopeApplyOutcome {
     reason?: string;
     expansionReasons?: string[];
     affectedReviewPaths?: string[];
+    affectedReviewRevision?: string;
     scopeRevision?: string;
 }
 
@@ -185,6 +186,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         grantConsent?: boolean;
         discardExplicitlyExcludedReviews?: boolean;
         expectedScopeRevision?: string;
+        expectedAffectedReviewRevision?: string;
     }): Promise<MonitoringScopeApplyOutcome> {
         const status = this.getStatus();
         const scope = status.requested.scope;
@@ -211,10 +213,18 @@ export class MonitoringScopeController implements vscode.Disposable {
             }
             await this.grantConsent(scope);
         }
-        if (status.explicitlyExcludedPendingReviews.length > 0 && !options?.discardExplicitlyExcludedReviews) {
+        const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
+        const affectedReviewRevision = this.tracker.getExplicitlyExcludedReviewRevision(scope);
+        if (options?.discardExplicitlyExcludedReviews &&
+            options.expectedAffectedReviewRevision !== affectedReviewRevision) {
+            return { status: 'conflict', scopeRevision: scope.scopeRevision,
+                reason: 'Affected review changed or discard approval is unbound; confirm the current review set again.' };
+        }
+        if (affectedReviewPaths.length > 0 && !options?.discardExplicitlyExcludedReviews) {
             return {
                 status: 'needsDiscardConfirmation',
-                affectedReviewPaths: status.explicitlyExcludedPendingReviews,
+                affectedReviewPaths,
+                affectedReviewRevision,
                 scopeRevision: scope.scopeRevision,
                 reason: 'Explicit exclusions would discard pending review for these paths.'
             };
@@ -228,7 +238,8 @@ export class MonitoringScopeController implements vscode.Disposable {
         const applied = await this.tracker.applyConfiguredMonitoringScope(
             scope,
             options?.discardExplicitlyExcludedReviews === true,
-            requestStillCurrent
+            requestStillCurrent,
+            options?.expectedAffectedReviewRevision
         );
         if (applied.status === 'applied') {
             await this.clearDismissedConsent();

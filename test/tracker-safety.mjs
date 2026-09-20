@@ -3238,6 +3238,13 @@ registerPR11ReviewRegressions({
         try { const { MonitoringScopeController }=require('../out/monitoringScopeController.js'); return new MonitoringScopeController(context,tracker); }
         finally { Module._load=originalLoad; }
     },
+    createScopePanel: controller => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try {
+            const { WatchExcludePanel }=require('../out/watchExcludePanel.js');
+            return Object.assign(Object.create(WatchExcludePanel.prototype),{scopeController:controller});
+        } finally {Module._load=originalLoad;}
+    },
     setVsCodeExcludes: value => { vscodeExcludes = value; },
     fireConfigurationChanged: key => configurationChanged({affectsConfiguration: name => name === key})
 });

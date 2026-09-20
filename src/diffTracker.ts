@@ -489,6 +489,7 @@ export class DiffTracker {
     // status and live coverage callbacks must still see the committed scope.
     private committedScopeDuringApply?: EffectiveMonitoringScope;
     private readonly canonicalTrackingPaths = new Map<string, string>();
+    private readonly rootIdentityUnavailableReason = 'Workspace root identity is unverified; prior review is preserved until identity and current state can be reconciled';
     private pendingMonitoringScope?: CanonicalMonitoringScope;
     private pendingScopeSuspendedPaths = new Set<string>();
     private retainedReviewPaths = new Set<string>();
@@ -2163,6 +2164,19 @@ export class DiffTracker {
         return results.sort((left, right) => left.localeCompare(right));
     }
 
+    public getExplicitlyExcludedReviewRevision(scope: CanonicalMonitoringScope): string {
+        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope).map(filePath => [
+            filePath,
+            { ...this.trackedChanges.get(filePath), timestamp: undefined },
+            this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
+            this.opaqueBaselineFiles.get(filePath), this.unresolvedBaselineFiles.get(filePath),
+            this.coverageGaps.get(filePath)
+        ]);
+        return createHash('sha256').update(JSON.stringify({
+            epoch: this.sessionEpoch, scopeRevision: scope.scopeRevision, entries
+        })).digest('hex');
+    }
+
     private async enumerateExplicitIncludeFiles(rootPath: string, epoch: number): Promise<string[]> {
         const files: string[] = [];
         const pending = [rootPath];
@@ -2264,7 +2278,8 @@ export class DiffTracker {
     public async applyConfiguredMonitoringScope(
         scope: CanonicalMonitoringScope,
         discardExplicitlyExcludedReviews = false,
-        requestStillCurrent: () => boolean = () => true
+        requestStillCurrent: () => boolean = () => true,
+        expectedAffectedReviewRevision?: string
     ): Promise<MonitoringScopeApplyResult> {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
@@ -2304,6 +2319,16 @@ export class DiffTracker {
             }
         }
         const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
+        const approvedDiscardRevision = discardExplicitlyExcludedReviews
+            ? expectedAffectedReviewRevision ?? this.getExplicitlyExcludedReviewRevision(scope) : undefined;
+        let approvedReviewsDiscarded = false;
+        const discardApprovalStillCurrent = (): boolean => !discardExplicitlyExcludedReviews ||
+            (approvedReviewsDiscarded
+                ? this.getExplicitlyExcludedPendingReviewPaths(scope).length === 0
+                : this.getExplicitlyExcludedReviewRevision(scope) === approvedDiscardRevision);
+        if (!discardApprovalStillCurrent()) {
+            return empty('conflict', 'Affected review changed after discard approval; confirm the current review set again.');
+        }
 
         const epoch = this.sessionEpoch;
         const previous = {
@@ -2357,6 +2382,7 @@ export class DiffTracker {
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
             !this.explicitIncludeNeedsSupplementalCoverage(scope) &&
+            discardApprovalStillCurrent() &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
         transaction.valid = scopeContextStillCurrent;
         if (!scopeContextStillCurrent()) {
@@ -2396,6 +2422,11 @@ export class DiffTracker {
                     result.retainedReviews++;
                 }
             }
+
+            // Only this synchronous discard step may consume the approved set.
+            // Later excluded reviews invalidate publication rather than sharing
+            // the earlier user's approval.
+            approvedReviewsDiscarded = discardExplicitlyExcludedReviews;
 
             const baselinePaths = new Set([
                 ...this.fileSnapshots.keys(),
@@ -2724,6 +2755,19 @@ export class DiffTracker {
         await this.resumeImportedDirectoryWatchers(epoch, version);
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
         this.pruneIgnoredTrackedChanges();
+        // Identity can recover without any rule text/fingerprint changing.
+        // Reconcile only already-retained review resources, never discover new
+        // paths or bypass pending explicit exclusions and hard boundaries.
+        if (!this.baselineTransaction && this.restoringEpoch === undefined &&
+            !this.baselineBuilding && this.snapshotInitialized) {
+            for (const change of [...this.trackedChanges.values()]) {
+                if (change.unavailableReason !== this.rootIdentityUnavailableReason) { continue; }
+                const uri = vscode.Uri.file(change.filePath);
+                if (this.isPathIgnored(uri)) { continue; }
+                await this.readFileAndUpdate(change.filePath, uri);
+                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+            }
+        }
         if (!this.isRecording || (!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
             this.restoringEpoch !== undefined || this.baselineBuilding || !this.snapshotInitialized) { return; }
         const restored = [...this.pendingImportedDirectoryReconciliation];
@@ -3292,6 +3336,18 @@ export class DiffTracker {
         return ignored;
     }
 
+    private preserveUnverifiedRootReview(filePath: string): boolean {
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+        if (!folder || folder.uri.scheme !== 'file' ||
+            typeof this.workspaceRootIdentityForFolder(folder).caseSensitive === 'boolean' ||
+            (!this.trackedChanges.has(filePath) && !this.retainedReviewPaths.has(filePath))) { return false; }
+        // Unproven identity blocks resource I/O, not preservation of evidence.
+        // Retained paths plus their existing baselines are durable in Session V4.
+        this.retainedReviewPaths.add(filePath);
+        this.markFileUnavailable(filePath, this.rootIdentityUnavailableReason);
+        return true;
+    }
+
     private pruneIgnoredTrackedChanges(): void {
         const removedFiles: string[] = [];
         const retainedFiles: string[] = [];
@@ -3299,6 +3355,10 @@ export class DiffTracker {
             const uri = vscode.Uri.file(filePath);
             const folder = vscode.workspace.getWorkspaceFolder(uri);
             if (this.workspaceContextChanged && (!folder || folder.uri.scheme !== 'file')) { continue; }
+            if (this.preserveUnverifiedRootReview(filePath)) {
+                retainedFiles.push(filePath);
+                continue;
+            }
             if (this.retainedReviewPaths.has(filePath) && !this.isPathIgnored(uri, false, false, false)) {
                 this.retainedReviewPaths.delete(filePath);
                 retainedFiles.push(filePath);
@@ -3793,7 +3853,11 @@ export class DiffTracker {
         this.inlineViews.clear();
 
         const restoredGapReviewPaths = new Set<string>();
+        for (const filePath of this.retainedReviewPaths) {
+            if (this.preserveUnverifiedRootReview(filePath)) { restoredGapReviewPaths.add(filePath); }
+        }
         for (const [filePath, reason] of this.coverageGaps) {
+            if (restoredGapReviewPaths.has(filePath)) { continue; }
             const hasBaselineEvidence = this.fileSnapshots.has(filePath) ||
                 this.opaqueBaselineFiles.has(filePath) ||
                 this.unresolvedBaselineFiles.has(filePath);
