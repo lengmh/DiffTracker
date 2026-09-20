@@ -153,6 +153,7 @@ export class WatchExcludePanel {
         }
 
         if (outcome.status === 'needsConsent') {
+            const promptedRevision = outcome.scopeRevision;
             const answer = await vscode.window.showWarningMessage(
                 'Apply this monitoring-scope expansion on this machine?',
                 {
@@ -163,16 +164,19 @@ export class WatchExcludePanel {
                 'Authorize and Apply'
             );
             if (answer !== 'Authorize and Apply') {
-                const requested = this.scopeController.getRequestedScope();
-                if (requested.ok && requested.scope) {
-                    await this.scopeController.dismissConsent(requested.scope.scopeRevision);
+                if (promptedRevision) {
+                    await this.scopeController.dismissConsent(promptedRevision);
                 }
                 return;
             }
-            outcome = await this.scopeController.applyPendingScope({ grantConsent: true });
+            outcome = await this.scopeController.applyPendingScope({
+                grantConsent: true,
+                expectedScopeRevision: promptedRevision
+            });
         }
 
         if (outcome.status === 'needsDiscardConfirmation') {
+            const promptedRevision = outcome.scopeRevision;
             const paths = outcome.affectedReviewPaths ?? [];
             const answer = await vscode.window.showWarningMessage(
                 `The requested explicit exclusions would discard ${paths.length} pending review item(s). Workspace files will not be modified.`,
@@ -182,7 +186,8 @@ export class WatchExcludePanel {
             if (answer !== 'Discard Reviews and Apply') { return; }
             outcome = await this.scopeController.applyPendingScope({
                 grantConsent: true,
-                discardExplicitlyExcludedReviews: true
+                discardExplicitlyExcludedReviews: true,
+                expectedScopeRevision: promptedRevision
             });
         }
 

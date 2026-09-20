@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { createLegacyEffectiveScope } from '../out/monitoringScope.js';
+import { createLegacyEffectiveScope, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 export function registerStateSchemaCompatibility(harness) {
     const { test, root, Uri, DiffTracker, faults, file, pending,
@@ -174,6 +174,64 @@ export function registerStateSchemaCompatibility(harness) {
             assert.deepEqual(saved.opaqueBaselineFiles, state.opaqueBaselineFiles);
         });
     }
+
+    test('SCHEMA-V4 restores coverage-gap snapshots as unknown reviews', async () => {
+        const target = file('coverage-gap.txt');
+        fs.writeFileSync(target, 'changed while unverified\n');
+        const storage = file('coverage-gap-storage');
+        fs.mkdirSync(storage);
+        const state = {
+            version: 4, isRecording: false, baselineState: 'ready', workspaceRoots: [root],
+            scanCoverage: 'a'.repeat(64),
+            fileSnapshots: [[target, 'baseline\n']], fileModes: [], baselineExistingFiles: [target],
+            unresolvedBaselineFiles: [], opaqueBaselineFiles: [], revertHistory: [], gitContexts: [],
+            effectiveMonitoringScope: createLegacyEffectiveScope(
+                [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
+            ),
+            retainedReviewPaths: [],
+            coverageGaps: [[target, 'Persisted observation gap requires explicit reconciliation']]
+        };
+        fs.writeFileSync(path.join(storage, 'session-state.json'), JSON.stringify(state));
+        const tracker = new DiffTracker(Uri.file(storage));
+        setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(pending(target)?.reviewKind, 'unknown');
+        assert.match(pending(target)?.unavailableReason ?? '', /observation gap/i);
+        assert.equal(tracker.getReviewToken(target), undefined);
+    });
+
+    test('SCHEMA-V4 pending explicit exclusion preserves restored baseline review as unknown', async () => {
+        const target = file('pending-exclude.txt');
+        fs.writeFileSync(target, 'changed while pending\n');
+        const storage = file('pending-exclude-storage');
+        fs.mkdirSync(storage);
+        const rootIdentity = {
+            name: 'test',
+            uri: Uri.file(root).toString(),
+            caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin'
+        };
+        const state = {
+            version: 4, isRecording: false, baselineState: 'ready', workspaceRoots: [root],
+            scanCoverage: 'a'.repeat(64),
+            fileSnapshots: [[target, 'baseline\n']], fileModes: [], baselineExistingFiles: [target],
+            unresolvedBaselineFiles: [], opaqueBaselineFiles: [], revertHistory: [], gitContexts: [],
+            effectiveMonitoringScope: createLegacyEffectiveScope([rootIdentity], []),
+            retainedReviewPaths: [], coverageGaps: []
+        };
+        fs.writeFileSync(path.join(storage, 'session-state.json'), JSON.stringify(state));
+        const pendingScope = validateAndCanonicalizeScope({
+            mode: 'rules',
+            includes: [],
+            excludes: [{ scope: 'all', pattern: 'pending-exclude.txt' }]
+        }, [rootIdentity]).scope;
+        const tracker = new DiffTracker(Uri.file(storage));
+        tracker.setPendingMonitoringScope(pendingScope);
+        setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        tracker.setPendingMonitoringScope(pendingScope);
+        assert.equal(pending(target)?.reviewKind, 'unknown');
+        assert.deepEqual(tracker.getExplicitlyExcludedPendingReviewPaths(pendingScope), [target]);
+    });
 
     test('SCHEMA-V4 requires effective scope, retained reviews and coverage gaps', async () => {
         for (const field of ['effectiveMonitoringScope', 'retainedReviewPaths', 'coverageGaps']) {

@@ -231,7 +231,7 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     const rejected = validateAndCanonicalizeScope(valid({
         includes: [
             { scope: 'all', path: '.git/objects' },
-            { scope: 'all', path: '.difftracker-restore-probe' }
+            { scope: 'all', path: '.difftracker-restore-probe/child' }
         ]
     }), roots, 'linux');
     assert.equal(rejected.ok, false, 'hard monitoring boundaries must be rejected as include requests');
@@ -265,5 +265,27 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         evaluateConfiguredScope(configured, 'workspace', 'Node_Modules/PRIVATE/file.txt', true),
         { monitored: true, source: 'explicitInclude' },
         'include matching must follow case-insensitive root identity'
+    );
+}
+
+
+{
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: '.difftracker-restore-note.txt' }]
+    }), roots, 'linux').scope;
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', '.difftracker-restore-note.txt', true, false),
+        { monitored: true, source: 'explicitInclude' },
+        'restore-prefixed ordinary file leaf must remain monitorable'
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', '.difftracker-restore-note.txt', true, true),
+        { monitored: false, source: 'hardBoundary' },
+        'restore-prefixed directory leaf must remain a hard boundary'
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', '.difftracker-restore-note.txt/child', true, false),
+        { monitored: false, source: 'hardBoundary' },
+        'descendants of a restore-prefixed directory component remain hard-boundary resources'
     );
 }

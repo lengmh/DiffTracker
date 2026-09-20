@@ -306,7 +306,8 @@ export class DiffTracker {
     public getReviewToken(filePath: string): ReviewToken | undefined {
         const change = this.trackedChanges.get(filePath);
         const baseline = this.fileSnapshots.get(filePath);
-        if (!change || change.reviewKind !== 'text' || change.unavailableReason || baseline === undefined || this.disposed) { return undefined; }
+        if (!change || change.reviewKind !== 'text' || change.unavailableReason || baseline === undefined ||
+            this.coverageGaps.has(filePath) || this.disposed) { return undefined; }
         return {
             filePath, epoch: this.sessionEpoch,
             baselineRevision: this.revision(baseline, this.baselineExistingFiles.has(filePath)),
@@ -335,7 +336,8 @@ export class DiffTracker {
 
     public getOpaqueReviewToken(filePath: string): OpaqueReviewToken | undefined {
         const change = this.trackedChanges.get(filePath);
-        if (!change || change.reviewKind !== 'opaque' || change.unavailableReason || this.disposed) { return undefined; }
+        if (!change || change.reviewKind !== 'opaque' || change.unavailableReason ||
+            this.coverageGaps.has(filePath) || this.disposed) { return undefined; }
         return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change) };
     }
 
@@ -2013,9 +2015,12 @@ export class DiffTracker {
                 ...this.trackedChanges.keys()
             ]);
             for (const filePath of baselinePaths) {
-                if (this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) {
-                    this.pendingScopeSuspendedPaths.add(filePath);
-                }
+                if (!this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) { continue; }
+                this.pendingScopeSuspendedPaths.add(filePath);
+                const reason = this.coverageGaps.get(filePath) ??
+                    'Monitoring is paused by a pending explicit exclusion; prior baseline/review state is preserved as unverified';
+                this.coverageGaps.set(filePath, reason);
+                this.markFileUnavailable(filePath, reason);
             }
         }
     }
@@ -2042,7 +2047,11 @@ export class DiffTracker {
             const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
-            if (isHardUnmonitorableRelativePath(relative, this.workspaceRootIdentityForFolder(folder).caseSensitive)) { continue; }
+            if (isHardUnmonitorableRelativePath(
+                relative,
+                this.workspaceRootIdentityForFolder(folder).caseSensitive,
+                true
+            )) { continue; }
 
             let entries: fs.Dirent[];
             try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
@@ -2058,7 +2067,8 @@ export class DiffTracker {
                 const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                 if (isHardUnmonitorableRelativePath(
                     childRelative,
-                    this.workspaceRootIdentityForFolder(folder).caseSensitive
+                    this.workspaceRootIdentityForFolder(folder).caseSensitive,
+                    entry.isDirectory()
                 ) || entry.isSymbolicLink()) { continue; }
                 if (entry.isDirectory()) {
                     pending.push(child);
@@ -2868,9 +2878,18 @@ export class DiffTracker {
             return true;
         }
         const hardBoundaryPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
+        const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+        let hardBoundaryDirectory = directory;
+        if (!hardBoundaryDirectory &&
+            !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity.caseSensitive, false) &&
+            isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity.caseSensitive, true)) {
+            try { hardBoundaryDirectory = fs.lstatSync(uri.fsPath).isDirectory(); }
+            catch (error) { if (!this.isFileNotFound(error)) { return true; } }
+        }
         if (isHardUnmonitorableRelativePath(
             hardBoundaryPath,
-            this.workspaceRootIdentityForFolder(folder).caseSensitive
+            rootIdentity.caseSensitive,
+            hardBoundaryDirectory
         )) { return true; }
         if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory)) { return true; }
 
@@ -3381,9 +3400,22 @@ export class DiffTracker {
         this.resetChangeBlocksCaches();
         this.inlineViews.clear();
 
+        const restoredGapReviewPaths = new Set<string>();
+        for (const [filePath, reason] of this.coverageGaps) {
+            const hasBaselineEvidence = this.fileSnapshots.has(filePath) ||
+                this.opaqueBaselineFiles.has(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath);
+            if (!hasBaselineEvidence) { continue; }
+            const uri = vscode.Uri.file(filePath);
+            if (this.isPathIgnored(uri, false, true, false)) { continue; }
+            this.markFileUnavailable(filePath, reason);
+            restoredGapReviewPaths.add(filePath);
+        }
+
         const snapshotPaths = Array.from(this.fileSnapshots.keys());
 
         await this.runWithConcurrency(snapshotPaths, 8, async (filePath) => {
+            if (restoredGapReviewPaths.has(filePath)) { return; }
             const uri = vscode.Uri.file(filePath);
             if (this.isPathIgnored(uri)) {
                 return;
@@ -3415,6 +3447,7 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) { return; }
         const opaquePaths = Array.from(this.opaqueBaselineFiles.keys());
         await this.runWithConcurrency(opaquePaths, 8, async (filePath) => {
+            if (restoredGapReviewPaths.has(filePath)) { return; }
             const uri = vscode.Uri.file(filePath);
             if (this.isPathIgnored(uri)) { return; }
             const currentState = await this.readCurrentFileState(filePath);
@@ -3423,6 +3456,7 @@ export class DiffTracker {
         });
         if (!this.isCurrentEpoch(epoch)) { return; }
         for (const [filePath, reason] of this.unresolvedBaselineFiles) {
+            if (restoredGapReviewPaths.has(filePath)) { continue; }
             if (!this.isPathIgnored(vscode.Uri.file(filePath))) {
                 this.markFileUnavailable(filePath, reason);
             }
@@ -4174,9 +4208,13 @@ export class DiffTracker {
             return 'Resource is outside the workspace or is its root; action blocked';
         }
         const relativePath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
+        let targetIsDirectory = false;
+        try { targetIsDirectory = fs.lstatSync(filePath).isDirectory(); }
+        catch (error) { if (!this.isFileNotFound(error)) { return 'Cannot verify the resource workspace boundary; action blocked'; } }
         if (isHardUnmonitorableRelativePath(
             relativePath,
-            this.workspaceRootIdentityForFolder(folder).caseSensitive
+            this.workspaceRootIdentityForFolder(folder).caseSensitive,
+            targetIsDirectory
         )) {
             return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';
         }

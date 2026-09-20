@@ -388,10 +388,18 @@ function explicitPatternForIgnore(pattern: string): string {
     return value;
 }
 
-export function isHardUnmonitorableRelativePath(relativePath: string, caseSensitive = true): boolean {
+export function isHardUnmonitorableRelativePath(
+    relativePath: string,
+    caseSensitive = true,
+    leafIsDirectory = false
+): boolean {
     const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean)
         .map(part => identityPart(part, caseSensitive));
-    return parts.some(part => part === '.git' || part.startsWith('.difftracker-restore-'));
+    return parts.some((part, index) => {
+        if (part === '.git') { return true; }
+        if (!part.startsWith('.difftracker-restore-')) { return false; }
+        return index < parts.length - 1 || leafIsDirectory;
+    });
 }
 
 export function evaluateConfiguredScope(
@@ -404,7 +412,7 @@ export function evaluateConfiguredScope(
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
     const root = scope.roots.find(candidate => candidate.name === rootName);
     const caseSensitive = root?.caseSensitive ?? true;
-    if (isHardUnmonitorableRelativePath(rel, caseSensitive)) {
+    if (isHardUnmonitorableRelativePath(rel, caseSensitive, directory)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
