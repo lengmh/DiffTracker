@@ -2052,7 +2052,7 @@ export class DiffTracker {
         const result = empty('failed');
         let committed = false;
         try {
-            this.effectiveMonitoringScope = { kind: 'configured', ...JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope };
+            this.effectiveMonitoringScope = { kind: 'configured', ...(JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope) };
             // Protect all pending reviews from matcher pruning until each path is
             // classified against the candidate scope.
             for (const filePath of this.trackedChanges.keys()) { this.retainedReviewPaths.add(filePath); }
@@ -2061,13 +2061,14 @@ export class DiffTracker {
             await this.refreshIgnoreMatchers();
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during scope preparation'); }
 
+            const explicitlyExcludedReviews = new Set(this.getExplicitlyExcludedPendingReviewPaths(scope));
             for (const filePath of [...this.trackedChanges.keys()]) {
                 const ignored = this.isPathIgnored(vscode.Uri.file(filePath), false, false);
                 if (!ignored) {
                     this.retainedReviewPaths.delete(filePath);
                     continue;
                 }
-                const explicitlyExcluded = this.getExplicitlyExcludedPendingReviewPaths(scope).includes(filePath);
+                const explicitlyExcluded = explicitlyExcludedReviews.has(filePath);
                 if (explicitlyExcluded && discardExplicitlyExcludedReviews) {
                     this.clearFileReview(filePath);
                     this.releaseScopeBaselineData(filePath);

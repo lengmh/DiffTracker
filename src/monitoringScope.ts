@@ -245,8 +245,10 @@ export function validateAndCanonicalizeScope(
             const includePath = canonicalizeIncludePath(value.path, platform);
             if (!includePath) {
                 errors.push({ field: 'include', index, message: 'Include path must be a non-root workspace-relative literal path using "/" separators.' });
+            } else if (isHardUnmonitorableRelativePath(includePath)) {
+                errors.push({ field: 'include', index, message: 'Include path targets a DiffTracker hard monitoring boundary.' });
             }
-            if (target && includePath) {
+            if (target && includePath && !isHardUnmonitorableRelativePath(includePath)) {
                 includes.push({ ...target, path: includePath });
             }
         });
