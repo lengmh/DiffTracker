@@ -77,6 +77,12 @@ export async function activate(context: vscode.ExtensionContext) {
     settingsTreeDataProvider = new SettingsTreeDataProvider();
     const monitoringScopeController = new MonitoringScopeController(context, diffTracker);
     context.subscriptions.push(monitoringScopeController);
+    // A fresh workspace with no legacy Global rules can safely adopt the default
+    // Rules scope before recording starts. Restored V1/V2/V3 sessions remain in
+    // compatibility mode until the user explicitly migrates/applies them.
+    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyGlobalRules().length === 0) {
+        await monitoringScopeController.applyPendingScope();
+    }
 
     // Register tree view provider for activity bar
     diffTreeDataProvider = new DiffTreeDataProvider(diffTracker);

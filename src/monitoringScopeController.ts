@@ -211,6 +211,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         // Migration preserves the old legacy semantics; treat the resulting
         // canonical scope as locally authorized on this host.
         await this.grantConsent(validated.scope);
+        this.syncPendingScopeGate();
         return { status: 'migrated' };
     }
 

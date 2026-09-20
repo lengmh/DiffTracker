@@ -60,23 +60,14 @@ module.exports = async function runExtensionHostScenario() {
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
 
-        // S3: migrate the legacy Global rules into an explicit workspace scope,
-        // then publish an ordinary Rules-mode effective scope through the real
-        // activation/controller command path.
-        const initialScope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
-        assert.equal(initialScope.effective.kind, 'legacyV3');
-        const migration = await vscode.commands.executeCommand('diffTracker._testMigrateLegacyScope');
-        assert.equal(migration.status, 'migrated', JSON.stringify(migration));
-        const initialApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
-            grantConsent: true,
-            discardExplicitlyExcludedReviews: true
-        });
-        assert.equal(initialApply.status, 'applied', JSON.stringify(initialApply));
+        // S3: a fresh workspace with no legacy Global watch rules adopts the
+        // default configured Rules scope before automatic recording starts.
         const configuredScope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
         assert.equal(configuredScope.effective.kind, 'configured');
         assert.equal(configuredScope.effective.mode, 'rules');
+        assert.equal(configuredScope.legacyMigrationComplete, true);
         assert.equal(configuredScope.requested.scope.scopeRevision, configuredScope.effective.scopeRevision);
-        console.log('PASS HOST-S3 legacy scope migrates and Rules scope becomes effective');
+        console.log('PASS HOST-S3 fresh workspace starts with configured Rules scope');
 
         // Explicit includes must baseline existing resources hidden by ordinary
         // default exclusions. Do not require subsequent watcher events here:
