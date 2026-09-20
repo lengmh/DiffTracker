@@ -2269,7 +2269,6 @@ export class DiffTracker {
         const currentExists = state.kind !== 'missing';
         const previous = this.trackedChanges.get(filePath);
         const hadLineChanges = this.lineChanges.has(filePath);
-        const hadInlineView = this.inlineViews.has(filePath);
 
         this.setTrackedChange(filePath, {
             filePath,
@@ -2294,8 +2293,7 @@ export class DiffTracker {
         this.inlineViews.delete(filePath);
         this.invalidateChangeBlocksCache(filePath);
         if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
-        if (hadLineChanges || hadInlineView) { this.emitTrackChangesEvent({ changedFiles: [filePath] }); }
-        else { this.emitTrackChangesEvent({ changedFiles: [filePath] }); }
+        this.emitTrackChangesEvent({ changedFiles: [filePath] });
     }
 
     private hasCapturedBaseline(filePath: string): boolean {

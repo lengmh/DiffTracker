@@ -385,4 +385,15 @@ await test('workspace document lookups distinguish file working documents from v
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
 });
+await test('opaque and unknown tree items expose only the read-only inspection action',()=>{
+    const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+    const items=manifest.contributes.menus['view/item/context'];
+    for(const contextValue of ['opaqueFile','unknownFile']){
+        const commands=items
+            .filter(item=>(item.when??'').includes(`viewItem == ${contextValue}`))
+            .map(item=>item.command)
+            .sort();
+        assert.deepEqual(commands,['diffTracker.showWebviewDiff']);
+    }
+});
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);

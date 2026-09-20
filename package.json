@@ -311,18 +311,8 @@
           "group": "inline"
         },
         {
-          "command": "diffTracker.openOriginalFile",
-          "when": "view == diffTracker.changesView && viewItem == opaqueFile",
-          "group": "inline"
-        },
-        {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == opaqueFile",
-          "group": "inline"
-        },
-        {
-          "command": "diffTracker.openOriginalFile",
-          "when": "view == diffTracker.changesView && viewItem == unknownFile",
           "group": "inline"
         },
         {
