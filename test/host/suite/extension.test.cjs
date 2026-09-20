@@ -257,7 +257,61 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal(binaryReview.currentExists, true);
         assert.equal(binaryReview.currentSize, 6);
         assert.match(binaryReview.currentFingerprint ?? '', /^[a-f0-9]{64}$/);
+
+        const initialBinaryBytes = Array.from(await vscode.workspace.fs.readFile(uri('new-image.png')));
+        const acknowledged = await vscode.commands.executeCommand(
+            'diffTracker._testAcknowledgeOpaque',
+            uri('new-image.png').fsPath
+        );
+        assert.equal(acknowledged.status, 'success', acknowledged.reason);
+        assert.deepEqual(Array.from(await vscode.workspace.fs.readFile(uri('new-image.png'))), initialBinaryBytes);
+        await untilStable('opaque acknowledge clears review', async () => !(await pending('new-image.png')));
+        console.log('PASS HOST-S2 Acknowledge advances binary identity without workspace mutation');
+
+        await write('existing.txt', 'mixed accept text\n');
+        const mixedAcceptBinary = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 2]);
+        await vscode.workspace.fs.writeFile(uri('new-image.png'), mixedAcceptBinary);
+        await untilStable('S2 mixed Accept text review', () => reviewablePending('existing.txt'));
+        await untilStable('S2 mixed Accept opaque review', async () => (await pending('new-image.png'))?.reviewKind === 'opaque');
+        const mixedAccept = await vscode.commands.executeCommand('diffTracker._testAcceptAllPending');
+        assert.equal(mixedAccept.accepted, 1, JSON.stringify(mixedAccept));
+        assert.equal(mixedAccept.acknowledged, 1, JSON.stringify(mixedAccept));
+        assert.equal(mixedAccept.needsAttention, 0, JSON.stringify(mixedAccept));
+        assert.equal(mixedAccept.succeeded, 2, JSON.stringify(mixedAccept));
+        assert.equal(await read('existing.txt'), 'mixed accept text\n');
+        assert.deepEqual(Array.from(await vscode.workspace.fs.readFile(uri('new-image.png'))), Array.from(mixedAcceptBinary));
+        await untilStable('S2 mixed Accept clears handled reviews', async () =>
+            !(await pending('existing.txt')) && !(await pending('new-image.png')));
+        console.log('PASS HOST-S2 mixed Accept keeps text and acknowledges opaque identity');
+
+        await write('existing.txt', 'mixed revert text\n');
+        const mixedRevertBinary = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 3]);
+        await vscode.workspace.fs.writeFile(uri('new-image.png'), mixedRevertBinary);
+        await untilStable('S2 mixed Revert text review', () => reviewablePending('existing.txt'));
+        await untilStable('S2 mixed Revert opaque review', async () => (await pending('new-image.png'))?.reviewKind === 'opaque');
+        const mixedRevert = await vscode.commands.executeCommand('diffTracker._testRevertAllPending');
+        assert.equal(mixedRevert.reverted, 1, JSON.stringify(mixedRevert));
+        assert.equal(mixedRevert.needsConfirmation, 1, JSON.stringify(mixedRevert));
+        assert.equal(mixedRevert.needsAttention, 0, JSON.stringify(mixedRevert));
+        assert.equal(await read('existing.txt'), 'mixed accept text\n');
+        assert.deepEqual(Array.from(await vscode.workspace.fs.readFile(uri('new-image.png'))), Array.from(mixedRevertBinary));
+        assert.equal((await pending('new-image.png'))?.reviewKind, 'opaque');
+        assert.equal(await pending('existing.txt'), undefined);
+        console.log('PASS HOST-S2 mixed Revert mutates text only and retains opaque review');
+
+        assert.equal(
+            (await vscode.commands.executeCommand('diffTracker._testAcknowledgeOpaque', uri('new-image.png').fsPath)).status,
+            'success'
+        );
+        await untilStable('S2 opaque cleanup acknowledgement', async () => !(await pending('new-image.png')));
         await vscode.workspace.fs.delete(uri('new-image.png'));
+        await untilStable('S2 opaque deletion review', async () => (await pending('new-image.png'))?.reviewKind === 'opaque');
+        assert.equal(
+            (await vscode.commands.executeCommand('diffTracker._testAcknowledgeOpaque', uri('new-image.png').fsPath)).status,
+            'success'
+        );
+        assert.equal(await missing('new-image.png'), true);
+        await untilStable('S2 acknowledged opaque deletion clears review', async () => !(await pending('new-image.png')));
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));
         await untilStable('baseline deletion pending', async () => (await pending('deleted.txt'))?.isDeleted === true);
