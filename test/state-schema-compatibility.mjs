@@ -222,7 +222,7 @@ export function registerStateSchemaCompatibility(harness) {
         const pendingScope = validateAndCanonicalizeScope({
             mode: 'rules',
             includes: [],
-            excludes: [{ scope: 'all', pattern: 'pending-exclude.txt' }]
+            excludes: [{ scope: 'all', pattern: path.basename(target) }]
         }, [rootIdentity]).scope;
         const tracker = new DiffTracker(Uri.file(storage));
         tracker.setPendingMonitoringScope(pendingScope);
