@@ -1123,6 +1123,120 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed Clear Diffs cancels an in-flight replacement create before replay',async()=>{
+    const stable=file('clear-active-create-stable.txt'),created=file('clear-active-create.txt'),storage=file('storage');
+    seed(stable,'stable','stable');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    listedFiles=[Uri.file(stable)];
+    const originalFindFiles=vscode.workspace.findFiles,scanEntered=deferred(),scanRelease=deferred();
+    let heldWorkspaceScan=false;
+    vscode.workspace.findFiles=async pattern=>{
+        if(!heldWorkspaceScan&&pattern.pattern==='**/*'){heldWorkspaceScan=true;scanEntered.resolve();await scanRelease.promise;}
+        return originalFindFiles(pattern);
+    };
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    let creating;
+    try {
+        const reset=tracker.resetBaselineToCurrentState();await scanEntered.promise;
+        fs.writeFileSync(created,'created while replacement scan is active');
+        const createGate=pause(created,'stat');creating=tracker.onExternalFileCreated(Uri.file(created));await createGate.entered;
+        scanRelease.resolve();
+        assert.equal(await reset,false);
+        assert.equal(pending(created)?.reviewKind,'text');
+        assert.equal(pending(created)?.unavailableReason,undefined);
+        assert.equal(tracker.getOriginalContent(created),'');
+        createGate.release();await creating;
+        assert.equal(pending(created)?.reviewKind,'text','cancelled replacement create must not overwrite replay');
+        assert.equal(pending(created)?.unavailableReason,undefined);
+    } finally {
+        scanRelease.resolve();vscode.workspace.findFiles=originalFindFiles;vscode.workspace.fs.writeFile=originalWriteFile;
+    }
+});
+test('S2 failed Clear Diffs cancels an in-flight populated-directory create before replay',async()=>{
+    const stable=file('clear-active-dir-stable.txt'),dir=file('clear-active-dir'),child=path.join(dir,'child.txt'),storage=file('storage');
+    seed(stable,'stable','stable');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    listedFiles=[Uri.file(stable)];
+    const originalFindFiles=vscode.workspace.findFiles,scanEntered=deferred(),scanRelease=deferred();
+    let heldWorkspaceScan=false;
+    vscode.workspace.findFiles=async pattern=>{
+        if(!heldWorkspaceScan&&pattern.pattern==='**/*'){heldWorkspaceScan=true;scanEntered.resolve();await scanRelease.promise;}
+        return originalFindFiles(pattern);
+    };
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    let creating;
+    try {
+        const reset=tracker.resetBaselineToCurrentState();await scanEntered.promise;
+        fs.mkdirSync(dir);fs.writeFileSync(child,'child created while replacement scan is active');listedFiles=[Uri.file(stable),Uri.file(child)];
+        const createGate=pause(dir,'stat');creating=tracker.onExternalFileCreated(Uri.file(dir));await createGate.entered;
+        scanRelease.resolve();
+        assert.equal(await reset,false);
+        assert.equal(pending(child)?.reviewKind,'text');
+        assert.equal(pending(child)?.unavailableReason,undefined);
+        assert.equal(tracker.getOriginalContent(child),'');
+        createGate.release();await creating;
+        assert.equal(pending(child)?.reviewKind,'text','cancelled directory handler must not reclassify replayed child');
+        assert.equal(pending(child)?.unavailableReason,undefined);
+    } finally {
+        scanRelease.resolve();vscode.workspace.findFiles=originalFindFiles;vscode.workspace.fs.writeFile=originalWriteFile;
+    }
+});
+test('S2 failed Clear Diffs replays an external change whose debounce read is already in flight',async()=>{
+    const p=file('clear-active-external-read.txt'),storage=file('storage');
+    seed(p,'baseline','baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,'changed before clear');
+    const readGate=pause(p,'read');await tracker.onExternalFileChanged(Uri.file(p));await readGate.entered;
+    assert.ok([...tracker.activeExternalOperations.values()].some(operation=>operation.uri.fsPath===p&&operation.kind==='change'));
+    listedFiles=[Uri.file(p)];
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    try {
+        assert.equal(await tracker.resetBaselineToCurrentState(),false);
+        assert.equal(tracker.getOriginalContent(p),'baseline');
+        assert.equal(pending(p)?.reviewKind,'text');
+        assert.equal(pending(p)?.currentContent,'changed before clear');
+        readGate.release();
+        await waitUntil(()=>tracker.activeExternalOperations.size===0,2000);
+        assert.equal(pending(p)?.currentContent,'changed before clear');
+    } finally {
+        readGate.release();vscode.workspace.fs.writeFile=originalWriteFile;
+    }
+});
+test('S2 failed Clear Diffs replays an in-flight external deletion',async()=>{
+    const p=file('clear-active-delete.txt'),storage=file('storage');
+    seed(p,'baseline','baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.unlinkSync(p);
+    const statGate=pause(p,'stat'),deleting=tracker.onExternalFileDeleted(Uri.file(p));await statGate.entered;
+    assert.ok([...tracker.activeExternalOperations.values()].some(operation=>operation.uri.fsPath===p&&operation.kind==='delete'));
+    listedFiles=[];
+    const temp=path.join(storage,'session-state.tmp.json'),originalWriteFile=vscode.workspace.fs.writeFile;
+    let failed=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!failed&&uri.fsPath===temp){failed=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    try {
+        assert.equal(await tracker.resetBaselineToCurrentState(),false);
+        assert.equal(tracker.getOriginalContent(p),'baseline');
+        assert.equal(pending(p)?.isDeleted,true);
+        statGate.release();await deleting;
+        assert.equal(pending(p)?.isDeleted,true);
+    } finally {
+        statGate.release();vscode.workspace.fs.writeFile=originalWriteFile;
+    }
+});
 test('S2 failed Clear Diffs preserves file create provenance observed after replacement startup',async()=>{
     const stable=file('clear-replacement-stable.txt'),created=file('clear-replacement-created.txt'),storage=file('storage');
     seed(stable,'stable','stable');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
@@ -1145,7 +1259,7 @@ test('S2 failed Clear Diffs preserves file create provenance observed after repl
         assert.equal(tracker.initialIgnoreEpoch,undefined,'create must occur after replacement startup deferral ends');
         fs.writeFileSync(created,'created during replacement scan');
         await tracker.onExternalFileCreated(Uri.file(created));
-        assert.ok(tracker.baselineTransaction?.observedCreations?.has(created));
+        assert.ok(tracker.baselineTransaction?.observedEvents?.get(created)?.kind==='create');
         scanRelease.resolve();
         assert.equal(await reset,false);
         assert.equal(pending(created)?.reviewKind,'text');
@@ -1178,8 +1292,8 @@ test('S2 failed Clear Diffs preserves populated directory create provenance obse
         assert.equal(tracker.initialIgnoreEpoch,undefined);
         fs.mkdirSync(dir);fs.writeFileSync(child,'new child');listedFiles=[Uri.file(stable),Uri.file(child)];
         await tracker.onExternalFileCreated(Uri.file(dir));
-        assert.ok(tracker.baselineTransaction?.observedCreations?.has(dir));
-        assert.ok(tracker.baselineTransaction?.observedCreations?.has(child));
+        assert.ok(tracker.baselineTransaction?.observedEvents?.get(dir)?.kind==='create');
+        assert.ok(tracker.baselineTransaction?.observedEvents?.get(child)?.kind==='create');
         scanRelease.resolve();
         assert.equal(await reset,false);
         assert.equal(pending(child)?.reviewKind,'text');
