@@ -336,6 +336,30 @@ test('S1 Revert succeeds when its own write observation clears the old review af
         tracker.restoreFileToContent=restore;
     }
 });
+test('S1 Revert may clear a stale text projection once authoritative state exactly matches baseline',async()=>{
+    const p=file('late-text-projection-after-revert.m');seed(p,'baseline\n','changed\n');await scan(p);
+    const token=tracker.getReviewToken(p);assert.ok(token);
+    const restore=tracker.restoreFileToContent.bind(tracker);
+    tracker.restoreFileToContent=async(...args)=>{
+        const result=await restore(...args);
+        if(result.status==='success'){
+            tracker.setTrackedChange(p,{
+                ...pending(p),
+                filePath:p,fileName:path.basename(p),originalContent:'baseline\n',currentContent:'stale projection\n',
+                isDeleted:false,reviewKind:'text',changes:[],timestamp:new Date()
+            });
+        }
+        return result;
+    };
+    try {
+        const result=await tracker.revertFile(p,token);
+        assert.equal(result.status,'success',result.reason);
+        assert.equal(disk(p),'baseline\n');
+        assert.equal(pending(p),undefined);
+    } finally {
+        tracker.restoreFileToContent=restore;
+    }
+});
 test('S1 Revert retains a late non-text review instead of mistaking missing token for cleared review',async()=>{
     const p=file('late-unknown-after-revert.m');seed(p,'baseline\n','changed\n');await scan(p);
     const token=tracker.getReviewToken(p);assert.ok(token);
