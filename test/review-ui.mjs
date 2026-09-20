@@ -368,7 +368,7 @@ await test('detached old annotation button sends its captured old review token',
     assert.equal(ui.sent[0].reviewToken.currentRevision,'current');assert.equal(ui.sent[0].changeBlockId,'old-block');
 });
 function commandHarness(options={}) {
-    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],...options};
+    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
     const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs']);
@@ -382,7 +382,19 @@ function commandHarness(options={}) {
     let sandbox;
     const vscode={Uri,ViewColumn:{One:1,Two:2},
         workspace:{getConfiguration:()=>({get:()=>state.mode}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
-        window:{showTextDocument:async()=>{},showInformationMessage:m=>state.info.push(m),showWarningMessage:m=>state.warnings.push(m)},
+        window:{
+            showTextDocument:async()=>{},
+            showInformationMessage:m=>state.info.push(m),
+            showWarningMessage:(message,...args)=>{
+                const modal=args.find(value=>value&&typeof value==='object'&&value.modal===true);
+                if(modal){
+                    state.prompts.push({message,args});
+                    return state.confirmClear?'Clear Diffs':undefined;
+                }
+                state.warnings.push(message);
+                return undefined;
+            }
+        },
         commands:{executeCommand:async(name,...args)=>sandbox.callbacks[name](...args)}};
     const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
         resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;}};
@@ -401,9 +413,15 @@ await test('current deleted review overrides a stale non-deleted tree item',asyn
 await test('existing file split still opens its editor and panel',async()=>{
     const h=commandHarness({deleted:false});await h.run('diffTracker.showOriginalAndWebviewSplit',filePath);assert.equal(h.state.opened,1);assert.equal(h.state.panels,1);
 });
-for(const recording of [false,true])for(const success of [false,true])await test(`clear command awaits durable result (recording=${recording}, success=${success})`,async()=>{
-    const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
+for(const recording of [false,true])for(const success of [false,true])await test(`clear command confirms and awaits durable result (recording=${recording}, success=${success})`,async()=>{
+    const h=commandHarness({recording,resetResult:success});await h.run('diffTracker.clearDiffs');
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
     assert.equal(h.state.info.length,success?1:0);assert.equal(h.state.warnings.length,success?0:1);
+    assert.match(h.state.prompts[0].message,recording?/rebuilding the review baseline/i:/clear the saved review baseline/i);
+});
+await test('clear command cancellation performs no baseline reset',async()=>{
+    const h=commandHarness({confirmClear:false});assert.equal(await h.run('diffTracker.clearDiffs'),false);
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,0);
 });
 await test('workspace document lookups distinguish file working documents from virtual documents',()=>{
     const sourceText=fs.readFileSync('src/diffTracker.ts','utf8');
@@ -419,7 +437,7 @@ await test('workspace document lookups distinguish file working documents from v
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
 });
-await test('opaque and unknown tree items expose only the read-only inspection action',()=>{
+await test('opaque exposes Acknowledge plus inspection while unknown remains inspection-only',()=>{
     const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
     const items=manifest.contributes.menus['view/item/context'];
     const opaqueCommands=items
