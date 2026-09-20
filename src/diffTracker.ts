@@ -652,7 +652,9 @@ export class DiffTracker {
             state.effectiveMonitoringScope.roots,
             this.currentWorkspaceRootIdentities()
         );
-        const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch;
+        const wholeWorkspaceNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
+            state.effectiveMonitoringScope.mode === 'wholeWorkspace';
+        const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch || wholeWorkspaceNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
@@ -738,7 +740,9 @@ export class DiffTracker {
                 ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
                 : !rootsMatch
                     ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
-                    : 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.';
+                    : !scopeRootsMatch
+                        ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
+                        : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
@@ -754,7 +758,14 @@ export class DiffTracker {
 
     public startRecording() {
         if (this.disposed || this.recoveryBlocked) { return; }
+        if (this.effectiveMonitoringScope.kind === 'configured' && this.effectiveMonitoringScope.mode === 'wholeWorkspace') {
+            vscode.window.showWarningMessage('Code Diff Tracker: Whole Workspace preparation requires the S4-W coverage path before recording can start.');
+            return;
+        }
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
+        if (this.effectiveMonitoringScope.kind === 'legacyV3') {
+            this.effectiveMonitoringScope = this.createLegacyEffectiveScopeForRoots(this.sessionWorkspaceRoots);
+        }
         const epoch = this.advanceEpoch();
         this.workspaceContextChanged = false;
         const removedFiles = Array.from(this.trackedChanges.keys());
@@ -1121,6 +1132,9 @@ export class DiffTracker {
         this.baselineGitContexts = new Map();
         this.pausedGitRepositories = new Map();
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
+        if (this.effectiveMonitoringScope.kind === 'legacyV3') {
+            this.effectiveMonitoringScope = this.createLegacyEffectiveScopeForRoots(this.sessionWorkspaceRoots);
+        }
         this.workspaceContextChanged = false;
         this.scanCoverage = undefined;
         this.snapshotInitialized = true;
@@ -2443,6 +2457,55 @@ export class DiffTracker {
         ];
     }
 
+    private async findScopeFilesUnderDirectory(rootPath: string): Promise<vscode.Uri[]> {
+        const candidates = new Map<string, vscode.Uri>();
+        const add = (uris: readonly vscode.Uri[]): void => {
+            for (const uri of uris) {
+                if (uri.scheme !== 'file' || !this.pathBelongsToRoot(uri.fsPath, rootPath)) { continue; }
+                const folder = vscode.workspace.getWorkspaceFolder(uri);
+                if (!folder || folder.uri.scheme !== 'file') { continue; }
+                const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
+                if (!isHardUnmonitorableRelativePath(relative)) { candidates.set(uri.fsPath, uri); }
+            }
+        };
+
+        add(await vscode.workspace.findFiles(
+            new vscode.RelativePattern(rootPath, '**/*'),
+            new vscode.RelativePattern(rootPath, '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
+        ));
+
+        if (this.effectiveMonitoringScope.kind === 'configured') {
+            const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
+            for (const rule of this.effectiveMonitoringScope.includes) {
+                const folders = rule.scope === 'folder'
+                    ? [foldersByName.get(rule.folder ?? '')].filter((value): value is vscode.WorkspaceFolder => !!value)
+                    : this.getSupportedWorkspaceFolders();
+                for (const folder of folders) {
+                    const target = path.join(folder.uri.fsPath, ...rule.path.split('/'));
+                    const rootInsideTarget = this.pathBelongsToRoot(rootPath, target);
+                    const targetInsideRoot = this.pathBelongsToRoot(target, rootPath);
+                    if (!rootInsideTarget && !targetInsideRoot) { continue; }
+                    const scanRoot = rootInsideTarget ? rootPath : target;
+                    let stat: fs.Stats | undefined;
+                    try { stat = fs.lstatSync(scanRoot); }
+                    catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
+                    if (!stat) { continue; }
+                    if (stat.isSymbolicLink()) { continue; }
+                    if (stat.isFile()) {
+                        add([vscode.Uri.file(scanRoot)]);
+                        continue;
+                    }
+                    if (!stat.isDirectory()) { continue; }
+                    add(await vscode.workspace.findFiles(
+                        new vscode.RelativePattern(scanRoot, '**/*'),
+                        new vscode.RelativePattern(scanRoot, '**/{.git,.difftracker-restore-*}/**')
+                    ));
+                }
+            }
+        }
+        return [...candidates.values()];
+    }
+
     private getVsCodeExcludePatterns(resource: vscode.Uri): string[] {
         const config = vscode.workspace.getConfiguration(undefined, resource);
         const watcherExclude = config.get<Record<string, boolean>>('files.watcherExclude', {});
@@ -2755,10 +2818,7 @@ export class DiffTracker {
                 return;
             }
 
-            const files = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(folder, '**/*'),
-                new vscode.RelativePattern(folder, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-            );
+            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
             if (!this.isCurrentEpoch(epoch)) { return; }
 
             const candidates = files.filter(uri => {
@@ -3114,10 +3174,7 @@ export class DiffTracker {
     private async discoverRestoredFiles(epoch: number): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(folder, '**/*'),
-                new vscode.RelativePattern(folder, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-            );
+            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
             if (!this.isCurrentEpoch(epoch)) { return; }
             for (const uri of files) { candidates.set(uri.fsPath, uri); }
         }
@@ -3411,10 +3468,7 @@ export class DiffTracker {
                     try { await this.watchImportedTree(filePath, epoch); }
                     catch { watchFailed = true; }
                     if (!creationIsCurrent()) { return; }
-                    const children = await vscode.workspace.findFiles(
-                        new vscode.RelativePattern(filePath, '**/*'),
-                        new vscode.RelativePattern(filePath, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-                    );
+                    const children = await this.findScopeFilesUnderDirectory(filePath);
                     if (!creationIsCurrent()) { return; }
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
@@ -3877,10 +3931,7 @@ export class DiffTracker {
                 this.markLineChangesUpdated(filePath);
             }
 
-            const files = await vscode.workspace.findFiles(
-                new vscode.RelativePattern(repoRoot, '**/*'),
-                new vscode.RelativePattern(repoRoot, '**/{node_modules,.git,out,dist,build,coverage,tmp}/**')
-            );
+            const files = await this.findScopeFilesUnderDirectory(repoRoot);
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
