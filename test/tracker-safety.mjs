@@ -3046,6 +3046,58 @@ test('S3 broad include defers when watcherExclude can hide a descendant',async()
     assert.equal(result.status,'requiresS4',JSON.stringify(result));
 });
 
+test('S3 restore-prefixed ordinary files are not treated as watcher hard boundaries',async()=>{
+    const includeDir=file('scope-restore-prefix');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    vscodeExcludes['files.watcherExclude']={'**/.difftracker-restore-*':true};
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'restore-prefix-watch-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+});
+
+test('S3 missing explicit include that becomes a directory drops its absent-file sentinel across restore',async()=>{
+    const target=file('scope-later-directory');
+    const storage=file('scope-later-directory-storage');
+    tracker.storageUri=Uri.file(storage);
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,target).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    assert.equal(tracker.fileSnapshots.has(target),true,'missing include starts with an absent-file sentinel');
+    assert.equal(tracker.baselineExistingFiles.has(target),false);
+
+    fs.mkdirSync(target);
+    await tracker.onExternalFileCreated(Uri.file(target));
+    assert.equal(tracker.fileSnapshots.has(target),false,'directory observation removes the file sentinel');
+    assert.equal(pending(target),undefined);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.fileSnapshots.has(target),false);
+    assert.equal(pending(target),undefined,'restoring the directory must not create a Resource is a directory review');
+});
+
 test('S3 watcherExclude change pauses an already-effective include and persists the gap',async()=>{
     const includeFile=file('scope-dynamic.txt');
     fs.writeFileSync(includeFile,'baseline');

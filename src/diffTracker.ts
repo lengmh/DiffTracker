@@ -2782,8 +2782,11 @@ export class DiffTracker {
 
     private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
         const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').split('/');
-        return segments.some(segment =>
-            segment === '.git' || segment.startsWith('.difftracker-restore-'));
+        // An exact .git path segment is unmonitorable regardless of whether the
+        // leaf is a file or directory. Restore-prefixed names are different:
+        // only restore-prefixed directories are hard boundaries, while an
+        // ordinary file such as ".difftracker-restore-notes" is monitorable.
+        return segments.some(segment => segment === '.git');
     }
 
     private watcherGlobSegmentMatches(patternSegment: string, value: string, caseSensitive: boolean): boolean {
@@ -3923,6 +3926,25 @@ export class DiffTracker {
         if (isCurrent()) { this.markFileUnavailable(filePath, reason); }
     }
 
+    private clearAbsentDirectorySentinel(filePath: string): boolean {
+        if (!this.fileSnapshots.has(filePath) || this.baselineExistingFiles.has(filePath)) {
+            return false;
+        }
+        const hadTrackedChange = this.trackedChanges.has(filePath);
+        const hadLineChanges = this.lineChanges.has(filePath);
+        const hadInlineView = this.inlineViews.has(filePath);
+        this.releaseScopeBaselineData(filePath);
+        this.deleteTrackedChange(filePath);
+        this.lineChanges.delete(filePath);
+        if (hadLineChanges) { this.markLineChangesUpdated(filePath); }
+        this.inlineViews.delete(filePath);
+        this.invalidateChangeBlocksCache(filePath);
+        if (hadTrackedChange || hadLineChanges || hadInlineView) {
+            this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged: true });
+        }
+        return true;
+    }
+
     private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
@@ -3953,8 +3975,13 @@ export class DiffTracker {
             const directory = await this.isUntrackedDirectory(uri);
             if (!creationIsCurrent()) { return; }
             if (directory) {
-                if (this.fileSnapshots.has(filePath)) {
-                    // An absent baseline no longer has a file at this path.
+                // A missing explicit include is represented by an absent-file
+                // sentinel. Once that path is known to be a directory the
+                // sentinel must not survive persistence: directories are not
+                // file review targets, and each discovered child receives its
+                // own absence provenance below.
+                const removedAbsentSentinel = !scanEvent && this.clearAbsentDirectorySentinel(filePath);
+                if (!removedAbsentSentinel && this.fileSnapshots.has(filePath)) {
                     this.updateTrackedDiff(filePath, '', { currentExists: false });
                 }
                 // Native watchers may report only the parent when a populated
@@ -3976,6 +4003,8 @@ export class DiffTracker {
                     }
                     if (watchFailed && creationIsCurrent()) {
                         await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
+                    } else if (removedAbsentSentinel && creationIsCurrent()) {
+                        this.schedulePersistState();
                     }
                 } catch {
                     if (creationIsCurrent()) {
