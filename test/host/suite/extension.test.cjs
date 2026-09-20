@@ -96,6 +96,28 @@ module.exports = async function runExtensionHostScenario() {
         );
         console.log('PASS HOST-S3 explicit include baselines resources hidden by ordinary exclusions');
 
+        // Confirmation must be bound to the exact scope revision shown to the
+        // user. A settings edit while the modal is open invalidates that approval.
+        const stableIncludes = [{ scope: 'all', path: 'node_modules/s3-private' }];
+        await scopeConfig.update('watchInclude', [
+            ...stableIncludes,
+            { scope: 'all', path: 'node_modules/revision-a' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const stalePrompt = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(stalePrompt.status, 'needsConsent', JSON.stringify(stalePrompt));
+        assert.ok(stalePrompt.scopeRevision);
+        await scopeConfig.update('watchInclude', [
+            ...stableIncludes,
+            { scope: 'all', path: 'node_modules/revision-b' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const staleApproval = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true,
+            expectedScopeRevision: stalePrompt.scopeRevision
+        });
+        assert.equal(staleApproval.status, 'conflict', JSON.stringify(staleApproval));
+        await scopeConfig.update('watchInclude', stableIncludes, vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 stale scope approval cannot authorize a newer revision');
+
         // Whole Workspace is a valid request in S3 but cannot become effective
         // until S4-W can atomically establish preparation and observation coverage.
         await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);

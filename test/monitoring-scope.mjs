@@ -49,6 +49,19 @@ function valid(overrides = {}) {
 }
 
 {
+    const malformed = [
+        { mode: 'invalid', includes: [], excludes: [] },
+        { mode: 'rules', includes: {}, excludes: [] },
+        { mode: 'rules', includes: [], excludes: 'secret/**' }
+    ];
+    for (const request of malformed) {
+        const result = validateAndCanonicalizeScope(request, roots, 'linux');
+        assert.equal(result.ok, false, 'malformed scope requests must remain invalid');
+        assert.equal(result.scope, undefined);
+    }
+}
+
+{
     const a = validateAndCanonicalizeScope(valid({
         includes: [
             { scope: 'all', path: 'z' },
