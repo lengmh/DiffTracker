@@ -477,6 +477,11 @@ export function previewLegacyWatchExcludeMigration(
             if (!seenExclude.has(key)) {
                 seenExclude.add(key);
                 excludes.push({ scope: 'all', pattern });
+                // Later ordinary policy (.gitignore, Git exclude, VS Code policy)
+                // can negate a legacy Global exclusion. A configured explicit
+                // exclude would outrank that downstream negation, so this
+                // conversion is a suggestion only and requires manual review.
+                manual.push(line);
             }
             continue;
         }

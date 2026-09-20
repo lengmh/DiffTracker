@@ -143,9 +143,11 @@ export async function activate(context: vscode.ExtensionContext) {
         const requestedMatchesEffective = requestedScope &&
             scopeStatus.effective.kind === 'configured' &&
             requestedScope.scopeRevision === scopeStatus.effective.scopeRevision;
-        if (scopeStatus.workspaceRequestPresent && !requestedMatchesEffective) {
+        const configuredScopeMismatch = scopeStatus.effective.kind === 'configured' && !requestedMatchesEffective;
+        const explicitPendingScope = scopeStatus.workspaceRequestPresent && !requestedMatchesEffective;
+        if (configuredScopeMismatch || explicitPendingScope) {
             void vscode.window.showWarningMessage(
-                'Code Diff Tracker: Workspace monitoring-scope settings are pending. Apply the requested scope (or restore the effective configuration) before rebuilding the recording baseline.'
+                'Code Diff Tracker: The requested monitoring scope differs from the effective scope. Apply the request (or restore the effective configuration) before rebuilding the recording baseline.'
             );
             return false;
         }
@@ -178,7 +180,8 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!latestScopeStatus.requested.ok ||
             latestRequestedScope?.scopeRevision !== checkedScopeRevision ||
             (latestScopeStatus.expansionReasons.length > 0 && !latestScopeStatus.consented) ||
-            (latestScopeStatus.workspaceRequestPresent && !latestRequestedMatchesEffective)) {
+            (!latestRequestedMatchesEffective &&
+                (latestScopeStatus.effective.kind === 'configured' || latestScopeStatus.workspaceRequestPresent))) {
             void vscode.window.showWarningMessage(
                 'Code Diff Tracker: Monitoring scope changed while recording confirmation was open. Review and apply the current scope before starting.'
             );

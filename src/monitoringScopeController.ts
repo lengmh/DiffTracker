@@ -221,7 +221,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
         const preview = previewLegacyWatchExcludeMigration(this.getLegacyGlobalRules());
         if (preview.manual.length > 0) {
-            return { status: 'manual', manual: preview.manual, reason: 'Some legacy negation rules require manual migration.' };
+            return { status: 'manual', manual: preview.manual, reason: 'Some legacy watch rules require manual migration to preserve downstream policy semantics.' };
         }
         const hasWorkspaceRules =
             this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined ||

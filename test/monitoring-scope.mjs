@@ -198,6 +198,10 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         'node_modules/',
         '!private-data/'
     ], 'linux');
+    assert.ok(preview.manual.includes('secret/**'),
+        'positive legacy exclusion requires manual confirmation because later ordinary negations may override it');
+    assert.ok(preview.manual.includes('node_modules/'),
+        'each positive legacy exclusion remains a manual migration item');
     assert.ok(preview.manual.includes('!secret/keep.txt'),
         'overlapping legacy negation must require manual migration');
     assert.ok(preview.includes.some(rule => rule.path === 'secret/keep.txt'),
@@ -219,7 +223,7 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     ], 'linux');
     assert.deepEqual(preview.excludes, [{ scope: 'all', pattern: 'node_modules/' }]);
     assert.deepEqual(preview.includes, [{ scope: 'all', path: 'private-data' }]);
-    assert.deepEqual(preview.manual, ['!src/**/generated', '!private-data/']);
+    assert.deepEqual(preview.manual, ['node_modules/', '!src/**/generated', '!private-data/']);
     assert.deepEqual(preview.ignoredNoops, ['# old comment']);
 }
 
