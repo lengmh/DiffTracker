@@ -1,0 +1,412 @@
+diff --git a/src/diffTracker.ts b/src/diffTracker.ts
+index 7e003de..3a0eca8 100644
+--- a/src/diffTracker.ts
++++ b/src/diffTracker.ts
+@@ -306,0 +307 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -337,0 +339 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -421 +423 @@ export class DiffTracker {
+-        const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === token.filePath && value.uri.scheme === 'file');
++        const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && this.canonicalTrackingPath(value.uri.fsPath) === token.filePath);
+@@ -432 +434 @@ export class DiffTracker {
+-                    document.uri.scheme === 'file' && document.uri.fsPath === filePath && document.isDirty
++                    document.uri.scheme === 'file' && this.canonicalTrackingPath(document.uri.fsPath) === filePath && document.isDirty
+@@ -451 +453 @@ export class DiffTracker {
+-            value.uri.fsPath === filePath && value.uri.scheme === 'file'
++            value.uri.scheme === 'file' && this.canonicalTrackingPath(value.uri.fsPath) === filePath
+@@ -485,0 +488,4 @@ export class DiffTracker {
++    // Scope preparation temporarily stages matcher/baseline state. Public
++    // status and live coverage callbacks must still see the committed scope.
++    private committedScopeDuringApply?: EffectiveMonitoringScope;
++    private readonly canonicalTrackingPaths = new Map<string, string>();
+@@ -680,0 +687,4 @@ export class DiffTracker {
++        this.canonicalTrackingPaths.clear();
++        for (const filePath of new Set([
++            ...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys(), ...this.opaqueBaselineFiles.keys()
++        ])) { this.canonicalTrackingPath(filePath, true); }
+@@ -815,0 +826 @@ export class DiffTracker {
++        this.canonicalTrackingPaths.clear();
+@@ -1240,0 +1252 @@ export class DiffTracker {
++        if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+@@ -2007,0 +2020,41 @@ export class DiffTracker {
++    private canonicalTrackingPath(filePath: string, preserveStoredKey = false): string {
++        // Already-established keys are stable for the life of their baseline.
++        if (!preserveStoredKey && (this.fileSnapshots.has(filePath) || this.opaqueBaselineFiles.has(filePath) ||
++            this.unresolvedBaselineFiles.has(filePath))) { return filePath; }
++        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
++        if (!folder || folder.uri.scheme !== 'file') { return filePath; }
++        const identity = this.workspaceRootIdentityForFolder(folder);
++        if (identity.caseSensitive !== false) { return filePath; }
++        const relative = path.relative(folder.uri.fsPath, filePath);
++        if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
++            return filePath;
++        }
++        const key = `${folder.uri.toString()}\0${this.toPosixPath(relative).toLowerCase()}`;
++        if (preserveStoredKey) {
++            if (!this.canonicalTrackingPaths.has(key)) { this.canonicalTrackingPaths.set(key, filePath); }
++            return this.canonicalTrackingPaths.get(key)!;
++        }
++        const known = this.canonicalTrackingPaths.get(key);
++        if (known) { return known; }
++        // Resolve spelling only after enforcing the no-symlink/workspace
++        // boundary. realpath must never turn a forbidden alias into permission.
++        if (this.validateResourceTarget(filePath)) { return filePath; }
++        let existing = filePath;
++        const missing: string[] = [];
++        try {
++            while (!fs.existsSync(existing)) {
++                missing.unshift(path.basename(existing));
++                const parent = path.dirname(existing);
++                if (parent === existing) { return filePath; }
++                existing = parent;
++            }
++            const actual = vscode.Uri.file(path.join(fs.realpathSync.native(existing), ...missing)).fsPath;
++            const actualFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(actual));
++            if (!actualFolder || actualFolder.uri.toString() !== folder.uri.toString() || this.validateResourceTarget(actual)) {
++                return filePath;
++            }
++            this.canonicalTrackingPaths.set(key, actual);
++            return actual;
++        } catch { return filePath; }
++    }
++
+@@ -2146,0 +2200 @@ export class DiffTracker {
++            filePath = this.canonicalTrackingPath(filePath);
+@@ -2166 +2220 @@ export class DiffTracker {
+-                const target = path.join(folder.uri.fsPath, ...rule.path.split('/'));
++                const target = this.canonicalTrackingPath(path.join(folder.uri.fsPath, ...rule.path.split('/')));
+@@ -2265,0 +2320 @@ export class DiffTracker {
++            this.committedScopeDuringApply = undefined;
+@@ -2294,0 +2350 @@ export class DiffTracker {
++            !this.explicitIncludeNeedsSupplementalCoverage(scope) &&
+@@ -2303,0 +2360 @@ export class DiffTracker {
++        this.committedScopeDuringApply = previous.effectiveMonitoringScope;
+@@ -2347 +2404,4 @@ export class DiffTracker {
+-            result.capturedBaselines = await this.captureConfiguredIncludeBaselines(scope, epoch);
++            // Apply is not Start: stopped sessions must not acquire new
++            // before-images or enumerate newly included resource contents.
++            result.capturedBaselines = this.isRecording
++                ? await this.captureConfiguredIncludeBaselines(scope, epoch) : 0;
+@@ -2357 +2417 @@ export class DiffTracker {
+-            this.scanCoverage = this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
++            this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+@@ -2360 +2420 @@ export class DiffTracker {
+-            if (!await this.flushPersistState(true, transaction)) {
++            if (!await this.flushPersistState(false, transaction)) {
+@@ -2366,0 +2427 @@ export class DiffTracker {
++            this.committedScopeDuringApply = undefined;
+@@ -2394 +2455 @@ export class DiffTracker {
+-        return JSON.parse(JSON.stringify(this.effectiveMonitoringScope)) as EffectiveMonitoringScope;
++        return JSON.parse(JSON.stringify(this.committedScopeDuringApply ?? this.effectiveMonitoringScope)) as EffectiveMonitoringScope;
+@@ -2443 +2504 @@ export class DiffTracker {
+-        if (this.isRecording && !this.activeWriteFiles.has(doc.uri.fsPath)) {
++        if (this.isRecording && !this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath))) {
+@@ -2446 +2507 @@ export class DiffTracker {
+-        if (!this.activeWriteFiles.has(doc.uri.fsPath) && this.pendingWriteFiles.delete(doc.uri.fsPath)) {
++        if (!this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath)) && this.pendingWriteFiles.delete(this.canonicalTrackingPath(doc.uri.fsPath))) {
+@@ -2657 +2718 @@ export class DiffTracker {
+-        if ((!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
++        if (!this.isRecording || (!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
+@@ -2725 +2786 @@ export class DiffTracker {
+-                if (!isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) { candidates.set(uri.fsPath, uri); }
++                if (!isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) { const canonical = this.canonicalTrackingPath(uri.fsPath); candidates.set(canonical, vscode.Uri.file(canonical)); }
+@@ -2741 +2802 @@ export class DiffTracker {
+-                    const target = path.join(folder.uri.fsPath, ...rule.path.split('/'));
++                    const target = this.canonicalTrackingPath(path.join(folder.uri.fsPath, ...rule.path.split('/')));
+@@ -2942,3 +3003,3 @@ export class DiffTracker {
+-        if (this.effectiveMonitoringScope.kind !== 'configured' ||
+-            this.effectiveMonitoringScope.mode !== 'rules') { return; }
+-        const issue = this.explicitIncludeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
++        const committedScope = this.getEffectiveMonitoringScope();
++        if (committedScope.kind !== 'configured' || committedScope.mode !== 'rules') { return; }
++        const issue = this.explicitIncludeNeedsSupplementalCoverage(committedScope);
+@@ -3005,7 +3066,16 @@ export class DiffTracker {
+-    private getWatchExcludePatterns(_resource: vscode.Uri): string[] {
+-        // Compatibility sessions preserve the old Global matcher exactly.
+-        // Once a configured effective scope is published, Global watchExclude
+-        // no longer participates in Policy Fingerprint or Rules Mode matching.
+-        return this.effectiveMonitoringScope.kind === 'legacyV3'
+-            ? this.getLegacyGlobalWatchExcludePatterns()
+-            : [];
++    private getWatchExcludePatterns(resource: vscode.Uri): string[] {
++        if (this.effectiveMonitoringScope.kind !== 'legacyV3') { return []; }
++        // 0.7.2 used resource-scoped VS Code precedence: Folder overrides
++        // Workspace, which overrides Global. Arrays replace, not concatenate.
++        const config = vscode.workspace.getConfiguration('diffTracker', resource);
++        const raw = config.get<unknown>('watchExclude', []);
++        if (Array.isArray(raw) && raw.every(value => typeof value === 'string')) {
++            return (raw as string[]).map(value => value.trim()).filter(Boolean);
++        }
++        if (Array.isArray(raw) && raw.every(value => value && typeof value === 'object' && !Array.isArray(value))) {
++            // A structured request is not yet an applied legacy matcher. Keep
++            // its predecessor until migration; the pending gate protects new
++            // explicit exclusions independently of this ordinary matcher.
++            return this.getLegacyGlobalWatchExcludePatterns();
++        }
++        throw new Error('Invalid legacy watchExclude configuration; compatibility discovery is blocked');
+@@ -3218 +3288 @@ export class DiffTracker {
+-
++        const retainedFiles: string[] = [];
+@@ -3222,4 +3292,4 @@ export class DiffTracker {
+-            if (this.workspaceContextChanged && (!folder || folder.uri.scheme !== 'file')) {
+-                // A removed workspace root is intentionally retained in the
+-                // paused review until the user explicitly rebuilds the baseline.
+-                continue;
++            if (this.workspaceContextChanged && (!folder || folder.uri.scheme !== 'file')) { continue; }
++            if (this.retainedReviewPaths.has(filePath) && !this.isPathIgnored(uri, false, false, false)) {
++                this.retainedReviewPaths.delete(filePath);
++                retainedFiles.push(filePath);
+@@ -3227,6 +3297,13 @@ export class DiffTracker {
+-            if (this.isPathIgnored(uri, false, true, false)) {
+-                this.deleteTrackedChange(filePath);
+-                this.lineChanges.delete(filePath);
+-                this.markLineChangesUpdated(filePath);
+-                this.inlineViews.delete(filePath);
+-                removedFiles.push(filePath);
++            if (!this.isPathIgnored(uri, false, true, false)) { continue; }
++            if (this.effectiveMonitoringScope.kind === 'configured' && folder?.uri.scheme === 'file') {
++                const identity = this.workspaceRootIdentityForFolder(folder);
++                const relative = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
++                if (typeof identity.caseSensitive === 'boolean' &&
++                    !isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) {
++                    // Ordinary policy does not acknowledge or discard review.
++                    // Retention permits only this resource's verification, not
++                    // discovery throughout its newly excluded parent directory.
++                    this.retainedReviewPaths.add(filePath);
++                    retainedFiles.push(filePath);
++                    continue;
++                }
+@@ -3233,0 +3311,5 @@ export class DiffTracker {
++            this.deleteTrackedChange(filePath);
++            this.lineChanges.delete(filePath);
++            this.markLineChangesUpdated(filePath);
++            this.inlineViews.delete(filePath);
++            removedFiles.push(filePath);
+@@ -3235,3 +3317,3 @@ export class DiffTracker {
+-
+-        if (removedFiles.length > 0) {
+-            this.emitTrackChangesEvent({ removedFiles });
++        if (retainedFiles.length > 0) {
++            this.schedulePersistState();
++            this.emitTrackChangesEvent({ changedFiles: retainedFiles, fullRefresh: true });
+@@ -3238,0 +3321 @@ export class DiffTracker {
++        if (removedFiles.length > 0) { this.emitTrackChangesEvent({ removedFiles }); }
+@@ -3283 +3366 @@ export class DiffTracker {
+-                const dirty = vscode.workspace.textDocuments.some(doc => doc.uri.scheme === 'file' && doc.uri.fsPath === filePath && doc.isDirty);
++                const dirty = vscode.workspace.textDocuments.some(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath && doc.isDirty);
+@@ -3436 +3519 @@ export class DiffTracker {
+-        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath && d.uri.scheme === 'file');
++        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && this.canonicalTrackingPath(d.uri.fsPath) === filePath);
+@@ -3447,0 +3531 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3498,0 +3583 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3539,0 +3625 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3543,0 +3630 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3545 +3632 @@ export class DiffTracker {
+-            document.uri.scheme === 'file' && document.uri.fsPath === filePath && document.isDirty);
++            document.uri.scheme === 'file' && this.canonicalTrackingPath(document.uri.fsPath) === filePath && document.isDirty);
+@@ -3548,0 +3636 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3573,0 +3662 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3641,0 +3731 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -3845,0 +3936 @@ export class DiffTracker {
++        if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+@@ -3874 +3965 @@ export class DiffTracker {
+-            const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
++            const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && this.canonicalTrackingPath(d.uri.fsPath) === filePath);
+@@ -3948,0 +4040 @@ export class DiffTracker {
++        if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+@@ -4052,0 +4145 @@ export class DiffTracker {
++        if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+@@ -4081,0 +4175,2 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
++        if (uri.scheme === 'file') { uri = vscode.Uri.file(filePath); }
+@@ -4086 +4181 @@ export class DiffTracker {
+-            const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
++            const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && this.canonicalTrackingPath(value.uri.fsPath) === filePath);
+@@ -4094 +4189 @@ export class DiffTracker {
+-        const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && doc.uri.fsPath === filePath);
++        const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath);
+@@ -4125,0 +4221 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -4768,0 +4865 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -4942,0 +5040 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5023 +5121 @@ export class DiffTracker {
+-        const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && doc.uri.fsPath === item.filePath);
++        const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === item.filePath);
+@@ -5291 +5389 @@ export class DiffTracker {
+-        const openDoc = vscode.workspace.textDocuments.find(doc => doc.uri.fsPath === filePath && doc.uri.scheme === 'file');
++        const openDoc = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath);
+@@ -5375 +5473 @@ export class DiffTracker {
+-        const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
++        const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && this.canonicalTrackingPath(value.uri.fsPath) === filePath);
+@@ -5415,0 +5514 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5419,0 +5519 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5423,0 +5524 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5432,0 +5534 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5446,0 +5549 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5606,0 +5710 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5661 +5765 @@ export class DiffTracker {
+-                    const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath && d.uri.scheme === 'file');
++                    const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && this.canonicalTrackingPath(d.uri.fsPath) === filePath);
+@@ -5686 +5790 @@ export class DiffTracker {
+-        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
++        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && this.canonicalTrackingPath(d.uri.fsPath) === filePath);
+@@ -5781,0 +5886 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -5828,0 +5934 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -6073,2 +6179,2 @@ export class DiffTracker {
+-        const filePath = doc.uri.fsPath;
+-        const uri = doc.uri;
++        const filePath = this.canonicalTrackingPath(doc.uri.fsPath);
++        const uri = doc.uri.scheme === 'file' ? vscode.Uri.file(this.canonicalTrackingPath(doc.uri.fsPath)) : doc.uri;
+@@ -6135,2 +6241,2 @@ export class DiffTracker {
+-        const filePath = doc.uri.fsPath;
+-        const uri = doc.uri;
++        const filePath = this.canonicalTrackingPath(doc.uri.fsPath);
++        const uri = doc.uri.scheme === 'file' ? vscode.Uri.file(this.canonicalTrackingPath(doc.uri.fsPath)) : doc.uri;
+@@ -6185,0 +6292 @@ export class DiffTracker {
++        filePath = this.canonicalTrackingPath(filePath);
+@@ -6191 +6298 @@ export class DiffTracker {
+-        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.scheme === 'file' && textDoc.uri.fsPath === filePath);
++        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.scheme === 'file' && this.canonicalTrackingPath(textDoc.uri.fsPath) === filePath);
+@@ -6220 +6327 @@ export class DiffTracker {
+-        const filePath = doc.uri.fsPath;
++        const filePath = this.canonicalTrackingPath(doc.uri.fsPath);
+diff --git a/src/extension.ts b/src/extension.ts
+index e1c2ffd..e8b2afe 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -86 +86 @@ export async function activate(context: vscode.ExtensionContext) {
+-    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyGlobalRules().length === 0) {
++    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyWatchRules().length === 0) {
+diff --git a/src/monitoringScope.ts b/src/monitoringScope.ts
+index a4d6f22..3861884 100644
+--- a/src/monitoringScope.ts
++++ b/src/monitoringScope.ts
+@@ -631,2 +630,0 @@ function excludeRuleCovers(
+-    // A rule scoped only to a removed root has no remaining monitored
+-    // population, so dropping it is a contraction rather than an expansion.
+@@ -634,14 +632,18 @@ function excludeRuleCovers(
+-    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) {
+-        return false;
+-    }
+-    if (sameRule(candidate, effectiveRule)) { return true; }
+-
+-    // General glob-subset proofs are intentionally not guessed. We can safely
+-    // recognize broader exclusions when the effective rule is a literal path
+-    // and the candidate matcher excludes that exact resource (and, for a
+-    // directory rule, a representative descendant) on every affected root.
+-    const raw = effectiveRule.pattern;
+-    if (/[*?[]/.test(raw)) { return false; }
+-    const trimmed = raw.replace(/^\/+/, '').replace(/\/+$/, '');
+-    if (!trimmed) { return false; }
+-    const directoryRule = /\/$/.test(raw);
++    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) { return false; }
++    if (candidate.pattern === effectiveRule.pattern) { return true; }
++
++    // Containment is structural, not inferred from finite path probes. In
++    // particular, a slashless rule matches at arbitrary depths whereas /name
++    // matches only at the root. Unproved glob relationships remain expansions.
++    const literal = (pattern: string): { parts: string[]; anchored: boolean; directory: boolean } | undefined => {
++        const body = pattern.replace(/^\//, '').replace(/\/$/, '');
++        if (!body || /[\\*?\[\]{}\s]/.test(body)) { return undefined; }
++        return { parts: body.split('/'), anchored: pattern.startsWith('/') || body.includes('/'),
++            directory: pattern.endsWith('/') };
++    };
++    const effective = literal(effectiveRule.pattern);
++    if (!effective) { return false; }
++    const raw = candidate.pattern;
++    const recursive = raw.startsWith('**/') ? literal(raw.slice(3)) : undefined;
++    const ordinary = literal(raw);
++    const subtree = raw.endsWith('/**') ? literal(raw.slice(0, -3)) : undefined;
+@@ -650,3 +652,20 @@ function excludeRuleCovers(
+-        const matcher = ignore({ ignorecase: !root.caseSensitive }).add(explicitPatternForIgnore(candidate.pattern));
+-        if (directoryRule) {
+-            return matcher.ignores(`${trimmed}/`) && matcher.ignores(`${trimmed}/__difftracker_probe__`);
++        const equal = (left: string, right: string) => root.caseSensitive
++            ? left === right : left.toLowerCase() === right.toLowerCase();
++        if (!effective.anchored) {
++            const name = ordinary && !ordinary.anchored ? ordinary :
++                recursive && !recursive.anchored ? recursive : undefined;
++            return !!name && equal(name.parts[0], effective.parts[0]) &&
++                (!name.directory || effective.directory);
++        }
++        if (ordinary) {
++            if (!ordinary.anchored) {
++                return effective.parts.some((part, index) => equal(part, ordinary.parts[0]) &&
++                    (index < effective.parts.length - 1 || !ordinary.directory || effective.directory));
++            }
++            return ordinary.parts.length <= effective.parts.length &&
++                ordinary.parts.every((part, index) => equal(part, effective.parts[index])) &&
++                (ordinary.parts.length < effective.parts.length || !ordinary.directory || effective.directory);
++        }
++        if (recursive && !recursive.anchored) {
++            return effective.parts.some((part, index) => equal(part, recursive.parts[0]) &&
++                (index < effective.parts.length - 1 || !recursive.directory || effective.directory));
+@@ -654 +673,4 @@ function excludeRuleCovers(
+-        return matcher.ignores(trimmed);
++        // prefix/** covers every resource strictly below a literal prefix,
++        // but cannot cover a file at that prefix itself.
++        return !!subtree && subtree.parts.length < effective.parts.length &&
++            subtree.parts.every((part, index) => equal(part, effective.parts[index]));
+diff --git a/src/monitoringScopeController.ts b/src/monitoringScopeController.ts
+index e0cf95d..97ca581 100644
+--- a/src/monitoringScopeController.ts
++++ b/src/monitoringScopeController.ts
+@@ -98 +98,20 @@ export class MonitoringScopeController implements vscode.Disposable {
+-            this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined;
++            (this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined &&
++                !this.isLegacyStringArray(this.inspectWorkspaceValue<unknown>('watchExclude')));
++    }
++
++    private isLegacyStringArray(value: unknown): value is string[] {
++        return Array.isArray(value) && value.length > 0 && value.every(entry => typeof entry === 'string');
++    }
++
++    public getLegacyWatchRules(): string[] {
++        // This aggregate is only for migration UI/gating. Matching itself uses
++        // each resource's merged configuration, never this union.
++        const rules = new Set(this.getLegacyGlobalRules());
++        const workspace = this.inspectWorkspaceValue<unknown>('watchExclude');
++        if (this.isLegacyStringArray(workspace)) { workspace.forEach(rule => rules.add(rule)); }
++        for (const folder of vscode.workspace.workspaceFolders ?? []) {
++            const config = vscode.workspace.getConfiguration('diffTracker', folder.uri);
++            const value = typeof config.inspect === 'function' ? config.inspect<unknown>('watchExclude')?.workspaceFolderValue : undefined;
++            if (this.isLegacyStringArray(value)) { value.forEach(rule => rules.add(rule)); }
++        }
++        return [...rules];
+@@ -108 +127,3 @@ export class MonitoringScopeController implements vscode.Disposable {
+-            excludes: excludes === undefined ? [] : excludes
++            excludes: excludes === undefined ||
++                (this.tracker.getEffectiveMonitoringScope().kind === 'legacyV3' && this.isLegacyStringArray(excludes))
++                ? [] : excludes
+@@ -137 +158 @@ export class MonitoringScopeController implements vscode.Disposable {
+-        const legacyGlobalRules = this.getLegacyGlobalRules();
++        const legacyGlobalRules = this.getLegacyWatchRules();
+@@ -181 +202 @@ export class MonitoringScopeController implements vscode.Disposable {
+-            return { status: 'needsMigration', reason: 'Legacy Global watch rules must be migrated before configured scope can become effective.' };
++            return { status: 'needsMigration', reason: 'Legacy watch rules must be migrated before configured scope can become effective.' };
+@@ -222 +243 @@ export class MonitoringScopeController implements vscode.Disposable {
+-        const preview = previewLegacyWatchExcludeMigration(this.getLegacyGlobalRules());
++        const preview = previewLegacyWatchExcludeMigration(this.getLegacyWatchRules());
+@@ -270 +291,3 @@ export class MonitoringScopeController implements vscode.Disposable {
+-        await config.update('watchExclude', undefined, vscode.ConfigurationTarget.Workspace);
++        if (!this.isLegacyStringArray(this.inspectWorkspaceValue<unknown>('watchExclude'))) {
++            await config.update('watchExclude', undefined, vscode.ConfigurationTarget.Workspace);
++        }
