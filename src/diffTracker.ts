@@ -1968,15 +1968,36 @@ export class DiffTracker {
         this.pendingMonitoringScope = scope
             ? JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope
             : undefined;
+
+        // Paths leaving a pending exclusion have an observation gap: reads were
+        // intentionally paused, so the old effective baseline cannot claim that
+        // nothing changed while the request was pending.
         for (const filePath of [...this.pendingScopeSuspendedPaths]) {
             const uri = vscode.Uri.file(filePath);
             if (this.pendingScopeExplicitlyExcludes(uri)) { continue; }
             this.pendingScopeSuspendedPaths.delete(filePath);
-            if (this.isRecording && !this.isPathIgnored(uri, false, true, false)) {
+            if (!this.isPathIgnored(uri, false, true, false)) {
                 const reason = 'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review';
                 this.coverageGaps.set(filePath, reason);
                 this.markFileUnavailable(filePath, reason);
                 this.schedulePersistState();
+            }
+        }
+
+        // Once an explicit exclusion request is pending, all existing baseline
+        // evidence it covers must be treated as potentially stale even if the host
+        // never delivers a file event during the pause (including across reload).
+        if (this.pendingMonitoringScope) {
+            const baselinePaths = new Set([
+                ...this.fileSnapshots.keys(),
+                ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys(),
+                ...this.trackedChanges.keys()
+            ]);
+            for (const filePath of baselinePaths) {
+                if (this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) {
+                    this.pendingScopeSuspendedPaths.add(filePath);
+                }
             }
         }
     }

@@ -66,17 +66,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
+    // Install requested-scope gating before restoration so a pending explicit
+    // exclusion cannot be read while V4/V3 state is being reconciled.
+    const monitoringScopeController = new MonitoringScopeController(context, diffTracker);
+    context.subscriptions.push(monitoringScopeController);
     // Commands and restored review views must never precede Git reconciliation.
     diffTracker.setGitContextPending(true);
     const restoreOutcome = await diffTracker.restorePersistedState();
+    monitoringScopeController.reconcileRequestedScope();
     decorationManager = new DecorationManager(diffTracker);
     statusBarManager = new StatusBarManager(diffTracker);
     originalContentProvider = new OriginalContentProvider(diffTracker);
     inlineContentProvider = new InlineContentProvider(diffTracker);
     codeLensProvider = new DiffCodeLensProvider(diffTracker);
     settingsTreeDataProvider = new SettingsTreeDataProvider();
-    const monitoringScopeController = new MonitoringScopeController(context, diffTracker);
-    context.subscriptions.push(monitoringScopeController);
     // A fresh workspace with no legacy Global rules can safely adopt the default
     // Rules scope before recording starts. Restored V1/V2/V3 sessions remain in
     // compatibility mode until the user explicitly migrates/applies them.

@@ -46,19 +46,19 @@ export class MonitoringScopeController implements vscode.Disposable {
         private readonly context: vscode.ExtensionContext,
         private readonly tracker: DiffTracker
     ) {
-        this.syncPendingScopeGate();
+        this.reconcileRequestedScope();
         this.disposables.push(vscode.workspace.onDidChangeConfiguration(event => {
             if (
                 event.affectsConfiguration('diffTracker.monitoringScope') ||
                 event.affectsConfiguration('diffTracker.watchInclude') ||
                 event.affectsConfiguration('diffTracker.watchExclude')
             ) {
-                this.syncPendingScopeGate();
+                this.reconcileRequestedScope();
             }
         }));
     }
 
-    private syncPendingScopeGate(): void {
+    public reconcileRequestedScope(): void {
         const requested = this.getRequestedScope();
         const effective = this.tracker.getEffectiveMonitoringScope();
         const scope = requested.ok ? requested.scope : undefined;
@@ -181,7 +181,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         );
         if (applied.status === 'applied') {
             await this.clearDismissedConsent();
-            this.syncPendingScopeGate();
+            this.reconcileRequestedScope();
             return { status: 'applied' };
         }
         if (applied.status === 'requiresS4') { return { status: 'requiresS4', reason: applied.reason }; }
@@ -211,7 +211,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         // Migration preserves the old legacy semantics; treat the resulting
         // canonical scope as locally authorized on this host.
         await this.grantConsent(validated.scope);
-        this.syncPendingScopeGate();
+        this.reconcileRequestedScope();
         return { status: 'migrated' };
     }
 
@@ -221,7 +221,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
         }
         await this.markLegacyMigrationComplete();
-        this.syncPendingScopeGate();
+        this.reconcileRequestedScope();
         return { status: 'completed' };
     }
 

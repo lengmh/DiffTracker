@@ -163,7 +163,11 @@ for(const scenario of ['delayed','immediate','unavailable','recovered','incomple
     const handler=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='handleGitContextEvent')handler.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
     const calls=[];let callback,pending=false,releaseStart;const starting=new Promise(resolve=>{releaseStart=resolve;});
     const restored=scenario==='recovered'||scenario==='incomplete'?scenario:'restored';
-    const sandbox={context:{subscriptions:[],storageUri:undefined},runningExtensionTests:true,
+    const sandbox={context:{subscriptions:[],storageUri:undefined,workspaceState:{get:()=>undefined,update:async()=>{}}},runningExtensionTests:true,
+        MonitoringScopeController:class {
+            constructor(){}
+            reconcileRequestedScope(){}
+        },
         DiffTracker:class {
             setGitContextPending(value){pending=value;calls.push(value?'pause':'release');}
             async restorePersistedState(){assert.equal(pending,true);return restored;}
