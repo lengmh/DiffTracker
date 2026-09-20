@@ -95,21 +95,39 @@ module.exports = async function runExtensionHostScenario() {
         // watcher as the positive control for supplemental coverage instead.
         const directEvents = [];
         const directWatcher = fs.watch(excludedTree, { persistent: false }, (kind, filename) => {
-            directEvents.push({ kind, filename: filename?.toString() });
+            directEvents.push({ kind, filename: filename?.toString(), observedAt: Date.now() });
         });
         try {
             await delay(500);
             const directProbeName = 'direct-probe.txt';
             const directProbe = path.join(excludedTree, directProbeName);
+            const directProbeFinalContent = 'direct supplemental probe\nfollow-up\n';
+            const directProbeStartedAt = Date.now();
             fs.writeFileSync(directProbe, 'direct supplemental probe\n');
             await delay(250);
             fs.appendFileSync(directProbe, 'follow-up\n');
             try {
-                await until('direct watcher coverage for watcherExclude subtree', () =>
-                    directEvents.some(event =>
+                await until('direct watcher coverage for watcherExclude subtree', () => {
+                    const matchingNamedEvent = directEvents.some(event =>
                         event.filename &&
                         path.basename(event.filename).toLocaleLowerCase() === directProbeName.toLocaleLowerCase()
-                    ), 10_000);
+                    );
+                    if (matchingNamedEvent) { return true; }
+
+                    // Node explicitly permits fs.watch events without a filename.
+                    // In this isolated probe directory, accept such an event only
+                    // when it was observed after the probe started and the probe
+                    // itself has reached the expected post-write state.
+                    const unnamedProbeWindowEvent = directEvents.some(event =>
+                        !event.filename && event.observedAt >= directProbeStartedAt
+                    );
+                    if (!unnamedProbeWindowEvent) { return false; }
+                    try {
+                        return fs.readFileSync(directProbe, 'utf8') === directProbeFinalContent;
+                    } catch {
+                        return false;
+                    }
+                }, 10_000);
             } catch (error) {
                 throw new Error(`${error.message}; direct watcher events=${JSON.stringify(directEvents)}`);
             }
