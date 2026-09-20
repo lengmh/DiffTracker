@@ -3447,10 +3447,12 @@ export class DiffTracker {
         if (!currentMatchesBaseline) {
             return this.actionResult(filePath, 'conflict', 'File does not match the baseline after revert; review retained', result.bufferChanged);
         }
-        const latestChange = this.trackedChanges.get(filePath);
-        if (latestChange && latestChange.reviewKind !== 'text') {
-            return this.actionResult(filePath, 'conflict', 'Review changed during revert', result.bufferChanged);
-        }
+        // Any pending projection left here is stale with respect to the
+        // authoritative resource state we just verified. This includes late
+        // watcher/document events from our own write. A genuinely newer state
+        // (dirty, unreadable, deleted, binary, or different text) cannot reach
+        // this branch because readCurrentFileState/currentMatchesBaseline above
+        // rejects it.
         this.clearFileReview(filePath);
         this.schedulePersistState();
         return result;

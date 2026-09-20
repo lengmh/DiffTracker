@@ -360,7 +360,7 @@ test('S1 Revert may clear a stale text projection once authoritative state exact
         tracker.restoreFileToContent=restore;
     }
 });
-test('S1 Revert retains a late non-text review instead of mistaking missing token for cleared review',async()=>{
+test('S1 Revert clears a stale late unknown projection after authoritative state matches baseline',async()=>{
     const p=file('late-unknown-after-revert.m');seed(p,'baseline\n','changed\n');await scan(p);
     const token=tracker.getReviewToken(p);assert.ok(token);
     const restore=tracker.restoreFileToContent.bind(tracker);
@@ -371,12 +371,30 @@ test('S1 Revert retains a late non-text review instead of mistaking missing toke
     };
     try {
         const result=await tracker.revertFile(p,token);
-        assert.equal(result.status,'conflict');
-        assert.match(result.reason??'',/Review changed during revert/);
+        assert.equal(result.status,'success',result.reason);
         assert.equal(disk(p),'baseline\n');
-        assert.equal(pending(p)?.reviewKind,'unknown');
-        assert.match(pending(p)?.reviewReason??'',/Late review uncertainty/);
+        assert.equal(pending(p),undefined);
     } finally {
+        tracker.restoreFileToContent=restore;
+    }
+});
+test('S1 Revert refuses to clear review when the final authoritative reread becomes unavailable',async()=>{
+    const p=file('final-reread-unavailable.m');seed(p,'baseline\n','changed\n');await scan(p);
+    const token=tracker.getReviewToken(p);assert.ok(token);
+    const restore=tracker.restoreFileToContent.bind(tracker);
+    tracker.restoreFileToContent=async(...args)=>{
+        const result=await restore(...args);
+        if(result.status==='success') faults.set(p,{read:error('NoPermissions')});
+        return result;
+    };
+    try {
+        const result=await tracker.revertFile(p,token);
+        assert.equal(result.status,'conflict');
+        assert.match(result.reason??'',/does not match the baseline/);
+        assert.equal(disk(p),'baseline\n');
+        assert.ok(pending(p),'pending review must remain when final state cannot be proven');
+    } finally {
+        faults.delete(p);
         tracker.restoreFileToContent=restore;
     }
 });
