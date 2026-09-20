@@ -2037,18 +2037,27 @@ export class DiffTracker {
         const known = this.canonicalTrackingPaths.get(key);
         if (known) { return known; }
         // Resolve spelling only after enforcing the no-symlink/workspace
-        // boundary. realpath must never turn a forbidden alias into permission.
+        // boundary. realpath on Windows may preserve the requested casing, so
+        // obtain the actual spelling from each parent directory's entries.
         if (this.validateResourceTarget(filePath)) { return filePath; }
-        let existing = filePath;
-        const missing: string[] = [];
+        let actual = folder.uri.fsPath;
+        const components = relative.split(path.sep);
         try {
-            while (!fs.existsSync(existing)) {
-                missing.unshift(path.basename(existing));
-                const parent = path.dirname(existing);
-                if (parent === existing) { return filePath; }
-                existing = parent;
+            for (let index = 0; index < components.length; index++) {
+                const name = components[index];
+                const entries = fs.readdirSync(actual, { withFileTypes: true });
+                const matches = entries.filter(entry => entry.name.toLowerCase() === name.toLowerCase());
+                if (matches.length === 0) {
+                    // The remaining missing suffix has no physical spelling
+                    // yet. Preserve its requested identity until it is observed.
+                    actual = path.join(actual, ...components.slice(index));
+                    break;
+                }
+                if (matches.length !== 1 || matches[0].isSymbolicLink()) { return filePath; }
+                if (index < components.length - 1 && !matches[0].isDirectory()) { return filePath; }
+                actual = path.join(actual, matches[0].name);
             }
-            const actual = vscode.Uri.file(path.join(fs.realpathSync.native(existing), ...missing)).fsPath;
+            actual = vscode.Uri.file(actual).fsPath;
             const actualFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(actual));
             if (!actualFolder || actualFolder.uri.toString() !== folder.uri.toString() || this.validateResourceTarget(actual)) {
                 return filePath;

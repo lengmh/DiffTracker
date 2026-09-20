@@ -136,6 +136,42 @@ export function registerPR11ReviewRegressions(h) {
         finally{vscode.workspace.getConfiguration=old;}
     });
 
+    test('PR11 canonical spelling comes from directory entries, not realpath input casing',async()=>{
+        const t=h.getTracker(),dir=file('SpellingDir');fs.mkdirSync(dir);
+        const actual=path.join(dir,'MixedName.txt');fs.writeFileSync(actual,'baseline');
+        const alias=path.join(root,path.basename(dir).toUpperCase(),'mixedname.TXT');
+        const identify=t.workspaceRootIdentityForFolder,validate=t.validateResourceTarget;
+        const realpath=fs.realpathSync.native;
+        // Emulate a case-insensitive resource boundary on every test platform.
+        // Windows realpath can preserve the requested spelling; it is not a
+        // directory-entry-casing oracle. The production resolver must enumerate.
+        t.workspaceRootIdentityForFolder=folder=>({...identify.call(t,folder),caseSensitive:false});
+        t.validateResourceTarget=()=>undefined;
+        fs.realpathSync.native=value=>value;
+        try{
+            assert.equal(t.canonicalTrackingPath(alias),actual);
+            assert.equal(t.canonicalTrackingPath(actual),actual);
+        }finally{
+            t.workspaceRootIdentityForFolder=identify;t.validateResourceTarget=validate;
+            fs.realpathSync.native=realpath;
+        }
+    });
+
+    test('PR11 case-insensitive directory include captures descendants with actual spelling',async()=>{
+        const t=h.getTracker();
+        if(t.currentWorkspaceRootIdentities()[0].caseSensitive!==false) {console.log('SKIP PR11 case-insensitive directory scenario on a case-sensitive root');return;}
+        const dir=file('MixedDirectory');fs.mkdirSync(dir);
+        const actual=path.join(dir,'MixedChild.txt');fs.writeFileSync(actual,'directory baseline');
+        const aliasDir=path.join(root,path.basename(dir).toUpperCase());
+        const result=await t.applyConfiguredMonitoringScope(scope([{scope:'all',path:relative(aliasDir)}]));
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(t.getOriginalContent(actual),'directory baseline');
+        fs.writeFileSync(actual,'directory edit');await t.onExternalFileChanged(Uri.file(actual));
+        await waitUntil(()=>t.getTrackedChanges().length===1);
+        assert.equal(t.getTrackedChanges()[0].reviewKind,'text');
+        assert.ok(t.getReviewToken(path.join(aliasDir,'mixedchild.TXT')));
+    });
+
     test('PR11 case-insensitive explicit file uses one identity for capture lookup actions and restore',async()=>{
         let t=h.getTracker();
         if(t.currentWorkspaceRootIdentities()[0].caseSensitive!==false) {console.log('SKIP PR11 Windows case-insensitive filesystem scenario on a case-sensitive root');return;}
