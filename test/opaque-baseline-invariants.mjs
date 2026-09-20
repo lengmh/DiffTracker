@@ -137,7 +137,9 @@ export function registerOpaqueBaselineInvariants(harness) {
                     } finally { gate.release(); }
                     assert.equal(await operation, true);
                     if (notification !== 'open-after-parent') {
-                        await waitUntil(() => !!pending(target)?.unavailableReason, 5000);
+                        await waitUntil(() => notification === 'document'
+                            ? pending(target)?.reviewKind === 'unknown'
+                            : pending(target)?.reviewKind === 'opaque', 5000);
                     } else {
                         assert.equal(pending(target), undefined, 'opening known unchanged bytes is quiet');
                     }
@@ -210,7 +212,7 @@ export function registerOpaqueBaselineInvariants(harness) {
                 if (notification.startsWith('save')) { tracker.onDidSaveDocument(doc); }
                 else { tracker.onDocumentChanged({ document: doc, contentChanges: [] }); }
                 if (changed) {
-                    await waitUntil(() => /changed since the baseline/i.test(pending(target)?.unavailableReason ?? ''), 5000);
+                    await waitUntil(() => pending(target)?.reviewKind === 'opaque', 5000);
                 } else {
                     await waitUntil(() => pending(target) === undefined, 5000);
                 }
@@ -245,7 +247,7 @@ export function registerOpaqueBaselineInvariants(harness) {
                                 doc.isDirty = false;
                                 tracker.onDidSaveDocument(doc);
                                 if (captured) {
-                                    await waitUntil(() => /changed since the baseline/i.test(pending(target)?.unavailableReason ?? ''), 5000);
+                                    await waitUntil(() => pending(target)?.reviewKind === 'opaque', 5000);
                                 }
                             }
                             assert.ok(pending(target)?.unavailableReason);

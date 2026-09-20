@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
-import { DiffTracker, FileDiff, ReviewToken } from './diffTracker';
+import { DiffTracker, FileDiff, ReviewKind, ReviewToken } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -37,33 +37,36 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 return Promise.resolve([...items, emptyItem]);
             }
 
-            const revertButton = new TreeItem('Revert All Changes', vscode.TreeItemCollapsibleState.None);
-            revertButton.command = {
-                command: 'diffTracker.revertAllChanges',
-                title: 'Revert All Changes',
-                arguments: [reviewTokens]
-            };
-            revertButton.iconPath = new vscode.ThemeIcon('discard');
-            revertButton.tooltip = `Restore all ${changes.length} file(s) to original state`;
-            revertButton.description = `${changes.length} file(s)`;
-            items.push(revertButton);
+            const counts = this.countReviewKinds(changes);
+            const summary = new TreeItem('Pending Review', vscode.TreeItemCollapsibleState.None);
+            summary.iconPath = new vscode.ThemeIcon('list-tree');
+            summary.description = `${counts.text} text · ${counts.opaque} read-only · ${counts.unknown} unknown`;
+            summary.tooltip = `${changes.length} pending file(s): ${counts.text} text-reviewable, ${counts.opaque} read-only opaque, ${counts.unknown} unknown`;
+            items.push(summary);
 
-            const keepButton = new TreeItem('Accept All Changes', vscode.TreeItemCollapsibleState.None);
-            keepButton.command = {
-                command: 'diffTracker.keepAllChanges',
-                title: 'Accept All Changes',
-                arguments: [reviewTokens]
-            };
-            keepButton.iconPath = new vscode.ThemeIcon('check');
-            keepButton.tooltip = `Accept all ${changes.length} file(s) as new baseline`;
-            keepButton.description = `${changes.length} file(s)`;
-            items.push(keepButton);
+            if (reviewTokens.length > 0) {
+                const revertButton = new TreeItem('Revert Text Changes', vscode.TreeItemCollapsibleState.None);
+                revertButton.command = {
+                    command: 'diffTracker.revertAllChanges',
+                    title: 'Revert Text Changes',
+                    arguments: [reviewTokens]
+                };
+                revertButton.iconPath = new vscode.ThemeIcon('discard');
+                revertButton.tooltip = `Restore ${reviewTokens.length} text-reviewable file(s); read-only and unknown entries remain pending`;
+                revertButton.description = `${reviewTokens.length} text file(s)`;
+                items.push(revertButton);
 
-            const actionsHeader = new TreeItem('Actions', vscode.TreeItemCollapsibleState.None);
-            actionsHeader.tooltip = 'Action shortcuts';
-            actionsHeader.iconPath = new vscode.ThemeIcon('tools');
-            actionsHeader.description = '';
-            items.push(actionsHeader);
+                const keepButton = new TreeItem('Accept Text Changes', vscode.TreeItemCollapsibleState.None);
+                keepButton.command = {
+                    command: 'diffTracker.keepAllChanges',
+                    title: 'Accept Text Changes',
+                    arguments: [reviewTokens]
+                };
+                keepButton.iconPath = new vscode.ThemeIcon('check');
+                keepButton.tooltip = `Accept ${reviewTokens.length} text-reviewable file(s); read-only and unknown entries remain pending`;
+                keepButton.description = `${reviewTokens.length} text file(s)`;
+                items.push(keepButton);
+            }
 
             const rootNode: DirNode = {
                 name: '',
@@ -117,35 +120,77 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         const fileName = displayFileName(fileDiff.filePath);
         const displayName = fileDiff.isDeleted ? `${fileName} [Deleted]` : fileName;
         const item = new TreeItem(displayName, vscode.TreeItemCollapsibleState.None);
+        const reviewKind = this.reviewKindOf(fileDiff);
         item.filePath = fileDiff.filePath;
         item.reviewToken = this.diffTracker.getReviewToken(fileDiff.filePath);
         item.isDeleted = fileDiff.isDeleted;
-        item.description = fileDiff.unavailableReason ? `Unavailable: ${fileDiff.unavailableReason}` : undefined;
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
-        item.iconPath = vscode.ThemeIcon.File;
-        item.tooltip = fileDiff.isDeleted
-            ? `${fileDiff.filePath}\nDeleted from disk`
-            : fileDiff.filePath;
+        item.tooltip = fileDiff.filePath;
 
-        if (fileDiff.unavailableReason) {
-            item.tooltip += `\n${fileDiff.unavailableReason}`;
+        if (reviewKind === 'opaque') {
+            const state = fileDiff.isDeleted ? 'Deleted' : fileDiff.baselineExists === false ? 'Added' : 'Changed';
+            item.description = `Read-only · ${state}${fileDiff.currentSize !== undefined ? ` · ${this.formatBytes(fileDiff.currentSize)}` : ''}`;
+            item.iconPath = new vscode.ThemeIcon('file-binary');
+            item.contextValue = 'opaqueFile';
+            item.tooltip += `\nRead-only file review\n${fileDiff.reviewReason ?? 'Content is not text-reviewable'}`;
+            item.tooltip += this.identityTooltip(fileDiff);
+            item.command = {
+                command: 'diffTracker.showWebviewDiff',
+                title: 'Inspect Read-only Change',
+                arguments: [item]
+            };
+        } else if (reviewKind === 'unknown') {
+            const reason = fileDiff.reviewReason ?? fileDiff.unavailableReason ?? 'Review evidence is incomplete';
+            item.description = `Unknown · ${reason}`;
+            item.iconPath = new vscode.ThemeIcon('warning');
+            item.contextValue = 'unknownFile';
+            item.tooltip += `\nReview status unknown\n${reason}`;
+            item.command = {
+                command: 'diffTracker.showWebviewDiff',
+                title: 'Inspect Unknown Change',
+                arguments: [item]
+            };
+        } else {
+            item.description = fileDiff.sourceNote ? 'Source uncertain' : undefined;
+            item.iconPath = vscode.ThemeIcon.File;
+            item.contextValue = 'changedFile';
+            item.tooltip += fileDiff.isDeleted ? '\nDeleted from disk' : '';
+            if (fileDiff.sourceNote) { item.tooltip += `\n${fileDiff.sourceNote}`; }
+            item.command = {
+                command: 'diffTracker.openDiffDefault',
+                title: 'Open Diff',
+                arguments: [item]
+            };
         }
-        if (fileDiff.sourceNote) {
-            item.tooltip += `\n${fileDiff.sourceNote}`;
-            if (!fileDiff.unavailableReason) { item.description = 'Source uncertain'; }
-        }
-
-        // Open with configured default mode
-        item.command = {
-            command: 'diffTracker.openDiffDefault',
-            title: 'Open Diff',
-            arguments: [item]
-        };
-
-        // Add side-by-side button in context menu
-        item.contextValue = 'changedFile';
 
         return item;
+    }
+
+    private reviewKindOf(fileDiff: FileDiff): ReviewKind {
+        return fileDiff.reviewKind ?? (fileDiff.unavailableReason ? 'unknown' : 'text');
+    }
+
+    private countReviewKinds(changes: FileDiff[]): Record<ReviewKind, number> {
+        const counts: Record<ReviewKind, number> = { text: 0, opaque: 0, unknown: 0 };
+        for (const change of changes) { counts[this.reviewKindOf(change)]++; }
+        return counts;
+    }
+
+    private formatBytes(value: number): string {
+        if (value < 1024) { return `${value} B`; }
+        if (value < 1024 * 1024) { return `${(value / 1024).toFixed(1)} KiB`; }
+        return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+    }
+
+    private identityTooltip(fileDiff: FileDiff): string {
+        const lines: string[] = [];
+        lines.push(`\nBaseline: ${fileDiff.baselineExists === false ? 'missing' : 'exists'}`);
+        if (fileDiff.baselineSize !== undefined) { lines.push(` · ${this.formatBytes(fileDiff.baselineSize)}`); }
+        if (fileDiff.baselineFingerprint) { lines.push(`\nBaseline SHA-256: ${fileDiff.baselineFingerprint}`); }
+        lines.push(`\nCurrent: ${fileDiff.currentExists === false ? 'missing' : 'exists'}`);
+        if (fileDiff.currentSize !== undefined) { lines.push(` · ${this.formatBytes(fileDiff.currentSize)}`); }
+        if (fileDiff.currentFingerprint) { lines.push(`\nCurrent SHA-256: ${fileDiff.currentFingerprint}`); }
+        return lines.join('');
     }
 
     private toWorkspaceRelative(filePath: string): string[] {

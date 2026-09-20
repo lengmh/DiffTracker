@@ -57,7 +57,13 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         getOriginalContent: () => '',
         getChangeBlocks: () => [],
         getBaselineState: () => 'ready'
-        ,getReviewToken:()=>reviewToken,getReviewTokens:()=>[reviewToken],getIsRecording:()=>true,
+        ,getReviewToken:()=> {
+            const change = state.changes[0];
+            return change && change.reviewKind && change.reviewKind !== 'text' ? undefined : reviewToken;
+        },getReviewTokens:()=> {
+            const change = state.changes[0];
+            return change && change.reviewKind && change.reviewKind !== 'text' ? [] : [reviewToken];
+        },getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
     const panel = Object.create(load('webviewDiffPanel.ts').WebviewDiffPanel.prototype);
@@ -209,7 +215,7 @@ await test('unavailable state is visible in generated DOM, tree and incremental 
     h.panel.sendDataUpdate();
     assert.equal(h.messages[0].unavailableReason, reason);
     const ui = runInline(h.panel.getHtmlContent());
-    assert.equal(ui.notice(), `Review unavailable: ${reason}`);
+    assert.equal(ui.notice(), `Review status unknown: ${reason}`);
     assert.equal(ui.elements.get('btn-keep-all').disabled, true);
     assert.equal(ui.elements.get('btn-reject-all').disabled, true);
     const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
@@ -220,6 +226,46 @@ await test('unavailable state is visible in generated DOM, tree and incremental 
     ui.receive({ ...h.messages[0], unavailableReason: undefined });
     assert.match(ui.notice(), /Empty file created/);
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+});
+
+await test('opaque file review is visible, read-only and carries identity metadata', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const h = harness({
+        filePath,
+        fileName: 'image.png',
+        originalContent: '',
+        currentContent: '',
+        isDeleted: false,
+        reviewKind: 'opaque',
+        reviewReason: 'Read-only unsupported file was created after the baseline',
+        baselineExists: false,
+        currentExists: true,
+        currentSize: 6,
+        currentFingerprint: fingerprint,
+        changes: []
+    });
+    h.panel.sendDataUpdate();
+    const payload = h.messages[0];
+    assert.equal(payload.reviewKind, 'opaque');
+    assert.equal(payload.reviewToken, undefined);
+    assert.equal(payload.currentSize, 6);
+    assert.equal(payload.currentFingerprint, fingerprint);
+
+    const ui = runInline(h.panel.getHtmlContent());
+    assert.match(ui.notice(), /Read-only file change:/);
+    assert.match(ui.notice(), /Baseline: missing/);
+    assert.match(ui.notice(), /Current: exists \(6 B\)/);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+    assert.equal(ui.rendererCalls(), 0);
+
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const root = await tree.getChildren();
+    const leaf = root.find(item => item.filePath === filePath);
+    assert.match(leaf.description, /Read-only · Added · 6 B/);
+    assert.equal(leaf.contextValue, 'opaqueFile');
+    assert.ok(leaf.tooltip.includes(fingerprint));
+    assert.equal(leaf.reviewToken, undefined);
 });
 
 await test('failed acknowledgement unlocks the generated UI while pending file remains reviewable', () => {

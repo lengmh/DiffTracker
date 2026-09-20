@@ -246,8 +246,17 @@ module.exports = async function runExtensionHostScenario() {
         await untilStable('WorkspaceEdit-created review cleared', async () => !(await pending('workspace-created.txt')));
 
         await vscode.workspace.fs.writeFile(uri('new-image.png'), Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
-        await delay(1000);
-        assert.equal(await pending('new-image.png'), undefined, 'binary additions are excluded from text review');
+        const binaryReview = await untilStable('binary addition read-only review', async () => {
+            const current = await state();
+            const filePath = uri('new-image.png').fsPath;
+            const change = current.trackedChanges.find(item => item.filePath === filePath);
+            return change?.reviewKind === 'opaque' &&
+                !current.reviewTokens.some(token => token.filePath === filePath) ? change : undefined;
+        });
+        assert.equal(binaryReview.baselineExists, false);
+        assert.equal(binaryReview.currentExists, true);
+        assert.equal(binaryReview.currentSize, 6);
+        assert.match(binaryReview.currentFingerprint ?? '', /^[a-f0-9]{64}$/);
         await vscode.workspace.fs.delete(uri('new-image.png'));
 
         await vscode.workspace.fs.delete(uri('deleted.txt'));

@@ -244,10 +244,18 @@ test('DT-02 VS Code create event repairs a change-first new text file',async()=>
     assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
     assert.ok(succeeded(await tracker.keepAllChangesInFile(p)));
 });
-test('DT-02 newly created binary files are excluded from text review',async()=>{
+test('S1 newly created binary files remain visible as read-only opaque review',async()=>{
     const p=file('image.png');fs.writeFileSync(p,Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]));
     await tracker.onExternalFileCreated(Uri.file(p));
-    assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),'');
+    const change=pending(p);
+    assert.equal(change?.reviewKind,'opaque');
+    assert.equal(change?.baselineExists,false);
+    assert.equal(change?.currentExists,true);
+    assert.equal(change?.currentSize,6);
+    assert.match(change?.currentFingerprint ?? '',/^[a-f0-9]{64}$/);
+    assert.equal(change?.unavailableReason,undefined);
+    assert.equal(tracker.getReviewToken(p),undefined);
+    assert.equal(tracker.getOriginalContent(p),'');
     assert.equal(tracker.baselineExistingFiles.has(p),false);
 });
 test('DT-02 hunk Keep on a new file establishes existence for later Revert',async()=>{

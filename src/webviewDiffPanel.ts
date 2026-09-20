@@ -178,7 +178,7 @@ export class WebviewDiffPanel {
         // Try to get current content from: tracked changes > open document > original
         let currentContent = fileChange?.currentContent;
         if (currentContent === undefined) {
-            const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === this.filePath);
+            const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === this.filePath);
             currentContent = doc?.getText() ?? originalContent;
         }
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
@@ -196,7 +196,15 @@ export class WebviewDiffPanel {
             fileName,
             hasFileChange: !!fileChange,
             isDeleted: fileChange?.isDeleted ?? false,
+            reviewKind: fileChange?.reviewKind ?? (fileChange?.unavailableReason ? 'unknown' : 'text'),
+            reviewReason: fileChange?.reviewReason,
             unavailableReason: fileChange?.unavailableReason,
+            baselineExists: fileChange?.baselineExists,
+            currentExists: fileChange?.currentExists,
+            baselineSize: fileChange?.baselineSize,
+            currentSize: fileChange?.currentSize,
+            baselineFingerprint: fileChange?.baselineFingerprint,
+            currentFingerprint: fileChange?.currentFingerprint,
             sourceNote: fileChange?.sourceNote,
             lang,
             oldContents: logicalOriginalContent,
@@ -562,7 +570,15 @@ export class WebviewDiffPanel {
         let reviewToken = ${this.serializeForInlineScript(this.diffTracker.getReviewToken(this.filePath) ?? null)};
         let hasFileChange = ${!!fileChange};
         let isDeleted = ${fileChange?.isDeleted ?? false};
+        let reviewKind = ${this.serializeForInlineScript(fileChange?.reviewKind ?? (fileChange?.unavailableReason ? 'unknown' : 'text'))};
+        let reviewReason = ${this.serializeForInlineScript(fileChange?.reviewReason ?? '')};
         let unavailableReason = ${this.serializeForInlineScript(fileChange?.unavailableReason ?? '')};
+        let baselineExists = ${this.serializeForInlineScript(fileChange?.baselineExists)};
+        let currentExists = ${this.serializeForInlineScript(fileChange?.currentExists)};
+        let baselineSize = ${this.serializeForInlineScript(fileChange?.baselineSize)};
+        let currentSize = ${this.serializeForInlineScript(fileChange?.currentSize)};
+        let baselineFingerprint = ${this.serializeForInlineScript(fileChange?.baselineFingerprint ?? '')};
+        let currentFingerprint = ${this.serializeForInlineScript(fileChange?.currentFingerprint ?? '')};
         let sourceNote = ${this.serializeForInlineScript(fileChange?.sourceNote ?? '')};
 
         const oldFile = {
@@ -625,7 +641,30 @@ export class WebviewDiffPanel {
         }
 
         function updateToolbarMutationState() {
-            setToolbarButtonsDisabled(isMutationLocked() || !!unavailableReason || !hasFileChange);
+            setToolbarButtonsDisabled(
+                isMutationLocked() || reviewKind !== 'text' || !reviewToken || !!unavailableReason || !hasFileChange
+            );
+        }
+
+        function formatBytes(value) {
+            if (!Number.isFinite(value)) return '';
+            if (value < 1024) return value + ' B';
+            if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KiB';
+            return (value / (1024 * 1024)).toFixed(1) + ' MiB';
+        }
+
+        function identitySummary() {
+            const baseline = baselineExists === false
+                ? 'Baseline: missing'
+                : 'Baseline: exists' + (Number.isFinite(baselineSize) ? ' (' + formatBytes(baselineSize) + ')' : '');
+            const current = currentExists === false
+                ? 'Current: missing'
+                : 'Current: exists' + (Number.isFinite(currentSize) ? ' (' + formatBytes(currentSize) + ')' : '');
+            const fingerprints = [
+                baselineFingerprint ? 'Baseline SHA-256: ' + baselineFingerprint : '',
+                currentFingerprint ? 'Current SHA-256: ' + currentFingerprint : ''
+            ].filter(Boolean);
+            return [baseline, current, ...fingerprints].join(' · ');
         }
 
         function setBlockWrapperBusy(wrapper, busy) {
@@ -956,10 +995,20 @@ export class WebviewDiffPanel {
             currentStyle = style;
             container.innerHTML = '';
 
-            if (unavailableReason) {
+            if (reviewKind === 'opaque') {
                 const notice = document.createElement('div');
                 notice.className = 'no-changes';
-                notice.textContent = 'Review unavailable: ' + unavailableReason;
+                notice.textContent = 'Read-only file change: ' + (reviewReason || 'Content is not text-reviewable') +
+                    (identitySummary() ? ' · ' + identitySummary() : '');
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
+
+            if (reviewKind === 'unknown' || unavailableReason) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                notice.textContent = 'Review status unknown: ' + (reviewReason || unavailableReason || 'Evidence is incomplete');
                 container.appendChild(notice);
                 updateToolbarMutationState();
                 return;
@@ -1115,7 +1164,16 @@ export class WebviewDiffPanel {
                 }
                 hasFileChange = message.hasFileChange === true;
                 isDeleted = message.isDeleted === true;
+                reviewKind = typeof message.reviewKind === 'string' ? message.reviewKind :
+                    (typeof message.unavailableReason === 'string' ? 'unknown' : 'text');
+                reviewReason = typeof message.reviewReason === 'string' ? message.reviewReason : '';
                 unavailableReason = typeof message.unavailableReason === 'string' ? message.unavailableReason : '';
+                baselineExists = message.baselineExists;
+                currentExists = message.currentExists;
+                baselineSize = message.baselineSize;
+                currentSize = message.currentSize;
+                baselineFingerprint = typeof message.baselineFingerprint === 'string' ? message.baselineFingerprint : '';
+                currentFingerprint = typeof message.currentFingerprint === 'string' ? message.currentFingerprint : '';
                 sourceNote = typeof message.sourceNote === 'string' ? message.sourceNote : '';
                 oldFile.contents = message.oldContents;
                 newFile.contents = message.newContents;
