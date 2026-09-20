@@ -1,0 +1,75 @@
+diff --git a/src/diffTracker.ts b/src/diffTracker.ts
+--- a/src/diffTracker.ts
++++ b/src/diffTracker.ts
+@@ -2040 +2040,2 @@
+-        // boundary. realpath must never turn a forbidden alias into permission.
++        // boundary. realpath on Windows may preserve the requested casing, so
++        // obtain the actual spelling from each parent directory's entries.
+@@ -2042,2 +2043,2 @@
+-        let existing = filePath;
+-        const missing: string[] = [];
++        let actual = folder.uri.fsPath;
++        const components = relative.split(path.sep);
+@@ -2045,7 +2046,15 @@
+-            while (!fs.existsSync(existing)) {
+-                missing.unshift(path.basename(existing));
+-                const parent = path.dirname(existing);
+-                if (parent === existing) { return filePath; }
+-                existing = parent;
+-            }
+-            const actual = vscode.Uri.file(path.join(fs.realpathSync.native(existing), ...missing)).fsPath;
++            for (let index = 0; index < components.length; index++) {
++                const name = components[index];
++                const entries = fs.readdirSync(actual, { withFileTypes: true });
++                const matches = entries.filter(entry => entry.name.toLowerCase() === name.toLowerCase());
++                if (matches.length === 0) {
++                    // The remaining missing suffix has no physical spelling
++                    // yet. Preserve its requested identity until it is observed.
++                    actual = path.join(actual, ...components.slice(index));
++                    break;
++                }
++                if (matches.length !== 1 || matches[0].isSymbolicLink()) { return filePath; }
++                if (index < components.length - 1 && !matches[0].isDirectory()) { return filePath; }
++                actual = path.join(actual, matches[0].name);
++            }
++            actual = vscode.Uri.file(actual).fsPath;
+diff --git a/test/pr11-review-regressions.mjs b/test/pr11-review-regressions.mjs
+--- a/test/pr11-review-regressions.mjs
++++ b/test/pr11-review-regressions.mjs
+@@ -138,0 +139,36 @@
++    test('PR11 canonical spelling comes from directory entries, not realpath input casing',async()=>{
++        const t=h.getTracker(),dir=file('SpellingDir');fs.mkdirSync(dir);
++        const actual=path.join(dir,'MixedName.txt');fs.writeFileSync(actual,'baseline');
++        const alias=path.join(root,path.basename(dir).toUpperCase(),'mixedname.TXT');
++        const identify=t.workspaceRootIdentityForFolder,validate=t.validateResourceTarget;
++        const realpath=fs.realpathSync.native;
++        // Emulate a case-insensitive resource boundary on every test platform.
++        // Windows realpath can preserve the requested spelling; it is not a
++        // directory-entry-casing oracle. The production resolver must enumerate.
++        t.workspaceRootIdentityForFolder=folder=>({...identify.call(t,folder),caseSensitive:false});
++        t.validateResourceTarget=()=>undefined;
++        fs.realpathSync.native=value=>value;
++        try{
++            assert.equal(t.canonicalTrackingPath(alias),actual);
++            assert.equal(t.canonicalTrackingPath(actual),actual);
++        }finally{
++            t.workspaceRootIdentityForFolder=identify;t.validateResourceTarget=validate;
++            fs.realpathSync.native=realpath;
++        }
++    });
++
++    test('PR11 case-insensitive directory include captures descendants with actual spelling',async()=>{
++        const t=h.getTracker();
++        if(t.currentWorkspaceRootIdentities()[0].caseSensitive!==false) {console.log('SKIP PR11 case-insensitive directory scenario on a case-sensitive root');return;}
++        const dir=file('MixedDirectory');fs.mkdirSync(dir);
++        const actual=path.join(dir,'MixedChild.txt');fs.writeFileSync(actual,'directory baseline');
++        const aliasDir=path.join(root,path.basename(dir).toUpperCase());
++        const result=await t.applyConfiguredMonitoringScope(scope([{scope:'all',path:relative(aliasDir)}]));
++        assert.equal(result.status,'applied',JSON.stringify(result));
++        assert.equal(t.getOriginalContent(actual),'directory baseline');
++        fs.writeFileSync(actual,'directory edit');await t.onExternalFileChanged(Uri.file(actual));
++        await waitUntil(()=>t.getTrackedChanges().length===1);
++        assert.equal(t.getTrackedChanges()[0].reviewKind,'text');
++        assert.ok(t.getReviewToken(path.join(aliasDir,'mixedchild.TXT')));
++    });
++
