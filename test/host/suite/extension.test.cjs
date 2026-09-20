@@ -148,8 +148,12 @@ module.exports = async function runExtensionHostScenario() {
         );
         assert.equal(await vscode.workspace.applyEdit(restoreEdit), true);
         assert.equal(await pendingExcludeDoc.save(), true);
-        await untilStable('pending-scope gap clears after verified baseline restoration',
-            async () => !(await pending('existing.txt')));
+        await delay(300);
+        assert.equal((await pending('existing.txt'))?.reviewKind, 'unknown',
+            'ordinary reads must not silently erase a durable pending-scope coverage gap');
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
+        await untilStable('pending-scope gap clears only after explicit baseline rebuild',
+            async () => (await state()).baselineState === 'ready' && !(await pending('existing.txt')));
         console.log('PASS HOST-S3 pending explicit exclusion preserves a conservative evidence gap');
 
         // Stable watcher contract used by S0/W1 planning:

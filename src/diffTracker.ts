@@ -780,6 +780,9 @@ export class DiffTracker {
         this.baselineExistingFiles.clear();
         this.unresolvedBaselineFiles.clear();
         this.opaqueBaselineFiles.clear();
+        this.retainedReviewPaths.clear();
+        this.coverageGaps.clear();
+        this.pendingScopeSuspendedPaths.clear();
         this.clearTrackedChanges();
         this.lineChanges.clear();
         this.resetChangeBlocksCaches();
@@ -919,6 +922,9 @@ export class DiffTracker {
             baselineBuilding: this.baselineBuilding,
             workspaceContextChanged: this.workspaceContextChanged,
             scanCoverage: this.scanCoverage,
+            retainedReviewPaths: new Set(this.retainedReviewPaths),
+            coverageGaps: new Map(this.coverageGaps),
+            pendingScopeSuspendedPaths: new Set(this.pendingScopeSuspendedPaths),
             pendingExternalChanges: new Set(this.pendingExternalChanges),
             postBaselineUnknownFiles: previousPostBaselineUnknownFiles,
             scanUncertainFiles: previousScanUncertainFiles
@@ -947,6 +953,9 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.workspaceContextChanged = previous.workspaceContextChanged;
             this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            this.retainedReviewPaths = new Set(previous.retainedReviewPaths);
+            this.coverageGaps = new Map(previous.coverageGaps);
+            this.pendingScopeSuspendedPaths = new Set(previous.pendingScopeSuspendedPaths);
             this.pendingExternalChanges = new Set([
                 ...previous.pendingExternalChanges,
                 ...preResetObservedPaths,
@@ -1074,6 +1083,9 @@ export class DiffTracker {
         this.baselineExistingFiles = new Set();
         this.unresolvedBaselineFiles = new Map();
         this.opaqueBaselineFiles = new Map();
+        this.retainedReviewPaths = new Set();
+        this.coverageGaps = new Map();
+        this.pendingScopeSuspendedPaths = new Set();
         this.clearTrackedChanges();
         this.lineChanges = new Map();
         this.resetChangeBlocksCaches();
@@ -1122,7 +1134,10 @@ export class DiffTracker {
             pausedGitRepositories: this.pausedGitRepositories, sessionWorkspaceRoots: this.sessionWorkspaceRoots,
             snapshotInitialized: this.snapshotInitialized, baselineBuilding: this.baselineBuilding,
             workspaceContextChanged: this.workspaceContextChanged,
-            scanCoverage: this.scanCoverage
+            scanCoverage: this.scanCoverage,
+            retainedReviewPaths: this.retainedReviewPaths,
+            coverageGaps: this.coverageGaps,
+            pendingScopeSuspendedPaths: this.pendingScopeSuspendedPaths
         };
         const transaction = this.beginBaselineTransaction(() => { Object.assign(this, previous); });
         this.fileSnapshots = new Map();
@@ -1130,6 +1145,9 @@ export class DiffTracker {
         this.baselineExistingFiles = new Set();
         this.unresolvedBaselineFiles = new Map();
         this.opaqueBaselineFiles = new Map();
+        this.retainedReviewPaths = new Set();
+        this.coverageGaps = new Map();
+        this.pendingScopeSuspendedPaths = new Set();
         this.revertHistory = [];
         this.baselineGitContexts = new Map();
         this.pausedGitRepositories = new Map();
@@ -1912,6 +1930,7 @@ export class DiffTracker {
         this.opaqueBaselineFiles.delete(filePath);
         this.postBaselineUnknownFiles.delete(filePath);
         this.retainedReviewPaths.delete(filePath);
+        this.coverageGaps.delete(filePath);
         this.revertHistory = this.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -1932,6 +1951,13 @@ export class DiffTracker {
         return evaluateConfiguredScope(scope, folder.name, relPath, false, directory).source === 'explicitExclude';
     }
 
+    private retainCoverageGapReview(filePath: string): boolean {
+        const reason = this.coverageGaps.get(filePath);
+        if (!reason) { return false; }
+        this.markFileUnavailable(filePath, reason);
+        return true;
+    }
+
     private deferPendingScopeEvent(uri: vscode.Uri, directory = false): boolean {
         if (!this.pendingScopeExplicitlyExcludes(uri, directory)) { return false; }
         this.pendingScopeSuspendedPaths.add(uri.fsPath);
@@ -1947,10 +1973,10 @@ export class DiffTracker {
             if (this.pendingScopeExplicitlyExcludes(uri)) { continue; }
             this.pendingScopeSuspendedPaths.delete(filePath);
             if (this.isRecording && !this.isPathIgnored(uri, false, true, false)) {
-                this.markFileUnavailable(
-                    filePath,
-                    'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review'
-                );
+                const reason = 'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review';
+                this.coverageGaps.set(filePath, reason);
+                this.markFileUnavailable(filePath, reason);
+                this.schedulePersistState();
             }
         }
     }
@@ -3414,6 +3440,7 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        if (this.retainCoverageGapReview(filePath)) { return; }
         this.recordBaselineTransactionEvent(uri, 'change');
         const operationId = this.beginExternalOperation(uri, 'change');
         try {
@@ -3497,6 +3524,7 @@ export class DiffTracker {
         }
 
         const filePath = uri.fsPath;
+        if (this.retainCoverageGapReview(filePath)) { return; }
         this.recordBaselineTransactionEvent(uri, 'create');
         const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.hasCapturedBaseline(filePath));
         // Capture creation evidence before stat/ignore discovery can yield. A
@@ -3584,6 +3612,7 @@ export class DiffTracker {
         }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) { return; }
+        if (this.retainCoverageGapReview(uri.fsPath)) { return; }
         this.recordBaselineTransactionEvent(uri, 'delete');
         const operationId = this.beginExternalOperation(uri, 'delete');
         try {
@@ -3607,6 +3636,7 @@ export class DiffTracker {
     private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (this.deferPendingScopeEvent(uri)) { return; }
+        if (this.retainCoverageGapReview(filePath)) { return; }
         if (this.pendingWriteFiles.has(filePath) && !this.activeWriteFiles.has(filePath)) {
             const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
@@ -5586,6 +5616,7 @@ export class DiffTracker {
 
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
+        if (this.retainCoverageGapReview(filePath)) { return; }
         if (this.restoringEpoch === epoch) {
             if (this.restoreEvents.get(filePath)?.kind !== 'create') {
                 this.restoreEvents.set(filePath, { uri, kind: 'change' });
@@ -5647,6 +5678,7 @@ export class DiffTracker {
 
         const filePath = doc.uri.fsPath;
         const uri = doc.uri;
+        if (this.retainCoverageGapReview(filePath)) { return; }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
