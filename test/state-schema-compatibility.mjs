@@ -1,17 +1,18 @@
 /** Persisted-schema migration and downgrade safety, using the production tracker.
  * DT_EXPECT_LEGACY_REJECTION=1 runs the downgrade subset with DT_SOURCE pointing
- * to the released 0.7.1 tracker; normal npm test exercises the current writer.
+ * to a released pre-V4 tracker; normal npm test exercises the current writer.
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { createLegacyEffectiveScope } from '../out/monitoringScope.js';
 
 export function registerStateSchemaCompatibility(harness) {
     const { test, root, Uri, DiffTracker, faults, file, pending,
         getTracker, setTracker, setListedFiles } = harness;
 
-    function fixture(version = 3) {
+    function fixture(version = 4) {
         const target = file('schema-bom.txt');
         const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x61]);
         fs.writeFileSync(target, bytes);
@@ -22,6 +23,10 @@ export function registerStateSchemaCompatibility(harness) {
                 version, isRecording: true, baselineState: 'ready', workspaceRoots: [root],
                 fileSnapshots: [], fileModes: [], baselineExistingFiles: [],
                 unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
+                effectiveMonitoringScope: createLegacyEffectiveScope(
+                    [{ name: 'test', uri: Uri.file(root).toString() }], []
+                ),
+                retainedReviewPaths: [], coverageGaps: [],
                 opaqueBaselineFiles: [[target, {
                     reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version',
                     size: stat.size, mtime: stat.mtimeMs,
@@ -33,7 +38,7 @@ export function registerStateSchemaCompatibility(harness) {
 
     if (process.env.DT_EXPECT_LEGACY_REJECTION === '1') {
         for (const layout of ['primary', 'both', 'backup', 'interrupted-upgrade']) {
-            test(`SCHEMA-DOWNGRADE released 0.7.1 preserves ${layout} V3 state`, async () => {
+            test(`SCHEMA-DOWNGRADE released pre-V4 version preserves ${layout} V3 state`, async () => {
                 const tracker = getTracker();
                 const { target, state } = fixture();
                 assert.equal(tracker.parsePersistedState(state), undefined,
@@ -71,8 +76,8 @@ export function registerStateSchemaCompatibility(harness) {
         return;
     }
 
-    for (const version of [1, 2, 3]) {
-        test(`SCHEMA-V3 normalize V${version} preserves existence and provenance`, async () => {
+    for (const version of [1, 2, 3, 4]) {
+        test(`SCHEMA-V4 normalize V${version} preserves existence and provenance`, async () => {
             const tracker = getTracker();
             const existing = file('existing.txt'), absent = file('new.txt');
             const state = {
@@ -82,10 +87,15 @@ export function registerStateSchemaCompatibility(harness) {
                 unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
                 scanCoverage: 'a'.repeat(64)
             };
-            if (version === 3) { state.opaqueBaselineFiles = []; }
+            if (version >= 3) { state.opaqueBaselineFiles = []; }
+            if (version < 4) {
+                delete state.effectiveMonitoringScope;
+                delete state.retainedReviewPaths;
+                delete state.coverageGaps;
+            }
             const parsed = tracker.parsePersistedState(state);
             assert.ok(parsed);
-            assert.equal(parsed.version, 3);
+            assert.equal(parsed.version, 4);
             assert.equal(parsed.migratedFromV1, version === 1);
             assert.equal(parsed.scanCoverage, version === 1 ? undefined : state.scanCoverage);
             assert.deepEqual(parsed.fileSnapshots, state.fileSnapshots);
@@ -95,30 +105,30 @@ export function registerStateSchemaCompatibility(harness) {
         });
     }
 
-    test('SCHEMA-V3 migrates pre-release V2 opaque identities without discarding them', async () => {
+    test('SCHEMA-V4 migrates pre-release V2 opaque identities without discarding them', async () => {
         const { state } = fixture(2);
         const parsed = getTracker().parsePersistedState(state);
         assert.ok(parsed);
-        assert.equal(parsed.version, 3);
+        assert.equal(parsed.version, 4);
         assert.deepEqual(parsed.opaqueBaselineFiles, state.opaqueBaselineFiles);
         assert.equal(parsed.migratedFromV1, false);
     });
 
     for (const invalid of [undefined, null]) {
-        test(`SCHEMA-V3 rejects ${String(invalid)} opaque identity array`, async () => {
+        test(`SCHEMA-V4 rejects ${String(invalid)} opaque identity array`, async () => {
             const { state } = fixture();
             state.opaqueBaselineFiles = invalid;
             assert.equal(getTracker().parsePersistedState(state), undefined);
         });
     }
-    for (const version of [0, 4, 999, '3']) {
-        test(`SCHEMA-V3 rejects unsupported version ${JSON.stringify(version)}`, async () => {
+    for (const version of [0, 5, 999, '4']) {
+        test(`SCHEMA-V4 rejects unsupported version ${JSON.stringify(version)}`, async () => {
             const { state } = fixture(version);
             assert.equal(getTracker().parsePersistedState(state), undefined);
         });
     }
 
-    test('SCHEMA-V3 writes primary and backup with opaque identities and version 3', async () => {
+    test('SCHEMA-V4 writes primary and backup with effective scope and opaque identities', async () => {
         const tracker = getTracker();
         const { target } = fixture();
         const storage = file('writer-storage');
@@ -128,14 +138,17 @@ export function registerStateSchemaCompatibility(harness) {
         assert.equal(await tracker.flushPendingPersistence(), true);
         for (const name of ['session-state.json', 'session-state.last-good.json']) {
             const saved = JSON.parse(fs.readFileSync(path.join(storage, name), 'utf8'));
-            assert.equal(saved.version, 3);
+            assert.equal(saved.version, 4);
             assert.deepEqual(saved.opaqueBaselineFiles, [...tracker.opaqueBaselineFiles.entries()]);
+            assert.equal(saved.effectiveMonitoringScope.kind, 'legacyV3');
+            assert.deepEqual(saved.retainedReviewPaths, []);
+            assert.deepEqual(saved.coverageGaps, []);
             assert.equal(saved.fileSnapshots.some(([p]) => p === target), false);
         }
     });
 
     for (const layout of ['primary', 'both', 'recover-backup']) {
-        test(`SCHEMA-V3 restores ${layout} opaque identity and detects offline deletion`, async () => {
+        test(`SCHEMA-V4 restores ${layout} opaque identity and detects offline deletion`, async () => {
             const { target, state } = fixture();
             const storage = file('restore-storage');
             fs.mkdirSync(storage);
@@ -153,12 +166,41 @@ export function registerStateSchemaCompatibility(harness) {
             assert.match(pending(target)?.reviewReason ?? '', /deleted.*unsupported baseline/i);
             assert.equal(await tracker.flushPendingPersistence(), true);
             const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
-            assert.equal(saved.version, 3);
+            assert.equal(saved.version, 4);
             assert.deepEqual(saved.opaqueBaselineFiles, state.opaqueBaselineFiles);
         });
     }
 
-    for (const version of [2, 3]) {
+    test('SCHEMA-V4 requires effective scope, retained reviews and coverage gaps', async () => {
+        for (const field of ['effectiveMonitoringScope', 'retainedReviewPaths', 'coverageGaps']) {
+            const { state } = fixture(4);
+            delete state[field];
+            assert.equal(getTracker().parsePersistedState(state), undefined, `missing ${field} must invalidate V4`);
+        }
+    });
+
+    test('SCHEMA-V3 migration enters legacy scope compatibility and next write is V4', async () => {
+        const { state } = fixture(3);
+        delete state.effectiveMonitoringScope;
+        delete state.retainedReviewPaths;
+        delete state.coverageGaps;
+        const parsed = getTracker().parsePersistedState(state);
+        assert.ok(parsed);
+        assert.equal(parsed.version, 4);
+        assert.equal(parsed.effectiveMonitoringScope.kind, 'legacyV3');
+        const tracker = getTracker();
+        const storage = file('v3-to-v4-storage');
+        fs.mkdirSync(storage);
+        fs.writeFileSync(path.join(storage, 'session-state.json'), JSON.stringify(state));
+        tracker.storageUri = Uri.file(storage);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+        assert.equal(saved.version, 4);
+        assert.equal(saved.effectiveMonitoringScope.kind, 'legacyV3');
+    });
+
+    for (const version of [2, 3, 4]) {
         test(`SCHEMA-MTIME V${version} accepts finite pre-epoch timestamps`, async () => {
             const { state } = fixture(version);
             state.opaqueBaselineFiles[0][1].mtime = -315619200000;
@@ -219,7 +261,7 @@ export function registerStateSchemaCompatibility(harness) {
     }
 
     for (const failAt of ['write', 'rename', 'copy']) {
-        test(`SCHEMA-V3 interrupted V2 upgrade at ${failAt} retains durable intent until retry`, async () => {
+        test(`SCHEMA-V4 interrupted V2 upgrade at ${failAt} retains durable intent until retry`, async () => {
             const tracker = getTracker();
             const { state } = fixture(2);
             state.isRecording = false;
@@ -242,7 +284,7 @@ export function registerStateSchemaCompatibility(harness) {
             assert.equal(await tracker.flushPendingPersistence(), true);
             assert.equal(fs.existsSync(path.join(storage, 'session-state.unsaved')), false);
             for (const p of [primary, backup]) {
-                assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).version, 3);
+                assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).version, 4);
             }
         });
     }

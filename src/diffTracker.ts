@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
+import { createLegacyEffectiveScope, EffectiveMonitoringScope, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -135,13 +136,16 @@ interface OpaqueBaselineState {
 }
 
 interface PersistedTrackerState {
-    version: 3;
+    version: 4;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
     migratedFromV1?: boolean;
     isRecording: boolean;
     baselineState: 'building' | 'ready';
     scanCoverage?: string;
     workspaceRoots: string[];
+    effectiveMonitoringScope: EffectiveMonitoringScope;
+    retainedReviewPaths: string[];
+    coverageGaps: Array<[string, string]>;
     fileSnapshots: Array<[string, string]>;
     fileModes: Array<[string, number]>;
     baselineExistingFiles: string[];
@@ -466,6 +470,9 @@ export class DiffTracker {
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
     private ignoreFingerprint?: string;
     private scanCoverage?: string;
+    private effectiveMonitoringScope: EffectiveMonitoringScope;
+    private retainedReviewPaths = new Set<string>();
+    private coverageGaps = new Map<string, string>();
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
     private externalWatcherEnabled = false;
@@ -509,6 +516,7 @@ export class DiffTracker {
 
     constructor(private readonly storageUri?: vscode.Uri) {
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
+        this.effectiveMonitoringScope = this.createLegacyEffectiveScopeForRoots(this.sessionWorkspaceRoots);
         this.disposables.push(
             vscode.workspace.onDidChangeTextDocument(this.onDocumentChanged, this)
         );
@@ -630,8 +638,15 @@ export class DiffTracker {
         const currentRoots = this.getWorkspaceRoots();
         this.sessionWorkspaceRoots = [...state.workspaceRoots];
         const rootsMatch = this.sameStringSet(state.workspaceRoots, currentRoots);
-        const incomplete = state.baselineState === 'building' || !rootsMatch;
+        const scopeRootsMatch = this.sameWorkspaceRootIdentities(
+            state.effectiveMonitoringScope.roots,
+            this.currentWorkspaceRootIdentities()
+        );
+        const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch;
         this.isRecording = incomplete ? false : state.isRecording;
+        this.effectiveMonitoringScope = state.effectiveMonitoringScope;
+        this.retainedReviewPaths = new Set(state.retainedReviewPaths);
+        this.coverageGaps = new Map(state.coverageGaps);
         this.fileSnapshots = new Map(state.fileSnapshots);
         this.fileModes = new Map(state.fileModes);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
@@ -647,7 +662,7 @@ export class DiffTracker {
         this.pendingExternalChanges.clear();
         this.snapshotInitialized = !incomplete;
         this.baselineBuilding = incomplete;
-        this.workspaceContextChanged = !rootsMatch;
+        this.workspaceContextChanged = !rootsMatch || !scopeRootsMatch;
 
         // Cover ignore discovery too; restore callbacks queue until reconciliation.
         if (this.isRecording) {
@@ -711,7 +726,9 @@ export class DiffTracker {
         if (incomplete) {
             this.persistenceIssue = state.baselineState === 'building'
                 ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
-                : 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.';
+                : !rootsMatch
+                    ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
+                    : 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
@@ -1380,6 +1397,33 @@ export class DiffTracker {
             .sort((left, right) => left.localeCompare(right));
     }
 
+    private workspaceRootIdentitiesForPaths(roots: readonly string[]): WorkspaceRootIdentity[] {
+        const current = new Map(this.getSupportedWorkspaceFolders()
+            .map(folder => [path.resolve(folder.uri.fsPath), { name: folder.name, uri: folder.uri.toString() }] as const));
+        return [...roots]
+            .map(root => {
+                const normalized = path.resolve(root);
+                return current.get(normalized) ?? { name: path.basename(normalized) || normalized, uri: vscode.Uri.file(normalized).toString() };
+            })
+            .sort((left, right) => left.uri.localeCompare(right.uri) || left.name.localeCompare(right.name));
+    }
+
+    private currentWorkspaceRootIdentities(): WorkspaceRootIdentity[] {
+        return this.workspaceRootIdentitiesForPaths(this.getWorkspaceRoots());
+    }
+
+    private sameWorkspaceRootIdentities(left: readonly WorkspaceRootIdentity[], right: readonly WorkspaceRootIdentity[]): boolean {
+        if (left.length !== right.length) { return false; }
+        const key = (root: WorkspaceRootIdentity) => `${root.name}\0${root.uri}`;
+        const a = [...left].map(key).sort((x, y) => x.localeCompare(y));
+        const b = [...right].map(key).sort((x, y) => x.localeCompare(y));
+        return a.every((value, index) => value === b[index]);
+    }
+
+    private createLegacyEffectiveScopeForRoots(roots: readonly string[]): EffectiveMonitoringScope {
+        return createLegacyEffectiveScope(this.workspaceRootIdentitiesForPaths(roots), this.getLegacyGlobalWatchExcludePatterns());
+    }
+
     private sameStringSet(left: string[], right: string[]): boolean {
         if (left.length !== right.length) { return false; }
         const sortedLeft = [...left].sort((a, b) => a.localeCompare(b));
@@ -1398,11 +1442,14 @@ export class DiffTracker {
         }
 
         return {
-            version: 3,
+            version: 4,
             isRecording: this.isRecording,
             baselineState: this.baselineBuilding || !this.snapshotInitialized ? 'building' : 'ready',
             scanCoverage: this.scanCoverage,
             workspaceRoots: [...this.sessionWorkspaceRoots],
+            effectiveMonitoringScope: this.effectiveMonitoringScope,
+            retainedReviewPaths: [...this.retainedReviewPaths].sort((left, right) => left.localeCompare(right)),
+            coverageGaps: [...this.coverageGaps.entries()].sort(([left], [right]) => left.localeCompare(right)),
             fileSnapshots: Array.from(this.fileSnapshots.entries())
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             fileModes: [...this.fileModes].filter(([filePath]) => this.fileSnapshots.has(filePath)),
@@ -1599,6 +1646,9 @@ export class DiffTracker {
             baselineState?: unknown;
             scanCoverage?: unknown;
             workspaceRoots?: unknown;
+            effectiveMonitoringScope?: unknown;
+            retainedReviewPaths?: unknown;
+            coverageGaps?: unknown;
             fileSnapshots?: unknown;
             fileModes?: unknown;
             baselineExistingFiles?: unknown;
@@ -1608,7 +1658,8 @@ export class DiffTracker {
             gitContexts?: unknown;
         };
 
-        if ((candidate.version !== 1 && candidate.version !== 2 && candidate.version !== 3) || typeof candidate.isRecording !== 'boolean') {
+        if ((candidate.version !== 1 && candidate.version !== 2 && candidate.version !== 3 && candidate.version !== 4) ||
+            typeof candidate.isRecording !== 'boolean') {
             return undefined;
         }
 
@@ -1671,7 +1722,7 @@ export class DiffTracker {
         }
 
         // V1/V2 sessions remain readable, including development V2 states that
-        // already contain opaque entries. V3 requires the field so corruption
+        // already contain opaque entries. V3/V4 require the field so corruption
         // cannot silently erase the only before-image for unsupported files.
         const rawOpaque = candidate.version === 1 ? [] : candidate.version === 2
             ? (candidate.opaqueBaselineFiles ?? []) : candidate.opaqueBaselineFiles;
@@ -1720,13 +1771,48 @@ export class DiffTracker {
         const gitContexts = this.parseGitContexts(candidate.version === 1 ? [] : (candidate.gitContexts ?? []), normalizedRoots);
         if (!gitContexts) { return undefined; }
 
+        const effectiveMonitoringScope = candidate.version === 4
+            ? parseEffectiveMonitoringScope(candidate.effectiveMonitoringScope)
+            : this.createLegacyEffectiveScopeForRoots(normalizedRoots);
+        if (!effectiveMonitoringScope) { return undefined; }
+
+        const parsePathList = (rawList: unknown): string[] | undefined => {
+            if (!Array.isArray(rawList) || rawList.length > this.maxPersistedSnapshots) { return undefined; }
+            const values: string[] = [];
+            const seen = new Set<string>();
+            for (const value of rawList) {
+                if (typeof value !== 'string' || !path.isAbsolute(value) || !isWithinRoot(value) || seen.has(value)) { return undefined; }
+                seen.add(value);
+                values.push(value);
+            }
+            return values;
+        };
+        const retainedReviewPaths = candidate.version === 4 ? parsePathList(candidate.retainedReviewPaths) : [];
+        if (!retainedReviewPaths) { return undefined; }
+
+        const rawCoverageGaps = candidate.version === 4 ? candidate.coverageGaps : [];
+        if (!Array.isArray(rawCoverageGaps) || rawCoverageGaps.length > this.maxPersistedSnapshots) { return undefined; }
+        const coverageGaps: Array<[string, string]> = [];
+        const gapPaths = new Set<string>();
+        for (const entry of rawCoverageGaps) {
+            if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
+            const [filePath, reason] = entry;
+            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) || gapPaths.has(filePath) ||
+                typeof reason !== 'string' || reason.length === 0 || reason.length > 1000) { return undefined; }
+            gapPaths.add(filePath);
+            coverageGaps.push([filePath, reason]);
+        }
+
         return {
-            version: 3,
+            version: 4,
             isRecording: candidate.isRecording,
             migratedFromV1: candidate.version === 1,
             baselineState,
             scanCoverage: candidate.version !== 1 ? candidate.scanCoverage as string | undefined : undefined,
             workspaceRoots: normalizedRoots,
+            effectiveMonitoringScope,
+            retainedReviewPaths,
+            coverageGaps,
             fileSnapshots,
             fileModes,
             baselineExistingFiles,
@@ -2115,29 +2201,27 @@ export class DiffTracker {
         return Array.from(patterns);
     }
 
-    private getWatchExcludePatterns(resource: vscode.Uri): string[] {
-        const config = vscode.workspace.getConfiguration('diffTracker', resource);
-        // S3 separates the new Workspace request from the legacy Global policy.
-        // Until an explicit migration publishes a new effective scope, the
-        // existing matcher must keep the old Global string rules verbatim and
-        // must never interpret structured Workspace entries as legacy strings.
+    private getLegacyGlobalWatchExcludePatterns(): string[] {
+        const config = vscode.workspace.getConfiguration('diffTracker');
         const inspected = typeof config.inspect === 'function'
             ? config.inspect<unknown[]>('watchExclude')
             : undefined;
         const raw = inspected?.globalValue ?? config.get<unknown[]>('watchExclude', []) ?? [];
         if (!Array.isArray(raw)) { return []; }
         const ignoreRules: string[] = [];
-
         raw.forEach(line => {
             if (typeof line !== 'string') { return; }
             const trimmed = line.trim();
-            if (!trimmed) {
-                return;
-            }
-            ignoreRules.push(trimmed);
+            if (trimmed) { ignoreRules.push(trimmed); }
         });
-
         return ignoreRules;
+    }
+
+    private getWatchExcludePatterns(_resource: vscode.Uri): string[] {
+        // Legacy V3 compatibility mode reads only the old Global string rules.
+        // Structured Workspace rules stay requested-only until S3 publishes an
+        // effective configured scope transaction.
+        return this.getLegacyGlobalWatchExcludePatterns();
     }
 
     private async buildIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
