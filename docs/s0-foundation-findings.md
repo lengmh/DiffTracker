@@ -1,9 +1,10 @@
 # S0 foundation findings
 
-- 状态：S0 complete（最终 head 仍需 PR 验证通过后合并）
-- 基线：`main@60928fad6209c2cf1198fac6eff8b338b9e1bffb`
+- 状态：S0 complete，已通过 PR #7 合并
+- S0 基线：`main@60928fad6209c2cf1198fac6eff8b338b9e1bffb`
+- S0 最终提交：`b1b7c4e0019b1f2a5f42c51f218b4405386dffcd`
 - 实施分支：`feat/0.8-s0-native-review-foundation`
-- 目标：冻结 0.8.x 剩余实现范围，不进入 S1 功能开发
+- 目标：冻结 0.8.x 剩余实现范围；后续 S1、S2 已分别通过 PR #8、PR #9 完成
 
 ## 1. PR #6 Gate-0 结论
 
@@ -120,3 +121,5 @@ S0 最终冻结前的真实验证证据：
 - S0 没有实现 Acknowledge、V4、范围配置、whole-workspace、handoff 或生产 native review UI，因此没有跨入 S1—S4 的功能边界。
 
 `docs/roadmap.md` 中旧的 0.7.0/二进制状态描述已在 S0 校准；后续产品契约仍以 `CONTEXT.md`、`docs/monitoring-scope-0.8.md` 和 ADR 为准。
+
+S0 之后的执行状态与“评估 Diff View 必要性”后的路线修订见 [`0.8-revised-execution-route.md`](./0.8-revised-execution-route.md)。

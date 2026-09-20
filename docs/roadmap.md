@@ -29,6 +29,21 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 
 “0.9.x”是保留讨论的路线标签，不是排期。未启动的候选项可以推迟、取消或转为独立扩展。本文不修改扩展版本号，也不意味着已有功能获得更强的安全保证。
 
+### 2.1 0.8.x 实施检查点（2026-09-20）
+
+当前主线已完成：
+
+- **S0 / PR #7**：冻结 Native Review 稳定 API adapter 契约、virtual URI 安全边界和 watcher/W1 capability contract。
+- **S1 / PR #8**：完成 opaque / unknown 只读 review visibility。
+- **S2 / PR #9**：完成 Acknowledge、mixed actions、计数和 Clear Diffs 事务语义。
+- **S3**：下一实现阶段，负责 monitoring scope、Workspace Trust、Scope Revision / Policy Fingerprint / Coverage Generation、Session V4 与 Rules 模式。
+- **S4**：后续负责 Whole Workspace、supplemental coverage、coverage reconciliation 与 W1 watcher handoff/reclaim。
+- **S5**：0.8.0 RC 验收，并在真实 Host 中完成 production Native Review 入口的最终验收与产品决策。
+
+Native Review 不成为第二套状态源；DiffTracker 后端继续管理 baseline、session、review token、stale protection、Keep/Revert/Acknowledge、恢复、Git context、scope 和 coverage。任意 block 内部分行 Keep/Revert 不属于 0.8.0 完成门。
+
+详见 [`0.8-revised-execution-route.md`](./0.8-revised-execution-route.md)。
+
 ## 3. 现有基础：保留什么，不顺手重写什么
 
 核对日期当天，仓库 [package.json](../package.json) 的版本为 `0.7.2`。S0 的实现差距与测量见 [foundation findings](./s0-foundation-findings.md)。当前行为和限制见 [中文说明](../README_CN.md)、[英文说明](../README.md)；本文不是对 Marketplace 当前安装包的独立核验。
@@ -37,7 +52,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 
 当前实现有单个受支持文本文件 5 MiB、快照条目数 10,000、单份序列化 session 状态 50 MiB、Revert 历史最多 10 条等限制。50 MiB 不是包含备份、归档和临时文件后的整个目录总占用承诺；当前也没有按天清理的通用保留策略。未来调整这些限制，需要独立验证，而不是在功能扩展时直接放大。
 
-当前已经有 opaque baseline identity 基础：稳定的不支持文本资源可以保存存在性、size、mtime 和 SHA-256 fingerprint，并保留 dirty editor、扫描不确定性和 rollback 安全边界；但统一的用户可见文件级记录、Acknowledge、混合批量动作和范围模型仍属于 0.8.x 工作。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。
+当前已经完成 0.8.x 的前半段审阅能力：S1 将待审资源统一投影为 `text`、`opaque` 和 `unknown`，为稳定的不支持文本资源提供用户可见的只读文件级记录；S2 已实现绑定可靠 identity 的 Acknowledge、混合 Accept/Revert、统一结果计数以及 Clear Diffs 的事务化语义。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。尚未完成的核心工作是 S3 的监控范围/Session V4 和 S4 的 whole-workspace/真实监听覆盖。
 
 0.8.x 不重写已经验证的文本 Diff、块级 Keep/Revert 和安全恢复算法。应在其外围分离“文件记录”与“可执行能力”，并继续遵守过期审阅拒绝、未保存缓冲区保护、Git 上下文隔离和持久化失败保护。
 
