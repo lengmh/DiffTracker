@@ -1,0 +1,67 @@
+name: PR11 final review validation
+on:
+  push:
+    branches: [work/pr11-review-e3e5a23]
+    paths: ['.github/workflows/pr11-final-review-validation.yml', '.pr11/final-review.patch']
+permissions:
+  contents: write
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patches
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: e9854e777520783acf715e087ef93fd1a1484937
+          fetch-depth: 0
+          path: candidate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: candidate/package-lock.json
+      - name: Apply and verify locally tested source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e9854e777520783acf715e087ef93fd1a1484937
+          git -C ../patches show HEAD:.pr11/final-review.patch > ../final-review.patch
+          git apply --unidiff-zero --check ../final-review.patch
+          git apply --unidiff-zero ../final-review.patch
+          sha256sum --check <<'HASHES'
+          c8d2009d969b7bd2390c548adaede96cad18ef60d54c07f6ba4a793e8d0fc80c  src/diffTracker.ts
+          dcda552d10be380d1fc7eab5dcd432574883c6f15bdf661742bf6a7edec80627  src/monitoringScopeController.ts
+          d184daf289277ac83501bceb3eb34ccb114ee9dd9320c1c64764ed0e9e393398  src/watchExcludePanel.ts
+          6fb4f784ee9678f398b4675fbc2ece1a786ec4224ed7a4d82147cb731f4e4513  test/pr11-review-regressions.mjs
+          6d973f5b6c2e07ac454da3c98f049c587a20d078926684c083d4e761dc3cb002  test/tracker-safety.mjs
+          HASHES
+          git diff --check
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+      - name: Publish only validated source and tests to isolated candidate
+        run: |
+          set -euo pipefail
+          git add src/diffTracker.ts src/monitoringScopeController.ts src/watchExcludePanel.ts test/pr11-review-regressions.mjs test/tracker-safety.mjs
+          test "$(git diff --cached --name-only | wc -l)" -eq 5
+          git config user.name lengmh
+          git config user.email 47114200+lengmh@users.noreply.github.com
+          git commit -m "fix: bind review discard approval and preserve unverified root evidence"
+          test "$(git rev-parse HEAD^)" = e9854e777520783acf715e087ef93fd1a1484937
+          git push origin HEAD:refs/heads/work/pr11-final-e9854e7
+          git rev-parse HEAD > ../candidate-commit.txt
+          git show --stat --oneline HEAD >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr11-final-review-candidate-commit
+          path: candidate-commit.txt
+          retention-days: 3
+          if-no-files-found: error
