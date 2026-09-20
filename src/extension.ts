@@ -688,6 +688,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 'Cancel'
             );
             if (answer !== 'Clear Diffs') { return false; }
+            if (diffTracker.getIsRecording() !== wasRecording) {
+                void vscode.window.showWarningMessage(
+                    'Code Diff Tracker: Recording state changed while Clear Diffs was awaiting confirmation; nothing was cleared.'
+                );
+                return false;
+            }
             if (!await diffTracker.resetBaselineToCurrentState()) {
                 vscode.window.showWarningMessage('Code Diff Tracker: Clear Diffs did not complete. The review remains unavailable or preserved according to the current baseline state; check persistence and coverage warnings.');
                 return false;

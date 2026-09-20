@@ -389,6 +389,7 @@ function commandHarness(options={}) {
                 const modal=args.find(value=>value&&typeof value==='object'&&value.modal===true);
                 if(modal){
                     state.prompts.push({message,args});
+                    if(state.toggleRecordingOnConfirm) state.recording=!state.recording;
                     return state.confirmClear?'Clear Diffs':undefined;
                 }
                 state.warnings.push(message);
@@ -418,6 +419,13 @@ for(const recording of [false,true])for(const success of [false,true])await test
     assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,1);assert.equal(h.state.legacyClears,0);
     assert.equal(h.state.info.length,success?1:0);assert.equal(h.state.warnings.length,success?0:1);
     assert.match(h.state.prompts[0].message,recording?/rebuilding the review baseline/i:/clear the saved review baseline/i);
+});
+await test('clear command aborts when recording mode changes while confirmation is open',async()=>{
+    const h=commandHarness({recording:true,toggleRecordingOnConfirm:true});
+    assert.equal(await h.run('diffTracker.clearDiffs'),false);
+    assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);
+    assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,1);
+    assert.match(h.state.warnings[0],/Recording state changed/i);
 });
 await test('clear command cancellation performs no baseline reset',async()=>{
     const h=commandHarness({confirmClear:false});assert.equal(await h.run('diffTracker.clearDiffs'),false);
