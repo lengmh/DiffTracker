@@ -311,7 +311,9 @@ test('S2 Acknowledge accepts a reliable binary identity without writing workspac
     const before={...counters},history=tracker.revertHistory.length;
     const result=await tracker.acknowledgeOpaqueChange(p,token);
     assert.equal(result.status,'success',result.reason);assert.deepEqual(fs.readFileSync(p),bytes);
-    assert.deepEqual(counters,before);assert.equal(tracker.revertHistory.length,history);
+    assert.equal(counters.apply,before.apply);assert.equal(counters.save,before.save);
+    assert.ok(counters.write>before.write,'Acknowledge must durably persist session state');
+    assert.equal(tracker.revertHistory.length,history);
     assert.equal(pending(p),undefined);assert.equal(tracker.opaqueBaselineFiles.get(p)?.fingerprint,createHash('sha256').update(bytes).digest('hex'));
     assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
     assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(p),undefined);
