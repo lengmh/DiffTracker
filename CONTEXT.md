@@ -108,6 +108,9 @@ _Avoid_: 文件变化、忽略目录
 **文本审阅资源（Text-Reviewable Resource）**:
 内容能够被 DiffTracker 安全表示为文本基线并使用现有 Diff、Keep、Revert 和恢复保护的可监控资源。资源是否被 Git 或普通规则忽略不改变其文本审阅能力。
 
+**原生审阅适配器（Native Review Adapter）**:
+把文本审阅资源投影到 VS Code 原生 Diff、Multi Diff、Quick Diff 或选区界面的薄适配层。它不拥有 baseline、session 或审阅动作语义；无法证明目标和版本时必须拒绝写操作，而不是重新解释为当前最新审阅。
+
 **不透明资源（Opaque Resource）**:
 无法安全参加文本 Keep/Revert，但可以用存在性和内容身份建立审阅基线的可监控资源。其基线不包含文件内容副本。
 _Avoid_: 二进制文件、不可读文件

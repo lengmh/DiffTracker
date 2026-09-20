@@ -2547,7 +2547,7 @@ export class DiffTracker {
             return;
         }
 
-        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
         if (doc && doc.isDirty) {
             this.markFileUnavailable(filePath, 'External change while editor has unsaved content; reconcile disk and buffer before review');
             return;
@@ -2701,7 +2701,7 @@ export class DiffTracker {
     private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
         const epoch = this.sessionEpoch;
         if (this.pendingWriteFiles.has(filePath) && !this.activeWriteFiles.has(filePath)) {
-            const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+            const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
         }
         if (this.isPathIgnored(uri)) { return; }
@@ -2709,7 +2709,7 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch) || this.isPathIgnored(uri)) { return; }
         // A watcher read can finish after native Undo or another buffer edit.
         // Its disk snapshot must not erase the newer unsaved review.
-        const document = vscode.workspace.textDocuments.find(doc => doc.uri.fsPath === filePath);
+        const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && doc.uri.fsPath === filePath);
         if (document?.isDirty && !this.activeWriteFiles.has(filePath)) {
             this.markFileUnavailable(filePath, 'Disk notification while editor has unsaved content; reconcile disk and buffer before review');
             return;
@@ -3728,7 +3728,7 @@ export class DiffTracker {
     }
 
     private async deleteFileForMissingBaseline(uri: vscode.Uri, filePath: string, review?: ReviewToken): Promise<ActionResult> {
-        const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(value => value.uri.scheme === 'file' && value.uri.fsPath === filePath);
         if (doc?.isDirty) {
             return this.actionResult(filePath, 'conflict', 'Unsaved editor changes; file skipped');
         }
@@ -4039,7 +4039,7 @@ export class DiffTracker {
             return this.actionResult(filePath, 'failed', 'Block action could not be completed; review retained');
         }
         const originalContent = this.fileSnapshots.get(filePath);
-        const doc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === filePath);
         const currentText = doc?.getText() ?? this.trackedChanges.get(filePath)?.currentContent;
 
         if (originalContent === undefined || currentText === undefined) {
@@ -4540,7 +4540,7 @@ export class DiffTracker {
             return tracked.currentContent;
         }
 
-        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.fsPath === filePath);
+        const doc = vscode.workspace.textDocuments.find(textDoc => textDoc.uri.scheme === 'file' && textDoc.uri.fsPath === filePath);
         return doc?.getText();
     }
 

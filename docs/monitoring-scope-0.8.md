@@ -246,6 +246,8 @@ include 和 exclude 分别按顺序无关的集合求值。所有 exclude 的并
 
 现有 imported directory watcher 的 bridge、handoff、容量回收和失败分类属于 S4 专项，必须保留活动 watcher 上限、epoch、ignore refresh、Git context 和未知 before-image 保护。
 
+稳定的 VS Code `FileSystemWatcher` API 不提供可用于证明“某个新 watcher 已独立接管该子树”的事件归属或 ready 信号；相同底层请求还可能被宿主复用。对于 `files.watcherExclude` 路径，S0 的真实 Host 探测也证明不能依赖简单的 RelativePattern watcher 自动恢复事件覆盖。因此 S4 的 bridge 只能在**独立可证明的替代覆盖已经建立并完成子树核对**后释放。临时 imported bridge 和持续所需的 supplemental watcher 必须分别计数；成功 handoff 的目标是临时 bridge 可回收，不要求仍承担有效覆盖的 supplemental watcher 数量归零。
+
 ## 10. 审阅能力
 
 监控范围只决定是否纳入，资源内容能力决定如何审阅。
@@ -365,12 +367,12 @@ V3 恢复后进入范围兼容模式，继续使用旧 Global `watchExclude` 的
 
 | 阶段 | 目标 |
 |---|---|
-| S0 | 同步并验证 0.7.2/post-0.7.2 main，完成 gap matrix、测量和设计核验 |
+| S0 | 同步并验证 0.7.2/post-0.7.2 main，完成 gap matrix、测量、原生审阅安全契约和 watcher 接管前置核验 |
 | S1 | 补齐 opaque 和未知资源的只读审阅展示 |
 | S2 | 实现 Acknowledge、混合批量动作、计数和 Clear Diffs 说明 |
 | S3 | 实现 V4、范围状态模型、Workspace 配置、旧规则迁移、规则模式和范围管理器 |
 | S4 | 实现全工作区预检、原子准备、枚举、补充监听、覆盖缺口和 watcher handoff |
-| S5 | 完成 Host、跨平台、迁移、downgrade、性能、文档、复审和 VSIX 发布候选验证 |
+| S5 | 完成 Host、跨平台、原生审阅真实交互、迁移、downgrade、性能、文档、复审和 VSIX 发布候选验证 |
 | S6 | 按真实反馈维护，默认不启动 |
 
 0.8.0 的完成门为 S0–S5。
@@ -397,3 +399,5 @@ V3 恢复后进入范围兼容模式，继续使用旧 Global `watchExclude` 的
 | [0016](./adr/0016-canonical-scope-paths-and-rule-matching.md) | 路径和规则匹配 |
 | [0017](./adr/0017-unified-monitoring-scope-management-and-diagnostics.md) | 统一范围管理和诊断 |
 | [0018](./adr/0018-distinct-monitoring-scope-recovery-commands.md) | 独立恢复命令 |
+| [0019](./adr/0019-native-review-as-stable-api-adapter.md) | 原生文本审阅作为稳定 API 适配层 |
+| [0020](./adr/0020-provable-watcher-handoff-coverage.md) | watcher handoff 必须基于可证明的替代覆盖 |

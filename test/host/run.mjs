@@ -21,6 +21,7 @@ try {
     mkdirSync(workspacePath, { recursive: true });
     for (const [name, content] of [
         ['existing.txt', 'base\n'],
+        ['virtual-baseline.txt', 'alpha\nbeta\nomega\n'],
         ['crlf.txt', 'one\r\ntwo\r\n'],
         ['deleted.txt', 'delete baseline\n'],
         ['batch-a.txt', 'batch a\n'],
@@ -45,7 +46,10 @@ try {
     }
     writeFileSync(path.join(secondRoot, '.vscode', 'settings.json'), JSON.stringify({
         'files.exclude': { 'scope-files.txt': true },
-        'files.watcherExclude': { 'scope-watcher.txt': true },
+        'files.watcherExclude': {
+            'scope-watcher.txt': true,
+            'excluded-tree/**': true
+        },
         'search.exclude': { 'scope-search.txt': true }
     }));
     writeFileSync(workspaceFile, JSON.stringify({ folders: [{ path: workspacePath }, { path: secondRoot }] }));
