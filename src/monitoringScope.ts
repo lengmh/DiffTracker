@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import ignore from 'ignore';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -65,6 +66,11 @@ export interface LegacyRuleMigrationPreview {
     includes: MonitoringIncludeRule[];
     manual: string[];
     ignoredNoops: string[];
+}
+
+export interface ConfiguredScopeDecision {
+    monitored: boolean;
+    source: 'explicitExclude' | 'explicitInclude' | 'wholeWorkspace' | 'ordinaryPolicy';
 }
 
 export interface LegacyEffectiveMonitoringScope {
@@ -324,6 +330,58 @@ export function scopeConsentMatches(raw: unknown, scope: CanonicalMonitoringScop
         .map(key).sort(compareText);
     const right = scope.roots.map(key).sort(compareText);
     return left.length === value.roots.length && left.every((item, index) => item === right[index]);
+}
+
+function ruleAppliesToRoot(rule: { scope: MonitoringRuleScope; folder?: string }, rootName: string): boolean {
+    return rule.scope === 'all' || (rule.scope === 'folder' && rule.folder === rootName);
+}
+
+function includeCoversRelativePath(includePath: string, relativePath: string, directory: boolean): boolean {
+    const includeParts = includePath.split('/');
+    const targetParts = relativePath.replace(/\/$/, '').split('/').filter(Boolean);
+    if (targetParts.length >= includeParts.length &&
+        includeParts.every((part, index) => targetParts[index] === part)) {
+        return true;
+    }
+    return directory && targetParts.length < includeParts.length &&
+        targetParts.every((part, index) => includeParts[index] === part);
+}
+
+function explicitPatternForIgnore(pattern: string): string {
+    let value = pattern;
+    if (value.startsWith('#')) { value = `\\${value}`; }
+    const trailing = value.match(/ +$/)?.[0].length ?? 0;
+    if (trailing > 0) {
+        value = value.slice(0, -trailing) + '\\ '.repeat(trailing);
+    }
+    return value;
+}
+
+export function evaluateConfiguredScope(
+    scope: CanonicalMonitoringScope,
+    rootName: string,
+    relativePath: string,
+    ordinaryIgnored: boolean,
+    directory = false
+): ConfiguredScopeDecision {
+    const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
+    for (const rule of scope.excludes) {
+        if (!ruleAppliesToRoot(rule, rootName)) { continue; }
+        const matcher = ignore().add(explicitPatternForIgnore(rule.pattern));
+        if (matcher.ignores(rel + (directory && rel && !rel.endsWith('/') ? '/' : ''))) {
+            return { monitored: false, source: 'explicitExclude' };
+        }
+    }
+    for (const rule of scope.includes) {
+        if (!ruleAppliesToRoot(rule, rootName)) { continue; }
+        if (includeCoversRelativePath(rule.path, rel, directory)) {
+            return { monitored: true, source: 'explicitInclude' };
+        }
+    }
+    if (scope.mode === 'wholeWorkspace') {
+        return { monitored: true, source: 'wholeWorkspace' };
+    }
+    return { monitored: !ordinaryIgnored, source: 'ordinaryPolicy' };
 }
 
 export function previewLegacyWatchExcludeMigration(

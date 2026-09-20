@@ -13,6 +13,7 @@ import {
     scopeConsentMatches,
     scopeMigrationMatches,
     detectScopeExpansion,
+    evaluateConfiguredScope,
     validateAndCanonicalizeScope
 } from '../out/monitoringScope.js';
 
@@ -188,4 +189,39 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     assert.deepEqual(preview.includes, [{ scope: 'all', path: 'private-data' }]);
     assert.deepEqual(preview.manual, ['!src/**/generated']);
     assert.deepEqual(preview.ignoredNoops, ['# old comment']);
+}
+
+{
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'folder', folder: 'frontend', path: 'private-data' }],
+        excludes: [{ scope: 'all', pattern: '**/*.pem' }]
+    }), roots, 'linux').scope;
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', 'private-data/model.bin', true),
+        { monitored: true, source: 'explicitInclude' }
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', 'private-data', true, true),
+        { monitored: true, source: 'explicitInclude' }
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', 'private-data/nested', true, true),
+        { monitored: true, source: 'explicitInclude' }
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'frontend', 'keys/server.pem', false),
+        { monitored: false, source: 'explicitExclude' }
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, 'backend', 'private-data/model.bin', true),
+        { monitored: false, source: 'ordinaryPolicy' }
+    );
+}
+{
+    const whole = validateAndCanonicalizeScope(valid({
+        mode: 'wholeWorkspace',
+        excludes: [{ scope: 'all', pattern: 'secret/**' }]
+    }), roots, 'linux').scope;
+    assert.equal(evaluateConfiguredScope(whole, 'frontend', 'node_modules/a.js', true).monitored, true);
+    assert.equal(evaluateConfiguredScope(whole, 'frontend', 'secret/a.txt', false).monitored, false);
 }
