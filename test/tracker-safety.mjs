@@ -319,6 +319,26 @@ test('S1 Revert succeeds when its own write observation clears the old review af
         tracker.restoreFileToContent=restore;
     }
 });
+test('S1 Revert retains a late non-text review instead of mistaking missing token for cleared review',async()=>{
+    const p=file('late-unknown-after-revert.m');seed(p,'baseline\n','changed\n');await scan(p);
+    const token=tracker.getReviewToken(p);assert.ok(token);
+    const restore=tracker.restoreFileToContent.bind(tracker);
+    tracker.restoreFileToContent=async(...args)=>{
+        const result=await restore(...args);
+        if(result.status==='success') tracker.markFileUnavailable(p,'Late review uncertainty after revert write');
+        return result;
+    };
+    try {
+        const result=await tracker.revertFile(p,token);
+        assert.equal(result.status,'conflict');
+        assert.match(result.reason??'',/Review changed during revert/);
+        assert.equal(disk(p),'baseline\n');
+        assert.equal(pending(p)?.reviewKind,'unknown');
+        assert.match(pending(p)?.reviewReason??'',/Late review uncertainty/);
+    } finally {
+        tracker.restoreFileToContent=restore;
+    }
+});
 test('DT-09 save failure retains its recovery record in durable session state',async()=>{
     const p=file(); seed(p,'baseline','changed'); await scan(p); faults.set(p,{save:false});
     const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage);

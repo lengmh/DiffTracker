@@ -3470,9 +3470,12 @@ export class DiffTracker {
         if (!currentMatchesBaseline) {
             return this.actionResult(filePath, 'conflict', 'File does not match the baseline after revert; review retained', result.bufferChanged);
         }
-        const latestReview = this.getReviewToken(filePath);
-        if (latestReview && !this.matchesReview(review)) {
-            return this.actionResult(filePath, 'conflict', 'Review changed during revert', result.bufferChanged);
+        const latestChange = this.trackedChanges.get(filePath);
+        if (latestChange) {
+            const latestReview = this.getReviewToken(filePath);
+            if (!latestReview || !this.matchesReview(review)) {
+                return this.actionResult(filePath, 'conflict', 'Review changed during revert', result.bufferChanged);
+            }
         }
         this.clearFileReview(filePath);
         this.schedulePersistState();
