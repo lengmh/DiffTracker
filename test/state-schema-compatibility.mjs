@@ -85,7 +85,11 @@ export function registerStateSchemaCompatibility(harness) {
                 fileSnapshots: [[existing, ''], [absent, '']],
                 fileModes: [[existing, 0o644]], baselineExistingFiles: [existing],
                 unresolvedBaselineFiles: [], revertHistory: [], gitContexts: [],
-                scanCoverage: 'a'.repeat(64)
+                scanCoverage: 'a'.repeat(64),
+                effectiveMonitoringScope: createLegacyEffectiveScope(
+                    [{ name: 'test', uri: Uri.file(root).toString() }], []
+                ),
+                retainedReviewPaths: [], coverageGaps: []
             };
             if (version >= 3) { state.opaqueBaselineFiles = []; }
             if (version < 4) {
