@@ -74,10 +74,11 @@ module.exports = async function runExtensionHostScenario() {
         // supplemental observation coverage for host-excluded subtrees is S4-W.
         const privateDir = path.join(workspacePath, 'node_modules', 's3-private');
         const privatePath = path.join(privateDir, 'existing.txt');
+        const privateTrackedPath = vscode.Uri.file(privatePath).fsPath;
         fs.mkdirSync(privateDir, { recursive: true });
         fs.writeFileSync(privatePath, 's3 private baseline\n');
         assert.equal(
-            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privatePath),
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privateTrackedPath),
             undefined,
             'ordinary excluded path must not already have a baseline'
         );
@@ -89,7 +90,7 @@ module.exports = async function runExtensionHostScenario() {
         });
         assert.equal(includeApply.status, 'applied', JSON.stringify(includeApply));
         assert.equal(
-            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privatePath),
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privateTrackedPath),
             's3 private baseline\n',
             'explicit include must capture the existing ignored resource as its current baseline'
         );
