@@ -573,10 +573,10 @@ export class WebviewDiffPanel {
         let reviewKind = ${this.serializeForInlineScript(fileChange?.reviewKind ?? (fileChange?.unavailableReason ? 'unknown' : 'text'))};
         let reviewReason = ${this.serializeForInlineScript(fileChange?.reviewReason ?? '')};
         let unavailableReason = ${this.serializeForInlineScript(fileChange?.unavailableReason ?? '')};
-        let baselineExists = ${this.serializeForInlineScript(fileChange?.baselineExists)};
-        let currentExists = ${this.serializeForInlineScript(fileChange?.currentExists)};
-        let baselineSize = ${this.serializeForInlineScript(fileChange?.baselineSize)};
-        let currentSize = ${this.serializeForInlineScript(fileChange?.currentSize)};
+        let baselineExists = ${this.serializeForInlineScript(fileChange?.baselineExists ?? null)};
+        let currentExists = ${this.serializeForInlineScript(fileChange?.currentExists ?? null)};
+        let baselineSize = ${this.serializeForInlineScript(fileChange?.baselineSize ?? null)};
+        let currentSize = ${this.serializeForInlineScript(fileChange?.currentSize ?? null)};
         let baselineFingerprint = ${this.serializeForInlineScript(fileChange?.baselineFingerprint ?? '')};
         let currentFingerprint = ${this.serializeForInlineScript(fileChange?.currentFingerprint ?? '')};
         let sourceNote = ${this.serializeForInlineScript(fileChange?.sourceNote ?? '')};
