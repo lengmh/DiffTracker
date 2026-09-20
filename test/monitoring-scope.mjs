@@ -191,6 +191,20 @@ console.log('monitoring scope canonicalization and expansion tests passed');
 
 {
     const preview = previewLegacyWatchExcludeMigration([
+        'secret/**',
+        '!secret/keep.txt',
+        'node_modules/',
+        '!private-data/'
+    ], 'linux');
+    assert.ok(preview.manual.includes('!secret/keep.txt'),
+        'overlapping legacy negation must require manual migration');
+    assert.ok(!preview.includes.some(rule => rule.path === 'secret/keep.txt'));
+    assert.ok(preview.includes.some(rule => rule.path === 'private-data'),
+        'non-overlapping simple negation can still migrate to explicit include');
+}
+
+{
+    const preview = previewLegacyWatchExcludeMigration([
         'node_modules/',
         '!private-data/',
         '!src/**/generated',
@@ -300,5 +314,28 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         evaluateConfiguredScope(configured, 'frontend', '.difftracker-restore-note.txt/child', true, false),
         { monitored: false, source: 'hardBoundary' },
         'descendants of a restore-prefixed directory component remain hard-boundary resources'
+    );
+}
+
+
+{
+    const duplicateRoots = [
+        { name: 'app', uri: 'file:///case-sensitive/app', caseSensitive: true },
+        { name: 'app', uri: 'file:///case-insensitive/app', caseSensitive: false }
+    ];
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: 'Private/Data' }]
+    }), duplicateRoots, 'linux').scope;
+    assert.equal(configured !== undefined, true,
+        'scope-all rules remain valid when display names are duplicated');
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, duplicateRoots[0], 'private/data/file.txt', true),
+        { monitored: false, source: 'ordinaryPolicy' },
+        'case-sensitive duplicate-name root must keep its own path identity'
+    );
+    assert.deepEqual(
+        evaluateConfiguredScope(configured, duplicateRoots[1], 'private/data/file.txt', true),
+        { monitored: true, source: 'explicitInclude' },
+        'all-root evaluation must use the actual root identity, not the first matching display name'
     );
 }

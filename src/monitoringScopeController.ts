@@ -28,6 +28,7 @@ export interface MonitoringScopeStatus {
     dismissed: boolean;
     legacyMigrationComplete: boolean;
     legacyGlobalRules: string[];
+    workspaceRequestPresent: boolean;
     expansionReasons: string[];
     explicitlyExcludedPendingReviews: string[];
 }
@@ -91,6 +92,12 @@ export class MonitoringScopeController implements vscode.Disposable {
         return inspected?.workspaceValue;
     }
 
+    private hasWorkspaceScopeRequest(): boolean {
+        return this.inspectWorkspaceValue<unknown>('monitoringScope') !== undefined ||
+            this.inspectWorkspaceValue<unknown>('watchInclude') !== undefined ||
+            this.inspectWorkspaceValue<unknown>('watchExclude') !== undefined;
+    }
+
     public getRequestedRawScope(): { mode: unknown; includes: unknown; excludes: unknown } {
         const mode = this.inspectWorkspaceValue<unknown>('monitoringScope');
         const includes = this.inspectWorkspaceValue<unknown>('watchInclude');
@@ -137,6 +144,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             legacyMigrationComplete: legacyGlobalRules.length === 0 ||
                 scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots()),
             legacyGlobalRules,
+            workspaceRequestPresent: this.hasWorkspaceScopeRequest(),
             expansionReasons,
             explicitlyExcludedPendingReviews: canonical ? this.tracker.getExplicitlyExcludedPendingReviewPaths(canonical) : []
         };

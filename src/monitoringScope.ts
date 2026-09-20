@@ -404,13 +404,16 @@ export function isHardUnmonitorableRelativePath(
 
 export function evaluateConfiguredScope(
     scope: CanonicalMonitoringScope,
-    rootName: string,
+    rootIdentity: string | WorkspaceRootIdentity,
     relativePath: string,
     ordinaryIgnored: boolean,
     directory = false
 ): ConfiguredScopeDecision {
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
-    const root = scope.roots.find(candidate => candidate.name === rootName);
+    const root = typeof rootIdentity === 'string'
+        ? scope.roots.find(candidate => candidate.name === rootIdentity)
+        : rootIdentity;
+    const rootName = typeof rootIdentity === 'string' ? rootIdentity : rootIdentity.name;
     const caseSensitive = root?.caseSensitive ?? true;
     if (isHardUnmonitorableRelativePath(rel, caseSensitive, directory)) {
         return { monitored: false, source: 'hardBoundary' };
@@ -444,6 +447,7 @@ export function previewLegacyWatchExcludeMigration(
     const ignoredNoops: string[] = [];
     const seenExclude = new Set<string>();
     const seenInclude = new Set<string>();
+    const simpleNegations: Array<{ raw: string; includePath: string }> = [];
 
     for (const raw of input) {
         if (typeof raw !== 'string') { continue; }
@@ -477,10 +481,28 @@ export function previewLegacyWatchExcludeMigration(
             manual.push(line);
             continue;
         }
-        const key = `all\0${includePath}`;
+        simpleNegations.push({ raw: line, includePath });
+    }
+
+    // Configured scope gives explicit excludes higher priority than includes,
+    // unlike ordered gitignore rules. Any simple negation that intersects a
+    // migrated positive exclusion is therefore not semantics-preserving and
+    // must be reviewed manually.
+    const positivePatterns = excludes.map(rule => explicitPatternForIgnore(rule.pattern));
+    const positiveCaseSensitive = ignore({ ignorecase: false }).add(positivePatterns);
+    const positiveCaseInsensitive = ignore({ ignorecase: true }).add(positivePatterns);
+    for (const candidate of simpleNegations) {
+        const overlapsExclude = positivePatterns.length > 0 &&
+            (positiveCaseSensitive.ignores(candidate.includePath) ||
+                positiveCaseInsensitive.ignores(candidate.includePath));
+        if (overlapsExclude) {
+            manual.push(candidate.raw);
+            continue;
+        }
+        const key = `all\0${candidate.includePath}`;
         if (!seenInclude.has(key)) {
             seenInclude.add(key);
-            includes.push({ scope: 'all', path: includePath });
+            includes.push({ scope: 'all', path: candidate.includePath });
         }
     }
 

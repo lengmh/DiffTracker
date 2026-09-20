@@ -138,6 +138,16 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             return false;
         }
+        const requestedScope = scopeStatus.requested.scope;
+        const requestedMatchesEffective = requestedScope &&
+            scopeStatus.effective.kind === 'configured' &&
+            requestedScope.scopeRevision === scopeStatus.effective.scopeRevision;
+        if (scopeStatus.workspaceRequestPresent && !requestedMatchesEffective) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: Workspace monitoring-scope settings are pending. Apply the requested scope (or restore the effective configuration) before rebuilding the recording baseline.'
+            );
+            return false;
+        }
         if (diffTracker.isRecoveryBlocked()) {
             const answer = await vscode.window.showErrorMessage(
                 'Code Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',

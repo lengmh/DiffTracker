@@ -1968,7 +1968,7 @@ export class DiffTracker {
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') { return false; }
         const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
-        return evaluateConfiguredScope(scope, folder.name, relPath, false, directory).source === 'explicitExclude';
+        return evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, directory).source === 'explicitExclude';
     }
 
     private retainCoverageGapReview(filePath: string): boolean {
@@ -2032,7 +2032,7 @@ export class DiffTracker {
             const folder = vscode.workspace.getWorkspaceFolder(uri);
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
-            const decision = evaluateConfiguredScope(scope, folder.name, relPath, false, false);
+            const decision = evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, false);
             if (decision.source === 'explicitExclude') { results.push(filePath); }
         }
         return results.sort((left, right) => left.localeCompare(right));
@@ -2847,7 +2847,7 @@ export class DiffTracker {
         if (this.effectiveMonitoringScope.kind === 'configured') {
             const decision = evaluateConfiguredScope(
                 this.effectiveMonitoringScope as CanonicalMonitoringScope,
-                targetFolder.name,
+                this.workspaceRootIdentityForFolder(targetFolder),
                 relPath,
                 ordinaryIgnored,
                 false
@@ -2916,7 +2916,7 @@ export class DiffTracker {
         const ignored = this.effectiveMonitoringScope.kind === 'configured'
             ? !evaluateConfiguredScope(
                 this.effectiveMonitoringScope as CanonicalMonitoringScope,
-                folder.name,
+                this.workspaceRootIdentityForFolder(folder),
                 relPath,
                 ordinaryIgnored,
                 directory

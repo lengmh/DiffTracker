@@ -144,8 +144,38 @@ test('production start blocks invalid monitoring scope configuration',async()=>{
         gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
         monitoringScopeController:{getStatus:()=>({
             requested:{ok:false,errors:[{message:'invalid'}]},
+            effective:{kind:'configured',scopeRevision:'effective'},
+            workspaceRequestPresent:true,
             expansionReasons:[],
             consented:false
+        })},
+        diffTracker:{
+            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,[]);
+});
+
+test('production start blocks an unapplied configured scope revision',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    const sandbox={
+        restoreOutcome:'restored',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:true,scope:{scopeRevision:'requested-new'}},
+            effective:{kind:'configured',scopeRevision:'effective-old'},
+            workspaceRequestPresent:true,
+            expansionReasons:[],
+            consented:true
         })},
         diffTracker:{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
@@ -171,7 +201,13 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
             setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
             setGitContextPending:()=>calls.push('release')},
         gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},
-        monitoringScopeController:{getStatus:()=>({requested:{ok:true},expansionReasons:[],consented:true})},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:true,scope:{scopeRevision:'same'}},
+            effective:{kind:'configured',scopeRevision:'same'},
+            workspaceRequestPresent:false,
+            expansionReasons:[],
+            consented:true
+        })},
         vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
     vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
