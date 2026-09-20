@@ -1110,6 +1110,20 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed recording Clear Diffs replays a pre-reset debounced external change against the old baseline',async()=>{
+    const p=file('clear-debounce-race.txt'),storage=file('storage');
+    seed(p,'baseline','baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,'external just before clear');
+    await tracker.onExternalFileChanged(Uri.file(p));
+    assert.ok(tracker.externalChangeTimers.has(p),'precondition: watcher update is still debounced');
+    listedFiles=[Uri.file(p)];
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    const result=await tracker.resetBaselineToCurrentState();
+    assert.equal(result,false);faults.clear();
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.currentContent,'external just before clear');
+});
 test('S2 successful recording Clear Diffs rebuilds current text and opaque baselines without workspace writes',async()=>{
     const textFile=file('clear-current.txt'),opaqueFile=file('clear-current.bin'),storage=file('storage');
     seed(textFile,'old','current');await scan(textFile);

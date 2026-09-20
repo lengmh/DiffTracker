@@ -805,6 +805,13 @@ export class DiffTracker {
                 return false;
             }
         }
+        const preResetObservedPaths = new Set<string>([
+            ...this.pendingExternalChanges,
+            ...this.externalChangeTimers.keys(),
+            ...this.documentChangeTimers.keys(),
+            ...this.activeCreations.keys(),
+            ...this.scanUncertainFiles
+        ]);
         const epoch = this.advanceEpoch();
         if (watchers) { this.activateExternalWatchers(watchers); }
         if (!this.isRecording) {
@@ -856,7 +863,11 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.workspaceContextChanged = previous.workspaceContextChanged;
             this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
-            this.pendingExternalChanges = new Set([...previous.pendingExternalChanges, ...observedPaths]);
+            this.pendingExternalChanges = new Set([
+                ...previous.pendingExternalChanges,
+                ...preResetObservedPaths,
+                ...observedPaths
+            ]);
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
