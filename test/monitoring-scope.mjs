@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import {
     canonicalizeExcludePattern,
     canonicalizeIncludePath,
+    createLegacyEffectiveScope,
+    parseEffectiveMonitoringScope,
     detectScopeExpansion,
     validateAndCanonicalizeScope
 } from '../out/monitoringScope.js';
@@ -63,7 +65,7 @@ function valid(overrides = {}) {
     }), [...roots].reverse(), 'linux');
     assert.equal(a.ok, true);
     assert.equal(b.ok, true);
-    assert.equal(a.scope.revision, b.scope.revision, 'scope identity must be order-independent');
+    assert.equal(a.scope.scopeRevision, b.scope.scopeRevision, 'scope identity must be order-independent');
 }
 
 for (const value of ['', '.', './foo', '../foo', 'foo/../bar', '/absolute', 'C:/drive', 'file:///tmp/a', '~/secret', '$HOME/a', 'foo//bar']) {
@@ -135,4 +137,20 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     const excludeItems = manifest.contributes.configuration.properties['diffTracker.watchExclude'].items.oneOf;
     assert.ok(excludeItems.some(item => item.type === 'string'), 'legacy Global string rules must remain schema-readable during migration');
     assert.ok(excludeItems.some(item => item.type === 'object'), 'structured Workspace exclusions must be expressible');
+}
+
+{
+    const legacy = createLegacyEffectiveScope(roots, ['node_modules/', ' !keep-me ', '', 42]);
+    assert.equal(legacy.kind, 'legacyV3');
+    assert.deepEqual(legacy.legacyWatchExclude, ['node_modules/', '!keep-me']);
+    assert.deepEqual(parseEffectiveMonitoringScope(legacy), legacy);
+    assert.equal(parseEffectiveMonitoringScope({ ...legacy, scopeRevision: '0'.repeat(64) }), undefined);
+}
+{
+    const configured = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: 'private' }],
+        excludes: [{ scope: 'all', pattern: '**/*.pem' }]
+    }), roots, 'linux').scope;
+    const persisted = { kind: 'configured', ...configured };
+    assert.deepEqual(parseEffectiveMonitoringScope(persisted), persisted);
 }

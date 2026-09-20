@@ -28,7 +28,7 @@ export interface MonitoringScopeRequest {
 
 export interface CanonicalMonitoringScope extends MonitoringScopeRequest {
     roots: WorkspaceRootIdentity[];
-    revision: string;
+    scopeRevision: string;
 }
 
 export interface ScopeValidationError {
@@ -48,6 +48,19 @@ export interface ScopeExpansionResult {
     expands: boolean;
     reasons: string[];
 }
+
+export interface LegacyEffectiveMonitoringScope {
+    kind: 'legacyV3';
+    roots: WorkspaceRootIdentity[];
+    legacyWatchExclude: string[];
+    scopeRevision: string;
+}
+
+export interface ConfiguredEffectiveMonitoringScope extends CanonicalMonitoringScope {
+    kind: 'configured';
+}
+
+export type EffectiveMonitoringScope = LegacyEffectiveMonitoringScope | ConfiguredEffectiveMonitoringScope;
 
 const SCOPE_REVISION_MODEL = 1;
 
@@ -256,7 +269,7 @@ export function validateAndCanonicalizeScope(
             roots,
             includes: canonicalIncludes,
             excludes: canonicalExcludes,
-            revision: stableHash(identity)
+            scopeRevision: stableHash(identity)
         }
     };
 }
@@ -276,6 +289,77 @@ function includeCovers(effective: MonitoringIncludeRule, requested: MonitoringIn
 
 function rootKey(root: WorkspaceRootIdentity): string {
     return `${root.name}\0${root.uri}`;
+}
+
+function normalizeLegacyPatterns(patterns: readonly unknown[]): string[] {
+    const result: string[] = [];
+    for (const pattern of patterns) {
+        if (typeof pattern !== 'string') { continue; }
+        const trimmed = pattern.trim();
+        if (trimmed) { result.push(trimmed); }
+    }
+    return result;
+}
+
+export function createLegacyEffectiveScope(
+    rootsInput: readonly WorkspaceRootIdentity[],
+    legacyWatchExcludeInput: readonly unknown[]
+): LegacyEffectiveMonitoringScope {
+    const errors: ScopeValidationError[] = [];
+    const roots = normalizeRoots(rootsInput, errors);
+    const legacyWatchExclude = normalizeLegacyPatterns(legacyWatchExcludeInput);
+    const identity = {
+        model: 'legacy-v3',
+        roots,
+        legacyWatchExclude
+    };
+    return {
+        kind: 'legacyV3',
+        roots,
+        legacyWatchExclude,
+        scopeRevision: stableHash(identity)
+    };
+}
+
+export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoringScope | undefined {
+    if (!raw || typeof raw !== 'object') { return undefined; }
+    const candidate = raw as {
+        kind?: unknown;
+        roots?: unknown;
+        legacyWatchExclude?: unknown;
+        scopeRevision?: unknown;
+        mode?: unknown;
+        includes?: unknown;
+        excludes?: unknown;
+    };
+    if (!Array.isArray(candidate.roots) || typeof candidate.scopeRevision !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(candidate.scopeRevision)) {
+        return undefined;
+    }
+    const roots: WorkspaceRootIdentity[] = [];
+    for (const root of candidate.roots) {
+        if (!root || typeof root !== 'object') { return undefined; }
+        const value = root as { name?: unknown; uri?: unknown };
+        if (typeof value.name !== 'string' || value.name.length === 0 ||
+            typeof value.uri !== 'string' || value.uri.length === 0) { return undefined; }
+        roots.push({ name: value.name, uri: value.uri });
+    }
+
+    if (candidate.kind === 'legacyV3') {
+        if (!Array.isArray(candidate.legacyWatchExclude)) { return undefined; }
+        const parsed = createLegacyEffectiveScope(roots, candidate.legacyWatchExclude);
+        return parsed.scopeRevision === candidate.scopeRevision ? parsed : undefined;
+    }
+    if (candidate.kind !== 'configured') { return undefined; }
+    const validated = validateAndCanonicalizeScope({
+        mode: candidate.mode,
+        includes: candidate.includes,
+        excludes: candidate.excludes
+    }, roots);
+    if (!validated.ok || !validated.scope || validated.scope.scopeRevision !== candidate.scopeRevision) {
+        return undefined;
+    }
+    return { kind: 'configured', ...validated.scope };
 }
 
 export function detectScopeExpansion(
