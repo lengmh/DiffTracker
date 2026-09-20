@@ -1118,25 +1118,31 @@ test('S2 failed Clear Diffs resumes an interrupted prior baseline scan to Ready'
     const oldRead=pause(p,'read'),oldScan=tracker.initializeWorkspaceSnapshots();
     await oldRead.entered;
 
-    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
-    const reset=tracker.resetBaselineToCurrentState();
-    await persistGate.entered;
-    oldRead.release();await oldScan;
-    tracker.setGitContextPending(true);
-    persistGate.release();
+    const temp=path.join(storage,'session-state.tmp.json');
+    const originalWriteFile=vscode.workspace.fs.writeFile;
+    let injectedFailure=false;
+    vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+        if(!injectedFailure&&uri.fsPath===temp){injectedFailure=true;throw error('NoPermissions');}
+        return originalWriteFile(uri,bytes);
+    };
+    try {
+        assert.equal(await tracker.resetBaselineToCurrentState(),false);
+        assert.equal(injectedFailure,true,'replacement baseline persistence must fail once');
+        assert.equal(tracker.getBaselineState(),'ready','rollback must restart the cancelled prior baseline scan');
+        assert.equal(tracker.snapshotInitialized,true);
+        assert.equal(tracker.baselineBuilding,false);
+        assert.equal(tracker.initialIgnoreEpoch,undefined);
+        assert.equal(tracker.getPersistenceIssue(),undefined,'resumed baseline persistence should clear the transient failure');
+        assert.equal(tracker.getOriginalContent(p),'baseline under construction');
 
-    assert.equal(await reset,false);
-    tracker.setGitContextPending(false);
-    assert.equal(tracker.getBaselineState(),'ready','rollback must restart the cancelled prior baseline scan');
-    assert.equal(tracker.snapshotInitialized,true);
-    assert.equal(tracker.baselineBuilding,false);
-    assert.equal(tracker.initialIgnoreEpoch,undefined);
-    assert.equal(tracker.getOriginalContent(p),'baseline under construction');
-
-    fs.writeFileSync(p,'later change');await scan(p);
-    assert.equal(pending(p)?.reviewKind,'text');
-    assert.equal(pending(p)?.originalContent,'baseline under construction');
-    assert.equal(pending(p)?.currentContent,'later change');
+        fs.writeFileSync(p,'later change');await scan(p);
+        assert.equal(pending(p)?.reviewKind,'text');
+        assert.equal(pending(p)?.originalContent,'baseline under construction');
+        assert.equal(pending(p)?.currentContent,'later change');
+    } finally {
+        vscode.workspace.fs.writeFile=originalWriteFile;
+        oldRead.release();await oldScan;
+    }
 });
 test('S2 failed recording Clear Diffs replays startup events queued during replacement ignore refresh',async()=>{
     const p=file('clear-startup-event.txt'),storage=file('storage');
