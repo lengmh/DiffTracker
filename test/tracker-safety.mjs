@@ -1110,6 +1110,26 @@ test('S2 recording Clear Diffs persistence failure rolls back the previous revie
     assert.equal(JSON.stringify(tracker.revertHistory),beforeHistory);
     faults.clear();
 });
+test('S2 failed recording Clear Diffs preserves same-session create provenance for unknown additions',async()=>{
+    const p=file('clear-unknown-provenance.txt'),storage=file('storage');
+    tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,'new text');
+    faults.set(p,{read:error('NoPermissions')});
+    await tracker.onExternalFileChanged(Uri.file(p));
+    await waitUntil(()=>pending(p)?.reviewKind==='unknown',2000);
+    assert.ok(tracker.postBaselineUnknownFiles.has(p),'precondition: change-first path has same-session create provenance');
+    faults.delete(p);
+    listedFiles=[Uri.file(p)];
+    faults.set(path.join(storage,'session-state.tmp.json'),{write:error('NoPermissions')});
+    assert.equal(await tracker.resetBaselineToCurrentState(),false);
+    faults.delete(path.join(storage,'session-state.tmp.json'));
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.ok(tracker.postBaselineUnknownFiles.has(p),'failed Clear Diffs must restore create provenance');
+    await tracker.onExternalFileCreated(Uri.file(p));
+    await waitUntil(()=>pending(p)?.reviewKind==='text'&&pending(p)?.unavailableReason===undefined,2000);
+    assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+});
 test('S2 failed recording Clear Diffs replays a pre-reset debounced external change against the old baseline',async()=>{
     const p=file('clear-debounce-race.txt'),storage=file('storage');
     seed(p,'baseline','baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();

@@ -812,6 +812,11 @@ export class DiffTracker {
             ...this.activeCreations.keys(),
             ...this.scanUncertainFiles
         ]);
+        // advanceEpoch() intentionally clears same-session provenance. Keep a
+        // copy so a failed replacement baseline can restore the old session
+        // exactly; otherwise a change-first addition can no longer be upgraded
+        // by a later create event after rollback.
+        const previousPostBaselineUnknownFiles = new Set(this.postBaselineUnknownFiles);
         const epoch = this.advanceEpoch();
         if (watchers) { this.activateExternalWatchers(watchers); }
         if (!this.isRecording) {
@@ -838,7 +843,8 @@ export class DiffTracker {
             baselineBuilding: this.baselineBuilding,
             workspaceContextChanged: this.workspaceContextChanged,
             scanCoverage: this.scanCoverage,
-            pendingExternalChanges: new Set(this.pendingExternalChanges)
+            pendingExternalChanges: new Set(this.pendingExternalChanges),
+            postBaselineUnknownFiles: previousPostBaselineUnknownFiles
         };
         const previousReviewPaths = [...previous.trackedChanges.keys()];
         let transaction!: BaselineTransaction;
@@ -868,6 +874,7 @@ export class DiffTracker {
                 ...preResetObservedPaths,
                 ...observedPaths
             ]);
+            this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
