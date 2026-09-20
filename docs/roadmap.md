@@ -37,8 +37,8 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 - **S1 / PR #8**：完成 opaque / unknown 只读 review visibility。
 - **S2 / PR #9**：完成 Acknowledge、mixed actions、计数和 Clear Diffs 事务语义。
 - **S3**：下一实现阶段，负责 monitoring scope、Workspace Trust、Scope Revision / Policy Fingerprint / Coverage Generation、Session V4 与 Rules 模式。
-- **S4**：后续负责 Whole Workspace、supplemental coverage、coverage reconciliation 与 W1 watcher handoff/reclaim。
-- **S5**：实现/集成 production Native Review stable-API adapter，并在真实 Host 中完成入口、映射边界、跨平台与 0.8.0 RC 的最终验收。
+- **S4**：分为两个独立子轨：S4-W 负责 Whole Workspace、supplemental coverage、coverage reconciliation 与 W1 watcher handoff/reclaim；S4-N 负责 production Native Review stable-API adapter 的正式实现，以及 Quick Diff / Multi Diff / stale-view / mapping-boundary 的真实 Host 验证。
+- **S5**：汇总跨平台、最低版本、迁移、性能和 VSIX 的 0.8.0 RC 验收，并依据 S4-N 证据明确决定是否切换默认文本审阅界面。
 
 Native Review 不成为第二套状态源；DiffTracker 后端继续管理 baseline、session、review token、stale protection、Keep/Revert/Acknowledge、恢复、Git context、scope 和 coverage。任意 block 内部分行 Keep/Revert 不属于 0.8.0 完成门。
 
