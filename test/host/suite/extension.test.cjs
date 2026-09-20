@@ -95,15 +95,24 @@ module.exports = async function runExtensionHostScenario() {
         // watcher as the positive control for supplemental coverage instead.
         const directEvents = [];
         const directWatcher = fs.watch(excludedTree, { persistent: false }, (kind, filename) => {
-            if (filename) { directEvents.push(filename.toString()); }
+            directEvents.push({ kind, filename: filename?.toString() });
         });
         try {
-            await delay(250);
+            await delay(500);
             const directProbeName = 'direct-probe.txt';
             const directProbe = path.join(excludedTree, directProbeName);
             fs.writeFileSync(directProbe, 'direct supplemental probe\n');
-            await until('direct watcher coverage for watcherExclude subtree', () =>
-                directEvents.includes(directProbeName), 10_000);
+            await delay(250);
+            fs.appendFileSync(directProbe, 'follow-up\n');
+            try {
+                await until('direct watcher coverage for watcherExclude subtree', () =>
+                    directEvents.some(event =>
+                        event.filename &&
+                        path.basename(event.filename).toLocaleLowerCase() === directProbeName.toLocaleLowerCase()
+                    ), 10_000);
+            } catch (error) {
+                throw new Error(`${error.message}; direct watcher events=${JSON.stringify(directEvents)}`);
+            }
         } finally {
             directWatcher.close();
         }
