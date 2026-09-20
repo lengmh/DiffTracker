@@ -10,6 +10,7 @@ import ts from 'typescript';
 const require = createRequire(import.meta.url);
 const filePath = '/workspace/研究 folder/empty.m';
 const reviewToken={filePath,epoch:1,baselineRevision:'base',currentRevision:'current'};
+const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
@@ -63,6 +64,15 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         },getReviewTokens:()=> {
             const change = state.changes[0];
             return change && change.reviewKind && change.reviewKind !== 'text' ? [] : [reviewToken];
+        },getOpaqueReviewToken:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'opaque' ? opaqueReviewToken : undefined;
+        },getOpaqueReviewTokens:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'opaque' ? [opaqueReviewToken] : [];
+        },getUnknownReviewPaths:()=> {
+            const change = state.changes[0];
+            return change?.reviewKind === 'unknown' ? [filePath] : [];
         },getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
@@ -248,6 +258,7 @@ await test('opaque file review is visible, read-only and carries identity metada
     const payload = h.messages[0];
     assert.equal(payload.reviewKind, 'opaque');
     assert.equal(payload.reviewToken, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(payload.opaqueReviewToken)),opaqueReviewToken);
     assert.equal(payload.currentSize, 6);
     assert.equal(payload.currentFingerprint, fingerprint);
 
@@ -255,9 +266,14 @@ await test('opaque file review is visible, read-only and carries identity metada
     assert.match(ui.notice(), /Read-only file change:/);
     assert.match(ui.notice(), /Baseline: missing/);
     assert.match(ui.notice(), /Current: exists \(6 B\)/);
-    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    assert.equal(ui.elements.get('btn-keep-all').textContent, 'Acknowledge');
     assert.equal(ui.elements.get('btn-reject-all').disabled, true);
     assert.equal(ui.rendererCalls(), 0);
+    ui.click('btn-keep-all');
+    assert.equal(ui.sent[0].command,'acknowledge');
+    assert.equal(ui.sent[0].reviewToken,null);
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[0].opaqueReviewToken)),opaqueReviewToken);
 
     const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
     const root = await tree.getChildren();
@@ -268,6 +284,22 @@ await test('opaque file review is visible, read-only and carries identity metada
     assert.equal(leaf.reviewToken, undefined);
 });
 
+await test('opaque acknowledgement routes through the production command with the captured opaque token',async()=>{
+    const h=harness({
+        filePath,fileName:'image.png',originalContent:'',currentContent:'',isDeleted:false,
+        reviewKind:'opaque',reviewReason:'read-only',baselineExists:false,currentExists:true,
+        currentSize:3,currentFingerprint:'b'.repeat(64),changes:[]
+    });
+    await h.panel.handleMessage({
+        command:'acknowledge',filePath,requestId:'opaque-ack',
+        opaqueReviewToken,viewGeneration:0
+    });
+    assert.equal(h.commands.length,1);
+    assert.equal(h.commands[0][0],'diffTracker.acknowledgeOpaqueChange');
+    assert.equal(h.commands[0][1],filePath);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.commands[0][2])),opaqueReviewToken);
+    assert.deepEqual(h.messages.map(message=>message.command),['actionAck','updateData']);
+});
 await test('failed acknowledgement unlocks the generated UI while pending file remains reviewable', () => {
     const h = harness();
     const ui = runInline(h.panel.getHtmlContent());
@@ -322,7 +354,9 @@ await test('CodeLens and tree carry captured review tokens for block/file/batch 
     for(const lens of lenses.filter(v=>/keep|revert/i.test(v.command.command))) assert.equal(lens.command.arguments.at(-1),reviewToken);
     const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker),items=await tree.getChildren();
     assert.equal(items.find(i=>i.filePath===filePath).reviewToken,reviewToken);
-    for(const item of items.filter(i=>/^(diffTracker.keepAllChanges|diffTracker.revertAllChanges)$/.test(i.command?.command))) assert.equal(item.command.arguments[0][0],reviewToken);
+    for(const item of items.filter(i=>/^(diffTracker.keepAllChanges|diffTracker.revertAllChanges)$/.test(i.command?.command))) {
+        assert.equal(item.command.arguments,undefined,'mixed root actions capture text/opaque/unknown state at invocation');
+    }
 });
 await test('detached old annotation button sends its captured old review token',()=>{
     const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after'});
