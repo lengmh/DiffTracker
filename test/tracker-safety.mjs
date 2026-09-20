@@ -340,6 +340,17 @@ test('S2 stale opaque token cannot acknowledge a newer binary identity',async()=
     const result=await tracker.acknowledgeOpaqueChange(p,token);
     assert.equal(result.status,'conflict');assert.equal(tracker.opaqueBaselineFiles.get(p),before);assert.ok(pending(p));
 });
+test('S2 Acknowledge rolls back when the reviewed opaque identity changes during persistence',async()=>{
+    const p=file('ack-race.bin'),storage=file('storage');seed(p,'baseline','baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+    fs.writeFileSync(p,Buffer.from([0,1,2]));await scan(p);const token=tracker.getOpaqueReviewToken(p);assert.ok(token);
+    const temp=path.join(storage,'session-state.tmp.json'),gate=pause(temp,'write');
+    const op=tracker.acknowledgeOpaqueChange(p,token);await gate.entered;
+    fs.writeFileSync(p,Buffer.from([0,9,8]));await tracker.onExternalFileChanged(Uri.file(p));
+    gate.release();const result=await op;
+    assert.equal(result.status,'failed');assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.equal(pending(p)?.reviewKind,'opaque');
+    assert.equal(pending(p)?.currentFingerprint,createHash('sha256').update(Buffer.from([0,9,8])).digest('hex'));
+});
 test('S2 failed Acknowledge persistence rolls back the prior baseline and keeps review pending',async()=>{
     const p=file('ack-persist.bin'),storage=file('storage');seed(p,'text baseline','text baseline');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
     fs.writeFileSync(p,Buffer.from([0,1,2,3]));await scan(p);const token=tracker.getOpaqueReviewToken(p);assert.ok(token);

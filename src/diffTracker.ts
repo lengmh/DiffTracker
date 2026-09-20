@@ -3438,7 +3438,7 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
     }
 
-    private beginAcknowledgeTransaction(filePath: string): BaselineTransaction {
+    private beginAcknowledgeTransaction(filePath: string, review: OpaqueReviewToken): BaselineTransaction {
         const previous = {
             snapshotPresent: this.fileSnapshots.has(filePath),
             snapshot: this.fileSnapshots.get(filePath),
@@ -3469,7 +3469,7 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.snapshotInitialized = previous.snapshotInitialized;
         });
-        transaction.valid = () => !this.validateSnapshotTarget(filePath);
+        transaction.valid = () => !this.validateSnapshotTarget(filePath) && this.matchesOpaqueReview(review);
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -3562,7 +3562,7 @@ export class DiffTracker {
         const finalTargetError = this.validateActionTarget(filePath);
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
         const epoch = this.sessionEpoch;
-        const transaction = this.beginAcknowledgeTransaction(filePath);
+        const transaction = this.beginAcknowledgeTransaction(filePath, review);
         if (!this.applyAcknowledgedStateAsBaseline(filePath, current)) {
             this.endBaselineTransaction(transaction, false);
             return this.actionResult(filePath, 'conflict', 'Current resource identity is not reliable enough to acknowledge');
