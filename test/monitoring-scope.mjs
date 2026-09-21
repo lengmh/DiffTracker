@@ -432,6 +432,33 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     }
 }
 
+
+{
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-path-case-alias-'));
+    const original = path.join(parent, 'CaseAlias');
+    const alias = path.join(parent, 'caseAlias');
+    fs.mkdirSync(original);
+    let aliasCreated = false;
+    try {
+        fs.symlinkSync(original, alias, process.platform === 'win32' ? 'junction' : 'dir');
+        aliasCreated = fs.existsSync(alias) && fs.readdirSync(parent).includes('CaseAlias') &&
+            fs.readdirSync(parent).includes('caseAlias');
+    } catch {
+        // Hosts without symlink/junction permission cannot exercise this case.
+    }
+    try {
+        if (aliasCreated) {
+            assert.equal(
+                detectLocalPathCaseSensitivity(original),
+                true,
+                'a separately named case-variant alias does not prove case-insensitive lookup'
+            );
+        }
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+}
+
 for (const [before,after,expands] of [
     ['secret','/secret',true], ['secret/','/secret/',true], ['secret','**/secret',false],
     ['secret/','secret',false], ['secret','secret/',true],

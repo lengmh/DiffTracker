@@ -371,4 +371,40 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(t.getOriginalContent(p),'baseline');
     });
 
+
+    test('PR11 scope rollback restores committed legacy matcher even when matcher rebuild fails',async()=>{
+        const t=h.getTracker(),protectedPath=file('legacy-protected.txt');
+        const oldConfig=vscode.workspace.getConfiguration;
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=oldConfig(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,get:(key,fallback)=>key==='watchExclude'
+                ? [path.basename(protectedPath)] : base.get(key,fallback)};
+        };
+        const originalRefresh=t.refreshIgnoreMatchers.bind(t);
+        const originalCapture=t.captureConfiguredIncludeBaselines.bind(t);
+        try{
+            await originalRefresh();
+            assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3');
+            assert.equal(t.testIgnorePath(protectedPath).ignored,true,
+                'precondition: committed legacy matcher must protect the path');
+            let refreshCalls=0;
+            t.refreshIgnoreMatchers=async(...args)=>{
+                refreshCalls++;
+                if(refreshCalls===2) throw new Error('simulated rollback matcher rebuild failure');
+                return originalRefresh(...args);
+            };
+            t.captureConfiguredIncludeBaselines=async()=>{throw new Error('simulated candidate preparation failure');};
+            const result=await t.applyConfiguredMonitoringScope(scope());
+            assert.equal(result.status,'failed',JSON.stringify(result));
+            assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3');
+            assert.equal(t.testIgnorePath(protectedPath).ignored,true,
+                'failed scope apply must atomically restore the committed legacy matcher');
+        }finally{
+            t.refreshIgnoreMatchers=originalRefresh;
+            t.captureConfiguredIncludeBaselines=originalCapture;
+            vscode.workspace.getConfiguration=oldConfig;
+        }
+    });
+
 }
