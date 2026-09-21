@@ -164,6 +164,7 @@ interface PersistedTrackerState {
     effectiveMonitoringScope: EffectiveMonitoringScope;
     retainedReviewPaths: string[];
     coverageGaps: Array<[string, CoverageGapRecord]>;
+    legacyWatchExcludeByRoot: Array<[string, string[]]>;
     fileSnapshots: Array<[string, string]>;
     fileModes: Array<[string, number]>;
     baselineExistingFiles: string[];
@@ -511,6 +512,11 @@ export class DiffTracker {
     private pendingScopeSuspendedPaths = new Set<string>();
     private retainedReviewPaths = new Set<string>();
     private coverageGaps = new Map<string, CoverageGapRecord>();
+    // Resource-scoped legacy watchExclude policy that was actually committed
+    // before a structured S3 request started replacing Workspace settings.
+    // This is policy evidence, not user consent: it protects the old effective
+    // scope until configured publication succeeds atomically.
+    private committedLegacyWatchExcludeByRoot = new Map<string, string[]>();
     private coverageGeneration = 0;
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
@@ -698,6 +704,9 @@ export class DiffTracker {
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
+        this.committedLegacyWatchExcludeByRoot = new Map(
+            state.legacyWatchExcludeByRoot.map(([rootUri, patterns]) => [rootUri, [...patterns]])
+        );
         this.fileSnapshots = new Map(state.fileSnapshots);
         this.fileModes = new Map(state.fileModes);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
@@ -1664,6 +1673,7 @@ export class DiffTracker {
             return undefined;
         }
 
+        const effectiveRootUris = new Set(this.effectiveMonitoringScope.roots.map(root => root.uri));
         return {
             version: 4,
             isRecording: this.isRecording,
@@ -1673,6 +1683,12 @@ export class DiffTracker {
             effectiveMonitoringScope: this.effectiveMonitoringScope,
             retainedReviewPaths: [...this.retainedReviewPaths].sort((left, right) => left.localeCompare(right)),
             coverageGaps: [...this.coverageGaps.entries()].sort(([left], [right]) => left.localeCompare(right)),
+            legacyWatchExcludeByRoot: this.effectiveMonitoringScope.kind === 'legacyV3'
+                ? [...this.committedLegacyWatchExcludeByRoot.entries()]
+                    .filter(([rootUri]) => effectiveRootUris.has(rootUri))
+                    .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]])
+                    .sort(([left], [right]) => left.localeCompare(right))
+                : [],
             fileSnapshots: Array.from(this.fileSnapshots.entries())
                 .sort(([leftPath], [rightPath]) => leftPath.localeCompare(rightPath)),
             fileModes: [...this.fileModes].filter(([filePath]) => this.fileSnapshots.has(filePath)),
@@ -1872,6 +1888,7 @@ export class DiffTracker {
             effectiveMonitoringScope?: unknown;
             retainedReviewPaths?: unknown;
             coverageGaps?: unknown;
+            legacyWatchExcludeByRoot?: unknown;
             fileSnapshots?: unknown;
             fileModes?: unknown;
             baselineExistingFiles?: unknown;
@@ -2013,6 +2030,33 @@ export class DiffTracker {
         const retainedReviewPaths = candidate.version === 4 ? parsePathList(candidate.retainedReviewPaths) : [];
         if (!retainedReviewPaths) { return undefined; }
 
+        const rawLegacyWatchExcludeByRoot = candidate.version === 4
+            ? (candidate.legacyWatchExcludeByRoot ?? [])
+            : [];
+        if (!Array.isArray(rawLegacyWatchExcludeByRoot) ||
+            rawLegacyWatchExcludeByRoot.length > this.maxPersistedSnapshots) {
+            return undefined;
+        }
+        const effectiveRootUris = new Set(effectiveMonitoringScope.roots.map(root => root.uri));
+        const legacyWatchExcludeByRoot: Array<[string, string[]]> = [];
+        const legacyPolicyRoots = new Set<string>();
+        for (const entry of rawLegacyWatchExcludeByRoot) {
+            if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
+            const [rootUri, rawPatterns] = entry;
+            if (typeof rootUri !== 'string' || !effectiveRootUris.has(rootUri) ||
+                legacyPolicyRoots.has(rootUri) || !Array.isArray(rawPatterns) ||
+                rawPatterns.length > this.maxPersistedSnapshots) {
+                return undefined;
+            }
+            const patterns: string[] = [];
+            for (const pattern of rawPatterns) {
+                if (typeof pattern !== 'string' || pattern.length > 1000) { return undefined; }
+                patterns.push(pattern);
+            }
+            legacyPolicyRoots.add(rootUri);
+            legacyWatchExcludeByRoot.push([rootUri, patterns]);
+        }
+
         const rawCoverageGaps = candidate.version === 4 ? candidate.coverageGaps : [];
         if (!Array.isArray(rawCoverageGaps) || rawCoverageGaps.length > this.maxPersistedSnapshots) { return undefined; }
         const parseCoverageGapEvidence = (rawEvidence: unknown, expectedKind: 'file' | 'subtree'): CoverageGapEvidence | undefined => {
@@ -2072,6 +2116,7 @@ export class DiffTracker {
             effectiveMonitoringScope,
             retainedReviewPaths,
             coverageGaps,
+            legacyWatchExcludeByRoot,
             fileSnapshots,
             fileModes,
             baselineExistingFiles,
@@ -2528,6 +2573,10 @@ export class DiffTracker {
                 items: record.items.map(item => ({ ...item, before: { ...item.before }, after: { ...item.after } }))
             })),
             scanCoverage: this.scanCoverage,
+            committedLegacyWatchExcludeByRoot: new Map(
+                [...this.committedLegacyWatchExcludeByRoot]
+                    .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]])
+            ),
             ignoreMatchers: new Map(this.ignoreMatchers),
             ignoreFingerprint: this.ignoreFingerprint,
             ignoreResultCache: new Map(this.ignoreResultCache)
@@ -2548,6 +2597,10 @@ export class DiffTracker {
             this.inlineViews = new Map(previous.inlineViews);
             this.revertHistory = previous.revertHistory;
             this.scanCoverage = previous.scanCoverage;
+            this.committedLegacyWatchExcludeByRoot = new Map(
+                [...previous.committedLegacyWatchExcludeByRoot]
+                    .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]])
+            );
             // Candidate scope preparation publishes matcher state only inside the
             // transaction. Rollback restores the committed matcher atomically;
             // the best-effort rebuild below may refresh it, but a rebuild failure
@@ -2949,12 +3002,24 @@ export class DiffTracker {
         // may have excluded a different set even with identical rule text.
         const evidence: string[] = ['ignore-semantics-v2'];
         const previousMatchers = this.ignoreMatchers;
+        const currentRootUris = new Set(this.getSupportedWorkspaceFolders().map(folder => folder.uri.toString()));
+        const nextLegacyPolicy = this.effectiveMonitoringScope.kind === 'legacyV3'
+            ? new Map([...this.committedLegacyWatchExcludeByRoot]
+                .filter(([rootUri]) => currentRootUris.has(rootUri))
+                .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]]))
+            : new Map<string, string[]>();
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const matcher = await this.buildIgnoreMatcher(folder, evidence);
+            const matcher = await this.buildIgnoreMatcher(folder, evidence, nextLegacyPolicy);
             if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             matchers.set(folder.uri.fsPath, matcher);
         }
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+        const legacyPolicyChanged = !this.sameLegacyWatchExcludePolicy(
+            this.committedLegacyWatchExcludeByRoot,
+            nextLegacyPolicy
+        );
+        this.committedLegacyWatchExcludeByRoot = nextLegacyPolicy;
+        if (legacyPolicyChanged) { this.schedulePersistState(); }
         const fingerprint = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
         const changed = fingerprint !== this.ignoreFingerprint;
         this.ignoreFingerprint = fingerprint;
@@ -3326,30 +3391,121 @@ export class DiffTracker {
         return ignoreRules;
     }
 
-    private getWatchExcludePatterns(resource: vscode.Uri): string[] {
+    private hasStructuredWorkspaceScopeRequest(): boolean {
+        const config = vscode.workspace.getConfiguration('diffTracker');
+        const inspect = <T>(key: string): T | undefined =>
+            typeof config.inspect === 'function' ? config.inspect<T>(key)?.workspaceValue : undefined;
+        const mode = inspect<unknown>('monitoringScope');
+        const include = inspect<unknown>('watchInclude');
+        const exclude = inspect<unknown>('watchExclude');
+        if (mode !== undefined || include !== undefined) { return true; }
+        if (exclude === undefined) { return false; }
+        if (Array.isArray(exclude) && (exclude.length === 0 || exclude.every(value => typeof value === 'string'))) {
+            // An isolated empty/string array is still a valid pre-S3 legacy
+            // setting. Once mode/include exist, the branch above identifies S3.
+            return false;
+        }
+        return true;
+    }
+
+    private sameLegacyWatchExcludePolicy(
+        left: ReadonlyMap<string, readonly string[]>,
+        right: ReadonlyMap<string, readonly string[]>
+    ): boolean {
+        if (left.size !== right.size) { return false; }
+        for (const [rootUri, patterns] of left) {
+            const other = right.get(rootUri);
+            if (!other || patterns.length !== other.length ||
+                patterns.some((pattern, index) => pattern !== other[index])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private getWatchExcludePatterns(
+        resource: vscode.Uri,
+        legacyPolicyCandidate?: Map<string, string[]>
+    ): string[] {
         if (this.effectiveMonitoringScope.kind !== 'legacyV3') { return []; }
         // 0.7.2 used resource-scoped VS Code precedence: Folder overrides
         // Workspace, which overrides Global. Arrays replace, not concatenate.
         const config = vscode.workspace.getConfiguration('diffTracker', resource);
         const raw = config.get<unknown>('watchExclude', []);
-        if (Array.isArray(raw) && raw.every(value => typeof value === 'string')) {
-            return (raw as string[]).map(value => value.trim()).filter(Boolean);
+        const structuredRequest = this.hasStructuredWorkspaceScopeRequest();
+        const folder = vscode.workspace.getWorkspaceFolder(resource);
+        const rootUri = folder?.uri.toString();
+
+        if (Array.isArray(raw) && raw.every(value => typeof value === 'string') &&
+            (raw.length > 0 || !structuredRequest)) {
+            const patterns = (raw as string[]).map(value => value.trim()).filter(Boolean);
+            if (rootUri && legacyPolicyCandidate) {
+                legacyPolicyCandidate.set(rootUri, [...patterns]);
+            }
+            return patterns;
         }
-        if (Array.isArray(raw) && raw.every(value => value && typeof value === 'object' && !Array.isArray(value))) {
-            // A structured request is not yet an applied legacy matcher. Keep
-            // its predecessor until migration; the pending gate protects new
-            // explicit exclusions independently of this ordinary matcher.
-            return this.getLegacyGlobalWatchExcludePatterns();
+
+        if (structuredRequest) {
+            const committed = rootUri ? this.committedLegacyWatchExcludeByRoot.get(rootUri) : undefined;
+            if (committed) { return [...committed]; }
+            throw new Error(
+                'Committed resource-scoped legacy watchExclude policy is unavailable while a structured scope request is pending'
+            );
+        }
+
+        if (Array.isArray(raw) && raw.every(value => typeof value === 'string')) {
+            const patterns = (raw as string[]).map(value => value.trim()).filter(Boolean);
+            if (rootUri && legacyPolicyCandidate) {
+                legacyPolicyCandidate.set(rootUri, [...patterns]);
+            }
+            return patterns;
         }
         throw new Error('Invalid legacy watchExclude configuration; compatibility discovery is blocked');
     }
 
-    private async buildIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
+    public async prepareLegacyCompatibilityPolicySnapshot(): Promise<boolean> {
+        if (this.effectiveMonitoringScope.kind !== 'legacyV3') { return true; }
+        const previous = new Map(
+            [...this.committedLegacyWatchExcludeByRoot]
+                .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]])
+        );
+        const captured = new Map(previous);
+        try {
+            for (const folder of this.getSupportedWorkspaceFolders()) {
+                const config = vscode.workspace.getConfiguration('diffTracker', folder.uri);
+                const raw = config.get<unknown>('watchExclude', []);
+                if (Array.isArray(raw) && raw.every(value => typeof value === 'string')) {
+                    captured.set(
+                        folder.uri.toString(),
+                        (raw as string[]).map(value => value.trim()).filter(Boolean)
+                    );
+                    continue;
+                }
+                const committed = previous.get(folder.uri.toString());
+                if (!committed) {
+                    throw new Error('Resource-scoped legacy policy is no longer available for a safe migration snapshot');
+                }
+                captured.set(folder.uri.toString(), [...committed]);
+            }
+            this.committedLegacyWatchExcludeByRoot = captured;
+            if (await this.flushPendingPersistence()) { return true; }
+        } catch {
+            // The caller will keep Workspace settings unchanged.
+        }
+        this.committedLegacyWatchExcludeByRoot = previous;
+        return false;
+    }
+
+    private async buildIgnoreMatcher(
+        folder: vscode.WorkspaceFolder,
+        evidence: string[],
+        legacyPolicyCandidate?: Map<string, string[]>
+    ): Promise<Ignore> {
         const epoch = this.sessionEpoch;
         for (let attempt = 0; ; attempt++) {
             const candidateEvidence: string[] = [];
             try {
-                const matcher = await this.readIgnoreMatcher(folder, candidateEvidence);
+                const matcher = await this.readIgnoreMatcher(folder, candidateEvidence, legacyPolicyCandidate);
                 evidence.push(...candidateEvidence);
                 return matcher;
             } catch (error) {
@@ -3363,9 +3519,13 @@ export class DiffTracker {
         }
     }
 
-    private async readIgnoreMatcher(folder: vscode.WorkspaceFolder, evidence: string[]): Promise<Ignore> {
+    private async readIgnoreMatcher(
+        folder: vscode.WorkspaceFolder,
+        evidence: string[],
+        legacyPolicyCandidate?: Map<string, string[]>
+    ): Promise<Ignore> {
         const ig = ignore();
-        const watchExcludes = this.getWatchExcludePatterns(folder.uri);
+        const watchExcludes = this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate);
         const basePatterns = [
             ...this.getDefaultExcludePatterns(),
             ...this.getVsCodeExcludePatterns(folder.uri),
