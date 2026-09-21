@@ -305,19 +305,20 @@ export class MonitoringScopeController implements vscode.Disposable {
     ): Promise<ScopeValidationResult> {
         const validated = validateAndCanonicalizeScope(request, this.getWorkspaceRoots());
         if (!validated.ok || !validated.scope) { return validated; }
+        const validatedScope = validated.scope;
         const effective = this.tracker.getEffectiveMonitoringScope();
         const legacyRules = this.getLegacyWatchRules();
         const committedRules = this.getCommittedLegacyRules();
         const migrationRequired = effective.kind === 'legacyV3' &&
             (legacyRules.length > 0 || committedRules.some(([, patterns]) => patterns.length > 0));
         const migrationComplete = !migrationRequired ||
-            this.migrationRecordMatches(validated.scope.scopeRevision);
+            this.migrationRecordMatches(validatedScope.scopeRevision);
         const expectedLegacySourceFingerprint = effective.kind === 'legacyV3' && legacyRules.length > 0
-            ? options?.expectedLegacySourceFingerprint ?? this.getLegacySourceFingerprint(validated.scope.roots)
+            ? options?.expectedLegacySourceFingerprint ?? this.getLegacySourceFingerprint(validatedScope.roots)
             : undefined;
         const legacySourceStillCurrent = (): boolean =>
             !expectedLegacySourceFingerprint ||
-            this.getLegacySourceFingerprint(validated.scope.roots) === expectedLegacySourceFingerprint;
+            this.getLegacySourceFingerprint(validatedScope.roots) === expectedLegacySourceFingerprint;
         const sourceConflict = (): ScopeValidationResult => ({
             ok: false,
             errors: [{
@@ -351,15 +352,15 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (!legacySourceStillCurrent()) { return sourceConflict(); }
 
         const config = vscode.workspace.getConfiguration('diffTracker');
-        await config.update('monitoringScope', validated.scope.mode, vscode.ConfigurationTarget.Workspace);
+        await config.update('monitoringScope', validatedScope.mode, vscode.ConfigurationTarget.Workspace);
         if (!legacySourceStillCurrent()) { return sourceConflict(); }
 
-        await config.update('watchInclude', validated.scope.includes, vscode.ConfigurationTarget.Workspace);
+        await config.update('watchInclude', validatedScope.includes, vscode.ConfigurationTarget.Workspace);
         if (!legacySourceStillCurrent()) { return sourceConflict(); }
 
         // This is the destructive legacy-source replacement. Every await before
         // it is bound to the exact source fingerprint reviewed by migration.
-        await config.update('watchExclude', validated.scope.excludes, vscode.ConfigurationTarget.Workspace);
+        await config.update('watchExclude', validatedScope.excludes, vscode.ConfigurationTarget.Workspace);
         return validated;
     }
 
@@ -476,7 +477,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const latestRequested = this.getRequestedScope();
         const currentSource = this.getLegacySourceSnapshot();
         if (!latestRequested.ok || !latestRequested.scope ||
-            latestRequested.scope.scopeRevision !== validated.scope.scopeRevision ||
+            latestRequested.scope.scopeRevision !== validatedScope.scopeRevision ||
             !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
             return { status: 'conflict', reason: 'Legacy rule sources or the migration target changed while settings were being written; review the current migration again.' };
         }
@@ -484,7 +485,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             await this.markLegacyMigrationComplete({
                 approvedSourceFingerprint,
                 decision: 'automatic',
-                expectedScopeRevision: validated.scope.scopeRevision
+                expectedScopeRevision: validatedScope.scopeRevision
             });
         } catch (error) {
             return { status: 'conflict', reason: error instanceof Error ? error.message : 'Legacy migration evidence changed before publication.' };
