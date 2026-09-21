@@ -28,6 +28,8 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 旧 model:1 根级记录没有这些证据，不能证明当前 legacy source 已获迁移许可。源、目标、roots 或相关审阅证据在异步迁移/Apply 期间改变时，旧许可失效；关键 await 后以及最终发布前重新验证。结构化 configured scope 正式发布之前，旧 committed legacy policy 继续保护读取边界。
 
+为覆盖 Save→Apply 和中途重启窗口，legacyV3 session 持久化每个 Workspace Root 实际生效的 resource-scoped legacy `watchExclude` 有序数组。任何会用 structured Workspace settings 替换 legacy 字符串的 Save，必须先把该 committed policy 通过 Session V4 的原子 writer 持久化；失败则不写设置。structured request 已写入但 configured scope 尚未发布时，matcher 使用该 committed snapshot，而不是把空/structured Workspace 值解释成旧保护已撤销。configured scope 原子发布成功后清除 snapshot；事务失败或回滚恢复旧 snapshot。该 snapshot 是有效策略证据，不是迁移授权，也不能替代 migration source fingerprint。
+
 ## Session V4 reader 边界
 
 本次仍使用 Session V4，不自动拆分 sidecar 或提前引入新的业务 backend。新 reader 必须安全读取已发布 V1/V2/V3 以及本 PR 修复前的 V4；旧目录 sentinel 的文件系统核验发生在恢复阶段，而不是纯 parser 中。无法证明语义的旧证据保留为待核验状态，不静默接受当前内容。
