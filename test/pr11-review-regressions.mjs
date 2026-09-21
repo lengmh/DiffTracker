@@ -13,6 +13,26 @@ export function registerPR11ReviewRegressions(h) {
     };
     const relative = p => path.relative(root,p).split(path.sep).join('/');
 
+    test('PR11 subtree coverage failure publishes an immediate UI refresh signal',async()=>{
+        const t=h.getTracker(),dir=file('visible-subtree-gap');fs.mkdirSync(dir);
+        let fullRefreshes=0;
+        const subscription=t.onDidTrackChanges(event=>{if(event.fullRefresh)fullRefreshes++;});
+        try{
+            const before=fullRefreshes;
+            await t.markCreatedDirectoryUnavailable(
+                dir,
+                'Imported directory watch coverage is incomplete; repair watcher coverage',
+                false,
+                t.sessionEpoch
+            );
+            assert.equal(pending(dir),undefined);
+            assert.ok(t.coverageGaps.get(dir)?.subtree);
+            assert.ok(fullRefreshes>before,
+                'a subtree coverage failure must immediately refresh visible Changes/status diagnostics');
+        }finally{subscription.dispose();}
+    });
+
+
 
     test('PR11 migration completion is invalidated when legacy source evidence changes',async()=>{
         const old=vscode.workspace.getConfiguration;
