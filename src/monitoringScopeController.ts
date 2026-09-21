@@ -477,7 +477,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const latestRequested = this.getRequestedScope();
         const currentSource = this.getLegacySourceSnapshot();
         if (!latestRequested.ok || !latestRequested.scope ||
-            latestRequested.scope.scopeRevision !== validatedScope.scopeRevision ||
+            latestRequested.scope.scopeRevision !== validated.scope.scopeRevision ||
             !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
             return { status: 'conflict', reason: 'Legacy rule sources or the migration target changed while settings were being written; review the current migration again.' };
         }
@@ -485,7 +485,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             await this.markLegacyMigrationComplete({
                 approvedSourceFingerprint,
                 decision: 'automatic',
-                expectedScopeRevision: validatedScope.scopeRevision
+                expectedScopeRevision: validated.scope.scopeRevision
             });
         } catch (error) {
             return { status: 'conflict', reason: error instanceof Error ? error.message : 'Legacy migration evidence changed before publication.' };
