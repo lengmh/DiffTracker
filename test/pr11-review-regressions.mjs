@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
+import { detectScopeExpansion, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR11ReviewRegressions(h) {
@@ -812,6 +812,110 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(t.getOriginalContent(p),'baseline');
     });
 
+
+    test('PR11 failed compensating scope persistence enters recovery-blocked state',async()=>{
+        const storage=file('scope-rollback-persist-storage');
+        const isolated=new DiffTracker(Uri.file(storage));
+        const makeScope=(includes=[],excludes=[])=>{
+            const checked=validateAndCanonicalizeScope(
+                {mode:'rules',includes,excludes},
+                isolated.currentWorkspaceRootIdentities()
+            );
+            assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+            return checked.scope;
+        };
+        const target=file('scope-rollback-persist.txt');
+        fs.writeFileSync(target,'baseline');
+        isolated.startRecording();
+        await waitUntil(()=>isolated.getBaselineState()==='ready');
+        const initial=makeScope();
+        assert.equal((await isolated.applyConfiguredMonitoringScope(initial)).status,'applied');
+
+        const candidate=makeScope([{scope:'all',path:relative(target)}]);
+        const originalFlushPersist=isolated.flushPersistState.bind(isolated);
+        const originalFlushPending=isolated.flushPendingPersistence.bind(isolated);
+        let candidatePersisted=false;
+        isolated.flushPersistState=async(...args)=>{
+            const ok=await originalFlushPersist(...args);
+            if(args[1]&&ok){
+                candidatePersisted=true;
+                isolated.workspaceContextChanged=true;
+            }
+            return ok;
+        };
+        isolated.flushPendingPersistence=async()=>false;
+        try{
+            const result=await isolated.applyConfiguredMonitoringScope(candidate);
+            assert.equal(candidatePersisted,true,'precondition: candidate state reached durable storage before context invalidation');
+            assert.equal(result.status,'failed',JSON.stringify(result));
+            assert.equal(isolated.recoveryBlocked,true,
+                'failed compensating persistence must block recovery-sensitive actions in the current session');
+            assert.equal(isolated.getIsRecording(),false,
+                'recording must pause when durable storage may still contain a rejected candidate');
+            assert.match(isolated.persistenceIssue??'',/rollback|recovery|persist/i);
+            const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+            assert.equal(saved.effectiveMonitoringScope.scopeRevision,candidate.scopeRevision,
+                'fixture proves disk can still contain the rejected candidate when compensation is unwritable');
+        }finally{
+            isolated.flushPersistState=originalFlushPersist;
+            isolated.flushPendingPersistence=originalFlushPending;
+            await isolated.dispose();
+        }
+    });
+
+    test('PR11 multi-root folder includes collectively cover an all-roots include',async()=>{
+        const roots=[
+            {name:'a',uri:'file:///multi-a',caseSensitive:true},
+            {name:'b',uri:'file:///multi-b',caseSensitive:true}
+        ];
+        const canonical=request=>{
+            const checked=validateAndCanonicalizeScope(request,roots);
+            assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+            return checked.scope;
+        };
+        const effective=canonical({
+            mode:'rules',
+            includes:[
+                {scope:'folder',folder:'a',path:'src'},
+                {scope:'folder',folder:'b',path:'src'}
+            ],
+            excludes:[]
+        });
+        const requested=canonical({
+            mode:'rules',
+            includes:[{scope:'all',path:'src'}],
+            excludes:[]
+        });
+        const expansion=detectScopeExpansion(effective,requested);
+        assert.equal(expansion.expands,false,JSON.stringify(expansion.reasons));
+    });
+
+    test('PR11 multi-root folder exclusions collectively preserve an all-roots exclusion',async()=>{
+        const roots=[
+            {name:'a',uri:'file:///multi-a',caseSensitive:true},
+            {name:'b',uri:'file:///multi-b',caseSensitive:true}
+        ];
+        const canonical=request=>{
+            const checked=validateAndCanonicalizeScope(request,roots);
+            assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+            return checked.scope;
+        };
+        const effective=canonical({
+            mode:'rules',
+            includes:[],
+            excludes:[{scope:'all',pattern:'private/**'}]
+        });
+        const requested=canonical({
+            mode:'rules',
+            includes:[],
+            excludes:[
+                {scope:'folder',folder:'a',pattern:'private/**'},
+                {scope:'folder',folder:'b',pattern:'private/**'}
+            ]
+        });
+        const expansion=detectScopeExpansion(effective,requested);
+        assert.equal(expansion.expands,false,JSON.stringify(expansion.reasons));
+    });
 
     test('PR11 scope rollback restores committed legacy matcher even when matcher rebuild fails',async()=>{
         const t=h.getTracker(),protectedPath=file('legacy-protected.txt');
