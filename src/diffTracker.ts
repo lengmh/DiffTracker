@@ -136,6 +136,17 @@ interface OpaqueBaselineState {
     fingerprint?: string;
 }
 
+interface CoverageGapEvidence {
+    targetKind: 'file' | 'subtree';
+    reasonCode: string;
+    reason: string;
+}
+
+interface CoverageGapRecord {
+    file?: CoverageGapEvidence;
+    subtree?: CoverageGapEvidence;
+}
+
 interface PersistedTrackerState {
     version: 4;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
@@ -146,7 +157,7 @@ interface PersistedTrackerState {
     workspaceRoots: string[];
     effectiveMonitoringScope: EffectiveMonitoringScope;
     retainedReviewPaths: string[];
-    coverageGaps: Array<[string, string]>;
+    coverageGaps: Array<[string, CoverageGapRecord]>;
     fileSnapshots: Array<[string, string]>;
     fileModes: Array<[string, number]>;
     baselineExistingFiles: string[];
@@ -207,7 +218,7 @@ export interface MonitoringScopeApplyResult {
 type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
-    | { kind: 'unavailable'; reason: string; size?: number; mtime?: number; fingerprint?: string };
+    | { kind: 'unavailable'; reason: string; reasonCode?: string; targetKind?: 'file' | 'directory'; size?: number; mtime?: number; fingerprint?: string };
 
 export class DiffTracker {
     private sessionEpoch = 0;
@@ -308,7 +319,7 @@ export class DiffTracker {
         const change = this.trackedChanges.get(filePath);
         const baseline = this.fileSnapshots.get(filePath);
         if (!change || change.reviewKind !== 'text' || change.unavailableReason || baseline === undefined ||
-            this.coverageGaps.has(filePath) || this.disposed) { return undefined; }
+            !!this.coverageGaps.get(filePath)?.file || this.disposed) { return undefined; }
         return {
             filePath, epoch: this.sessionEpoch,
             baselineRevision: this.revision(baseline, this.baselineExistingFiles.has(filePath)),
@@ -339,7 +350,7 @@ export class DiffTracker {
         filePath = this.canonicalTrackingPath(filePath);
         const change = this.trackedChanges.get(filePath);
         if (!change || change.reviewKind !== 'opaque' || change.unavailableReason ||
-            this.coverageGaps.has(filePath) || this.disposed) { return undefined; }
+            !!this.coverageGaps.get(filePath)?.file || this.disposed) { return undefined; }
         return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change) };
     }
 
@@ -493,7 +504,7 @@ export class DiffTracker {
     private pendingMonitoringScope?: CanonicalMonitoringScope;
     private pendingScopeSuspendedPaths = new Set<string>();
     private retainedReviewPaths = new Set<string>();
-    private coverageGaps = new Map<string, string>();
+    private coverageGaps = new Map<string, CoverageGapRecord>();
     private coverageGeneration = 0;
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
@@ -724,6 +735,14 @@ export class DiffTracker {
             return 'blocked';
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+        const migratedDirectorySentinels = this.normalizeRestoredDirectorySentinels();
+        if (migratedDirectorySentinels && !await this.flushPersistState()) {
+            this.recoveryBlocked = true;
+            this.isRecording = false;
+            this.disposeFileWatchers();
+            this.persistenceIssue = 'Cannot persist migrated directory coverage diagnostics; the previous saved review remains preserved.';
+            return 'blocked';
+        }
         if (watcherCoverageNeedsS4 && state.baselineState !== 'building') {
             // Persist the pause so removing the setting before a later restart
             // cannot silently resurrect a baseline that had an observation gap.
@@ -1474,9 +1493,8 @@ export class DiffTracker {
             !this.unresolvedBaselineFiles.has(filePath)) {
             this.unresolvedBaselineFiles.set(filePath, reason);
         }
-        this.coverageGaps.set(filePath, reason);
+        this.setFileCoverageGap(filePath, 'scope-apply-event', reason);
         this.markFileUnavailable(filePath, reason);
-        this.schedulePersistState();
     }
 
     private async drainDeferredScopeApplyEvents(epoch: number): Promise<boolean> {
@@ -1991,15 +2009,51 @@ export class DiffTracker {
 
         const rawCoverageGaps = candidate.version === 4 ? candidate.coverageGaps : [];
         if (!Array.isArray(rawCoverageGaps) || rawCoverageGaps.length > this.maxPersistedSnapshots) { return undefined; }
-        const coverageGaps: Array<[string, string]> = [];
+        const parseCoverageGapEvidence = (rawEvidence: unknown, expectedKind: 'file' | 'subtree'): CoverageGapEvidence | undefined => {
+            if (!rawEvidence || typeof rawEvidence !== 'object') { return undefined; }
+            const value = rawEvidence as Partial<CoverageGapEvidence>;
+            if (value.targetKind !== expectedKind ||
+                typeof value.reasonCode !== 'string' || value.reasonCode.length === 0 || value.reasonCode.length > 100 ||
+                typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 1000) {
+                return undefined;
+            }
+            return { targetKind: expectedKind, reasonCode: value.reasonCode, reason: value.reason };
+        };
+        const coverageGaps: Array<[string, CoverageGapRecord]> = [];
         const gapPaths = new Set<string>();
         for (const entry of rawCoverageGaps) {
             if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
-            const [filePath, reason] = entry;
-            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) || gapPaths.has(filePath) ||
-                typeof reason !== 'string' || reason.length === 0 || reason.length > 1000) { return undefined; }
+            const [filePath, rawRecord] = entry;
+            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) || gapPaths.has(filePath)) {
+                return undefined;
+            }
+            let record: CoverageGapRecord | undefined;
+            if (typeof rawRecord === 'string') {
+                if (rawRecord.length === 0 || rawRecord.length > 1000) { return undefined; }
+                record = {
+                    file: { targetKind: 'file', reasonCode: 'legacy-file-gap', reason: rawRecord }
+                };
+            } else if (rawRecord && typeof rawRecord === 'object' &&
+                ((rawRecord as { targetKind?: unknown }).targetKind === 'file' ||
+                    (rawRecord as { targetKind?: unknown }).targetKind === 'subtree')) {
+                const targetKind = (rawRecord as { targetKind: 'file' | 'subtree' }).targetKind;
+                const evidence = parseCoverageGapEvidence(rawRecord, targetKind);
+                if (!evidence) { return undefined; }
+                record = targetKind === 'file' ? { file: evidence } : { subtree: evidence };
+            } else if (rawRecord && typeof rawRecord === 'object') {
+                const rawValue = rawRecord as { file?: unknown; subtree?: unknown };
+                const fileEvidence = rawValue.file === undefined ? undefined : parseCoverageGapEvidence(rawValue.file, 'file');
+                const subtreeEvidence = rawValue.subtree === undefined ? undefined : parseCoverageGapEvidence(rawValue.subtree, 'subtree');
+                if ((rawValue.file !== undefined && !fileEvidence) ||
+                    (rawValue.subtree !== undefined && !subtreeEvidence) ||
+                    (!fileEvidence && !subtreeEvidence)) {
+                    return undefined;
+                }
+                record = { file: fileEvidence, subtree: subtreeEvidence };
+            }
+            if (!record) { return undefined; }
             gapPaths.add(filePath);
-            coverageGaps.push([filePath, reason]);
+            coverageGaps.push([filePath, record]);
         }
 
         return {
@@ -2134,7 +2188,7 @@ export class DiffTracker {
         this.opaqueBaselineFiles.delete(filePath);
         this.postBaselineUnknownFiles.delete(filePath);
         this.retainedReviewPaths.delete(filePath);
-        this.coverageGaps.delete(filePath);
+        this.clearCoverageGap(filePath, 'file', false);
         this.revertHistory = this.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -2155,10 +2209,43 @@ export class DiffTracker {
         return evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, directory).source === 'explicitExclude';
     }
 
+    private setCoverageGap(
+        targetPath: string,
+        evidence: CoverageGapEvidence,
+        schedule = true
+    ): void {
+        const key = evidence.targetKind === 'file' ? this.canonicalTrackingPath(targetPath) : path.resolve(targetPath);
+        const previous = this.coverageGaps.get(key) ?? {};
+        const next: CoverageGapRecord = evidence.targetKind === 'file'
+            ? { ...previous, file: evidence }
+            : { ...previous, subtree: evidence };
+        this.coverageGaps.set(key, next);
+        if (schedule) { this.schedulePersistState(); }
+    }
+
+    private clearCoverageGap(targetPath: string, targetKind: 'file' | 'subtree', schedule = true): void {
+        const key = targetKind === 'file' ? this.canonicalTrackingPath(targetPath) : path.resolve(targetPath);
+        const previous = this.coverageGaps.get(key);
+        if (!previous) { return; }
+        const next: CoverageGapRecord = { ...previous };
+        if (targetKind === 'file') { delete next.file; } else { delete next.subtree; }
+        if (!next.file && !next.subtree) { this.coverageGaps.delete(key); }
+        else { this.coverageGaps.set(key, next); }
+        if (schedule) { this.schedulePersistState(); }
+    }
+
+    private setFileCoverageGap(filePath: string, reasonCode: string, reason: string): void {
+        this.setCoverageGap(filePath, { targetKind: 'file', reasonCode, reason });
+    }
+
+    private setSubtreeCoverageGap(directory: string, reasonCode: string, reason: string): void {
+        this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason });
+    }
+
     private retainCoverageGapReview(filePath: string): boolean {
-        const reason = this.coverageGaps.get(filePath);
-        if (!reason) { return false; }
-        this.markFileUnavailable(filePath, reason);
+        const evidence = this.coverageGaps.get(filePath)?.file;
+        if (!evidence) { return false; }
+        this.markFileUnavailable(filePath, evidence.reason);
         return true;
     }
 
@@ -2182,9 +2269,8 @@ export class DiffTracker {
             this.pendingScopeSuspendedPaths.delete(filePath);
             if (!this.isPathIgnored(uri, false, true, false)) {
                 const reason = 'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review';
-                this.coverageGaps.set(filePath, reason);
+                this.setFileCoverageGap(filePath, 'pending-scope-gap', reason);
                 this.markFileUnavailable(filePath, reason);
-                this.schedulePersistState();
             }
         }
 
@@ -2201,9 +2287,9 @@ export class DiffTracker {
             for (const filePath of baselinePaths) {
                 if (!this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) { continue; }
                 this.pendingScopeSuspendedPaths.add(filePath);
-                const reason = this.coverageGaps.get(filePath) ??
+                const reason = this.coverageGaps.get(filePath)?.file?.reason ??
                     'Monitoring is paused by a pending explicit exclusion; prior baseline/review state is preserved as unverified';
-                this.coverageGaps.set(filePath, reason);
+                this.setFileCoverageGap(filePath, 'pending-explicit-exclusion', reason);
                 this.markFileUnavailable(filePath, reason);
             }
         }
@@ -2228,7 +2314,7 @@ export class DiffTracker {
             { ...this.trackedChanges.get(filePath), timestamp: undefined },
             this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
             this.opaqueBaselineFiles.get(filePath), this.unresolvedBaselineFiles.get(filePath),
-            this.coverageGaps.get(filePath)
+            this.coverageGaps.get(filePath)?.file
         ]);
         return createHash('sha256').update(JSON.stringify({
             epoch: this.sessionEpoch, scopeRevision: scope.scopeRevision, entries
@@ -2572,7 +2658,14 @@ export class DiffTracker {
     }
 
     public getCoverageGaps(): Array<[string, string]> {
-        return [...this.coverageGaps.entries()].sort(([left], [right]) => left.localeCompare(right));
+        const result: Array<[string, string]> = [];
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (record.file) { result.push([targetPath, record.file.reason]); }
+            if (record.subtree) { result.push([targetPath, record.subtree.reason]); }
+        }
+        return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
+            leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
+        );
     }
 
     public getPolicyFingerprint(): string | undefined { return this.ignoreFingerprint; }
@@ -2843,10 +2936,9 @@ export class DiffTracker {
         if (!this.isRecording || (!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
             this.restoringEpoch !== undefined || this.baselineBuilding || !this.snapshotInitialized) { return; }
         const restored = [...this.pendingImportedDirectoryReconciliation];
-        const restoredMarkers = new Set([...this.importedDirectoryWatchers].filter(([directory, entry]) =>
-            entry.epoch === epoch && entry.provenAbsent && this.fileSnapshots.get(directory) === '' &&
-            !this.baselineExistingFiles.has(directory) && restored.some(root => this.pathBelongsToRoot(directory, root))
-        ).map(([directory]) => directory));
+        const restoredMarkers = new Set(restored.filter(directory =>
+            this.coverageGaps.get(directory)?.subtree !== undefined
+        ));
         try {
             // A same-fingerprint retry must reconcile the gap too. Retain this
             // obligation if discovery fails, even though OS watches now exist.
@@ -2872,12 +2964,10 @@ export class DiffTracker {
             const entry = this.importedDirectoryWatchers.get(directory);
             if (entry?.epoch !== epoch || this.validateResourceTarget(directory)) { continue; }
             try { if (!fs.lstatSync(directory).isDirectory()) { continue; } } catch { continue; }
-            this.fileSnapshots.delete(directory);
-            this.fileModes.delete(directory);
-            this.unresolvedBaselineFiles.delete(directory);
-            this.postBaselineUnknownFiles.delete(directory);
-            this.clearFileReview(directory, true);
-            this.schedulePersistState();
+            this.clearCoverageGap(directory, 'subtree');
+            if (this.fileSnapshots.has(directory) && !this.baselineExistingFiles.has(directory)) {
+                this.clearAbsentDirectorySentinel(directory);
+            }
         }
         restored.forEach(directory => this.pendingImportedDirectoryReconciliation.delete(directory));
     }
@@ -3612,7 +3702,12 @@ export class DiffTracker {
         try {
             const stat = await vscode.workspace.fs.stat(uri);
             if (stat.type & vscode.FileType.Directory) {
-                return { kind: 'unavailable', reason: 'Resource is a directory' };
+                return {
+                    kind: 'unavailable',
+                    targetKind: 'directory',
+                    reasonCode: 'resource-directory',
+                    reason: 'Resource is a directory'
+                };
             }
             if (stat.size > 5 * 1024 * 1024) {
                 const fingerprint = await this.fingerprintLocalFile(uri.fsPath);
@@ -3917,6 +4012,36 @@ export class DiffTracker {
         }
     }
 
+    private normalizeRestoredDirectorySentinels(): boolean {
+        let changed = false;
+        for (const [filePath, baseline] of [...this.fileSnapshots]) {
+            if (baseline !== '' || this.baselineExistingFiles.has(filePath) ||
+                this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath), true) ||
+                this.validateResourceTarget(filePath)) {
+                continue;
+            }
+            let stat: fs.Stats;
+            try { stat = fs.lstatSync(filePath); }
+            catch { continue; }
+            if (!stat.isDirectory() || stat.isSymbolicLink()) { continue; }
+
+            const priorReason = this.coverageGaps.get(filePath)?.file?.reason;
+            this.fileSnapshots.delete(filePath);
+            this.fileModes.delete(filePath);
+            this.unresolvedBaselineFiles.delete(filePath);
+            this.postBaselineUnknownFiles.delete(filePath);
+            this.clearFileReview(filePath, true);
+            this.clearCoverageGap(filePath, 'file', false);
+            this.setSubtreeCoverageGap(
+                filePath,
+                'legacy-directory-sentinel',
+                priorReason ?? 'Restored directory coverage requires subtree reconciliation'
+            );
+            changed = true;
+        }
+        return changed;
+    }
+
     private async rebuildTrackedChangesFromSnapshots(): Promise<void> {
         const epoch = this.sessionEpoch;
         this.clearTrackedChanges();
@@ -3928,15 +4053,16 @@ export class DiffTracker {
         for (const filePath of this.retainedReviewPaths) {
             if (this.preserveUnverifiedRootReview(filePath)) { restoredGapReviewPaths.add(filePath); }
         }
-        for (const [filePath, reason] of this.coverageGaps) {
-            if (restoredGapReviewPaths.has(filePath)) { continue; }
+        for (const [filePath, record] of this.coverageGaps) {
+            const evidence = record.file;
+            if (!evidence || restoredGapReviewPaths.has(filePath)) { continue; }
             const hasBaselineEvidence = this.fileSnapshots.has(filePath) ||
                 this.opaqueBaselineFiles.has(filePath) ||
                 this.unresolvedBaselineFiles.has(filePath);
             if (!hasBaselineEvidence) { continue; }
             const uri = vscode.Uri.file(filePath);
             if (this.isPathIgnored(uri, false, true, false)) { continue; }
-            this.markFileUnavailable(filePath, reason);
+            this.markFileUnavailable(filePath, evidence.reason);
             restoredGapReviewPaths.add(filePath);
         }
 
@@ -3959,7 +4085,16 @@ export class DiffTracker {
             if (currentState.kind === 'missing' && this.baselineExistingFiles.has(filePath)) {
                 this.updateTrackedDiff(filePath, '', { currentExists: false });
             } else if (currentState.kind === 'unavailable') {
-                if (this.isStableUnsupportedState(currentState)) {
+                if (currentState.targetKind === 'directory') {
+                    if (this.baselineExistingFiles.has(filePath)) {
+                        this.markFileUnavailable(
+                            filePath,
+                            'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+                        );
+                    } else {
+                        this.clearAbsentDirectorySentinel(filePath);
+                    }
+                } else if (this.isStableUnsupportedState(currentState)) {
                     this.markOpaqueReview(
                         filePath,
                         currentState,
@@ -4158,17 +4293,30 @@ export class DiffTracker {
     private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number, refreshVersion?: number): Promise<void> {
         const isCurrent = () => this.isCurrentEpoch(epoch) && (refreshVersion === undefined || refreshVersion === this.ignoreRefreshVersion);
         if (!isCurrent()) { return; }
-        if (!duringScan && !this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
-            (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
-            // Persist proven absence, so deleting this new tree clears its
-            // unavailable marker even after restoring the session. Scan-time
-            // and older unknown paths must retain their uncertainty.
+        const historicalFileEvidence = this.baselineExistingFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath);
+        if (!historicalFileEvidence) {
+            // A directory coverage obligation is not an absent text-file baseline.
+            // Remove only synthetic/unverified file projections; real file
+            // before-images remain protected by the branch below.
+            if (this.fileSnapshots.has(filePath) && !this.baselineExistingFiles.has(filePath)) {
+                this.clearAbsentDirectorySentinel(filePath);
+            }
             this.unresolvedBaselineFiles.delete(filePath);
             this.postBaselineUnknownFiles.delete(filePath);
-            this.fileSnapshots.set(filePath, '');
-            await this.completeBaseline(epoch);
+            this.clearCoverageGap(filePath, 'file', false);
+            this.clearFileReview(filePath, true);
+        } else {
+            this.markFileUnavailable(
+                filePath,
+                'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+            );
         }
-        if (isCurrent()) { this.markFileUnavailable(filePath, reason); }
+        if (!isCurrent()) { return; }
+        this.setSubtreeCoverageGap(
+            filePath,
+            duringScan ? 'directory-scan-coverage-gap' : 'directory-runtime-coverage-gap',
+            reason
+        );
     }
 
     private clearAbsentDirectorySentinel(filePath: string): boolean {
@@ -4230,9 +4378,12 @@ export class DiffTracker {
                 // sentinel must not survive persistence: directories are not
                 // file review targets, and each discovered child receives its
                 // own absence provenance below.
-                const removedAbsentSentinel = !scanEvent && this.clearAbsentDirectorySentinel(filePath);
-                if (!removedAbsentSentinel && this.fileSnapshots.has(filePath)) {
-                    this.updateTrackedDiff(filePath, '', { currentExists: false });
+                const removedAbsentSentinel = this.clearAbsentDirectorySentinel(filePath);
+                if (!removedAbsentSentinel && this.fileSnapshots.has(filePath) && this.baselineExistingFiles.has(filePath)) {
+                    this.markFileUnavailable(
+                        filePath,
+                        'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+                    );
                 }
                 // Native watchers may report only the parent when a populated
                 // directory appears; its nested .gitignore events are not guaranteed.
@@ -4253,8 +4404,12 @@ export class DiffTracker {
                     }
                     if (watchFailed && creationIsCurrent()) {
                         await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
-                    } else if (removedAbsentSentinel && creationIsCurrent()) {
-                        this.schedulePersistState();
+                    } else if (creationIsCurrent()) {
+                        // A successful watch plus the completed bounded scan above
+                        // satisfies an existing diagnostic; watcher installation
+                        // alone never clears the obligation.
+                        this.clearCoverageGap(filePath, 'subtree');
+                        if (removedAbsentSentinel) { this.schedulePersistState(); }
                     }
                 } catch {
                     if (creationIsCurrent()) {
@@ -4280,6 +4435,17 @@ export class DiffTracker {
                 return;
             }
             if (state.kind === 'unavailable') {
+                if (state.targetKind === 'directory') {
+                    if (this.fileSnapshots.has(filePath) && this.baselineExistingFiles.has(filePath)) {
+                        this.markFileUnavailable(
+                            filePath,
+                            'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+                        );
+                    } else if (this.fileSnapshots.has(filePath) && !this.baselineExistingFiles.has(filePath)) {
+                        this.clearAbsentDirectorySentinel(filePath);
+                    }
+                    return;
+                }
                 if (this.isStableUnsupportedState(state) && this.fileSnapshots.has(filePath)) {
                     this.markOpaqueReview(
                         filePath,
@@ -4317,7 +4483,8 @@ export class DiffTracker {
         const operationId = this.beginExternalOperation(uri, 'delete');
         try {
             // Remove watches only for a confirmed missing subtree.
-            if (!fs.existsSync(uri.fsPath)) { this.removeImportedDirectoryWatchers(uri.fsPath); }
+            const confirmedMissing = !fs.existsSync(uri.fsPath);
+            if (confirmedMissing) { this.removeImportedDirectoryWatchers(uri.fsPath); }
             // A delete notification may race an atomic replacement; confirm actual state.
             const baselinePaths = new Set([...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys()]);
             const targets = new Set([uri.fsPath, ...[...baselinePaths].filter(filePath => {
@@ -4327,6 +4494,9 @@ export class DiffTracker {
             for (const filePath of targets) {
                 if (!this.isCurrentEpoch(epoch)) { return; }
                 await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+            }
+            if (confirmedMissing && this.isCurrentEpoch(epoch)) {
+                this.clearCoverageGap(uri.fsPath, 'subtree');
             }
         } finally {
             this.endExternalOperation(operationId);
@@ -4357,6 +4527,22 @@ export class DiffTracker {
             return;
         }
         if (state.kind === 'unavailable') {
+            if (state.targetKind === 'directory') {
+                if (this.fileSnapshots.has(filePath) && this.baselineExistingFiles.has(filePath)) {
+                    this.markFileUnavailable(
+                        filePath,
+                        'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+                    );
+                } else if (this.fileSnapshots.has(filePath) && !this.baselineExistingFiles.has(filePath)) {
+                    this.clearAbsentDirectorySentinel(filePath);
+                } else if (this.opaqueBaselineFiles.has(filePath)) {
+                    this.markFileUnavailable(
+                        filePath,
+                        'A baseline file is now a directory; file actions are disabled while the replacement directory is preserved'
+                    );
+                }
+                return;
+            }
             if (this.isStableUnsupportedState(state) && this.fileSnapshots.has(filePath)) {
                 this.markOpaqueReview(
                     filePath,

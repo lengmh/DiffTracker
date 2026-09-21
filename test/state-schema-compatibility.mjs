@@ -203,8 +203,9 @@ export function registerStateSchemaCompatibility(harness) {
         const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
         assert.equal(saved.fileSnapshots.some(([target]) => target === directory), false);
         const savedGap = saved.coverageGaps.find(([target]) => target === directory)?.[1];
-        assert.equal(savedGap?.targetKind, 'subtree');
-        assert.equal(typeof savedGap?.reasonCode, 'string');
+        assert.equal(savedGap?.subtree?.targetKind, 'subtree');
+        assert.equal(typeof savedGap?.subtree?.reasonCode, 'string');
+        assert.equal(savedGap?.file, undefined);
     });
 
     test('SCHEMA-V4 restores coverage-gap snapshots as unknown reviews', async () => {

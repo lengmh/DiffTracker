@@ -152,7 +152,7 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
         const p=file('retained.txt');fs.writeFileSync(p,'changed');t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
         if(kind==='opaque')fs.writeFileSync(p,Buffer.from([0,1,2]));
-        if(kind==='unknown')t.coverageGaps.set(p,'historical uncertainty');
+        if(kind==='unknown')t.coverageGaps.set(p,{file:{targetKind:'file',reasonCode:'test-historical-gap',reason:'historical uncertainty'}});
         await t.readFileAndUpdate(p,Uri.file(p));assert.equal(pending(p)?.reviewKind,kind);
         let policy;
         if(source==='gitignore'){
@@ -361,7 +361,7 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
         const p=file('identity-review.txt');fs.writeFileSync(p,kind==='opaque'?Buffer.from([0,1,2]):'current');
         t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
-        if(kind==='unknown')t.coverageGaps.set(p,'prior coverage uncertainty');
+        if(kind==='unknown')t.coverageGaps.set(p,{file:{targetKind:'file',reasonCode:'test-prior-gap',reason:'prior coverage uncertainty'}});
         await t.readFileAndUpdate(p,Uri.file(p));assert.equal(pending(p)?.reviewKind,kind);
         await t.refreshIgnoreMatchers();const fingerprint=t.getPolicyFingerprint();
         const identify=t.workspaceRootIdentityForFolder;
