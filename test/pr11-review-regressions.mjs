@@ -445,8 +445,8 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal((await controller.completeLegacyMigrationUsingCurrentScope()).status,'completed');
             const saved=await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]});
             assert.equal(saved.ok,true,JSON.stringify(saved.errors));
-            assert.equal(controller.getStatus().legacyMigrationComplete,false,
-                'writing the structured request changes the source evidence and invalidates the earlier migration record');
+            assert.equal(controller.getStatus().legacyGlobalRules.length,0,
+                'the live Workspace setting is now structured, so compatibility must rely on committed legacy policy evidence');
             await t.refreshIgnoreMatchers();
             assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3','Save must not publish configured scope');
             assert.equal(t.testIgnorePath(protectedPath).ignored,true,
