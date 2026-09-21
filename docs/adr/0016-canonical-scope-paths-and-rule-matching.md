@@ -16,4 +16,6 @@ status: accepted
 
 include 和 exclude 各自是顺序无关的集合。Scope Revision 对规范化规则排序去重，UI 可以保留输入顺序但不改变语义；重复或冗余规则可以警告但不使配置无效，扩展不自动改写 settings 删除它们。所有 exclude 的并集高于所有 include 的并集，不采用“最后匹配者胜出”。
 
+scope expansion 的证明也按集合语义执行：对每个受影响且仍存在的 Workspace Root，分别判断规则集合的并集是否覆盖原授权/原排除集合，而不是要求某一条 candidate rule 单独覆盖所有 roots。因此 `all:src` 与“每个 root 各一条等价 `folder:src`”在同一 roots 集合上可以证明等价；exclude 同理。无法逐 root 结构化证明的 glob 关系继续 fail closed，仍视为 expansion。
+
 空路径、`.` 或等价根 include 被禁止，避免通过 include 偷渡每根独立的全工作区模式；需要全部根时使用 Whole Workspace。显式 exclude 可以合法地将某一工作区根排空：该根仍属于工作区、范围授权和根集合，只是有效资源集合为空，界面应显示“此根已被显式排除”，而不是伪装成 watcher 故障。已有待审按保留审阅或放弃确认规则处理。

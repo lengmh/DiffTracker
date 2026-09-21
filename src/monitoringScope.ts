@@ -350,19 +350,17 @@ function sameRule(left: MonitoringExcludeRule, right: MonitoringExcludeRule): bo
     return canonicalRuleKey(left) === canonicalRuleKey(right);
 }
 
-function includeCovers(
-    effective: MonitoringIncludeRule,
+function includeRulesCollectivelyCover(
+    effectiveRules: readonly MonitoringIncludeRule[],
     requested: MonitoringIncludeRule,
     roots: readonly CanonicalWorkspaceRootIdentity[]
 ): boolean {
-    if (effective.scope === 'folder') {
-        if (requested.scope !== 'folder' || effective.folder !== requested.folder) { return false; }
-    }
-    const affectedRoots = requested.scope === 'folder'
-        ? roots.filter(root => root.name === requested.folder)
-        : roots;
+    const affectedRoots = roots.filter(root => ruleAppliesToRoot(requested, root.name));
     return affectedRoots.length > 0 && affectedRoots.every(root =>
-        includeCoversRelativePath(effective.path, requested.path, false, root.caseSensitive)
+        effectiveRules.some(existing =>
+            ruleAppliesToRoot(existing, root.name) &&
+            includeCoversRelativePath(existing.path, requested.path, false, root.caseSensitive)
+        )
     );
 }
 
@@ -682,14 +680,14 @@ export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoring
     return { kind: 'configured', ...validated.scope };
 }
 
-function excludeRuleCovers(
+function excludeRuleCoversOnRoot(
     candidate: MonitoringExcludeRule,
     effectiveRule: MonitoringExcludeRule,
-    roots: readonly WorkspaceRootIdentity[]
+    root: WorkspaceRootIdentity
 ): boolean {
-    const affectedRoots = roots.filter(root => ruleAppliesToRoot(effectiveRule, root.name));
-    if (affectedRoots.length === 0) { return true; }
-    if (!affectedRoots.every(root => ruleAppliesToRoot(candidate, root.name))) { return false; }
+    if (!ruleAppliesToRoot(candidate, root.name) || !ruleAppliesToRoot(effectiveRule, root.name)) {
+        return false;
+    }
     if (candidate.pattern === effectiveRule.pattern) { return true; }
 
     // Containment is structural, not inferred from finite path probes. In
@@ -702,39 +700,49 @@ function excludeRuleCovers(
             directory: pattern.endsWith('/') };
     };
     const effective = literal(effectiveRule.pattern);
-    if (!effective) { return false; }
+    if (!effective || typeof root.caseSensitive !== 'boolean') { return false; }
     const raw = candidate.pattern;
     const recursive = raw.startsWith('**/') ? literal(raw.slice(3)) : undefined;
     const ordinary = literal(raw);
     const subtree = raw.endsWith('/**') ? literal(raw.slice(0, -3)) : undefined;
-    return affectedRoots.every(root => {
-        if (typeof root.caseSensitive !== 'boolean') { return false; }
-        const equal = (left: string, right: string) => root.caseSensitive
-            ? left === right : left.toLowerCase() === right.toLowerCase();
-        if (!effective.anchored) {
-            const name = ordinary && !ordinary.anchored ? ordinary :
-                recursive && !recursive.anchored ? recursive : undefined;
-            return !!name && equal(name.parts[0], effective.parts[0]) &&
-                (!name.directory || effective.directory);
+    const equal = (left: string, right: string) => root.caseSensitive
+        ? left === right : left.toLowerCase() === right.toLowerCase();
+
+    if (!effective.anchored) {
+        const name = ordinary && !ordinary.anchored ? ordinary :
+            recursive && !recursive.anchored ? recursive : undefined;
+        return !!name && equal(name.parts[0], effective.parts[0]) &&
+            (!name.directory || effective.directory);
+    }
+    if (ordinary) {
+        if (!ordinary.anchored) {
+            return effective.parts.some((part, index) => equal(part, ordinary.parts[0]) &&
+                (index < effective.parts.length - 1 || !ordinary.directory || effective.directory));
         }
-        if (ordinary) {
-            if (!ordinary.anchored) {
-                return effective.parts.some((part, index) => equal(part, ordinary.parts[0]) &&
-                    (index < effective.parts.length - 1 || !ordinary.directory || effective.directory));
-            }
-            return ordinary.parts.length <= effective.parts.length &&
-                ordinary.parts.every((part, index) => equal(part, effective.parts[index])) &&
-                (ordinary.parts.length < effective.parts.length || !ordinary.directory || effective.directory);
-        }
-        if (recursive && !recursive.anchored) {
-            return effective.parts.some((part, index) => equal(part, recursive.parts[0]) &&
-                (index < effective.parts.length - 1 || !recursive.directory || effective.directory));
-        }
-        // prefix/** covers every resource strictly below a literal prefix,
-        // but cannot cover a file at that prefix itself.
-        return !!subtree && subtree.parts.length < effective.parts.length &&
-            subtree.parts.every((part, index) => equal(part, effective.parts[index]));
-    });
+        return ordinary.parts.length <= effective.parts.length &&
+            ordinary.parts.every((part, index) => equal(part, effective.parts[index])) &&
+            (ordinary.parts.length < effective.parts.length || !ordinary.directory || effective.directory);
+    }
+    if (recursive && !recursive.anchored) {
+        return effective.parts.some((part, index) => equal(part, recursive.parts[0]) &&
+            (index < effective.parts.length - 1 || !recursive.directory || effective.directory));
+    }
+    // prefix/** covers every resource strictly below a literal prefix,
+    // but cannot cover a file at that prefix itself.
+    return !!subtree && subtree.parts.length < effective.parts.length &&
+        subtree.parts.every((part, index) => equal(part, effective.parts[index]));
+}
+
+function excludeRulesCollectivelyCover(
+    candidates: readonly MonitoringExcludeRule[],
+    effectiveRule: MonitoringExcludeRule,
+    roots: readonly WorkspaceRootIdentity[]
+): boolean {
+    const affectedRoots = roots.filter(root => ruleAppliesToRoot(effectiveRule, root.name));
+    if (affectedRoots.length === 0) { return true; }
+    return affectedRoots.every(root =>
+        candidates.some(candidate => excludeRuleCoversOnRoot(candidate, effectiveRule, root))
+    );
 }
 
 export function detectScopeExpansion(
@@ -755,7 +763,7 @@ export function detectScopeExpansion(
 
     if (effective.mode !== 'wholeWorkspace') {
         for (const include of requested.includes) {
-            if (!effective.includes.some(existing => includeCovers(existing, include, requested.roots))) {
+            if (!includeRulesCollectivelyCover(effective.includes, include, requested.roots)) {
                 reasons.push(`New or broader explicit include: ${include.scope === 'folder' ? include.folder + ':' : ''}${include.path}`);
             }
         }
@@ -768,7 +776,7 @@ export function detectScopeExpansion(
             // requested workspace, so removing it cannot broaden remaining scope.
             continue;
         }
-        if (!requested.excludes.some(candidate => excludeRuleCovers(candidate, exclude, requested.roots))) {
+        if (!excludeRulesCollectivelyCover(requested.excludes, exclude, requested.roots)) {
             reasons.push(`Explicit exclude removed or changed: ${exclude.scope === 'folder' ? exclude.folder + ':' : ''}${exclude.pattern}`);
         }
     }

@@ -2783,7 +2783,21 @@ export class DiffTracker {
                 else { this.pendingExternalChanges.add(event.uri.fsPath); }
             }
             await this.processPendingExternalChanges();
-            await this.flushPendingPersistence();
+            const rollbackPersisted = await this.flushPendingPersistence();
+            if (!rollbackPersisted) {
+                const wasRecording = this.isRecording;
+                this.recoveryBlocked = true;
+                this.isRecording = false;
+                this.disposeFileWatchers();
+                this.persistenceFailed = true;
+                this.persistenceIssue =
+                    'Monitoring scope rollback could not be persisted; recovery is blocked because durable storage may still contain the rejected candidate scope.';
+                if (wasRecording) { this._onDidChangeRecordingState.fire(false); }
+                this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+                result.status = 'failed';
+                result.reason = this.persistenceIssue;
+                return result;
+            }
             result.status = requiresS4Reason ? 'requiresS4' : 'failed';
             result.reason = requiresS4Reason ??
                 (error instanceof Error ? error.message : 'Monitoring scope preparation failed');
