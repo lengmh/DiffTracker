@@ -406,6 +406,32 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     }
 }
 
+
+{
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-path-distinct-case-'));
+    const first = path.join(parent, 'CaseProof');
+    const alternate = path.join(parent, 'caseProof');
+    fs.mkdirSync(first);
+    let distinctVariants = false;
+    try {
+        fs.mkdirSync(alternate);
+        distinctVariants = fs.realpathSync.native(first) !== fs.realpathSync.native(alternate);
+    } catch {
+        // Case-insensitive hosts cannot create two distinct variants.
+    }
+    try {
+        if (distinctVariants) {
+            assert.equal(
+                detectLocalPathCaseSensitivity(first),
+                true,
+                'two distinct resources at toggled casing prove case-sensitive lookup'
+            );
+        }
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+}
+
 for (const [before,after,expands] of [
     ['secret','/secret',true], ['secret/','/secret/',true], ['secret','**/secret',false],
     ['secret/','secret',false], ['secret','secret/',true],

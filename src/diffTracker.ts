@@ -503,6 +503,7 @@ export class DiffTracker {
     private pendingExternalChanges = new Set<string>();
     private externalChangeTimers = new Map<string, NodeJS.Timeout>();
     private documentChangeTimers = new Map<string, NodeJS.Timeout>();
+    private scopeApplyPreflight = false;
     private watcherSuppressionTimers = new Map<string, NodeJS.Timeout>();
     private automationSessions = new Map<string, AutomationSession>();
     private automationFileRefCounts = new Map<string, number>();
@@ -1466,6 +1467,63 @@ export class DiffTracker {
         this.documentChangeTimers.clear();
     }
 
+    private preserveDeferredScopeApplyEvent(filePath: string): void {
+        filePath = this.canonicalTrackingPath(filePath);
+        const reason = 'File event was observed before monitoring scope application; prior review evidence is preserved until the current state is reconciled';
+        if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
+            !this.unresolvedBaselineFiles.has(filePath)) {
+            this.unresolvedBaselineFiles.set(filePath, reason);
+        }
+        this.coverageGaps.set(filePath, reason);
+        this.markFileUnavailable(filePath, reason);
+        this.schedulePersistState();
+    }
+
+    private async drainDeferredScopeApplyEvents(epoch: number): Promise<boolean> {
+        const deadline = Date.now() + 5000;
+        this.scopeApplyPreflight = true;
+        try {
+            while (this.isCurrentEpoch(epoch)) {
+                const documentPaths = [...this.documentChangeTimers.keys()];
+                const externalPaths = [...this.externalChangeTimers.keys()];
+                for (const filePath of documentPaths) {
+                    const timer = this.documentChangeTimers.get(filePath);
+                    if (timer) { clearTimeout(timer); }
+                    this.documentChangeTimers.delete(filePath);
+                    const uri = vscode.Uri.file(filePath);
+                    if (this.pendingScopeExplicitlyExcludes(uri)) {
+                        this.preserveDeferredScopeApplyEvent(filePath);
+                        continue;
+                    }
+                    const doc = vscode.workspace.textDocuments.find(value =>
+                        value.uri.scheme === 'file' && this.canonicalTrackingPath(value.uri.fsPath) === filePath);
+                    if (doc) { this.processDocumentChange(doc); }
+                }
+                for (const filePath of externalPaths) {
+                    const timer = this.externalChangeTimers.get(filePath);
+                    if (timer) { clearTimeout(timer); }
+                    this.externalChangeTimers.delete(filePath);
+                    const uri = vscode.Uri.file(filePath);
+                    if (this.pendingScopeExplicitlyExcludes(uri)) {
+                        this.preserveDeferredScopeApplyEvent(filePath);
+                        continue;
+                    }
+                    await this.readFileAndUpdate(filePath, uri);
+                    if (!this.isCurrentEpoch(epoch)) { return false; }
+                }
+                if (this.activeExternalOperations.size === 0 && this.activeCreations.size === 0 &&
+                    this.externalChangeTimers.size === 0 && this.documentChangeTimers.size === 0) {
+                    return true;
+                }
+                if (Date.now() >= deadline) { return false; }
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            return false;
+        } finally {
+            this.scopeApplyPreflight = false;
+        }
+    }
+
     private clearWatcherSuppressionTimers(): void {
         this.watcherSuppressionTimers.forEach(timer => clearTimeout(timer));
         this.watcherSuppressionTimers.clear();
@@ -2319,6 +2377,10 @@ export class DiffTracker {
             }
         }
         const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
+        const preflightEpoch = this.sessionEpoch;
+        if (!await this.drainDeferredScopeApplyEvents(preflightEpoch) || !requestStillCurrent()) {
+            return empty('conflict', 'Monitoring scope preparation could not drain file events observed under the current effective scope; retry after file activity settles.');
+        }
         const approvedDiscardRevision = discardExplicitlyExcludedReviews
             ? expectedAffectedReviewRevision ?? this.getExplicitlyExcludedReviewRevision(scope) : undefined;
         let approvedReviewsDiscarded = false;
@@ -2383,6 +2445,7 @@ export class DiffTracker {
             !this.recoveryBlocked &&
             !this.explicitIncludeNeedsSupplementalCoverage(scope) &&
             discardApprovalStillCurrent() &&
+            (transaction.observedEvents?.size ?? 0) === 0 &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
         transaction.valid = scopeContextStillCurrent;
         if (!scopeContextStillCurrent()) {
@@ -4017,14 +4080,18 @@ export class DiffTracker {
         }
 
         if (this.deferInitialIgnoreEvent(uri)) { return; }
+        const filePath = uri.fsPath;
+        this.recordBaselineTransactionEvent(uri, 'change');
+        if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
+            this.preserveDeferredScopeApplyEvent(filePath);
+            return;
+        }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
 
-        const filePath = uri.fsPath;
         if (this.retainCoverageGapReview(filePath)) { return; }
-        this.recordBaselineTransactionEvent(uri, 'change');
         const operationId = this.beginExternalOperation(uri, 'change');
         try {
             const scanEvent = this.markScanEvent(filePath);
@@ -4038,6 +4105,11 @@ export class DiffTracker {
             const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && this.canonicalTrackingPath(d.uri.fsPath) === filePath);
             if (doc && doc.isDirty) {
                 this.markFileUnavailable(filePath, 'External change while editor has unsaved content; reconcile disk and buffer before review');
+                return;
+            }
+
+            if (this.scopeApplyPreflight) {
+                await this.readFileAndUpdate(filePath, uri);
                 return;
             }
 
@@ -4121,14 +4193,18 @@ export class DiffTracker {
         }
 
         if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
+        const filePath = uri.fsPath;
+        this.recordBaselineTransactionEvent(uri, 'create');
+        if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
+            this.preserveDeferredScopeApplyEvent(filePath);
+            return;
+        }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
         }
 
-        const filePath = uri.fsPath;
         if (this.retainCoverageGapReview(filePath)) { return; }
-        this.recordBaselineTransactionEvent(uri, 'create');
         const scanEvent = this.markScanEvent(filePath) || (duringScan && !this.hasCapturedBaseline(filePath));
         // Capture creation evidence before stat/ignore discovery can yield. A
         // concurrent refresh must not classify this directory's children as old.
@@ -4221,10 +4297,14 @@ export class DiffTracker {
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
+        this.recordBaselineTransactionEvent(uri, 'delete');
+        if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
+            this.preserveDeferredScopeApplyEvent(uri.fsPath);
+            return;
+        }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) { return; }
         if (this.retainCoverageGapReview(uri.fsPath)) { return; }
-        this.recordBaselineTransactionEvent(uri, 'delete');
         const operationId = this.beginExternalOperation(uri, 'delete');
         try {
             // Remove watches only for a confirmed missing subtree.
@@ -6259,6 +6339,11 @@ export class DiffTracker {
             return;
         }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
+        this.recordBaselineTransactionEvent(uri, 'change');
+        if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
+            this.preserveDeferredScopeApplyEvent(filePath);
+            return;
+        }
         if (this.deferPendingScopeEvent(uri)) { return; }
         if (this.isPathIgnored(uri)) {
             return;
@@ -6284,6 +6369,11 @@ export class DiffTracker {
                 }
                 return;
             }
+        }
+
+        if (this.scopeApplyPreflight) {
+            this.processDocumentChange(doc);
+            return;
         }
 
         const existingTimer = this.documentChangeTimers.get(filePath);

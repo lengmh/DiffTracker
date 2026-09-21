@@ -39,7 +39,9 @@ function probeExistingPath(existingPath: string): boolean | undefined {
         return true;
     }
     const same = sameExistingResource(existingPath, alternate);
-    return same === true ? false : undefined;
+    if (same === true) { return false; }
+    if (same === false) { return true; }
+    return undefined;
 }
 
 /**

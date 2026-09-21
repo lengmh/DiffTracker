@@ -3229,7 +3229,7 @@ registerStateSchemaCompatibility({
 });
 
 registerPR11ReviewRegressions({
-    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode,
+    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document,
     getTracker: () => tracker, setTracker: value => { tracker = value; },
     setListedFiles: value => { listedFiles = value; },
     setListedIgnores: value => { listedIgnores = value; },

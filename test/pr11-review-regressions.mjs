@@ -4,7 +4,7 @@ import path from 'node:path';
 import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 export function registerPR11ReviewRegressions(h) {
-    const { test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode } = h;
+    const { test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document } = h;
     const scope = (includes = [], excludes = []) => {
         const checked = validateAndCanonicalizeScope({mode:'rules',includes,excludes}, h.getTracker().currentWorkspaceRootIdentities());
         assert.equal(checked.ok,true,JSON.stringify(checked.errors));
@@ -313,4 +313,62 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(t.getOriginalContent(p),'baseline');
         }finally{vscode.workspace.fs.readFile=read;}
     });
+
+    test('PR11 Save preserves active legacy Workspace strings until migration completes',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,writes=[],state=new Map();
+        const legacy=['legacy-private/'];
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            return {...base,
+                inspect:key=>key==='watchExclude'?{workspaceValue:legacy}:undefined,
+                get:(key,fallback)=>key==='watchExclude'?legacy:base.get(key,fallback),
+                update:async(...args)=>writes.push(args)
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3');
+            const result=await controller.saveRequestedScope({
+                mode:'rules',includes:[],excludes:[{scope:'all',pattern:'new-private/**'}]
+            });
+            assert.equal(result.ok,false);assert.match(result.errors.map(e=>e.message).join(' '),/legacy.*migration/i);
+            assert.equal(writes.length,0,'Save must not shadow active Workspace legacy strings before migration');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
+    for(const source of ['external','document']) test(`PR11 scope apply drains pre-existing ${source} debounce before exclusion publication`,async()=>{
+        const t=h.getTracker(),p=file(`deferred-${source}.txt`);
+        fs.writeFileSync(p,'baseline');t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
+        if(source==='external'){
+            fs.writeFileSync(p,'changed');await t.onExternalFileChanged(Uri.file(p));
+            assert.equal(t.externalChangeTimers.has(p),true);
+        }else{
+            const doc=document(p);doc.text='changed';doc.isDirty=true;doc.version++;
+            t.onDocumentChanged({document:doc,contentChanges:[{text:'changed'}]});
+            assert.equal(t.documentChangeTimers.has(p),true);
+        }
+        const requested=scope([], [{scope:'all',pattern:relative(p)}]);
+        const result=await t.applyConfiguredMonitoringScope(requested);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.ok(pending(p),'event observed under the old scope must remain reviewable');
+        assert.ok(t.getRetainedReviewPaths().includes(p));
+        assert.equal(result.retainedReviews,1);
+    });
+
+    test('PR11 event arriving during scope transaction aborts publication and replays under committed scope',async()=>{
+        const t=h.getTracker(),p=file('transaction-event.txt'),storage=file('transaction-event-storage');
+        t.storageUri=Uri.file(storage);fs.writeFileSync(p,'baseline');
+        t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
+        await t.flushPendingPersistence();
+        const requested=scope([], [{scope:'all',pattern:relative(p)}]);
+        const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+        const applying=t.applyConfiguredMonitoringScope(requested);await gate.entered;
+        fs.writeFileSync(p,'changed during apply');await t.onExternalFileChanged(Uri.file(p));
+        gate.release();const result=await applying;
+        assert.notEqual(result.status,'applied',JSON.stringify(result));
+        await waitUntil(()=>!!pending(p));
+        assert.notEqual(t.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+        assert.equal(t.getOriginalContent(p),'baseline');
+    });
+
 }

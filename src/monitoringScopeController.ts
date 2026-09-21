@@ -172,9 +172,27 @@ export class MonitoringScopeController implements vscode.Disposable {
         };
     }
 
-    public async saveRequestedScope(request: MonitoringScopeRequest): Promise<ScopeValidationResult> {
+    public async saveRequestedScope(
+        request: MonitoringScopeRequest,
+        options?: { allowLegacyMigrationWrite?: boolean }
+    ): Promise<ScopeValidationResult> {
         const validated = validateAndCanonicalizeScope(request, this.getWorkspaceRoots());
         if (!validated.ok || !validated.scope) { return validated; }
+        const effective = this.tracker.getEffectiveMonitoringScope();
+        const legacyRules = this.getLegacyWatchRules();
+        const migrationComplete = legacyRules.length === 0 ||
+            scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots());
+        if (!options?.allowLegacyMigrationWrite && effective.kind === 'legacyV3' &&
+            legacyRules.length > 0 && !migrationComplete) {
+            return {
+                ok: false,
+                errors: [{
+                    field: 'exclude',
+                    message: 'Legacy watchExclude strings are still active. Complete or explicitly resolve legacy migration before saving structured monitoring-scope settings.'
+                }],
+                warnings: validated.warnings
+            };
+        }
         const config = vscode.workspace.getConfiguration('diffTracker');
         await config.update('monitoringScope', validated.scope.mode, vscode.ConfigurationTarget.Workspace);
         await config.update('watchInclude', validated.scope.includes, vscode.ConfigurationTarget.Workspace);
@@ -266,7 +284,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             mode: 'rules',
             includes: preview.includes,
             excludes: preview.excludes
-        });
+        }, { allowLegacyMigrationWrite: true });
         if (!validated.ok || !validated.scope) {
             return { status: 'conflict', reason: validated.errors.map(error => error.message).join('; ') };
         }
