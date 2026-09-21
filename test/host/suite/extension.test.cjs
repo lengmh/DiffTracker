@@ -107,6 +107,27 @@ module.exports = async function runExtensionHostScenario() {
         // an include whose future events are suppressed by files.watcherExclude.
         const filesConfig = vscode.workspace.getConfiguration('files');
         const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
+
+        // The Start command must project the backend's actual post-start state.
+        // Create a real S3 refusal: an already-effective explicit include becomes
+        // unobservable because files.watcherExclude changes after publication.
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        await filesConfig.update('watcherExclude', { '**/dist/s3-private/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        const refusedStart = await vscode.commands.executeCommand('diffTracker.startRecording');
+        assert.equal(refusedStart, false, 'backend must refuse Start while the effective include lacks observation coverage');
+        const refusedStartState = await state();
+        assert.equal(refusedStartState.isRecording, false);
+        assert.equal(refusedStartState.recordingContext, false,
+            'the command context must remain false when DiffTracker.startRecording() refuses');
+        await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker.startRecording'), true,
+            'restoring observation coverage must leave a valid recovery path');
+        await until('Ready baseline after rejected Start recovery', async () => (await state()).baselineState === 'ready');
+        console.log('PASS HOST-S3 rejected Start keeps recording command context false');
+
         await filesConfig.update('watcherExclude', { '**/watcher-hidden/**': true },
             vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchInclude', [

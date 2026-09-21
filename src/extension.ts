@@ -64,6 +64,16 @@ function isDeletedReview(filePath: string, filePathOrItem: string | any): boolea
 export async function activate(context: vscode.ExtensionContext) {
     const runningExtensionTests = context.extensionMode === vscode.ExtensionMode.Test;
 
+    // Test-only observability for the command context published by this extension.
+    // This does not change the production context-key contract; it only records
+    // the value passed through the same setContext call so Host regressions can
+    // compare UI projection with backend recording state.
+    let testRecordingContext: boolean | undefined;
+    const setRecordingContext = (value: boolean): void => {
+        if (runningExtensionTests) { testRecordingContext = value; }
+        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', value);
+    };
+
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
     // Install requested-scope gating before restoration so a pending explicit
@@ -192,14 +202,14 @@ export async function activate(context: vscode.ExtensionContext) {
         if (gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
         }
-        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', true);
+        setRecordingContext(true);
         return diffTracker.getIsRecording();
     };
 
     const stopRecordingFlow = () => {
         ++recordingRequest;
         diffTracker.stopRecording();
-        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', false);
+        setRecordingContext(false);
     };
 
     // Register toggle setting command
@@ -380,6 +390,7 @@ export async function activate(context: vscode.ExtensionContext) {
         context.subscriptions.push(
             vscode.commands.registerCommand('diffTracker._testState', () => ({
                 isRecording: diffTracker.getIsRecording(),
+                recordingContext: testRecordingContext,
                 baselineState: diffTracker.getBaselineState(),
                 reviewTokens: diffTracker.getReviewTokens(),
                 opaqueReviewTokens: diffTracker.getOpaqueReviewTokens(),
@@ -1049,7 +1060,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     refreshChangesTree();
-    await vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', diffTracker.getIsRecording());
+    setRecordingContext(diffTracker.getIsRecording());
 
     if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
         updateVisibleDecorations();

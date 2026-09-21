@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
+import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR11ReviewRegressions(h) {
     const { test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document } = h;
@@ -11,6 +12,59 @@ export function registerPR11ReviewRegressions(h) {
         return checked.scope;
     };
     const relative = p => path.relative(root,p).split(path.sep).join('/');
+
+
+    test('PR11 migration completion is invalidated when legacy source evidence changes',async()=>{
+        const old=vscode.workspace.getConfiguration;
+        let workspaceValue=['legacy-a/'];
+        const state=new Map();
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            return {...base,
+                inspect:key=>key==='watchExclude'?{workspaceValue}:base.inspect?.(key),
+                get:(key,fallback)=>key==='watchExclude'?workspaceValue:base.get(key,fallback)
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            assert.equal(controller.getStatus().legacyMigrationComplete,false);
+            await controller.markLegacyMigrationComplete();
+            assert.equal(controller.getStatus().legacyMigrationComplete,true);
+            workspaceValue=['legacy-b/'];
+            assert.equal(controller.getStatus().legacyMigrationComplete,false,
+                'a migration authorization must not survive a legacy source change on the same roots');
+            assert.equal((await controller.applyPendingScope()).status,'needsMigration');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
+    test('PR11 directory watcher failure remains a subtree diagnostic, not a file review',async()=>{
+        const t=h.getTracker(),dir=file('coverage-only-directory');
+        fs.mkdirSync(dir);
+        const previousLimit=t.maxImportedDirectoryWatchers;
+        t.maxImportedDirectoryWatchers=0;
+        try{
+            await t.onExternalFileCreated(Uri.file(dir));
+            assert.equal(pending(dir),undefined,'a pure directory must never become an unknown file review');
+            assert.equal(t.fileSnapshots.has(dir),false,'a pure directory must not receive a file snapshot sentinel');
+            assert.ok(t.getCoverageGaps().some(([target])=>target===dir),
+                'the watcher failure must remain visible as a coverage diagnostic');
+        }finally{t.maxImportedDirectoryWatchers=previousLimit;}
+    });
+
+    test('PR11 insensitive lookup recognizes the unique actual multi-character entry spelling',async()=>{
+        const parent=file('case-spelling-parent');
+        fs.mkdirSync(parent);
+        const actual=path.join(parent,'Foo');
+        fs.mkdirSync(actual);
+        const query=path.join(parent,'FOO');
+        const names=fs.readdirSync(parent);
+        if(!fs.existsSync(query)||names.includes('FOO')){
+            console.log('SKIP PR11 multi-character insensitive spelling scenario on a case-sensitive root');
+            return;
+        }
+        assert.equal(detectLocalPathCaseSensitivity(query),false,
+            'the unique actual Foo entry must prove that FOO resolves through case-insensitive lookup');
+    });
 
     for(const phase of ['read','write']) for(const committedAffected of [false,true]) {
         test(`PR11 candidate coverage callback ${phase} (committedAffected=${committedAffected})`,async()=>{
