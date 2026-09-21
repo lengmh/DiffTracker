@@ -62,8 +62,12 @@ export interface ScopeConsentRecord {
 }
 
 export interface ScopeMigrationRecord {
-    model: 1;
-    roots: WorkspaceRootIdentity[];
+    model: 2;
+    roots: CanonicalWorkspaceRootIdentity[];
+    approvedLegacySourceFingerprint: string;
+    currentLegacySourceFingerprint: string;
+    targetScopeRevision: string;
+    decision: 'automatic' | 'manual';
 }
 
 export interface LegacyRuleMigrationPreview {
@@ -95,6 +99,30 @@ const SCOPE_REVISION_MODEL = 1;
 
 function stableHash(value: unknown): string {
     return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function canonicalEvidenceValue(value: unknown): unknown {
+    if (value === undefined) { return { __type: 'undefined' }; }
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') { return value; }
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : { __type: 'number', value: String(value) };
+    }
+    if (Array.isArray(value)) { return value.map(canonicalEvidenceValue); }
+    if (typeof value === 'object') {
+        const source = value as Record<string, unknown>;
+        const result: Record<string, unknown> = {};
+        for (const key of Object.keys(source).sort(compareText)) {
+            result[key] = canonicalEvidenceValue(source[key]);
+        }
+        return result;
+    }
+    return { __type: typeof value, value: String(value) };
+}
+
+export function createLegacySourceFingerprint(source: unknown): string {
+    return createHash('sha256')
+        .update(JSON.stringify({ model: 1, source: canonicalEvidenceValue(source) }))
+        .digest('hex');
 }
 
 function compareText(left: string, right: string): number {
@@ -527,22 +555,54 @@ export function previewLegacyWatchExcludeMigration(
     return { excludes, includes, manual, ignoredNoops };
 }
 
-export function createScopeMigrationRecord(roots: readonly CanonicalWorkspaceRootIdentity[]): ScopeMigrationRecord {
+export function createScopeMigrationRecord(
+    roots: readonly CanonicalWorkspaceRootIdentity[],
+    approvedLegacySourceFingerprint: string,
+    currentLegacySourceFingerprint: string,
+    targetScopeRevision: string,
+    decision: 'automatic' | 'manual'
+): ScopeMigrationRecord {
     return {
-        model: 1,
-        roots: roots.map(root => ({ ...root })).sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name))
+        model: 2,
+        roots: roots.map(root => ({ ...root })).sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name)),
+        approvedLegacySourceFingerprint,
+        currentLegacySourceFingerprint,
+        targetScopeRevision,
+        decision
     };
 }
 
-export function scopeMigrationMatches(raw: unknown, roots: readonly WorkspaceRootIdentity[]): boolean {
+export function scopeMigrationMatches(
+    raw: unknown,
+    roots: readonly WorkspaceRootIdentity[],
+    currentLegacySourceFingerprint: string,
+    targetScopeRevision: string
+): boolean {
     if (!raw || typeof raw !== 'object') { return false; }
     const value = raw as Partial<ScopeMigrationRecord>;
-    if (value.model !== 1 || !Array.isArray(value.roots)) { return false; }
+    if (value.model !== 2 || !Array.isArray(value.roots) ||
+        typeof value.approvedLegacySourceFingerprint !== 'string' ||
+        typeof value.currentLegacySourceFingerprint !== 'string' ||
+        typeof value.targetScopeRevision !== 'string' ||
+        (value.decision !== 'automatic' && value.decision !== 'manual')) {
+        return false;
+    }
+    const fingerprint = /^[0-9a-f]{64}$/;
+    if (!fingerprint.test(value.approvedLegacySourceFingerprint) ||
+        !fingerprint.test(value.currentLegacySourceFingerprint) ||
+        !fingerprint.test(currentLegacySourceFingerprint) ||
+        !fingerprint.test(value.targetScopeRevision) ||
+        !fingerprint.test(targetScopeRevision)) {
+        return false;
+    }
     const errors: ScopeValidationError[] = [];
     const canonicalRoots = normalizeRoots(roots, errors);
     if (errors.length > 0) { return false; }
-    const expected = createScopeMigrationRecord(canonicalRoots);
-    return JSON.stringify(value.roots) === JSON.stringify(expected.roots);
+    const expectedRoots = canonicalRoots.map(root => ({ ...root }))
+        .sort((a, b) => compareText(a.uri, b.uri) || compareText(a.name, b.name));
+    return JSON.stringify(value.roots) === JSON.stringify(expectedRoots) &&
+        value.currentLegacySourceFingerprint === currentLegacySourceFingerprint &&
+        value.targetScopeRevision === targetScopeRevision;
 }
 
 function rootKey(root: WorkspaceRootIdentity): string {

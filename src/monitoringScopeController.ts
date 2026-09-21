@@ -3,6 +3,7 @@ import { DiffTracker } from './diffTracker';
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
+    createLegacySourceFingerprint,
     createScopeConsentRecord,
     createScopeMigrationRecord,
     detectScopeExpansion,
@@ -18,7 +19,25 @@ import {
 
 const CONSENT_KEY = 'diffTracker.monitoringScope.consent.v1';
 const DISMISSED_KEY = 'diffTracker.monitoringScope.dismissedRevision.v1';
-const MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v1';
+const MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v2';
+const LEGACY_MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v1';
+
+type LegacySourceValueEvidence =
+    | { kind: 'unset' }
+    | { kind: 'value'; value: unknown };
+
+interface LegacySourceSnapshot {
+    model: 1;
+    semanticsModel: 'legacy-watch-exclude-v1';
+    roots: WorkspaceRootIdentity[];
+    global: LegacySourceValueEvidence;
+    workspace: LegacySourceValueEvidence;
+    folders: Array<{
+        root: WorkspaceRootIdentity;
+        workspaceFolder: LegacySourceValueEvidence;
+        effective: LegacySourceValueEvidence;
+    }>;
+}
 
 export interface MonitoringScopeStatus {
     requested: ScopeValidationResult;
@@ -118,6 +137,73 @@ export class MonitoringScopeController implements vscode.Disposable {
         return [...rules];
     }
 
+    private legacySourceValue(value: unknown): LegacySourceValueEvidence {
+        return value === undefined ? { kind: 'unset' } : { kind: 'value', value };
+    }
+
+    private getLegacySourceSnapshot(roots = this.getWorkspaceRoots()): LegacySourceSnapshot {
+        const config = vscode.workspace.getConfiguration('diffTracker');
+        const inspected = typeof config.inspect === 'function'
+            ? config.inspect<unknown>('watchExclude')
+            : undefined;
+        const folders = roots.map(root => {
+            const folder = (vscode.workspace.workspaceFolders ?? [])
+                .find(candidate => candidate.uri.toString() === root.uri);
+            if (!folder) {
+                return {
+                    root: { ...root },
+                    workspaceFolder: this.legacySourceValue(undefined),
+                    effective: this.legacySourceValue(undefined)
+                };
+            }
+            const scoped = vscode.workspace.getConfiguration('diffTracker', folder.uri);
+            const scopedInspected = typeof scoped.inspect === 'function'
+                ? scoped.inspect<unknown>('watchExclude')
+                : undefined;
+            return {
+                root: { ...root },
+                workspaceFolder: this.legacySourceValue(scopedInspected?.workspaceFolderValue),
+                effective: this.legacySourceValue(scoped.get<unknown>('watchExclude'))
+            };
+        });
+        return {
+            model: 1,
+            semanticsModel: 'legacy-watch-exclude-v1',
+            roots: roots.map(root => ({ ...root })),
+            global: this.legacySourceValue(inspected?.globalValue),
+            workspace: this.legacySourceValue(inspected?.workspaceValue),
+            folders
+        };
+    }
+
+    private getLegacySourceFingerprint(roots = this.getWorkspaceRoots()): string {
+        return createLegacySourceFingerprint(this.getLegacySourceSnapshot(roots));
+    }
+
+    private migrationUnaffectedSourcesMatch(before: LegacySourceSnapshot, after: LegacySourceSnapshot): boolean {
+        const projection = (snapshot: LegacySourceSnapshot) => ({
+            model: snapshot.model,
+            semanticsModel: snapshot.semanticsModel,
+            roots: snapshot.roots,
+            global: snapshot.global,
+            folders: snapshot.folders.map(folder => ({
+                root: folder.root,
+                workspaceFolder: folder.workspaceFolder
+            }))
+        });
+        return createLegacySourceFingerprint(projection(before)) ===
+            createLegacySourceFingerprint(projection(after));
+    }
+
+    private migrationRecordMatches(scopeRevision: string, roots = this.getWorkspaceRoots()): boolean {
+        return scopeMigrationMatches(
+            this.context.workspaceState.get(MIGRATION_KEY),
+            roots,
+            this.getLegacySourceFingerprint(roots),
+            scopeRevision
+        );
+    }
+
     public getRequestedRawScope(): { mode: unknown; includes: unknown; excludes: unknown } {
         const mode = this.inspectWorkspaceValue<unknown>('monitoringScope');
         const includes = this.inspectWorkspaceValue<unknown>('watchInclude');
@@ -164,7 +250,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             consented: !!canonical && scopeConsentMatches(this.context.workspaceState.get(CONSENT_KEY), canonical),
             dismissed: !!canonical && dismissedRevision === canonical.scopeRevision,
             legacyMigrationComplete: legacyGlobalRules.length === 0 ||
-                scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots()),
+                (!!canonical && this.migrationRecordMatches(canonical.scopeRevision)),
             legacyGlobalRules,
             workspaceRequestPresent: this.hasWorkspaceScopeRequest(),
             expansionReasons,
@@ -181,7 +267,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const effective = this.tracker.getEffectiveMonitoringScope();
         const legacyRules = this.getLegacyWatchRules();
         const migrationComplete = legacyRules.length === 0 ||
-            scopeMigrationMatches(this.context.workspaceState.get(MIGRATION_KEY), this.getWorkspaceRoots());
+            this.migrationRecordMatches(validated.scope.scopeRevision);
         if (!options?.allowLegacyMigrationWrite && effective.kind === 'legacyV3' &&
             legacyRules.length > 0 && !migrationComplete) {
             return {
@@ -249,9 +335,24 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
 
         const expectedRevision = scope.scopeRevision;
+        const expectedLegacySourceFingerprint = status.effective.kind === 'legacyV3'
+            ? this.getLegacySourceFingerprint()
+            : undefined;
         const requestStillCurrent = (): boolean => {
             const latest = this.getRequestedScope();
-            return latest.ok && latest.scope?.scopeRevision === expectedRevision;
+            if (!latest.ok || latest.scope?.scopeRevision !== expectedRevision) { return false; }
+            if (!expectedLegacySourceFingerprint) { return true; }
+            const roots = this.getWorkspaceRoots();
+            const latestSourceFingerprint = this.getLegacySourceFingerprint(roots);
+            if (latestSourceFingerprint !== expectedLegacySourceFingerprint) { return false; }
+            const latestLegacyRules = this.getLegacyWatchRules();
+            return latestLegacyRules.length === 0 ||
+                scopeMigrationMatches(
+                    this.context.workspaceState.get(MIGRATION_KEY),
+                    roots,
+                    latestSourceFingerprint,
+                    expectedRevision
+                );
         };
         const applied = await this.tracker.applyConfiguredMonitoringScope(
             scope,
@@ -269,6 +370,8 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
+        const approvedSource = this.getLegacySourceSnapshot();
+        const approvedSourceFingerprint = createLegacySourceFingerprint(approvedSource);
         const preview = previewLegacyWatchExcludeMigration(this.getLegacyWatchRules());
         if (preview.manual.length > 0) {
             return { status: 'manual', manual: preview.manual, reason: 'Some legacy watch rules require manual migration to preserve downstream policy semantics.' };
@@ -288,7 +391,22 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (!validated.ok || !validated.scope) {
             return { status: 'conflict', reason: validated.errors.map(error => error.message).join('; ') };
         }
-        await this.markLegacyMigrationComplete();
+        const latestRequested = this.getRequestedScope();
+        const currentSource = this.getLegacySourceSnapshot();
+        if (!latestRequested.ok || !latestRequested.scope ||
+            latestRequested.scope.scopeRevision !== validated.scope.scopeRevision ||
+            !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
+            return { status: 'conflict', reason: 'Legacy rule sources or the migration target changed while settings were being written; review the current migration again.' };
+        }
+        try {
+            await this.markLegacyMigrationComplete({
+                approvedSourceFingerprint,
+                decision: 'automatic',
+                expectedScopeRevision: validated.scope.scopeRevision
+            });
+        } catch (error) {
+            return { status: 'conflict', reason: error instanceof Error ? error.message : 'Legacy migration evidence changed before publication.' };
+        }
         // Migration preserves the old legacy semantics; treat the resulting
         // canonical scope as locally authorized on this host.
         await this.grantConsent(validated.scope);
@@ -301,7 +419,15 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (!requested.ok || !requested.scope) {
             return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
         }
-        await this.markLegacyMigrationComplete();
+        try {
+            await this.markLegacyMigrationComplete({
+                approvedSourceFingerprint: this.getLegacySourceFingerprint(),
+                decision: 'manual',
+                expectedScopeRevision: requested.scope.scopeRevision
+            });
+        } catch (error) {
+            return { status: 'invalid', reason: error instanceof Error ? error.message : 'Legacy migration evidence changed before publication.' };
+        }
         this.reconcileRequestedScope();
         return { status: 'completed' };
     }
@@ -338,15 +464,42 @@ export class MonitoringScopeController implements vscode.Disposable {
         await this.context.workspaceState.update(DISMISSED_KEY, undefined);
     }
 
-    public async markLegacyMigrationComplete(): Promise<void> {
+    public async markLegacyMigrationComplete(options?: {
+        approvedSourceFingerprint?: string;
+        decision?: 'automatic' | 'manual';
+        expectedScopeRevision?: string;
+    }): Promise<void> {
         const requested = this.getRequestedScope();
         if (!requested.ok || !requested.scope) {
             throw new Error('Cannot mark legacy migration complete while workspace path identity is unverified.');
         }
-        await this.context.workspaceState.update(MIGRATION_KEY, createScopeMigrationRecord(requested.scope.roots));
+        if (options?.expectedScopeRevision && options.expectedScopeRevision !== requested.scope.scopeRevision) {
+            throw new Error('Monitoring scope target changed before legacy migration could be recorded.');
+        }
+        const currentSourceFingerprint = this.getLegacySourceFingerprint(requested.scope.roots);
+        const approvedSourceFingerprint = options?.approvedSourceFingerprint ?? currentSourceFingerprint;
+        const record = createScopeMigrationRecord(
+            requested.scope.roots,
+            approvedSourceFingerprint,
+            currentSourceFingerprint,
+            requested.scope.scopeRevision,
+            options?.decision ?? 'manual'
+        );
+        await this.context.workspaceState.update(MIGRATION_KEY, record);
+
+        const latest = this.getRequestedScope();
+        const roots = this.getWorkspaceRoots();
+        const latestFingerprint = this.getLegacySourceFingerprint(roots);
+        if (!latest.ok || !latest.scope ||
+            !scopeMigrationMatches(record, roots, latestFingerprint, latest.scope.scopeRevision)) {
+            await this.context.workspaceState.update(MIGRATION_KEY, undefined);
+            throw new Error('Legacy rule sources or the migration target changed before migration evidence was published.');
+        }
+        await this.context.workspaceState.update(LEGACY_MIGRATION_KEY, undefined);
     }
 
     public async clearLegacyMigration(): Promise<void> {
         await this.context.workspaceState.update(MIGRATION_KEY, undefined);
+        await this.context.workspaceState.update(LEGACY_MIGRATION_KEY, undefined);
     }
 }

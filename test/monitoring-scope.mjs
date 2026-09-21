@@ -7,6 +7,7 @@ import {
     canonicalizeExcludePattern,
     canonicalizeIncludePath,
     createLegacyEffectiveScope,
+    createLegacySourceFingerprint,
     createScopeConsentRecord,
     createScopeMigrationRecord,
     parseEffectiveMonitoringScope,
@@ -197,9 +198,29 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     assert.equal(scopeConsentMatches({ ...consent, roots: [{ name: 'renamed', uri: roots[0].uri }, roots[1]] }, requested), false);
 }
 {
-    const migration = createScopeMigrationRecord(roots);
-    assert.equal(scopeMigrationMatches(migration, roots), true);
-    assert.equal(scopeMigrationMatches(migration, [{ ...roots[0], name: 'renamed' }, roots[1]]), false);
+    const orderedSource = createLegacySourceFingerprint({
+        global: { kind: 'value', value: ['secret/**', '!secret/keep.txt'] },
+        workspace: { kind: 'unset' }
+    });
+    const reorderedSource = createLegacySourceFingerprint({
+        workspace: { kind: 'unset' },
+        global: { kind: 'value', value: ['!secret/keep.txt', 'secret/**'] }
+    });
+    const sameObjectOrderIndependent = createLegacySourceFingerprint({
+        workspace: { kind: 'unset' },
+        global: { kind: 'value', value: ['secret/**', '!secret/keep.txt'] }
+    });
+    assert.notEqual(orderedSource, reorderedSource, 'ordered legacy arrays are semantic evidence');
+    assert.equal(orderedSource, sameObjectOrderIndependent, 'object key order is not semantic evidence');
+
+    const targetRevision = '1'.repeat(64);
+    const migration = createScopeMigrationRecord(roots, orderedSource, orderedSource, targetRevision, 'manual');
+    assert.equal(scopeMigrationMatches(migration, roots, orderedSource, targetRevision), true);
+    assert.equal(scopeMigrationMatches(migration, roots, reorderedSource, targetRevision), false);
+    assert.equal(scopeMigrationMatches(migration, roots, orderedSource, '2'.repeat(64)), false);
+    assert.equal(scopeMigrationMatches(migration, [{ ...roots[0], name: 'renamed' }, roots[1]], orderedSource, targetRevision), false);
+    assert.equal(scopeMigrationMatches({ model: 1, roots }, roots, orderedSource, targetRevision), false,
+        'legacy roots-only migration records cannot authorize the new evidence model');
 }
 
 {
