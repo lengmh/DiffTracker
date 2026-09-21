@@ -704,6 +704,7 @@ export class DiffTracker {
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
+        this.restorePendingScopeSuspendedPathsFromCoverageGaps();
         this.committedLegacyWatchExcludeByRoot = new Map(
             state.legacyWatchExcludeByRoot.map(([rootUri, patterns]) => [rootUri, [...patterns]])
         );
@@ -787,6 +788,7 @@ export class DiffTracker {
         }
         await this.rebuildTrackedChangesFromSnapshots();
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+        this.reconcilePendingScopeSuspendedPaths();
         while (this.restoreEvents.size > 0) {
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
                 await this.refreshIgnoreMatchers();
@@ -2331,9 +2333,66 @@ export class DiffTracker {
         return true;
     }
 
+    private pendingScopeEvidenceKind(record: CoverageGapRecord | undefined): 'file' | 'subtree' | undefined {
+        if (record?.subtree?.reasonCode === 'pending-scope-deferred-event') { return 'subtree'; }
+        if (record?.file?.reasonCode === 'pending-scope-deferred-event' ||
+            record?.file?.reasonCode === 'pending-explicit-exclusion') {
+            return 'file';
+        }
+        return undefined;
+    }
+
+    private restorePendingScopeSuspendedPathsFromCoverageGaps(): void {
+        this.pendingScopeSuspendedPaths.clear();
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (this.pendingScopeEvidenceKind(record)) {
+                this.pendingScopeSuspendedPaths.add(targetPath);
+            }
+        }
+    }
+
+    private reconcilePendingScopeSuspendedPaths(): void {
+        for (const filePath of [...this.pendingScopeSuspendedPaths]) {
+            const record = this.coverageGaps.get(filePath);
+            const targetKind = this.pendingScopeEvidenceKind(record) ?? 'file';
+            const directory = targetKind === 'subtree';
+            const uri = vscode.Uri.file(filePath);
+            if (this.pendingScopeExplicitlyExcludes(uri, directory)) { continue; }
+
+            this.pendingScopeSuspendedPaths.delete(filePath);
+            if (this.isPathIgnored(uri, directory, true, false)) { continue; }
+
+            const reason = 'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review';
+            if (directory) {
+                this.setSubtreeCoverageGap(filePath, 'pending-scope-gap', reason);
+                continue;
+            }
+            this.setFileCoverageGap(filePath, 'pending-scope-gap', reason);
+            this.markFileUnavailable(filePath, reason);
+        }
+    }
+
     private deferPendingScopeEvent(uri: vscode.Uri, directory = false): boolean {
-        if (!this.pendingScopeExplicitlyExcludes(uri, directory)) { return false; }
+        let targetIsDirectory = directory;
+        if (!targetIsDirectory) {
+            try {
+                const stat = fs.lstatSync(uri.fsPath);
+                targetIsDirectory = stat.isDirectory() && !stat.isSymbolicLink();
+            } catch {
+                // A missing/racing path is conservatively recorded as file-level
+                // uncertainty. Creation events for real directories are still
+                // classified before any content read.
+            }
+        }
+        if (!this.pendingScopeExplicitlyExcludes(uri, targetIsDirectory)) { return false; }
+
         this.pendingScopeSuspendedPaths.add(uri.fsPath);
+        const reason = 'A resource event was observed while an explicit exclusion awaited confirmation; its baseline was intentionally not read';
+        if (targetIsDirectory) {
+            this.setSubtreeCoverageGap(uri.fsPath, 'pending-scope-deferred-event', reason);
+        } else {
+            this.setFileCoverageGap(uri.fsPath, 'pending-scope-deferred-event', reason);
+        }
         return true;
     }
 
@@ -2342,19 +2401,14 @@ export class DiffTracker {
             ? JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope
             : undefined;
 
-        // Paths leaving a pending exclusion have an observation gap: reads were
-        // intentionally paused, so the old effective baseline cannot claim that
-        // nothing changed while the request was pending.
-        for (const filePath of [...this.pendingScopeSuspendedPaths]) {
-            const uri = vscode.Uri.file(filePath);
-            if (this.pendingScopeExplicitlyExcludes(uri)) { continue; }
-            this.pendingScopeSuspendedPaths.delete(filePath);
-            if (!this.isPathIgnored(uri, false, true, false)) {
-                const reason = 'Monitoring was paused while an explicit exclusion awaited confirmation; current state requires review';
-                this.setFileCoverageGap(filePath, 'pending-scope-gap', reason);
-                this.markFileUnavailable(filePath, reason);
+        // Durable coverage evidence reconstructs same-session suspended paths
+        // after reload, so withdrawing the request cannot silently forget events.
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (this.pendingScopeEvidenceKind(record)) {
+                this.pendingScopeSuspendedPaths.add(targetPath);
             }
         }
+        this.reconcilePendingScopeSuspendedPaths();
 
         // Once an explicit exclusion request is pending, all existing baseline
         // evidence it covers must be treated as potentially stale even if the host

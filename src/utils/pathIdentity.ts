@@ -83,21 +83,35 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     return undefined;
 }
 
+function rootRequiresInternalCaseProbe(rootPath: string): boolean {
+    const normalized = path.resolve(rootPath);
+    const parent = path.dirname(normalized);
+    try {
+        if (fs.lstatSync(normalized).isSymbolicLink()) { return true; }
+        // Filesystem/volume roots and mount points do not inherit lookup
+        // semantics from the parent path that names the mount.
+        if (parent === normalized) { return true; }
+        const rootStat = fs.statSync(normalized);
+        const parentStat = fs.statSync(parent);
+        if (rootStat.dev !== parentStat.dev) { return true; }
+    } catch {
+        // If the boundary itself cannot be verified, do not use parent lookup
+        // semantics as a substitute for descendant identity.
+        return true;
+    }
+    return false;
+}
+
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
     _platform: NodeJS.Platform = process.platform
 ): boolean | undefined {
-    let rootIsSymbolicLink = false;
-    try {
-        rootIsSymbolicLink = fs.lstatSync(rootPath).isSymbolicLink();
-    } catch {
-        // Missing/unreadable roots remain fail-closed through the probes below.
-    }
+    const internalOnly = rootRequiresInternalCaseProbe(rootPath);
 
-    // A symlink/junction root may live on a volume with different case semantics
-    // than its target. Probing the link name would measure the parent lookup
-    // boundary, not descendant identity inside the workspace.
-    if (!rootIsSymbolicLink) {
+    // Ordinary directory roots can use their own name as evidence. Symlinks,
+    // junctions, filesystem roots and mount points must be probed only from
+    // descendants inside the workspace filesystem.
+    if (!internalOnly) {
         const rootProbe = probeExistingPath(rootPath);
         if (rootProbe !== undefined) { return rootProbe; }
     }

@@ -14,6 +14,8 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 覆盖证据继续只有一个权威集合，但每条证据必须区分文件不确定性和目录/子树诊断。新业务逻辑不得依赖提示字符串猜测目标类型；reason code、target kind 与必要 provenance 使用结构化字段表达。子树覆盖缺口出现或清除时必须立即刷新 Changes Tree 与状态栏；诊断在独立区域可见并提供监控范围管理入口，但不增加文件变化 badge。删除已确认不存在的父目录时，同时清理其后代中失效的子树诊断。
 
+pending explicit exclusion 只暂停读取，不得抹去“事件已经发生”的事实。任何在 pending exclusion 下被 deferred 的新文件或目录事件都写入 Session V4 的 typed coverage evidence：文件使用 file gap，真实目录使用 subtree gap；内存中的 suspended-path 集合可以作为运行时索引，但不能是唯一 provenance。重启时由 durable reason code 重建 suspended-path 索引；若请求仍排除该资源则继续暂停，若请求已撤回则文件转为 unknown review、目录保留独立 subtree diagnostic。
+
 ## 旧规则迁移授权
 
 迁移完成不是长期布尔值。迁移授权必须绑定：
