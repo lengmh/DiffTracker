@@ -34,13 +34,36 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     const base = path.basename(existingPath);
     const alternateBase = toggleAsciiCase(base);
     if (!alternateBase || alternateBase === base) { return undefined; }
-    const alternate = path.join(path.dirname(existingPath), alternateBase);
+    const parent = path.dirname(existingPath);
+    const alternate = path.join(parent, alternateBase);
+
+    // Two separately named directory entries prove case-sensitive lookup even
+    // when one is a symlink/hard-link alias of the other. Resource identity
+    // alone cannot distinguish such aliases from an insensitive lookup.
+    let exactBase = false;
+    let exactAlternate = false;
+    try {
+        const names = fs.readdirSync(parent);
+        exactBase = names.includes(base);
+        exactAlternate = names.includes(alternateBase);
+        if (exactBase && exactAlternate) { return true; }
+    } catch {
+        // Without parent-entry evidence, never infer insensitivity from an
+        // alias that merely resolves to the same underlying resource.
+    }
+
     if (!fs.existsSync(alternate)) {
         return true;
     }
     const same = sameExistingResource(existingPath, alternate);
-    if (same === true) { return false; }
     if (same === false) { return true; }
+    if (same === true) {
+        // On an insensitive filesystem one directory entry is reachable through
+        // both spellings. If parent enumeration proves exactly one spelling is
+        // present, the alternate is a lookup alias rather than a second entry.
+        if (exactBase !== exactAlternate) { return false; }
+        return undefined;
+    }
     return undefined;
 }
 
