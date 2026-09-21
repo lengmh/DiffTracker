@@ -2737,6 +2737,16 @@ export class DiffTracker {
         return JSON.parse(JSON.stringify(this.committedScopeDuringApply ?? this.effectiveMonitoringScope)) as EffectiveMonitoringScope;
     }
 
+    public getCommittedLegacyCompatibilityPolicy(): Array<[string, string[]]> {
+        const effective = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
+        if (effective.kind !== 'legacyV3') { return []; }
+        const rootUris = new Set(effective.roots.map(root => root.uri));
+        return [...this.committedLegacyWatchExcludeByRoot.entries()]
+            .filter(([rootUri]) => rootUris.has(rootUri))
+            .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]])
+            .sort(([left], [right]) => left.localeCompare(right));
+    }
+
     public getRetainedReviewPaths(): string[] {
         return [...this.retainedReviewPaths].sort((left, right) => left.localeCompare(right));
     }

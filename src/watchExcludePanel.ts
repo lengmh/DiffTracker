@@ -101,13 +101,21 @@ export class WatchExcludePanel {
         }
 
         if (message.command === 'completeLegacyMigration') {
+            const request: MonitoringScopeRequest = {
+                mode: message.mode === 'wholeWorkspace' ? 'wholeWorkspace' : 'rules',
+                includes: Array.isArray(message.includes) ? message.includes as MonitoringScopeRequest['includes'] : [],
+                excludes: Array.isArray(message.excludes) ? message.excludes as MonitoringScopeRequest['excludes'] : []
+            };
             const answer = await vscode.window.showWarningMessage(
-                'Confirm that the current Workspace monitoring-scope settings already represent the legacy Global watch rules you want to preserve?',
-                { modal: true, detail: 'This does not delete or modify the old Global setting. It only marks this workspace migration as reviewed.' },
-                'Mark Migration Complete'
+                'Save this editor target and mark the legacy monitoring migration as reviewed?',
+                {
+                    modal: true,
+                    detail: 'The exact editor target is validated and saved first, then migration evidence is bound to that Scope Revision. The committed legacy policy remains effective until Apply succeeds.'
+                },
+                'Save and Mark Migration Complete'
             );
-            if (answer === 'Mark Migration Complete') {
-                const outcome = await this.scopeController.completeLegacyMigrationUsingCurrentScope();
+            if (answer === 'Save and Mark Migration Complete') {
+                const outcome = await this.scopeController.completeLegacyMigrationUsingCurrentScope(request);
                 if (outcome.status !== 'completed') {
                     void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Current scope is invalid.'}`);
                 }
@@ -218,6 +226,7 @@ export class WatchExcludePanel {
             dismissed: status.dismissed,
             legacyMigrationComplete: status.legacyMigrationComplete,
             legacyGlobalRules: status.legacyGlobalRules,
+            legacyCommittedRules: status.legacyCommittedRules,
             expansionReasons: status.expansionReasons,
             explicitlyExcludedPendingReviews: status.explicitlyExcludedPendingReviews,
             retainedReviewPaths: this.diffTracker.getRetainedReviewPaths(),

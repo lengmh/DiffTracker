@@ -28,7 +28,18 @@
   document.getElementById('apply').addEventListener('click', () => vscode.postMessage({ command: 'apply' }));
   document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ command: 'reload' }));
   document.getElementById('migrate').addEventListener('click', () => vscode.postMessage({ command: 'migrateLegacy' }));
-  document.getElementById('complete-migration').addEventListener('click', () => vscode.postMessage({ command: 'completeLegacyMigration' }));
+  document.getElementById('complete-migration').addEventListener('click', () => {
+    try {
+      vscode.postMessage({
+        command: 'completeLegacyMigration',
+        mode: mode.value,
+        includes: parseArray(includes.value, 'Includes'),
+        excludes: parseArray(excludes.value, 'Excludes')
+      });
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    }
+  });
   document.getElementById('restore').addEventListener('click', () => vscode.postMessage({ command: 'restoreEffective' }));
   document.getElementById('dismiss').addEventListener('click', () => vscode.postMessage({ command: 'dismissConsent' }));
   document.getElementById('test-btn').addEventListener('click', () => {
@@ -49,6 +60,7 @@
         dismissed: message.dismissed,
         legacyMigrationComplete: message.legacyMigrationComplete,
         legacyGlobalRules: message.legacyGlobalRules,
+        legacyCommittedRules: message.legacyCommittedRules,
         expansionReasons: message.expansionReasons,
         explicitlyExcludedPendingReviews: message.explicitlyExcludedPendingReviews,
         retainedReviewPaths: message.retainedReviewPaths,

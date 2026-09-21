@@ -47,6 +47,7 @@ export interface MonitoringScopeStatus {
     dismissed: boolean;
     legacyMigrationComplete: boolean;
     legacyGlobalRules: string[];
+    legacyCommittedRules: Array<[string, string[]]>;
     workspaceRequestPresent: boolean;
     expansionReasons: string[];
     explicitlyExcludedPendingReviews: string[];
@@ -135,6 +136,39 @@ export class MonitoringScopeController implements vscode.Disposable {
             if (this.isLegacyStringArray(value)) { value.forEach(rule => rules.add(rule)); }
         }
         return [...rules];
+    }
+
+    private getCommittedLegacyRules(): Array<[string, string[]]> {
+        return this.tracker.getCommittedLegacyCompatibilityPolicy();
+    }
+
+    private legacyMigrationRequired(
+        liveRules = this.getLegacyWatchRules(),
+        committedRules = this.getCommittedLegacyRules()
+    ): boolean {
+        return this.tracker.getEffectiveMonitoringScope().kind === 'legacyV3' &&
+            (liveRules.length > 0 || committedRules.some(([, patterns]) => patterns.length > 0));
+    }
+
+    private getManualApprovedSourceFingerprint(roots = this.getWorkspaceRoots()): string {
+        if (this.getLegacyWatchRules().length > 0) {
+            return this.getLegacySourceFingerprint(roots);
+        }
+        const committedRules = this.getCommittedLegacyRules()
+            .filter(([, patterns]) => patterns.length > 0);
+        if (committedRules.length === 0) {
+            return this.getLegacySourceFingerprint(roots);
+        }
+        return createLegacySourceFingerprint({
+            model: 1,
+            semanticsModel: 'legacy-watch-exclude-v1',
+            evidenceKind: 'committed-effective-policy-after-source-replacement',
+            roots: roots.map(root => ({ ...root })),
+            effectiveByRoot: committedRules.map(([rootUri, patterns]) => ({
+                rootUri,
+                patterns: [...patterns]
+            }))
+        });
     }
 
     private legacySourceValue(value: unknown): LegacySourceValueEvidence {
@@ -243,15 +277,19 @@ export class MonitoringScopeController implements vscode.Disposable {
                 ]
             : [];
         const legacyGlobalRules = this.getLegacyWatchRules();
+        const legacyCommittedRules = this.getCommittedLegacyRules();
+        const migrationRequired = effective.kind === 'legacyV3' &&
+            (legacyGlobalRules.length > 0 || legacyCommittedRules.some(([, patterns]) => patterns.length > 0));
         return {
             requested,
             rawRequested: this.getRequestedRawScope(),
             effective,
             consented: !!canonical && scopeConsentMatches(this.context.workspaceState.get(CONSENT_KEY), canonical),
             dismissed: !!canonical && dismissedRevision === canonical.scopeRevision,
-            legacyMigrationComplete: legacyGlobalRules.length === 0 ||
+            legacyMigrationComplete: !migrationRequired ||
                 (!!canonical && this.migrationRecordMatches(canonical.scopeRevision)),
             legacyGlobalRules,
+            legacyCommittedRules,
             workspaceRequestPresent: this.hasWorkspaceScopeRequest(),
             expansionReasons,
             explicitlyExcludedPendingReviews: canonical ? this.tracker.getExplicitlyExcludedPendingReviewPaths(canonical) : []
@@ -266,15 +304,18 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (!validated.ok || !validated.scope) { return validated; }
         const effective = this.tracker.getEffectiveMonitoringScope();
         const legacyRules = this.getLegacyWatchRules();
-        const migrationComplete = legacyRules.length === 0 ||
+        const committedRules = this.getCommittedLegacyRules();
+        const migrationRequired = effective.kind === 'legacyV3' &&
+            (legacyRules.length > 0 || committedRules.some(([, patterns]) => patterns.length > 0));
+        const migrationComplete = !migrationRequired ||
             this.migrationRecordMatches(validated.scope.scopeRevision);
         if (!options?.allowLegacyMigrationWrite && effective.kind === 'legacyV3' &&
-            legacyRules.length > 0 && !migrationComplete) {
+            !migrationComplete) {
             return {
                 ok: false,
                 errors: [{
                     field: 'exclude',
-                    message: 'Legacy watchExclude strings are still active. Complete or explicitly resolve legacy migration before saving structured monitoring-scope settings.'
+                    message: 'Legacy monitoring policy still requires migration evidence. Complete or explicitly resolve legacy migration before saving structured monitoring-scope settings.'
                 }],
                 warnings: validated.warnings
             };
@@ -346,6 +387,9 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
 
         const expectedRevision = scope.scopeRevision;
+        const migrationEvidenceRequired = status.effective.kind === 'legacyV3' &&
+            (status.legacyGlobalRules.length > 0 ||
+                status.legacyCommittedRules.some(([, patterns]) => patterns.length > 0));
         const expectedLegacySourceFingerprint = status.effective.kind === 'legacyV3'
             ? this.getLegacySourceFingerprint()
             : undefined;
@@ -356,8 +400,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             const roots = this.getWorkspaceRoots();
             const latestSourceFingerprint = this.getLegacySourceFingerprint(roots);
             if (latestSourceFingerprint !== expectedLegacySourceFingerprint) { return false; }
-            const latestLegacyRules = this.getLegacyWatchRules();
-            return latestLegacyRules.length === 0 ||
+            return !migrationEvidenceRequired ||
                 scopeMigrationMatches(
                     this.context.workspaceState.get(MIGRATION_KEY),
                     roots,
@@ -425,14 +468,46 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'migrated' };
     }
 
-    public async completeLegacyMigrationUsingCurrentScope(): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
-        const requested = this.getRequestedScope();
-        if (!requested.ok || !requested.scope) {
-            return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
+    public async completeLegacyMigrationUsingCurrentScope(
+        reviewedTarget?: MonitoringScopeRequest
+    ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
+        const roots = this.getWorkspaceRoots();
+        const approvedSource = this.getLegacySourceSnapshot(roots);
+        const approvedSourceFingerprint = this.getManualApprovedSourceFingerprint(roots);
+        let requested: ScopeValidationResult;
+
+        if (reviewedTarget) {
+            try {
+                requested = await this.saveRequestedScope(reviewedTarget, { allowLegacyMigrationWrite: true });
+            } catch (error) {
+                return {
+                    status: 'invalid',
+                    reason: error instanceof Error ? error.message : 'The reviewed migration target could not be saved.'
+                };
+            }
+            if (!requested.ok || !requested.scope) {
+                return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
+            }
+            const latestRequested = this.getRequestedScope();
+            const currentSource = this.getLegacySourceSnapshot();
+            if (!latestRequested.ok || !latestRequested.scope ||
+                latestRequested.scope.scopeRevision !== requested.scope.scopeRevision ||
+                !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
+                return {
+                    status: 'invalid',
+                    reason: 'Legacy rule sources or the reviewed migration target changed while settings were being saved; review the current migration again.'
+                };
+            }
+        } else {
+            requested = this.getRequestedScope();
+            if (!requested.ok || !requested.scope) {
+                return { status: 'invalid', reason: requested.errors.map(error => error.message).join('; ') };
+            }
         }
+
         try {
             await this.markLegacyMigrationComplete({
-                approvedSourceFingerprint: this.getLegacySourceFingerprint(),
+                approvedSourceFingerprint,
                 decision: 'manual',
                 expectedScopeRevision: requested.scope.scopeRevision
             });

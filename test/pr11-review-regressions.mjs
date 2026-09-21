@@ -57,6 +57,106 @@ export function registerPR11ReviewRegressions(h) {
         }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
     });
 
+    test('PR11 direct structured edit cannot erase required legacy migration evidence',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        let monitoringScope,watchInclude;
+        let watchExclude=['legacy-direct/'];
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>{
+                    if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                    if(key==='watchInclude') return {workspaceValue:watchInclude};
+                    if(key==='watchExclude') return {workspaceValue:watchExclude};
+                    return base.inspect?.(key);
+                },
+                get:(key,fallback)=>{
+                    if(key==='monitoringScope') return monitoringScope??fallback;
+                    if(key==='watchInclude') return watchInclude??fallback;
+                    if(key==='watchExclude') return watchExclude??fallback;
+                    return base.get(key,fallback);
+                },
+                update:async(key,value)=>{
+                    if(key==='monitoringScope') monitoringScope=value;
+                    else if(key==='watchInclude') watchInclude=value;
+                    else if(key==='watchExclude') watchExclude=value;
+                }
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            await t.refreshIgnoreMatchers();
+            assert.ok(t.getCommittedLegacyCompatibilityPolicy().some(([,patterns])=>patterns.includes('legacy-direct/')),
+                'precondition: the active legacyV3 matcher must retain resource-scoped compatibility evidence');
+            assert.equal(controller.getStatus().legacyMigrationComplete,false);
+            monitoringScope='rules';watchInclude=[];watchExclude=[];
+            controller.reconcileRequestedScope();
+            await t.refreshIgnoreMatchers();
+            assert.equal(controller.getLegacyWatchRules().length,0,
+                'the live legacy string list disappears after the direct structured settings edit');
+            assert.equal(controller.getStatus().legacyMigrationComplete,false,
+                'an empty live string list must not erase the migration gate while committed legacy evidence remains');
+            assert.equal((await controller.applyPendingScope()).status,'needsMigration');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
+    test('PR11 manual migration completion saves and binds the reviewed editor target',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        let monitoringScope,watchInclude;
+        let watchExclude=['legacy-manual/'];
+        const writes=[];
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>{
+                    if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                    if(key==='watchInclude') return {workspaceValue:watchInclude};
+                    if(key==='watchExclude') return {workspaceValue:watchExclude};
+                    return base.inspect?.(key);
+                },
+                get:(key,fallback)=>{
+                    if(key==='monitoringScope') return monitoringScope??fallback;
+                    if(key==='watchInclude') return watchInclude??fallback;
+                    if(key==='watchExclude') return watchExclude??fallback;
+                    return base.get(key,fallback);
+                },
+                update:async(key,value)=>{
+                    writes.push([key,value]);
+                    if(key==='monitoringScope') monitoringScope=value;
+                    else if(key==='watchInclude') watchInclude=value;
+                    else if(key==='watchExclude') watchExclude=value;
+                }
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            await t.refreshIgnoreMatchers();
+            const reviewedTarget={mode:'rules',includes:[],excludes:[{scope:'all',pattern:'legacy-manual/**'}]};
+            const blocked=await controller.saveRequestedScope(reviewedTarget);
+            assert.equal(blocked.ok,false,'ordinary Save remains blocked until migration evidence is reviewed');
+            assert.equal(writes.length,0);
+            const outcome=await controller.completeLegacyMigrationUsingCurrentScope(reviewedTarget);
+            assert.equal(outcome.status,'completed',JSON.stringify(outcome));
+            assert.equal(monitoringScope,'rules');
+            assert.deepEqual(watchInclude,[]);
+            assert.deepEqual(watchExclude,reviewedTarget.excludes);
+            const status=controller.getStatus();
+            assert.equal(status.legacyGlobalRules.length,0);
+            assert.ok(status.legacyCommittedRules.some(([,patterns])=>patterns.includes('legacy-manual/')),
+                'the old effective legacy policy remains available until configured Apply succeeds');
+            assert.equal(status.legacyMigrationComplete,true,
+                'the saved target and migration record must be bound to the same Scope Revision');
+            const record=state.get('diffTracker.monitoringScope.legacyMigration.v2');
+            assert.equal(record?.targetScopeRevision,status.requested.scope?.scopeRevision);
+            assert.match(record?.approvedLegacySourceFingerprint??'',/^[0-9a-f]{64}$/);
+            assert.match(record?.currentLegacySourceFingerprint??'',/^[0-9a-f]{64}$/);
+            assert.notEqual(record?.approvedLegacySourceFingerprint,record?.currentLegacySourceFingerprint,
+                'manual migration evidence must distinguish the reviewed legacy source from the structured target state');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
     test('PR11 file-to-directory replacement preserves historical file evidence without destructive actions',async()=>{
         const t=h.getTracker(),p=file('file-to-directory');
         fs.writeFileSync(p,'baseline');

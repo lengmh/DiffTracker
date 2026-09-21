@@ -30,6 +30,10 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 为覆盖 Save→Apply 和中途重启窗口，legacyV3 session 持久化每个 Workspace Root 实际生效的 resource-scoped legacy `watchExclude` 有序数组。任何会用 structured Workspace settings 替换 legacy 字符串的 Save，必须先把该 committed policy 通过 Session V4 的原子 writer 持久化；失败则不写设置。structured request 已写入但 configured scope 尚未发布时，matcher 使用该 committed snapshot，而不是把空/structured Workspace 值解释成旧保护已撤销。configured scope 原子发布成功后清除 snapshot；事务失败或回滚恢复旧 snapshot。该 snapshot 是有效策略证据，不是迁移授权，也不能替代 migration source fingerprint。
 
+即使用户绕过面板直接修改 VS Code Settings，使当前 legacy 字符串列表变为空，只要 legacyV3 session 仍保存有非空 committed compatibility policy，就继续要求迁移授权；“live list 为空”本身不能把 migration 标记为完成。若原始设置层级已经被直接替换，手工迁移授权必须显式绑定到该 committed effective-policy 证据并标明 source replacement，而不是伪装成仍可读取原始 source hierarchy。
+
+手工迁移完成是一个绑定 target 的控制器操作：面板把当前编辑器中的 mode/includes/excludes 作为 reviewed target 传入；控制器先验证并保存该 target（保存前持久化 committed legacy policy），再校验未受迁移影响的 Global/WorkspaceFolder source 没有并发变化，最后把迁移记录绑定到该 target 的 Scope Revision。记录发布失败时 configured scope 不能生效，legacyV3 committed policy 继续保护读取边界。
+
 ## Session V4 reader 边界
 
 本次仍使用 Session V4，不自动拆分 sidecar 或提前引入新的业务 backend。新 reader 必须安全读取已发布 V1/V2/V3 以及本 PR 修复前的 V4；旧目录 sentinel 的文件系统核验发生在恢复阶段，而不是纯 parser 中。无法证明语义的旧证据保留为待核验状态，不静默接受当前内容。
