@@ -406,6 +406,53 @@ export function registerPR11ReviewRegressions(h) {
         }finally{vscode.workspace.fs.readFile=read;}
     });
 
+    test('PR11 migrated Save keeps committed Workspace legacy protection until configured Apply',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        let monitoringScope;
+        let watchInclude;
+        let workspaceValue=['legacy-private/'];
+        const protectedPath=file('legacy-private/secret.txt');
+        fs.mkdirSync(path.dirname(protectedPath),{recursive:true});
+        fs.writeFileSync(protectedPath,'protected');
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>{
+                    if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                    if(key==='watchInclude') return {workspaceValue:watchInclude};
+                    if(key==='watchExclude') return {workspaceValue};
+                    return base.inspect?.(key);
+                },
+                get:(key,fallback)=>{
+                    if(key==='monitoringScope') return monitoringScope??fallback;
+                    if(key==='watchInclude') return watchInclude??fallback;
+                    if(key==='watchExclude') return workspaceValue??fallback;
+                    return base.get(key,fallback);
+                },
+                update:async(key,value)=>{
+                    if(key==='monitoringScope') monitoringScope=value;
+                    else if(key==='watchInclude') watchInclude=value;
+                    else if(key==='watchExclude') workspaceValue=value;
+                }
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            await t.refreshIgnoreMatchers();
+            assert.equal(t.testIgnorePath(protectedPath).ignored,true,'legacy Workspace rule is initially effective');
+            assert.equal((await controller.completeLegacyMigrationUsingCurrentScope()).status,'completed');
+            const saved=await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]});
+            assert.equal(saved.ok,true,JSON.stringify(saved.errors));
+            assert.equal(controller.getStatus().legacyMigrationComplete,false,
+                'writing the structured request changes the source evidence and invalidates the earlier migration record');
+            await t.refreshIgnoreMatchers();
+            assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3','Save must not publish configured scope');
+            assert.equal(t.testIgnorePath(protectedPath).ignored,true,
+                'committed legacy Workspace protection must survive Save until configured scope is atomically applied');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
     test('PR11 Save preserves active legacy Workspace strings until migration completes',async()=>{
         const t=h.getTracker(),old=vscode.workspace.getConfiguration,writes=[],state=new Map();
         const legacy=['legacy-private/'];
