@@ -451,6 +451,28 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3','Save must not publish configured scope');
             assert.equal(t.testIgnorePath(protectedPath).ignored,true,
                 'committed legacy Workspace protection must survive Save until configured scope is atomically applied');
+            assert.deepEqual(t.committedLegacyWatchExcludeByRoot.get(vscode.workspace.workspaceFolders[0].uri.toString()),workspaceValue.length===0?[]:[path.basename(legacyDir)+'/']);
+
+            const storage=file('legacy-save-gap-storage');
+            t.storageUri=Uri.file(storage);
+            assert.equal(await t.flushPendingPersistence(),true);
+            const savedState=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+            assert.ok(savedState.legacyWatchExcludeByRoot.some(([rootUri,patterns])=>
+                rootUri===vscode.workspace.workspaceFolders[0].uri.toString() &&
+                patterns.includes(path.basename(legacyDir)+'/')),
+                'the committed legacy policy must survive a crash/restart between Save and Apply');
+
+            await t.dispose();
+            const restored=new DiffTracker(Uri.file(storage));h.setTracker(restored);
+            assert.equal(await restored.restorePersistedState(),'restored');
+            assert.equal(restored.getEffectiveMonitoringScope().kind,'legacyV3');
+            assert.equal(restored.testIgnorePath(protectedPath).ignored,true,
+                'reloaded legacyV3 matcher must use persisted committed policy while settings are structured');
+
+            const configured=scope();
+            assert.equal((await restored.applyConfiguredMonitoringScope(configured)).status,'applied');
+            assert.equal(restored.committedLegacyWatchExcludeByRoot.size,0,
+                'successful configured publication releases the committed legacy policy snapshot');
         }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
     });
 
