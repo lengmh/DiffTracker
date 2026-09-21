@@ -198,6 +198,10 @@ export async function activate(context: vscode.ExtensionContext) {
             return false;
         }
 
+        return startRecordingAfterPrechecks();
+    };
+
+    const startRecordingAfterPrechecks = (): boolean => {
         diffTracker.startRecording();
         if (gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
@@ -447,6 +451,9 @@ export async function activate(context: vscode.ExtensionContext) {
             ),
             vscode.commands.registerCommand('diffTracker._testMigrateLegacyScope', () =>
                 monitoringScopeController.migrateLegacyWatchRules()
+            ),
+            vscode.commands.registerCommand('diffTracker._testStartRecordingAfterPrechecks', () =>
+                startRecordingAfterPrechecks()
             )
         );
     }

@@ -115,7 +115,7 @@ module.exports = async function runExtensionHostScenario() {
         await filesConfig.update('watcherExclude', { '**/dist/s3-private/**': true },
             vscode.ConfigurationTarget.Workspace);
         await delay(250);
-        const refusedStart = await vscode.commands.executeCommand('diffTracker.startRecording');
+        const refusedStart = await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks');
         assert.equal(refusedStart, false, 'backend must refuse Start while the effective include lacks observation coverage');
         const refusedStartState = await state();
         assert.equal(refusedStartState.isRecording, false);
@@ -123,7 +123,7 @@ module.exports = async function runExtensionHostScenario() {
             'the command context must remain false when DiffTracker.startRecording() refuses');
         await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
         await delay(250);
-        assert.equal(await vscode.commands.executeCommand('diffTracker.startRecording'), true,
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
             'restoring observation coverage must leave a valid recovery path');
         await until('Ready baseline after rejected Start recovery', async () => (await state()).baselineState === 'ready');
         console.log('PASS HOST-S3 rejected Start keeps recording command context false');
