@@ -37,6 +37,24 @@ export function registerPR11ReviewRegressions(h) {
         }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
     });
 
+    test('PR11 file-to-directory replacement preserves historical file evidence without destructive actions',async()=>{
+        const t=h.getTracker(),p=file('file-to-directory');
+        fs.writeFileSync(p,'baseline');
+        t.fileSnapshots.set(p,'baseline');
+        t.baselineExistingFiles.add(p);
+        fs.rmSync(p);
+        fs.mkdirSync(p);
+        await t.readFileAndUpdate(p,Uri.file(p));
+        const change=pending(p);
+        assert.ok(change,'historical file evidence must remain reviewable when the path becomes a directory');
+        assert.equal(change.reviewKind,'unknown');
+        assert.match(change.unavailableReason??'',/directory/i);
+        assert.equal(t.getReviewToken(p),undefined,'file actions must not obtain a text review token for a directory');
+        const result=await t.revertFile(p);
+        assert.equal(result.status,'conflict');
+        assert.equal(fs.statSync(p).isDirectory(),true,'Revert must never recursively remove the replacement directory');
+    });
+
     test('PR11 directory watcher failure remains a subtree diagnostic, not a file review',async()=>{
         const t=h.getTracker(),dir=file('coverage-only-directory');
         fs.mkdirSync(dir);

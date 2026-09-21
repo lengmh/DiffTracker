@@ -175,6 +175,38 @@ export function registerStateSchemaCompatibility(harness) {
         });
     }
 
+    test('SCHEMA-V4 migrates a pre-fix directory sentinel into subtree diagnostics without a file review', async () => {
+        const directory = file('legacy-directory-sentinel');
+        fs.mkdirSync(directory);
+        const storage = file('legacy-directory-sentinel-storage');
+        fs.mkdirSync(storage);
+        const state = {
+            version: 4, isRecording: false, baselineState: 'ready', workspaceRoots: [root],
+            scanCoverage: 'a'.repeat(64),
+            fileSnapshots: [[directory, '']], fileModes: [], baselineExistingFiles: [],
+            unresolvedBaselineFiles: [], opaqueBaselineFiles: [], revertHistory: [], gitContexts: [],
+            effectiveMonitoringScope: createLegacyEffectiveScope(
+                [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
+            ),
+            retainedReviewPaths: [],
+            coverageGaps: [[directory, 'Imported directory watch coverage is incomplete; rebuild after resolving the watcher failure']]
+        };
+        fs.writeFileSync(path.join(storage, 'session-state.json'), JSON.stringify(state));
+        const tracker = new DiffTracker(Uri.file(storage));
+        setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(pending(directory), undefined, 'legacy directory sentinels must not reappear as unknown file reviews');
+        assert.equal(tracker.getOriginalContent(directory), undefined, 'a directory must not retain an empty text file baseline');
+        assert.ok(tracker.getCoverageGaps().some(([target]) => target === directory),
+            'the lost subtree coverage obligation must remain visible');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const saved = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+        assert.equal(saved.fileSnapshots.some(([target]) => target === directory), false);
+        const savedGap = saved.coverageGaps.find(([target]) => target === directory)?.[1];
+        assert.equal(savedGap?.targetKind, 'subtree');
+        assert.equal(typeof savedGap?.reasonCode, 'string');
+    });
+
     test('SCHEMA-V4 restores coverage-gap snapshots as unknown reviews', async () => {
         const target = file('coverage-gap.txt');
         fs.writeFileSync(target, 'changed while unverified\n');
