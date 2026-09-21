@@ -64,7 +64,15 @@ async function waitUntil(predicate, timeoutMs=1000) {
     const deadline=Date.now()+timeoutMs;
     while(!predicate()) { if(Date.now()>=deadline) throw new Error('Timed out waiting for test condition'); await new Promise(resolve=>setTimeout(resolve,5)); }
 }
-class Emitter { event = noopEvent; fire() {} dispose() {} }
+class Emitter {
+    listeners = new Set();
+    event = listener => {
+        this.listeners.add(listener);
+        return { dispose: () => this.listeners.delete(listener) };
+    };
+    fire(value) { for (const listener of [...this.listeners]) listener(value); }
+    dispose() { this.listeners.clear(); }
+}
 class Uri {
     constructor(p) { this.fsPath = p; this.path = p; this.scheme = 'file'; }
     static file(p) { return new Uri(p); }
