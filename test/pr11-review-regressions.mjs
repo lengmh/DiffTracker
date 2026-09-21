@@ -245,6 +245,75 @@ export function registerPR11ReviewRegressions(h) {
         }
     });
 
+    for(const kind of ['file','directory']) test(`PR11 pending exclusion persists deferred ${kind} evidence across reload`,async()=>{
+        let t=h.getTracker();
+        const storage=file(`pending-deferred-${kind}-storage`);
+        t.storageUri=Uri.file(storage);
+        t.startRecording();
+        await waitUntil(()=>t.getBaselineState()==='ready');
+
+        const target=file(`pending-deferred-${kind}`);
+        const requested=scope([], [{scope:'all',pattern:relative(target)}]);
+        t.setPendingMonitoringScope(requested);
+        if(kind==='directory') fs.mkdirSync(target);
+        else fs.writeFileSync(target,'created while exclusion is pending');
+        await t.onExternalFileCreated(Uri.file(target));
+
+        assert.equal(pending(target),undefined,
+            'a resource deferred by the still-pending exclusion must not become an actionable file review');
+        assert.equal(t.pendingScopeSuspendedPaths.has(target),true);
+        assert.equal(await t.flushPendingPersistence(),true);
+
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        const savedGap=saved.coverageGaps.find(([filePath])=>filePath===target)?.[1];
+        if(kind==='directory'){
+            assert.equal(savedGap?.subtree?.reasonCode,'pending-scope-deferred-event',
+                'directory deferral must persist typed subtree provenance');
+        }else{
+            assert.equal(savedGap?.file?.reasonCode,'pending-scope-deferred-event',
+                'file deferral must persist file provenance');
+        }
+
+        await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+        t.setPendingMonitoringScope(requested);
+        assert.equal(await t.restorePersistedState(),'restored');
+        assert.equal(t.pendingScopeSuspendedPaths.has(target),true,
+            'reload must reconstruct the pending-scope suspended path from durable evidence');
+
+        t.setPendingMonitoringScope(scope());
+        if(kind==='directory'){
+            assert.equal(pending(target),undefined,'directories remain diagnostics, never file reviews');
+            assert.equal(t.coverageGaps.get(target)?.subtree?.reasonCode,'pending-scope-gap');
+        }else{
+            assert.equal(pending(target)?.reviewKind,'unknown',
+                'withdrawing the pending exclusion after reload must surface the deferred file as unknown review');
+            assert.equal(t.coverageGaps.get(target)?.file?.reasonCode,'pending-scope-gap');
+        }
+    });
+
+    test('PR11 simulated mount-point root skips parent-boundary case probe',async()=>{
+        const mount=file('case-mount-root');
+        fs.mkdirSync(mount);
+        const resolved=path.resolve(mount);
+        const parent=path.dirname(resolved);
+        const originalStat=fs.statSync;
+        const parentStat=originalStat(parent);
+        fs.statSync=(value,...args)=>{
+            const stat=originalStat(value,...args);
+            if(typeof value==='string'&&path.resolve(value)===resolved){
+                return {...stat,dev:Number(parentStat.dev)+1};
+            }
+            return stat;
+        };
+        try{
+            assert.equal(detectLocalPathCaseSensitivity(mount),undefined,
+                'an empty mount-point root must fail closed instead of inheriting its parent filesystem case semantics');
+        }finally{
+            fs.statSync=originalStat;
+        }
+    });
+
     test('PR11 file-to-directory replacement preserves historical file evidence without destructive actions',async()=>{
         const t=h.getTracker(),p=file('file-to-directory');
         fs.writeFileSync(p,'baseline');
