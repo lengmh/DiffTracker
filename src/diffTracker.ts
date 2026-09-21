@@ -2410,7 +2410,10 @@ export class DiffTracker {
                 ...record,
                 items: record.items.map(item => ({ ...item, before: { ...item.before }, after: { ...item.after } }))
             })),
-            scanCoverage: this.scanCoverage
+            scanCoverage: this.scanCoverage,
+            ignoreMatchers: new Map(this.ignoreMatchers),
+            ignoreFingerprint: this.ignoreFingerprint,
+            ignoreResultCache: new Map(this.ignoreResultCache)
         };
         const restore = (): void => {
             this.committedScopeDuringApply = undefined;
@@ -2428,7 +2431,13 @@ export class DiffTracker {
             this.inlineViews = new Map(previous.inlineViews);
             this.revertHistory = previous.revertHistory;
             this.scanCoverage = previous.scanCoverage;
-            this.ignoreResultCache.clear();
+            // Candidate scope preparation publishes matcher state only inside the
+            // transaction. Rollback restores the committed matcher atomically;
+            // the best-effort rebuild below may refresh it, but a rebuild failure
+            // must never leave candidate exclusions active under a legacy scope.
+            this.ignoreMatchers = new Map(previous.ignoreMatchers);
+            this.ignoreFingerprint = previous.ignoreFingerprint;
+            this.ignoreResultCache = new Map(previous.ignoreResultCache);
             this.resetChangeBlocksCaches();
             this.trackedChangesVersion++;
             this.trackedChangesCacheVersion = -1;
