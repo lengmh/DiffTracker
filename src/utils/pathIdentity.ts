@@ -87,8 +87,20 @@ export function detectLocalPathCaseSensitivity(
     rootPath: string,
     _platform: NodeJS.Platform = process.platform
 ): boolean | undefined {
-    const rootProbe = probeExistingPath(rootPath);
-    if (rootProbe !== undefined) { return rootProbe; }
+    let rootIsSymbolicLink = false;
+    try {
+        rootIsSymbolicLink = fs.lstatSync(rootPath).isSymbolicLink();
+    } catch {
+        // Missing/unreadable roots remain fail-closed through the probes below.
+    }
+
+    // A symlink/junction root may live on a volume with different case semantics
+    // than its target. Probing the link name would measure the parent lookup
+    // boundary, not descendant identity inside the workspace.
+    if (!rootIsSymbolicLink) {
+        const rootProbe = probeExistingPath(rootPath);
+        if (rootProbe !== undefined) { return rootProbe; }
+    }
 
     try {
         const entries = fs.readdirSync(rootPath, { withFileTypes: true });

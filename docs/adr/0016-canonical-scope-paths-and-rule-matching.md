@@ -10,6 +10,8 @@ status: accepted
 
 路径身份按每个工作区根的实际资源语义求值：显式 include 使用根级路径身份，Git ignore 尽量遵循有效 `core.ignorecase`，无 Git 根遵循本地文件系统身份；持久化保持真实大小写。S0 必须选择并验证统一的根级 identity helper，不能在不同调用点各自猜测。无法可靠确定根的大小写语义时应显示配置或覆盖问题，不静默采用另一种匹配方式。
 
+若 Workspace Root 本身是 symlink/junction，根名称所在父目录的 lookup 语义不是工作区后代的可靠证据，因为 link 与 target 可以跨文件系统/卷。identity helper 不得直接 probe 该 link 名称；只能从 link 目标内部的非 symlink 子项取得 case-semantics 证据。目标为空、内部只有不可用探针或读取失败时返回未验证状态并 fail closed。
+
 结构化 exclude 每项包含一个相对于目标根的受限 gitignore 模式：`/foo` 锚定根，slashless 名称按 gitignore 语义作用于任意深度，尾随 `/` 表示目录及后代，`**` 保留递归含义；空模式和 `!` 否定无效。JSON 数组项不使用注释行语义，以 `#` 开头的名称按字面模式处理，尾部空格按实际字符串处理。所有根规则分别求值。
 
 include 和 exclude 各自是顺序无关的集合。Scope Revision 对规范化规则排序去重，UI 可以保留输入顺序但不改变语义；重复或冗余规则可以警告但不使配置无效，扩展不自动改写 settings 删除它们。所有 exclude 的并集高于所有 include 的并集，不采用“最后匹配者胜出”。

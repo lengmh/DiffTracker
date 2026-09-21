@@ -277,6 +277,24 @@ export function registerPR11ReviewRegressions(h) {
         }finally{t.maxImportedDirectoryWatchers=previousLimit;}
     });
 
+    test('PR11 symlink workspace root derives case identity only from inside the target',async()=>{
+        const target=file('case-symlink-target');
+        const link=file('case-symlink-root');
+        fs.mkdirSync(target);
+        fs.symlinkSync(target,link,process.platform==='win32'?'junction':'dir');
+
+        assert.equal(detectLocalPathCaseSensitivity(link),undefined,
+            'an empty symlink root must fail closed instead of inheriting the parent volume lookup semantics');
+
+        const probe=path.join(target,'ProbeName');
+        fs.mkdirSync(probe);
+        const targetSemantics=detectLocalPathCaseSensitivity(probe);
+        assert.equal(typeof targetSemantics,'boolean',
+            'the target child must provide a concrete case-semantics probe on the test filesystem');
+        assert.equal(detectLocalPathCaseSensitivity(link),targetSemantics,
+            'a symlink root must derive case identity from descendant lookup inside its target');
+    });
+
     test('PR11 insensitive lookup recognizes the unique actual multi-character entry spelling',async()=>{
         const parent=file('case-spelling-parent');
         fs.mkdirSync(parent);
