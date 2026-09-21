@@ -279,6 +279,17 @@ export class MonitoringScopeController implements vscode.Disposable {
                 warnings: validated.warnings
             };
         }
+        if (effective.kind === 'legacyV3' &&
+            !await this.tracker.prepareLegacyCompatibilityPolicySnapshot()) {
+            return {
+                ok: false,
+                errors: [{
+                    field: 'exclude',
+                    message: 'Cannot persist the committed legacy monitoring policy before replacing Workspace settings. The legacy configuration remains unchanged.'
+                }],
+                warnings: validated.warnings
+            };
+        }
         const config = vscode.workspace.getConfiguration('diffTracker');
         await config.update('monitoringScope', validated.scope.mode, vscode.ConfigurationTarget.Workspace);
         await config.update('watchInclude', validated.scope.includes, vscode.ConfigurationTarget.Workspace);
