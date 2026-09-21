@@ -413,6 +413,8 @@ export function registerPR11ReviewRegressions(h) {
         const legacyDir=file('legacy-private');
         let workspaceValue=[path.basename(legacyDir)+'/'];
         const protectedPath=path.join(legacyDir,'secret.txt');
+        const storage=file('legacy-save-gap-storage');
+        t.storageUri=Uri.file(storage);
         fs.mkdirSync(legacyDir,{recursive:true});
         fs.writeFileSync(protectedPath,'protected');
         vscode.workspace.getConfiguration=(section,resource)=>{
@@ -451,10 +453,12 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(t.getEffectiveMonitoringScope().kind,'legacyV3','Save must not publish configured scope');
             assert.equal(t.testIgnorePath(protectedPath).ignored,true,
                 'committed legacy Workspace protection must survive Save until configured scope is atomically applied');
-            assert.deepEqual(t.committedLegacyWatchExcludeByRoot.get(vscode.workspace.workspaceFolders[0].uri.toString()),workspaceValue.length===0?[]:[path.basename(legacyDir)+'/']);
+            assert.deepEqual(
+                t.committedLegacyWatchExcludeByRoot.get(vscode.workspace.workspaceFolders[0].uri.toString()),
+                [path.basename(legacyDir)+'/'],
+                'the committed snapshot must retain the pre-Save resource-scoped legacy rules'
+            );
 
-            const storage=file('legacy-save-gap-storage');
-            t.storageUri=Uri.file(storage);
             assert.equal(await t.flushPendingPersistence(),true);
             const savedState=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
             assert.ok(savedState.legacyWatchExcludeByRoot.some(([rootUri,patterns])=>
