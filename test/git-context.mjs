@@ -261,9 +261,9 @@ test('production start blocks an unapplied configured scope revision',async()=>{
 
 for(const scenario of ['fresh','stopped','restored']) test(`production activation coordinates late Git readiness (${scenario})`,async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
-    const names=new Set(['startRecordingFlow','stopRecordingFlow','handleGitContextEvent']),declarations=[];
+    const names=new Set(['setRecordingContext','startRecordingFlow','startRecordingAfterPrechecks','stopRecordingFlow','handleGitContextEvent']),declarations=[];
     const visit=node=>{if(ts.isVariableDeclaration(node)&&names.has(node.name.getText(source)))declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
-    assert.equal(declarations.length,3);
+    assert.equal(declarations.length,5);
     let release;const ready=new Promise(resolve=>{release=resolve;});const calls=[];let recording=scenario==='restored';
     const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
         diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',
@@ -279,7 +279,7 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
             consented:true
         })},
         vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
-    vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0,testRecordingContext;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
     if(scenario==='stopped')sandbox.flows.stopRecordingFlow();
     await sandbox.flows.handleGitContextEvent({kind:'ready',contexts:[context()]});release(true);if(start)await start;
