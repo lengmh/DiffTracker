@@ -405,6 +405,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 effectiveMonitoringScope: diffTracker.getEffectiveMonitoringScope(),
                 retainedReviewPaths: diffTracker.getRetainedReviewPaths(),
                 coverageGaps: diffTracker.getCoverageGaps(),
+                subtreeCoverageGaps: diffTracker.getSubtreeCoverageGaps(),
                 policyFingerprint: diffTracker.getPolicyFingerprint(),
                 coverageGeneration: diffTracker.getCoverageGeneration()
             })),

@@ -24,6 +24,12 @@ export class StatusBarManager {
             this.updateBaselineStatus(state);
         });
 
+        this.diffTracker.onDidTrackChanges(() => {
+            if (this.diffTracker.getBaselineState() !== 'building') {
+                this.updateStatusBar(this.diffTracker.getIsRecording());
+            }
+        });
+
         // Initialize
         this.updateStatusBar(this.diffTracker.getIsRecording());
         this.statusBarItem.show();
@@ -42,6 +48,10 @@ export class StatusBarManager {
         }
 
         if (state === 'ready') {
+            if (this.diffTracker.getSubtreeCoverageGaps().length > 0) {
+                this.updateStatusBar(this.diffTracker.getIsRecording());
+                return;
+            }
             this.statusBarItem.text = '$(check) Baseline ready';
             this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
             this.baselineReadyTimer = setTimeout(() => {
@@ -55,6 +65,18 @@ export class StatusBarManager {
     }
 
     private updateStatusBar(isRecording: boolean) {
+        const subtreeGaps = this.diffTracker.getSubtreeCoverageGaps();
+        if (subtreeGaps.length > 0) {
+            this.statusBarItem.text = '$(warning) Coverage Limited';
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            this.statusBarItem.command = 'diffTracker.manageMonitoringScope';
+            this.statusBarItem.tooltip =
+                `Monitoring coverage is limited for ${subtreeGaps.length} subtree(s). Click to review diagnostics and recovery options.`;
+            return;
+        }
+
+        this.statusBarItem.command = 'diffTracker.toggleRecording';
+        this.statusBarItem.tooltip = 'Toggle Diff Recording';
         if (isRecording) {
             this.statusBarItem.text = '$(circle-filled) Recording';
             this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');

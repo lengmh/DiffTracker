@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
-import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken } from './diffTracker';
+import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken, SubtreeCoverageDiagnostic } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -30,7 +30,11 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const changes = this.diffTracker.getTrackedChanges();
             const reviewTokens = this.diffTracker.getReviewTokens();
             const opaqueReviewTokens = this.diffTracker.getOpaqueReviewTokens();
+            const subtreeCoverageGaps = this.diffTracker.getSubtreeCoverageGaps();
             items.push(this.createRecordingItem());
+            if (subtreeCoverageGaps.length > 0) {
+                items.push(this.createCoverageDiagnosticItem(subtreeCoverageGaps));
+            }
 
             if (changes.length === 0) {
                 const emptyItem = new TreeItem('No changes tracked', vscode.TreeItemCollapsibleState.None);
@@ -86,6 +90,27 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         }
 
         return Promise.resolve(items);
+    }
+
+    private createCoverageDiagnosticItem(diagnostics: SubtreeCoverageDiagnostic[]): TreeItem {
+        const item = new TreeItem('Monitoring Coverage Limited', vscode.TreeItemCollapsibleState.Expanded);
+        item.iconPath = new vscode.ThemeIcon('warning');
+        item.description = `${diagnostics.length} subtree(s)`;
+        item.tooltip = 'Some monitored directories do not have complete observation coverage. Expand for details or open monitoring scope management.';
+
+        item.children = diagnostics.map(diagnostic => {
+            const relative = this.toWorkspaceRelative(diagnostic.targetPath).join('/');
+            const child = new TreeItem(relative || displayFileName(diagnostic.targetPath), vscode.TreeItemCollapsibleState.None);
+            child.iconPath = new vscode.ThemeIcon('warning');
+            child.description = diagnostic.reasonCode;
+            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}`;
+            child.command = {
+                command: 'diffTracker.manageMonitoringScope',
+                title: 'Manage Monitoring Scope'
+            };
+            return child;
+        });
+        return item;
     }
 
     private createRecordingItem(): TreeItem {

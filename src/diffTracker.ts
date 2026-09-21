@@ -147,6 +147,12 @@ interface CoverageGapRecord {
     subtree?: CoverageGapEvidence;
 }
 
+export interface SubtreeCoverageDiagnostic {
+    targetPath: string;
+    reasonCode: string;
+    reason: string;
+}
+
 interface PersistedTrackerState {
     version: 4;
     /** Parser-only provenance; never copied from JSON or emitted by buildPersistedState. */
@@ -2223,15 +2229,19 @@ export class DiffTracker {
         if (schedule) { this.schedulePersistState(); }
     }
 
-    private clearCoverageGap(targetPath: string, targetKind: 'file' | 'subtree', schedule = true): void {
+    private clearCoverageGap(targetPath: string, targetKind: 'file' | 'subtree', schedule = true): boolean {
         const key = targetKind === 'file' ? this.canonicalTrackingPath(targetPath) : path.resolve(targetPath);
         const previous = this.coverageGaps.get(key);
-        if (!previous) { return; }
+        if (!previous || (targetKind === 'file' ? !previous.file : !previous.subtree)) { return false; }
         const next: CoverageGapRecord = { ...previous };
         if (targetKind === 'file') { delete next.file; } else { delete next.subtree; }
         if (!next.file && !next.subtree) { this.coverageGaps.delete(key); }
         else { this.coverageGaps.set(key, next); }
         if (schedule) { this.schedulePersistState(); }
+        if (targetKind === 'subtree') {
+            this.emitTrackChangesEvent({ fullRefresh: true });
+        }
+        return true;
     }
 
     private setFileCoverageGap(filePath: string, reasonCode: string, reason: string): void {
@@ -2239,7 +2249,28 @@ export class DiffTracker {
     }
 
     private setSubtreeCoverageGap(directory: string, reasonCode: string, reason: string): void {
+        const key = path.resolve(directory);
+        const previous = this.coverageGaps.get(key)?.subtree;
         this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason });
+        if (!previous || previous.reasonCode !== reasonCode || previous.reason !== reason) {
+            this.emitTrackChangesEvent({ fullRefresh: true });
+        }
+    }
+
+    private clearSubtreeCoverageGapsUnder(root: string): void {
+        let changed = false;
+        for (const [targetPath, record] of [...this.coverageGaps]) {
+            if (!record.subtree || !this.pathBelongsToRoot(targetPath, root)) { continue; }
+            const next: CoverageGapRecord = { ...record };
+            delete next.subtree;
+            if (!next.file) { this.coverageGaps.delete(targetPath); }
+            else { this.coverageGaps.set(targetPath, next); }
+            changed = true;
+        }
+        if (changed) {
+            this.schedulePersistState();
+            this.emitTrackChangesEvent({ fullRefresh: true });
+        }
     }
 
     private retainCoverageGapReview(filePath: string): boolean {
@@ -2665,6 +2696,23 @@ export class DiffTracker {
         }
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
+        );
+    }
+
+    public getSubtreeCoverageGaps(): SubtreeCoverageDiagnostic[] {
+        const result: SubtreeCoverageDiagnostic[] = [];
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (!record.subtree) { continue; }
+            result.push({
+                targetPath,
+                reasonCode: record.subtree.reasonCode,
+                reason: record.subtree.reason
+            });
+        }
+        return result.sort((left, right) =>
+            left.targetPath.localeCompare(right.targetPath) ||
+            left.reasonCode.localeCompare(right.reasonCode) ||
+            left.reason.localeCompare(right.reason)
         );
     }
 
@@ -4496,7 +4544,9 @@ export class DiffTracker {
                 await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
             }
             if (confirmedMissing && this.isCurrentEpoch(epoch)) {
-                this.clearCoverageGap(uri.fsPath, 'subtree');
+                // A parent directory delete invalidates diagnostics for every
+                // covered descendant, not only the exact watcher path.
+                this.clearSubtreeCoverageGapsUnder(uri.fsPath);
             }
         } finally {
             this.endExternalOperation(operationId);
