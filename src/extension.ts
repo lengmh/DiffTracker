@@ -203,11 +203,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const startRecordingAfterPrechecks = (): boolean => {
         diffTracker.startRecording();
-        if (gitContextMonitor?.isReady()) {
+        const started = diffTracker.getIsRecording();
+        if (started && gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
         }
-        setRecordingContext(true);
-        return diffTracker.getIsRecording();
+        setRecordingContext(started);
+        return started;
     };
 
     const stopRecordingFlow = () => {
@@ -1046,6 +1047,10 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         diffTracker.onDidChangeBaselineState(() => {
             refreshChangesTree();
+            // Baseline startup/recovery can fail asynchronously after Start
+            // returned. Keep command visibility projected from the backend's
+            // current state rather than from the user's earlier intent.
+            setRecordingContext(diffTracker.getIsRecording());
         })
     );
 

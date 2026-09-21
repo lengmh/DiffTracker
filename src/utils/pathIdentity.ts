@@ -30,54 +30,66 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
     }
 }
 
+function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
+    try {
+        const folded = requested.toLowerCase();
+        return fs.readdirSync(parent).filter(name => name.toLowerCase() === folded);
+    } catch {
+        return undefined;
+    }
+}
+
 function probeExistingPath(existingPath: string): boolean | undefined {
     const base = path.basename(existingPath);
-    const alternateBase = toggleAsciiCase(base);
-    if (!alternateBase || alternateBase === base) { return undefined; }
+    if (!base) { return undefined; }
     const parent = path.dirname(existingPath);
-    const alternate = path.join(parent, alternateBase);
+    const equivalentEntries = caseEquivalentEntries(parent, base);
 
-    // Two separately named directory entries prove case-sensitive lookup even
-    // when one is a symlink/hard-link alias of the other. Resource identity
-    // alone cannot distinguish such aliases from an insensitive lookup.
-    let exactBase = false;
-    let exactAlternate = false;
-    try {
-        const names = fs.readdirSync(parent);
-        exactBase = names.includes(base);
-        exactAlternate = names.includes(alternateBase);
-        if (exactBase && exactAlternate) { return true; }
-    } catch {
-        // Without parent-entry evidence, never infer insensitivity from an
-        // alias that merely resolves to the same underlying resource.
+    if (equivalentEntries) {
+        // Two separately named directory entries that differ only by case prove
+        // that this lookup boundary is case-sensitive. This remains true even if
+        // they are hard links or symlinks to the same target.
+        if (equivalentEntries.length > 1) { return true; }
+
+        const [actualBase] = equivalentEntries;
+        if (actualBase && actualBase !== base) {
+            // The requested spelling is not an actual directory entry, but it
+            // resolves. Verify that it reaches the unique real entry before using
+            // that fact as positive evidence for case-insensitive lookup.
+            const same = sameExistingResource(existingPath, path.join(parent, actualBase));
+            if (same === true) { return false; }
+            return undefined;
+        }
     }
 
+    const alternateBase = toggleAsciiCase(base);
+    if (!alternateBase || alternateBase === base) { return undefined; }
+    const alternate = path.join(parent, alternateBase);
+
+    if (equivalentEntries?.includes(alternateBase)) {
+        return true;
+    }
     if (!fs.existsSync(alternate)) {
         return true;
     }
     const same = sameExistingResource(existingPath, alternate);
     if (same === false) { return true; }
     if (same === true) {
-        // On an insensitive filesystem one directory entry is reachable through
-        // both spellings. If parent enumeration proves exactly one spelling is
-        // present, the alternate is a lookup alias rather than a second entry.
-        if (exactBase !== exactAlternate) { return false; }
-        return undefined;
+        // When the parent listing proves that only the requested spelling exists,
+        // a differently-cased lookup resolving to it is sufficient evidence for
+        // an insensitive boundary. Without listing evidence, remain unverified.
+        return equivalentEntries?.includes(base) ? false : undefined;
     }
     return undefined;
 }
 
-/**
- * Determine the local root's path-case semantics without writing probe files.
- * If existing resource identity cannot prove the answer, return undefined.
- * Callers must fail closed rather than guessing from the operating system.
- */
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
     _platform: NodeJS.Platform = process.platform
 ): boolean | undefined {
     const rootProbe = probeExistingPath(rootPath);
     if (rootProbe !== undefined) { return rootProbe; }
+
     try {
         const entries = fs.readdirSync(rootPath, { withFileTypes: true });
         for (const entry of entries.slice(0, 128)) {
@@ -86,16 +98,13 @@ export function detectLocalPathCaseSensitivity(
             if (probe !== undefined) { return probe; }
         }
     } catch {
-        // The caller separately validates root accessibility. Identity detection
-        // must never broaden a hard boundary because a probe could not run.
+        // Fall through to the fail-closed result below.
     }
+
     return undefined;
 }
 
 export function pathIdentityText(value: string, caseSensitive: boolean): string {
-    return caseSensitive ? value : value.toLowerCase();
-}
-
-export function pathIdentityEquals(left: string, right: string, caseSensitive: boolean): boolean {
-    return pathIdentityText(left, caseSensitive) === pathIdentityText(right, caseSensitive);
+    const normalized = path.resolve(value);
+    return caseSensitive ? normalized : normalized.toLowerCase();
 }
