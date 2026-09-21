@@ -410,9 +410,10 @@ export function registerPR11ReviewRegressions(h) {
         const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
         let monitoringScope;
         let watchInclude;
-        let workspaceValue=['legacy-private/'];
-        const protectedPath=file('legacy-private/secret.txt');
-        fs.mkdirSync(path.dirname(protectedPath),{recursive:true});
+        const legacyDir=file('legacy-private');
+        let workspaceValue=[path.basename(legacyDir)+'/'];
+        const protectedPath=path.join(legacyDir,'secret.txt');
+        fs.mkdirSync(legacyDir,{recursive:true});
         fs.writeFileSync(protectedPath,'protected');
         vscode.workspace.getConfiguration=(section,resource)=>{
             const base=old(section,resource);
