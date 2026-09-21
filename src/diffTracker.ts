@@ -1668,12 +1668,18 @@ export class DiffTracker {
             return undefined;
         }
 
+        const effectiveRootUris = new Set(this.effectiveMonitoringScope.roots.map(root => root.uri));
+        const hasCommittedLegacyPolicyEvidence = this.effectiveMonitoringScope.kind === 'legacyV3' &&
+            [...this.committedLegacyWatchExcludeByRoot.entries()].some(([rootUri, patterns]) =>
+                effectiveRootUris.has(rootUri) && patterns.length > 0
+            );
+
         if (!this.isRecording && !this.baselineBuilding && !this.snapshotInitialized && this.fileSnapshots.size === 0 &&
-            this.unresolvedBaselineFiles.size === 0 && this.opaqueBaselineFiles.size === 0) {
+            this.unresolvedBaselineFiles.size === 0 && this.opaqueBaselineFiles.size === 0 &&
+            !hasCommittedLegacyPolicyEvidence) {
             return undefined;
         }
 
-        const effectiveRootUris = new Set(this.effectiveMonitoringScope.roots.map(root => root.uri));
         return {
             version: 4,
             isRecording: this.isRecording,

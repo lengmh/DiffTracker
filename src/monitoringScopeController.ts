@@ -298,7 +298,10 @@ export class MonitoringScopeController implements vscode.Disposable {
 
     public async saveRequestedScope(
         request: MonitoringScopeRequest,
-        options?: { allowLegacyMigrationWrite?: boolean }
+        options?: {
+            allowLegacyMigrationWrite?: boolean;
+            expectedLegacySourceFingerprint?: string;
+        }
     ): Promise<ScopeValidationResult> {
         const validated = validateAndCanonicalizeScope(request, this.getWorkspaceRoots());
         if (!validated.ok || !validated.scope) { return validated; }
@@ -309,6 +312,20 @@ export class MonitoringScopeController implements vscode.Disposable {
             (legacyRules.length > 0 || committedRules.some(([, patterns]) => patterns.length > 0));
         const migrationComplete = !migrationRequired ||
             this.migrationRecordMatches(validated.scope.scopeRevision);
+        const expectedLegacySourceFingerprint = effective.kind === 'legacyV3' && legacyRules.length > 0
+            ? options?.expectedLegacySourceFingerprint ?? this.getLegacySourceFingerprint(validated.scope.roots)
+            : undefined;
+        const legacySourceStillCurrent = (): boolean =>
+            !expectedLegacySourceFingerprint ||
+            this.getLegacySourceFingerprint(validated.scope.roots) === expectedLegacySourceFingerprint;
+        const sourceConflict = (): ScopeValidationResult => ({
+            ok: false,
+            errors: [{
+                field: 'exclude',
+                message: 'Legacy watchExclude source changed while the reviewed migration target was being saved. The legacy Workspace rule was not replaced; review the current source again.'
+            }],
+            warnings: validated.warnings
+        });
         if (!options?.allowLegacyMigrationWrite && effective.kind === 'legacyV3' &&
             !migrationComplete) {
             return {
@@ -331,9 +348,17 @@ export class MonitoringScopeController implements vscode.Disposable {
                 warnings: validated.warnings
             };
         }
+        if (!legacySourceStillCurrent()) { return sourceConflict(); }
+
         const config = vscode.workspace.getConfiguration('diffTracker');
         await config.update('monitoringScope', validated.scope.mode, vscode.ConfigurationTarget.Workspace);
+        if (!legacySourceStillCurrent()) { return sourceConflict(); }
+
         await config.update('watchInclude', validated.scope.includes, vscode.ConfigurationTarget.Workspace);
+        if (!legacySourceStillCurrent()) { return sourceConflict(); }
+
+        // This is the destructive legacy-source replacement. Every await before
+        // it is bound to the exact source fingerprint reviewed by migration.
         await config.update('watchExclude', validated.scope.excludes, vscode.ConfigurationTarget.Workspace);
         return validated;
     }
@@ -441,7 +466,10 @@ export class MonitoringScopeController implements vscode.Disposable {
             mode: 'rules',
             includes: preview.includes,
             excludes: preview.excludes
-        }, { allowLegacyMigrationWrite: true });
+        }, {
+            allowLegacyMigrationWrite: true,
+            expectedLegacySourceFingerprint: approvedSourceFingerprint
+        });
         if (!validated.ok || !validated.scope) {
             return { status: 'conflict', reason: validated.errors.map(error => error.message).join('; ') };
         }
@@ -478,7 +506,12 @@ export class MonitoringScopeController implements vscode.Disposable {
 
         if (reviewedTarget) {
             try {
-                requested = await this.saveRequestedScope(reviewedTarget, { allowLegacyMigrationWrite: true });
+                requested = await this.saveRequestedScope(reviewedTarget, {
+                    allowLegacyMigrationWrite: true,
+                    expectedLegacySourceFingerprint: this.getLegacyWatchRules().length > 0
+                        ? createLegacySourceFingerprint(approvedSource)
+                        : undefined
+                });
             } catch (error) {
                 return {
                     status: 'invalid',

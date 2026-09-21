@@ -34,6 +34,10 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 手工迁移完成是一个绑定 target 的控制器操作：面板把当前编辑器中的 mode/includes/excludes 作为 reviewed target 传入；控制器先验证并保存该 target（保存前持久化 committed legacy policy），再校验未受迁移影响的 Global/WorkspaceFolder source 没有并发变化，最后把迁移记录绑定到该 target 的 Scope Revision。记录发布失败时 configured scope 不能生效，legacyV3 committed policy 继续保护读取边界。
 
+任何会覆盖 Workspace legacy `watchExclude` 的自动或手工迁移，还必须把 destructive write 绑定到用户审阅前的完整 source fingerprint。compatibility snapshot 持久化以及先行写入 `monitoringScope` / `watchInclude` 的每个 await 后都重新验证；若 Workspace source 在此期间新增、删除或改写规则，则停止在 `watchExclude` 覆盖之前，不得用旧 target 擦除新规则。控制器自己的最终 structured replacement 由 target Scope Revision 单独验证，不把该预期变化误判成 source race。
+
+Session V4 的“无 baseline、stopped、无 review 时可省略状态”规则不得丢弃非空 committed legacy policy。只要 legacyV3 的任一有效 Workspace Root 仍有 committed compatibility pattern，即使没有文件 snapshot，也必须保留 V4 policy-only 状态；重启后以 paused/incomplete 方式恢复，直到迁移/Apply 明确完成。
+
 ## Session V4 reader 边界
 
 本次仍使用 Session V4，不自动拆分 sidecar 或提前引入新的业务 backend。新 reader 必须安全读取已发布 V1/V2/V3 以及本 PR 修复前的 V4；旧目录 sentinel 的文件系统核验发生在恢复阶段，而不是纯 parser 中。无法证明语义的旧证据保留为待核验状态，不静默接受当前内容。

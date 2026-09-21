@@ -157,6 +157,94 @@ export function registerPR11ReviewRegressions(h) {
         }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
     });
 
+    test('PR11 reviewed manual migration never overwrites a concurrently changed Workspace legacy source',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        let monitoringScope,watchInclude;
+        let watchExclude=['legacy-reviewed/'];
+        let releaseMonitoringScope;
+        let enteredMonitoringScope;
+        const entered=new Promise(resolve=>{enteredMonitoringScope=resolve;});
+        const gate=new Promise(resolve=>{releaseMonitoringScope=resolve;});
+        const writes=[];
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>{
+                    if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                    if(key==='watchInclude') return {workspaceValue:watchInclude};
+                    if(key==='watchExclude') return {workspaceValue:watchExclude};
+                    return base.inspect?.(key);
+                },
+                get:(key,fallback)=>{
+                    if(key==='monitoringScope') return monitoringScope??fallback;
+                    if(key==='watchInclude') return watchInclude??fallback;
+                    if(key==='watchExclude') return watchExclude??fallback;
+                    return base.get(key,fallback);
+                },
+                update:async(key,value)=>{
+                    writes.push([key,value]);
+                    if(key==='monitoringScope'){
+                        enteredMonitoringScope();
+                        await gate;
+                        monitoringScope=value;
+                    }else if(key==='watchInclude') watchInclude=value;
+                    else if(key==='watchExclude') watchExclude=value;
+                }
+            };
+        };
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            await t.refreshIgnoreMatchers();
+            const reviewedTarget={mode:'rules',includes:[],excludes:[{scope:'all',pattern:'legacy-reviewed/**'}]};
+            const completing=controller.completeLegacyMigrationUsingCurrentScope(reviewedTarget);
+            await entered;
+            watchExclude=['legacy-reviewed/','added-during-save/'];
+            releaseMonitoringScope();
+            const outcome=await completing;
+            assert.equal(outcome.status,'invalid',JSON.stringify(outcome));
+            assert.deepEqual(watchExclude,['legacy-reviewed/','added-during-save/'],
+                'the controller must not overwrite a Workspace legacy source that changed after review');
+            assert.equal(writes.some(([key])=>key==='watchExclude'),false,
+                'destructive watchExclude replacement must be skipped after source revalidation fails');
+            assert.equal(state.has('diffTracker.monitoringScope.legacyMigration.v2'),false,
+                'stale reviewed source must not publish migration evidence');
+        }finally{
+            releaseMonitoringScope?.();
+            controller.dispose();vscode.workspace.getConfiguration=old;
+        }
+    });
+
+    test('PR11 stopped empty legacy session persists committed compatibility policy evidence',async()=>{
+        const old=vscode.workspace.getConfiguration;
+        const storage=file('stopped-legacy-policy-storage');
+        const legacy=['stopped-private/'];
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>key==='watchExclude'?{workspaceValue:legacy}:base.inspect?.(key),
+                get:(key,fallback)=>key==='watchExclude'?legacy:base.get(key,fallback)
+            };
+        };
+        let isolated=new DiffTracker(Uri.file(storage));
+        try{
+            assert.equal(isolated.getIsRecording(),false);
+            assert.equal(await isolated.prepareLegacyCompatibilityPolicySnapshot(),true);
+            const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+            assert.ok(saved.legacyWatchExcludeByRoot.some(([,patterns])=>patterns.includes('stopped-private/')),
+                'committed legacy policy must keep an otherwise empty stopped Session V4 durable');
+            await isolated.dispose();
+            isolated=new DiffTracker(Uri.file(storage));
+            assert.equal(await isolated.restorePersistedState(),'incomplete',
+                'a policy-only stopped state restores paused rather than being treated as a fresh workspace');
+            assert.ok(isolated.getCommittedLegacyCompatibilityPolicy().some(([,patterns])=>patterns.includes('stopped-private/')));
+        }finally{
+            await isolated.dispose();
+            vscode.workspace.getConfiguration=old;
+        }
+    });
+
     test('PR11 file-to-directory replacement preserves historical file evidence without destructive actions',async()=>{
         const t=h.getTracker(),p=file('file-to-directory');
         fs.writeFileSync(p,'baseline');
