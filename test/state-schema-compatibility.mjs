@@ -149,7 +149,7 @@ export function registerStateSchemaCompatibility(harness) {
             assert.equal(saved.effectiveMonitoringScope.kind, 'legacyV3');
             assert.deepEqual(saved.retainedReviewPaths, []);
             assert.deepEqual(saved.coverageGaps, []);
-            assert.deepEqual(saved.legacyWatchExcludeByRoot, []);
+            assert.deepEqual(saved.legacyWatchExcludeByRoot, [[Uri.file(root).toString(), []]]);
             assert.equal(saved.fileSnapshots.some(([p]) => p === target), false);
         }
     });

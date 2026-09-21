@@ -54,6 +54,11 @@ module.exports = async function auditHost(workspace) {
         const ignoredPaths = ['node_modules', 'out'].map(dir => vscode.Uri.file(path.join(workspace, dir, 'audit-ignored.txt')).fsPath);
         for (const ignored of ignoredPaths) { await vscode.workspace.openTextDocument(vscode.Uri.file(ignored)); }
         tracker = new DiffTracker(vscode.Uri.file(storage));
+        assert.equal(
+            await tracker.prepareLegacyCompatibilityPolicySnapshot(),
+            true,
+            'direct production-tracker audit must capture the resource-scoped legacy policy before structured settings are evaluated'
+        );
         tracker.startRecording(); await until(() => tracker.getBaselineState() === 'ready');
         const initialState = JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
         for (const ignored of ignoredPaths) {
