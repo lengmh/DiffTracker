@@ -26,7 +26,7 @@ export function registerStateSchemaCompatibility(harness) {
                 effectiveMonitoringScope: createLegacyEffectiveScope(
                     [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
                 ),
-                retainedReviewPaths: [], coverageGaps: [],
+                retainedReviewPaths: [], coverageGaps: [], legacyWatchExcludeByRoot: [],
                 opaqueBaselineFiles: [[target, {
                     reason: 'UTF-8 BOM files require encoding preservation and are read-only in this version',
                     size: stat.size, mtime: stat.mtimeMs,
@@ -89,13 +89,14 @@ export function registerStateSchemaCompatibility(harness) {
                 effectiveMonitoringScope: createLegacyEffectiveScope(
                     [{ name: 'test', uri: Uri.file(root).toString(), caseSensitive: process.platform !== 'win32' && process.platform !== 'darwin' }], []
                 ),
-                retainedReviewPaths: [], coverageGaps: []
+                retainedReviewPaths: [], coverageGaps: [], legacyWatchExcludeByRoot: []
             };
             if (version >= 3) { state.opaqueBaselineFiles = []; }
             if (version < 4) {
                 delete state.effectiveMonitoringScope;
                 delete state.retainedReviewPaths;
                 delete state.coverageGaps;
+                delete state.legacyWatchExcludeByRoot;
             }
             const parsed = tracker.parsePersistedState(state);
             assert.ok(parsed);
@@ -106,6 +107,7 @@ export function registerStateSchemaCompatibility(harness) {
             assert.deepEqual(parsed.baselineExistingFiles, [existing]);
             assert.deepEqual(parsed.fileModes, [[existing, 0o644]]);
             assert.deepEqual(parsed.opaqueBaselineFiles, []);
+            assert.deepEqual(parsed.legacyWatchExcludeByRoot, []);
         });
     }
 
@@ -147,6 +149,7 @@ export function registerStateSchemaCompatibility(harness) {
             assert.equal(saved.effectiveMonitoringScope.kind, 'legacyV3');
             assert.deepEqual(saved.retainedReviewPaths, []);
             assert.deepEqual(saved.coverageGaps, []);
+            assert.deepEqual(saved.legacyWatchExcludeByRoot, []);
             assert.equal(saved.fileSnapshots.some(([p]) => p === target), false);
         }
     });
