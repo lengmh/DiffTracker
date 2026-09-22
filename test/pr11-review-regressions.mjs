@@ -292,6 +292,66 @@ export function registerPR11ReviewRegressions(h) {
         }
     });
 
+    test('PR11 pending parent-only directory delete preserves descendant provenance across reload',async()=>{
+        let t=h.getTracker();
+        const storage=file('pending-directory-delete-storage');
+        t.storageUri=Uri.file(storage);
+
+        const dir=file('pending-delete-dir');
+        const child=path.join(dir,'child.txt');
+        const nested=path.join(dir,'sub');
+        const grand=path.join(nested,'grand.txt');
+        fs.mkdirSync(nested,{recursive:true});
+        fs.writeFileSync(child,'child baseline');
+        fs.writeFileSync(grand,'grand baseline');
+        t.fileSnapshots.set(child,'child baseline');
+        t.fileSnapshots.set(grand,'grand baseline');
+        t.baselineExistingFiles.add(child);
+        t.baselineExistingFiles.add(grand);
+        t.isRecording=true;
+        t.externalWatcherEnabled=true;
+        t.snapshotInitialized=true;
+        t.baselineBuilding=false;
+
+        const requested=scope([], [{scope:'all',pattern:relative(dir)}]);
+        t.setPendingMonitoringScope(requested);
+        fs.rmSync(dir,{recursive:true,force:true});
+
+        // Emulate a backend that reports only the parent deletion.
+        await t.onExternalFileDeleted(Uri.file(dir));
+
+        const parentGap=t.coverageGaps.get(dir);
+        assert.equal(parentGap?.file,undefined,
+            'a historically proven directory deletion must never become a phantom file gap');
+        assert.equal(parentGap?.subtree?.reasonCode,'pending-scope-deferred-delete',
+            'parent-only delete must persist subtree deletion provenance');
+        for(const filePath of [child,grand]){
+            assert.equal(t.coverageGaps.get(filePath)?.file?.reasonCode,'pending-scope-deferred-delete',
+                'parent deletion must explicitly preserve each known baseline descendant');
+            assert.equal(t.pendingScopeSuspendedPaths.has(filePath),true);
+        }
+        assert.equal(await t.flushPendingPersistence(),true);
+
+        await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+        t.setPendingMonitoringScope(requested);
+        assert.equal(await t.restorePersistedState(),'restored');
+        assert.equal(t.coverageGaps.get(dir)?.subtree?.reasonCode,'pending-scope-deferred-delete');
+        for(const filePath of [child,grand]){
+            assert.equal(t.pendingScopeSuspendedPaths.has(filePath),true,
+                'reload must reconstruct descendant deletion provenance');
+        }
+
+        t.setPendingMonitoringScope(scope());
+        assert.equal(pending(dir),undefined,'deleted directory itself must not become a file review');
+        assert.equal(t.coverageGaps.get(dir)?.subtree?.reasonCode,'pending-scope-gap');
+        for(const filePath of [child,grand]){
+            assert.equal(pending(filePath)?.reviewKind,'unknown',
+                'withdrawing the exclusion must surface each deleted baseline child for review');
+            assert.equal(t.coverageGaps.get(filePath)?.file?.reasonCode,'pending-scope-gap');
+        }
+    });
+
     test('PR11 simulated mount-point root skips parent-boundary case probe',async()=>{
         const mount=file('case-mount-root');
         fs.mkdirSync(mount);
