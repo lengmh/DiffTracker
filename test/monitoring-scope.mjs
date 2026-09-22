@@ -112,6 +112,19 @@ for (const value of [
     assert.equal(result.ok, false, 'non-canonical explicit excludes must reject the whole scope request');
     assert.equal(result.scope, undefined);
 }
+for (const value of ['a/***', '/a/***', 'a/****', 'a/***/b']) {
+    assert.equal(canonicalizeExcludePattern(value, 'linux'), undefined,
+        `unsupported wildcard run accepted: ${value}`);
+}
+{
+    const result = validateAndCanonicalizeScope(valid({
+        includes: [{ scope: 'all', path: 'a' }],
+        excludes: [{ scope: 'all', pattern: 'a/***' }]
+    }), roots, 'linux');
+    assert.equal(result.ok, false,
+        'scope must reject exclusion syntax whose semantics diverge from the installed ignore engine');
+    assert.equal(result.scope, undefined);
+}
 assert.equal(canonicalizeExcludePattern('/generated/**', 'linux'), '/generated/**');
 assert.equal(canonicalizeExcludePattern('#literal-name', 'linux'), '#literal-name');
 assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailing spaces are semantic input');
