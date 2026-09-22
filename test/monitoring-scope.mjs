@@ -473,8 +473,8 @@ console.log('monitoring scope canonicalization and expansion tests passed');
         if (aliasCreated) {
             assert.equal(
                 detectLocalPathCaseSensitivity(original),
-                true,
-                'a separately named case-variant alias does not prove case-insensitive lookup'
+                undefined,
+                'a case-variant alias outside an empty workspace proves neither internal sensitive nor insensitive lookup'
             );
         }
     } finally {
