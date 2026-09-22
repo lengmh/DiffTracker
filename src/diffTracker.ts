@@ -4887,9 +4887,20 @@ export class DiffTracker {
             return;
         }
         this.recordBaselineTransactionEvent(uri, 'delete');
-        if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
-            this.preserveDeferredScopeApplyEvent(uri.fsPath);
-            return;
+        if (this.scopeApplyPreflight) {
+            // A parent-only delete can arrive after the subtree has already
+            // disappeared, so file-system stat cannot recover its type. Route
+            // historically proven directories through the same subtree-aware
+            // pending-scope deletion path before the file-level preflight
+            // fallback preserves the event.
+            if (this.hasHistoricalDirectoryProvenance(uri.fsPath) &&
+                this.deferPendingScopeDeletion(uri)) {
+                return;
+            }
+            if (this.pendingScopeExplicitlyExcludes(uri)) {
+                this.preserveDeferredScopeApplyEvent(uri.fsPath);
+                return;
+            }
         }
         if (this.deferPendingScopeDeletion(uri)) { return; }
         const operationId = this.beginExternalOperation(uri, 'delete');
