@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
+import * as path from 'path';
 import ignore from 'ignore';
-import { asciiCaseFold, resolveRelativePathIdentity } from './utils/pathIdentity';
+import { asciiCaseFold, detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -304,7 +305,7 @@ export function validateAndCanonicalizeScope(
                     : roots.filter(root => root.name === target.folder)
                 : [];
             const hardBoundary = !!includePath && targetRoots.some(root =>
-                isHardUnmonitorableRelativePath(includePath, root.caseSensitive)
+                isHardUnmonitorableRelativePath(includePath, root)
             );
             if (hardBoundary) {
                 errors.push({ field: 'include', index, message: 'Include path targets a DiffTracker hard monitoring boundary.' });
@@ -406,10 +407,6 @@ function ruleAppliesToRoot(rule: { scope: MonitoringRuleScope; folder?: string }
     return rule.scope === 'all' || (rule.scope === 'folder' && rule.folder === rootName);
 }
 
-function identityPart(value: string, caseSensitive: boolean): string {
-    return caseSensitive ? value : asciiCaseFold(value);
-}
-
 function localRootPath(root: WorkspaceRootIdentity): string | undefined {
     try {
         const url = new URL(root.uri);
@@ -420,11 +417,10 @@ function localRootPath(root: WorkspaceRootIdentity): string | undefined {
 }
 
 function relativeIdentity(root: WorkspaceRootIdentity, value: string): string {
-    if (root.caseSensitive !== false) { return value; }
     const rootPath = localRootPath(root);
     return rootPath
         ? resolveRelativePathIdentity(rootPath, value, false).identity
-        : value.split('/').map(asciiCaseFold).join('/');
+        : value;
 }
 
 function includeCoversRelativePath(
@@ -433,7 +429,6 @@ function includeCoversRelativePath(
     directory: boolean,
     root: WorkspaceRootIdentity
 ): boolean {
-    const caseSensitive = root.caseSensitive !== false;
     const includeParts = relativeIdentity(root, includePath).split('/').filter(Boolean);
     const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, '')).split('/').filter(Boolean);
     if (targetParts.length >= includeParts.length &&
@@ -456,16 +451,97 @@ function explicitPatternForIgnore(pattern: string): string {
 
 export function isHardUnmonitorableRelativePath(
     relativePath: string,
-    caseSensitive = true,
+    identity: boolean | WorkspaceRootIdentity = true,
     leafIsDirectory = false
 ): boolean {
-    const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean)
-        .map(part => identityPart(part, caseSensitive));
+    const rootPath = typeof identity === 'boolean' ? undefined : localRootPath(identity);
+    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const parts = (resolved?.resolvedRelativePath ?? relativePath)
+        .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
     return parts.some((part, index) => {
-        if (part === '.git') { return true; }
-        if (!part.startsWith('.difftracker-restore-')) { return false; }
-        return index < parts.length - 1 || leafIsDirectory;
+        const folded = asciiCaseFold(part);
+        const reserved = folded === '.git' ||
+            (folded.startsWith('.difftracker-restore-') && (index < parts.length - 1 || leafIsDirectory));
+        if (!reserved) { return false; }
+        if (part === '.git' || part.startsWith('.difftracker-restore-')) { return true; }
+        if (!rootPath || !resolved) {
+            return typeof identity === 'boolean' ? !identity : true;
+        }
+        // Missing/unreadable reserved spellings are conservative boundaries.
+        if (index >= resolved.verifiedPrefixLength) { return true; }
+        const prefix = parts.slice(0, index);
+        const reservedSpelling = folded === '.git' ? '.git' : '.difftracker-restore-' + part.slice('.difftracker-restore-'.length);
+        const canonical = resolveRelativePathIdentity(rootPath, [...prefix, reservedSpelling].join('/'), true);
+        return canonical.unavailable || (canonical.verifiedPrefixLength === index + 1 &&
+            canonical.identity === [...prefix, part].join('/'));
     });
+}
+
+function literalPatternComponent(component: string): string | undefined {
+    let literal = '';
+    for (let index = 0; index < component.length; index++) {
+        const character = component[index];
+        if (character === '\\' && index + 1 < component.length) { literal += component[++index]; }
+        else if (character === '*' || character === '?' || character === '[') { return undefined; }
+        else { literal += character; }
+    }
+    return literal;
+}
+
+function explicitExcludeMatches(
+    pattern: string, relativePath: string, directory: boolean, root: WorkspaceRootIdentity
+): boolean {
+    const body = pattern.replace(/^\//, '').replace(/\/$/, '');
+    const components = body.split('/');
+    const rootPath = localRootPath(root);
+    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const target = (resolved?.resolvedRelativePath ?? relativePath).replace(/\/$/, '').split('/').filter(Boolean);
+    const directoryOnly = pattern.endsWith('/');
+    const anchored = pattern.startsWith('/') || body.includes('/');
+    const componentMatches = (component: string, index: number): boolean => {
+        // Preserve the installed ignore engine's escaping/glob semantics before
+        // consulting filesystem identity for a literal that did not match.
+        const exact = ignore({ ignorecase: false }).add('/' + explicitPatternForIgnore(component));
+        if (exact.ignores(target[index])) { return true; }
+        const literal = literalPatternComponent(component);
+        if (literal !== undefined && exact.ignores(literal)) {
+            if (!rootPath) { return false; }
+            const requested = resolveRelativePathIdentity(rootPath, [...target.slice(0, index), literal].join('/'), true);
+            // Unreadable/ambiguous identity must not turn an exclusion into
+            // permission to read. Missing paths, by contrast, remain distinct.
+            return requested.unavailable || !!resolved?.unavailable ||
+                requested.identity === target.slice(0, index + 1).join('/');
+        }
+        const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
+        const sensitive = parent ? detectLocalPathCaseSensitivity(parent) : root.caseSensitive;
+        return sensitive !== true && ignore({ ignorecase: true })
+            .add('/' + explicitPatternForIgnore(component)).ignores(target[index]);
+    };
+    const memo = new Map<string, boolean>();
+    const matches = (patternIndex: number, targetIndex: number): boolean => {
+        const key = `${patternIndex}:${targetIndex}`;
+        const cached = memo.get(key);
+        if (cached !== undefined) { return cached; }
+        let result: boolean;
+        if (patternIndex === components.length) {
+            result = targetIndex > 0 && (!directoryOnly || targetIndex < target.length || directory);
+        } else if (components[patternIndex] === '**') {
+            // A trailing /** matches descendants, not the prefix node itself.
+            result = patternIndex === components.length - 1
+                ? directoryOnly
+                    ? (targetIndex > 0 && (targetIndex < target.length || directory)) ||
+                        (targetIndex < target.length && (directory || targetIndex + 1 < target.length))
+                    : targetIndex < target.length
+                : matches(patternIndex + 1, targetIndex) ||
+                    (targetIndex < target.length && matches(patternIndex, targetIndex + 1));
+        } else {
+            result = targetIndex < target.length && componentMatches(components[patternIndex], targetIndex) &&
+                matches(patternIndex + 1, targetIndex + 1);
+        }
+        memo.set(key, result);
+        return result;
+    };
+    return anchored ? matches(0, 0) : target.some((_, index) => matches(0, index));
 }
 
 export function evaluateConfiguredScope(
@@ -484,15 +560,18 @@ export function evaluateConfiguredScope(
         return { monitored: false, source: 'identityUnknown' };
     }
     const caseSensitive = root.caseSensitive;
-    if (isHardUnmonitorableRelativePath(rel, caseSensitive, directory)) {
+    if (isHardUnmonitorableRelativePath(rel, root, directory)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        const matcher = ignore({ ignorecase: !caseSensitive }).add(explicitPatternForIgnore(rule.pattern));
-        if (matcher.ignores(rel + (directory && rel && !rel.endsWith('/') ? '/' : ''))) {
+        if (explicitExcludeMatches(rule.pattern, rel, directory, root)) {
             return { monitored: false, source: 'explicitExclude' };
         }
+    }
+    const rootPath = localRootPath(root);
+    if (rootPath && resolveRelativePathIdentity(rootPath, rel, caseSensitive).unavailable) {
+        return { monitored: false, source: 'identityUnknown' };
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
@@ -737,15 +816,9 @@ function excludeRuleCoversOnRoot(
     const recursive = raw.startsWith('**/') ? literal(raw.slice(3)) : undefined;
     const ordinary = literal(raw);
     const subtree = raw.endsWith('/**') ? literal(raw.slice(0, -3)) : undefined;
-    const equal = (left: string, right: string) => {
-        if (left === right) { return true; }
-        if (root.caseSensitive) { return false; }
-        // The root probe establishes ASCII case-insensitive lookup only. Do
-        // not use ECMAScript's broader Unicode case table to prove exclusion
-        // containment; an unproved non-ASCII spelling change is an expansion.
-        return /^[\x00-\x7F]+$/.test(left) && /^[\x00-\x7F]+$/.test(right) &&
-            asciiCaseFold(left) === asciiCaseFold(right);
-    };
+    // Structural containment quantifies over all descendants, including missing
+    // and future directories. A root-wide case flag cannot prove their aliases.
+    const equal = (left: string, right: string) => left === right;
 
     if (!effective.anchored) {
         const name = ordinary && !ordinary.anchored ? ordinary :

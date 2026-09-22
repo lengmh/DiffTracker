@@ -121,7 +121,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     private isLegacyStringArray(value: unknown): value is string[] {
-        return Array.isArray(value) && value.length > 0 && value.every(entry => typeof entry === 'string');
+        return Array.isArray(value) && value.every(entry => typeof entry === 'string');
     }
 
     public getLegacyWatchRules(): string[] {

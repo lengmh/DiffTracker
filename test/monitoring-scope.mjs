@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import ignore from 'ignore';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { withLookups } from './pr11-final-scope-regressions.mjs';
 import {
     canonicalizeExcludePattern,
     canonicalizeIncludePath,
@@ -328,22 +330,32 @@ console.log('monitoring scope canonicalization and expansion tests passed');
 
 
 {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-verified-insensitive-'));
+    const actual = path.join(workspace, 'node_modules', 'private');
+    fs.mkdirSync(actual, { recursive: true });
+    fs.writeFileSync(path.join(actual, 'file.txt'), 'data');
     const insensitiveRoots = [
-        { name: 'workspace', uri: 'file:///workspace', caseSensitive: false }
+        { name: 'workspace', uri: pathToFileURL(workspace).href, caseSensitive: false }
     ];
-    const hard = validateAndCanonicalizeScope(valid({
-        includes: [{ scope: 'all', path: '.GIT/objects' }]
-    }), insensitiveRoots, 'win32');
-    assert.equal(hard.ok, false, 'case-equivalent .GIT must remain a hard boundary');
-
-    const configured = validateAndCanonicalizeScope(valid({
-        includes: [{ scope: 'all', path: 'node_modules/private' }]
-    }), insensitiveRoots, 'win32').scope;
-    assert.deepEqual(
-        evaluateConfiguredScope(configured, 'workspace', 'Node_Modules/PRIVATE/file.txt', true),
-        { monitored: true, source: 'explicitInclude' },
-        'include matching must follow case-insensitive root identity'
-    );
+    try {
+        const hard = validateAndCanonicalizeScope(valid({
+            includes: [{ scope: 'all', path: '.GIT/objects' }]
+        }), insensitiveRoots, 'win32');
+        assert.equal(hard.ok, false, 'case-equivalent .GIT must remain a hard boundary');
+        await withLookups([
+            [path.join(workspace, 'Node_Modules'), path.join(workspace, 'node_modules')],
+            [path.join(workspace, 'node_modules', 'PRIVATE'), actual]
+        ], [], async () => {
+            const configured = validateAndCanonicalizeScope(valid({
+                includes: [{ scope: 'all', path: 'node_modules/private' }]
+            }), insensitiveRoots, 'win32').scope;
+            assert.deepEqual(
+                evaluateConfiguredScope(configured, 'workspace', 'Node_Modules/PRIVATE/file.txt', true),
+                { monitored: true, source: 'explicitInclude' },
+                'include matching must follow verified lookup at each boundary'
+            );
+        });
+    } finally { fs.rmSync(workspace, { recursive: true, force: true }); }
 }
 
 
@@ -370,25 +382,38 @@ console.log('monitoring scope canonicalization and expansion tests passed');
 
 
 {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-duplicate-root-identity-'));
+    const sensitive = path.join(workspace, 'sensitive'), insensitive = path.join(workspace, 'insensitive');
+    for (const root of [sensitive, insensitive]) {
+        fs.mkdirSync(path.join(root, 'private', 'data'), { recursive: true });
+        fs.writeFileSync(path.join(root, 'private', 'data', 'file.txt'), 'data');
+    }
     const duplicateRoots = [
-        { name: 'app', uri: 'file:///case-sensitive/app', caseSensitive: true },
-        { name: 'app', uri: 'file:///case-insensitive/app', caseSensitive: false }
+        { name: 'app', uri: pathToFileURL(sensitive).href, caseSensitive: true },
+        { name: 'app', uri: pathToFileURL(insensitive).href, caseSensitive: false }
     ];
-    const configured = validateAndCanonicalizeScope(valid({
-        includes: [{ scope: 'all', path: 'Private/Data' }]
-    }), duplicateRoots, 'linux').scope;
-    assert.equal(configured !== undefined, true,
-        'scope-all rules remain valid when display names are duplicated');
-    assert.deepEqual(
-        evaluateConfiguredScope(configured, duplicateRoots[0], 'private/data/file.txt', true),
-        { monitored: false, source: 'ordinaryPolicy' },
-        'case-sensitive duplicate-name root must keep its own path identity'
-    );
-    assert.deepEqual(
-        evaluateConfiguredScope(configured, duplicateRoots[1], 'private/data/file.txt', true),
-        { monitored: true, source: 'explicitInclude' },
-        'all-root evaluation must use the actual root identity, not the first matching display name'
-    );
+    try {
+        await withLookups([
+            [path.join(insensitive, 'Private'), path.join(insensitive, 'private')],
+            [path.join(insensitive, 'private', 'Data'), path.join(insensitive, 'private', 'data')]
+        ], [path.join(sensitive, 'Private')], async () => {
+            const configured = validateAndCanonicalizeScope(valid({
+                includes: [{ scope: 'all', path: 'Private/Data' }]
+            }), duplicateRoots, 'linux').scope;
+            assert.equal(configured !== undefined, true,
+                'scope-all rules remain valid when display names are duplicated');
+            assert.deepEqual(
+                evaluateConfiguredScope(configured, duplicateRoots[0], 'private/data/file.txt', true),
+                { monitored: false, source: 'ordinaryPolicy' },
+                'case-sensitive duplicate-name root must keep its own path identity'
+            );
+            assert.deepEqual(
+                evaluateConfiguredScope(configured, duplicateRoots[1], 'private/data/file.txt', true),
+                { monitored: true, source: 'explicitInclude' },
+                'all-root evaluation must use the actual root identity, not the first matching display name'
+            );
+        });
+    } finally { fs.rmSync(workspace, { recursive: true, force: true }); }
 }
 
 
@@ -528,4 +553,24 @@ for (const [before,after,expands] of [
         }
     }
     console.log(`PR11 checked ${proofs} structural contractions against ${paths.length*2} file/directory witnesses each`);
+}
+
+// Verify segment-aware exclusions against the installed ignore engine.
+{
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'dt-glob-oracle-'));
+const identity={name:'oracle',uri:pathToFileURL(root).href,caseSensitive:true};
+const names=['a','b','aa','ab','secret','a.txt','b.txt','a.log','.hidden','#note','café','file[1]'];
+const paths=[...names,...names.flatMap(a=>names.map(b=>`${a}/${b}`)),...['a','b'].flatMap(a=>['a','b','secret'].flatMap(b=>names.map(c=>`${a}/${b}/${c}`)))];
+for(const rel of paths)fs.mkdirSync(path.join(root,rel),{recursive:true});
+const patterns=['*','**','**/','/','a','/a','a/','/a/','a/**','a/**/','**/a','**/a/','a/**/b','a/**/b/','**/a/**/b','a/*','a/*/','*/a','*/a/','*/a/**','*.txt','**/*.txt','a/*.txt','[ab]','[!a]','[a-z]*','a?','a**','**a','***','a/**b','a**/b','a/***/b','**/**','**/**/','**/*/**','file\\[1]','#note','café','a\\.txt','a\\*',' a','name   ','a[bc]','a/??','a/ab/**','a/**/','**/a/**'];
+let checked=0,failed=[];
+const convert=p=>{if(p.startsWith('#'))p='\\'+p; const m=p.match(/ +$/)?.[0].length??0;return m?p.slice(0,-m)+'\\ '.repeat(m):p};
+for(const pattern of patterns.filter(p=>p!=='/'))for(const rel of paths)for(const directory of [false,true]){
+ const expected=ignore({ignorecase:false}).add(convert(pattern)).ignores(rel+(directory?'/':''));
+ const got=evaluateConfiguredScope({roots:[identity],mode:'rules',includes:[],excludes:[{scope:'all',pattern}]},identity,rel,false,directory).source==='explicitExclude';
+ checked++;if(expected!==got&&failed.length<30)failed.push({pattern,rel,directory,expected,got});
+}
+fs.rmSync(root,{recursive:true,force:true});
+assert.deepEqual(failed, [], 'filesystem-aware matching must preserve ordinary gitignore glob semantics');
+console.log(`PR11 checked ${checked} exclusion decisions against the installed ignore engine`);
 }

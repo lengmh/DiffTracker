@@ -2262,13 +2262,13 @@ export class DiffTracker {
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
         if (!folder || folder.uri.scheme !== 'file') { return filePath; }
         const identity = this.workspaceRootIdentityForFolder(folder);
-        if (identity.caseSensitive !== false) { return filePath; }
+        if (typeof identity.caseSensitive !== 'boolean') { return filePath; }
         const relative = path.relative(folder.uri.fsPath, filePath);
         if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             return filePath;
         }
         const relativePosix = this.toPosixPath(relative);
-        const resolvedIdentity = resolveRelativePathIdentity(folder.uri.fsPath, relativePosix, false);
+        const resolvedIdentity = resolveRelativePathIdentity(folder.uri.fsPath, relativePosix, identity.caseSensitive);
         const key = `${folder.uri.toString()}\0${resolvedIdentity.identity}`;
         const resolvedPath = vscode.Uri.file(path.join(
             folder.uri.fsPath,
@@ -2582,7 +2582,7 @@ export class DiffTracker {
             const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                isHardUnmonitorableRelativePath(relative, rootIdentity.caseSensitive, true)) { continue; }
+                isHardUnmonitorableRelativePath(relative, rootIdentity, true)) { continue; }
             const currentDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, true);
             if (currentDecision.source === 'explicitExclude') { continue; }
 
@@ -2599,7 +2599,7 @@ export class DiffTracker {
                 const child = path.join(current, entry.name);
                 const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                 if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                    isHardUnmonitorableRelativePath(childRelative, rootIdentity.caseSensitive, entry.isDirectory()) ||
+                    isHardUnmonitorableRelativePath(childRelative, rootIdentity, entry.isDirectory()) ||
                     entry.isSymbolicLink()) { continue; }
                 const childDecision = evaluateConfiguredScope(
                     scope, rootIdentity, childRelative, false, entry.isDirectory()
@@ -2947,11 +2947,25 @@ export class DiffTracker {
         return [...this.retainedReviewPaths].sort((left, right) => left.localeCompare(right));
     }
 
+    private isDormantPendingScopeGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
+        if (!evidence.reasonCode.startsWith('pending-scope-') &&
+            evidence.reasonCode !== 'pending-explicit-exclusion') { return false; }
+        // Retained file review is still actionable evidence even outside scope.
+        if (evidence.targetKind === 'file' && this.trackedChanges.has(targetPath)) { return false; }
+        const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
+        if (scope.kind !== 'configured') { return false; }
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(targetPath));
+        if (!folder || folder.uri.scheme !== 'file') { return false; }
+        const relative = this.toPosixPath(path.relative(folder.uri.fsPath, targetPath));
+        return evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relative,
+            false, evidence.targetKind === 'subtree').source === 'explicitExclude';
+    }
+
     public getCoverageGaps(): Array<[string, string]> {
         const result: Array<[string, string]> = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (record.file) { result.push([targetPath, record.file.reason]); }
-            if (record.subtree) { result.push([targetPath, record.subtree.reason]); }
+            if (record.file && !this.isDormantPendingScopeGap(targetPath, record.file)) { result.push([targetPath, record.file.reason]); }
+            if (record.subtree && !this.isDormantPendingScopeGap(targetPath, record.subtree)) { result.push([targetPath, record.subtree.reason]); }
         }
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
@@ -2961,7 +2975,7 @@ export class DiffTracker {
     public getSubtreeCoverageGaps(): SubtreeCoverageDiagnostic[] {
         const result: SubtreeCoverageDiagnostic[] = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (!record.subtree) { continue; }
+            if (!record.subtree || this.isDormantPendingScopeGap(targetPath, record.subtree)) { continue; }
             result.push({
                 targetPath,
                 reasonCode: record.subtree.reasonCode,
@@ -3317,7 +3331,7 @@ export class DiffTracker {
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
                 const identity = this.workspaceRootIdentityForFolder(folder);
                 if (typeof identity.caseSensitive !== 'boolean') { continue; }
-                if (!isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) { const canonical = this.canonicalTrackingPath(uri.fsPath); candidates.set(canonical, vscode.Uri.file(canonical)); }
+                if (!isHardUnmonitorableRelativePath(relative, identity)) { const canonical = this.canonicalTrackingPath(uri.fsPath); candidates.set(canonical, vscode.Uri.file(canonical)); }
             }
         };
 
@@ -3867,14 +3881,14 @@ export class DiffTracker {
         if (typeof rootIdentity.caseSensitive !== 'boolean') { return true; }
         let hardBoundaryDirectory = directory;
         if (!hardBoundaryDirectory &&
-            !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity.caseSensitive, false) &&
-            isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity.caseSensitive, true)) {
+            !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, false) &&
+            isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, true)) {
             try { hardBoundaryDirectory = fs.lstatSync(uri.fsPath).isDirectory(); }
             catch (error) { if (!this.isFileNotFound(error)) { return true; } }
         }
         if (isHardUnmonitorableRelativePath(
             hardBoundaryPath,
-            rootIdentity.caseSensitive,
+            rootIdentity,
             hardBoundaryDirectory
         )) { return true; }
         if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory)) { return true; }
@@ -3944,7 +3958,7 @@ export class DiffTracker {
                 const identity = this.workspaceRootIdentityForFolder(folder);
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
                 if (typeof identity.caseSensitive === 'boolean' &&
-                    !isHardUnmonitorableRelativePath(relative, identity.caseSensitive)) {
+                    !isHardUnmonitorableRelativePath(relative, identity)) {
                     // Ordinary policy does not acknowledge or discard review.
                     // Retention permits only this resource's verification, not
                     // discovery throughout its newly excluded parent directory.
@@ -5423,7 +5437,7 @@ export class DiffTracker {
         catch (error) { if (!this.isFileNotFound(error)) { return 'Cannot verify the resource workspace boundary; action blocked'; } }
         if (isHardUnmonitorableRelativePath(
             relativePath,
-            rootIdentity.caseSensitive,
+            rootIdentity,
             targetIsDirectory
         )) {
             return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';

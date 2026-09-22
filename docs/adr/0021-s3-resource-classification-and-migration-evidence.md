@@ -16,11 +16,15 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 pending explicit exclusion 只暂停读取，不得抹去“事件已经发生”的事实。任何在 pending exclusion 下被 deferred 的新文件或目录事件都写入 Session V4 的 typed coverage evidence：文件使用 file gap，真实目录使用 subtree gap；内存中的 suspended-path 集合可以作为运行时索引，但不能是唯一 provenance。重启时由 durable reason code 重建 suspended-path 索引；若请求仍排除该资源则继续暂停，若请求已撤回则文件转为 unknown review、目录保留独立 subtree diagnostic。
 
+若 pending explicit exclusion 成功发布为 committed effective scope，相应 deferred gap 在活动覆盖诊断中休眠，不再错误显示 Coverage Limited；历史证据仍保留在同一个 Session V4 coverage 集合。此判定只使用 committed scope，不使用事务中尚未发布的 candidate。重启保持休眠；资源重新纳入有效范围时原有不确定性重新可见，不能据此假定已完成扫描。已有 retained file review 的证据不因休眠规则而隐藏。
+
 delete event 不能依赖删除后的 `lstat` 来判断资源种类。若 imported-directory watcher、已有 subtree diagnostic 或已知 baseline/review descendants 能证明被删路径历史上是目录，则父 delete 必须记录 subtree-level deferred-deletion provenance，并同时把所有已知 descendant file evidence 标记为 durable deferred deletion；即使后端只上报父目录一次 delete，也不能生成父目录 phantom file review 或丢失子文件删除证据。
 
 ordinary policy 收缩不会自动承认已有 review。若父目录已被 `.gitignore` / exclude 等 ordinary policy 忽略，但其中仍有显式 retained review，父目录 delete 事件不得在 parent-level ignore check 处直接丢弃；必须先只核对这些已 retained descendants 的当前状态。该例外不允许递归扫描 ignored subtree、发现新资源或恢复普通监控，只为保持已经存在的审阅证据与实际删除状态一致。
 
 ## 旧规则迁移授权
+
+孤立的 Workspace `watchExclude: []` 与纯字符串数组继续属于 legacy compatibility，不自动制造 structured pending request；显式 `monitoringScope`、`watchInclude` 或结构化 exclude 才建立结构化请求。controller 与 tracker 必须采用一致判定。
 
 迁移完成不是长期布尔值。迁移授权必须绑定：
 

@@ -1,3 +1,4 @@
+import { registerFinalScopeRegressions, withLookups } from './pr11-final-scope-regressions.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -5,6 +6,7 @@ import { detectScopeExpansion, evaluateConfiguredScope, validateAndCanonicalizeS
 import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR11ReviewRegressions(h) {
+    registerFinalScopeRegressions(h);
     const { test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document } = h;
     const scope = (includes = [], excludes = []) => {
         const checked = validateAndCanonicalizeScope({mode:'rules',includes,excludes}, h.getTracker().currentWorkspaceRootIdentities());
@@ -860,8 +862,13 @@ export function registerPR11ReviewRegressions(h) {
         t.validateResourceTarget=()=>undefined;
         fs.realpathSync.native=value=>value;
         try{
-            assert.equal(t.canonicalTrackingPath(alias),actual);
-            assert.equal(t.canonicalTrackingPath(actual),actual);
+            await withLookups([
+                [path.dirname(alias), dir],
+                [path.join(dir,'mixedname.TXT'), actual]
+            ], [], async()=>{
+                assert.equal(t.canonicalTrackingPath(alias),actual);
+                assert.equal(t.canonicalTrackingPath(actual),actual);
+            });
         }finally{
             t.workspaceRootIdentityForFolder=identify;t.validateResourceTarget=validate;
             fs.realpathSync.native=realpath;
