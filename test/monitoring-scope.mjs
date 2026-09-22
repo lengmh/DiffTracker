@@ -112,9 +112,12 @@ for (const value of [
     assert.equal(result.ok, false, 'non-canonical explicit excludes must reject the whole scope request');
     assert.equal(result.scope, undefined);
 }
-for (const value of ['a/***', '/a/***', 'a/****', 'a/***/b']) {
+for (const value of [
+    'a/***', '/a/***', 'a/****', 'a/***/b',
+    '**/**', '/**/**', '**/**/', 'a/**/**', 'a/**/**/b', '**/**/*.txt', 'a/**/**/*.txt'
+]) {
     assert.equal(canonicalizeExcludePattern(value, 'linux'), undefined,
-        `unsupported wildcard run accepted: ${value}`);
+        `unsupported glob structure accepted: ${value}`);
 }
 {
     const result = validateAndCanonicalizeScope(valid({
@@ -632,7 +635,12 @@ const identity={name:'oracle',uri:pathToFileURL(root).href,caseSensitive:true};
 const names=['a','b','aa','ab','secret','a.txt','b.txt','a.log','.hidden','#note','café','file[1]'];
 const paths=[...names,...names.flatMap(a=>names.map(b=>`${a}/${b}`)),...['a','b'].flatMap(a=>['a','b','secret'].flatMap(b=>names.map(c=>`${a}/${b}/${c}`)))];
 for(const rel of paths)fs.mkdirSync(path.join(root,rel),{recursive:true});
-const patterns=['*','**','**/','/','a','/a','a/','/a/','a/**','a/**/','**/a','**/a/','a/**/b','a/**/b/','**/a/**/b','a/*','a/*/','*/a','*/a/','*/a/**','*.txt','**/*.txt','a/*.txt','[ab]','[!a]','[a-z]*','a?','a**','**a','***','a/**b','a**/b','a/***/b','**/**','**/**/','**/*/**','file\\[1]','#note','café','a\\.txt','a\\*',' a','name   ','a[bc]','a/??','a/ab/**','a/**/','**/a/**'];
+const patterns=['*','**','**/','a','/a','a/','/a/','a/**','a/**/','**/a','**/a/','a/**/b','a/**/b/','**/a/**/b','a/*','a/*/','*/a','*/a/','*/a/**','*.txt','**/*.txt','a/*.txt','[ab]','[!a]','[a-z]*','a?','a**','**a','a/**b','a**/b','**/*/**','file\\[1]','#note','café','a\\.txt','a\\*',' a','name   ','a[bc]','a/??','a/ab/**','a/**/','**/a/**'];
+const rejectedPatterns=['***','a/***/b','**/**','**/**/','**/**/*.txt','a/**/**/b'];
+for(const pattern of rejectedPatterns){
+ assert.equal(canonicalizeExcludePattern(pattern,'linux'),undefined,
+   `oracle unsupported pattern must be rejected before matching: ${pattern}`);
+}
 let checked=0,failed=[];
 const convert=p=>{if(p.startsWith('#'))p='\\'+p; const m=p.match(/ +$/)?.[0].length??0;return m?p.slice(0,-m)+'\\ '.repeat(m):p};
 for(const pattern of patterns.filter(p=>p!=='/'))for(const rel of paths)for(const directory of [false,true]){
