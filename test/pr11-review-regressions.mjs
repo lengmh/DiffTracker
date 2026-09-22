@@ -217,6 +217,108 @@ export function registerPR11ReviewRegressions(h) {
         }
     });
 
+
+    test('PR11 committed-only migration binds every Workspace settings write to the reviewed transaction snapshot',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        const target={mode:'rules',includes:[{scope:'all',path:'src'}],excludes:[{scope:'all',pattern:'legacy-committed/**'}]};
+        for(const mutation of [
+            {key:'watchExclude',value:['added-during-save/']},
+            {key:'watchInclude',value:[{scope:'all',path:'user-edit'}]},
+            {key:'monitoringScope',value:'wholeWorkspace'}
+        ]){
+            let monitoringScope='rules';
+            let watchInclude=[];
+            let watchExclude=[];
+            let entered;
+            let release;
+            const gateEntered=new Promise(resolve=>{entered=resolve;});
+            const gate=new Promise(resolve=>{release=resolve;});
+            let first=true;
+            const writes=[];
+            vscode.workspace.getConfiguration=(section,resource)=>{
+                const base=old(section,resource);
+                if(section!=='diffTracker') return base;
+                return {...base,
+                    inspect:key=>{
+                        if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                        if(key==='watchInclude') return {workspaceValue:watchInclude};
+                        if(key==='watchExclude') return {workspaceValue:watchExclude};
+                        return base.inspect?.(key);
+                    },
+                    get:(key,fallback)=>{
+                        if(key==='monitoringScope') return monitoringScope??fallback;
+                        if(key==='watchInclude') return watchInclude??fallback;
+                        if(key==='watchExclude') return watchExclude??fallback;
+                        return base.get(key,fallback);
+                    },
+                    update:async(key,value)=>{
+                        writes.push([key,value]);
+                        if(first){first=false;entered();await gate;}
+                        if(key==='monitoringScope') monitoringScope=value;
+                        else if(key==='watchInclude') watchInclude=value;
+                        else if(key==='watchExclude') watchExclude=value;
+                    }
+                };
+            };
+            t.effectiveMonitoringScope={kind:'legacyV3',roots:t.currentWorkspaceRootIdentities()};
+            t.committedLegacyWatchExcludeByRoot=new Map([[t.currentWorkspaceRootIdentities()[0].uri,['legacy-committed/']]]);
+            const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+            try{
+                const completing=controller.completeLegacyMigrationUsingCurrentScope(target);
+                await gateEntered;
+                if(mutation.key==='monitoringScope') monitoringScope=mutation.value;
+                else if(mutation.key==='watchInclude') watchInclude=mutation.value;
+                else watchExclude=mutation.value;
+                release();
+                const outcome=await completing;
+                assert.equal(outcome.status,'invalid',`${mutation.key}: ${JSON.stringify(outcome)}`);
+                const current=mutation.key==='monitoringScope'?monitoringScope:mutation.key==='watchInclude'?watchInclude:watchExclude;
+                assert.deepEqual(current,mutation.value,`${mutation.key}: concurrent Workspace edit must survive migration conflict`);
+                assert.equal(state.has('diffTracker.monitoringScope.legacyMigration.v2'),false,
+                    `${mutation.key}: stale transaction must not publish migration evidence`);
+                if(mutation.key==='watchExclude'){
+                    assert.equal(writes.filter(([key])=>key==='watchExclude').length,0,
+                        'committed-only migration must revalidate Workspace watchExclude before destructive replacement');
+                }
+            }finally{release?.();controller.dispose();}
+        }
+        vscode.workspace.getConfiguration=old;
+    });
+
+    test('PR11 committed-only legacy evidence cannot be auto-migrated from an empty live source',async()=>{
+        const t=h.getTracker(),old=vscode.workspace.getConfiguration,state=new Map();
+        let monitoringScope,watchInclude,watchExclude;
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const base=old(section,resource);
+            if(section!=='diffTracker') return base;
+            return {...base,
+                inspect:key=>{
+                    if(key==='monitoringScope') return {workspaceValue:monitoringScope};
+                    if(key==='watchInclude') return {workspaceValue:watchInclude};
+                    if(key==='watchExclude') return {workspaceValue:watchExclude};
+                    return base.inspect?.(key);
+                },
+                get:(key,fallback)=>key==='watchExclude'?(watchExclude??fallback):base.get(key,fallback),
+                update:async(key,value)=>{
+                    if(key==='monitoringScope') monitoringScope=value;
+                    else if(key==='watchInclude') watchInclude=value;
+                    else if(key==='watchExclude') watchExclude=value;
+                }
+            };
+        };
+        t.effectiveMonitoringScope={kind:'legacyV3',roots:t.currentWorkspaceRootIdentities()};
+        t.committedLegacyWatchExcludeByRoot=new Map([[t.currentWorkspaceRootIdentities()[0].uri,['committed-only/']]]);
+        const controller=h.createScopeController({workspaceState:{get:key=>state.get(key),update:async(k,v)=>state.set(k,v)}});
+        try{
+            const outcome=await controller.migrateLegacyWatchRules();
+            assert.equal(outcome.status,'manual',
+                'automatic migration must not synthesize an empty target when only committed policy evidence survives');
+            assert.equal(monitoringScope,undefined);
+            assert.equal(watchInclude,undefined);
+            assert.equal(watchExclude,undefined);
+        }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
+    });
+
     test('PR11 stopped empty legacy session persists committed compatibility policy evidence',async()=>{
         const old=vscode.workspace.getConfiguration;
         const storage=file('stopped-legacy-policy-storage');
