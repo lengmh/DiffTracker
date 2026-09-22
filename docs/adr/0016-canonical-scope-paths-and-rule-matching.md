@@ -12,7 +12,9 @@ status: accepted
 
 case-insensitive 不等于 ECMAScript Unicode `toLowerCase()`。根级 probe 只证明 ASCII case lookup 语义；实际已存在组件必须通过父目录真实 entry spelling 与 same-resource lookup 建立 identity。缺失后缀可以按已证明的 ASCII case-insensitive 语义折叠 ASCII 字母，但不得推断更广的 Unicode 等价。这样即使文件系统允许 `ß` 与 `ẞ` 作为两个独立 entry，显式 include、baseline key 和 review key 也必须保持二者分离；若某文件系统确实把非 ASCII 别名解析到同一资源，则由实际 lookup/same-resource 证据统一它们。
 
-若 Workspace Root 本身是 symlink/junction、文件系统根或 mount point，根名称所在父目录的 lookup 语义不是工作区后代的可靠证据，因为 link/挂载边界与 workspace 内部可以具有不同的文件系统大小写语义。identity helper 对 symlink/junction，以及与父目录 `stat.dev` 不同的挂载根，只能从工作区内部的非 symlink 子项取得 case-semantics 证据；不得直接 probe 该根名称。目标为空、内部只有不可用探针或读取失败时返回未验证状态并 fail closed。
+Workspace Root 名称所在父目录的 lookup 语义从不作为工作区内部大小写身份的最终证据。除 symlink/junction、文件系统根和 mount point 外，还必须覆盖 Windows per-directory case sensitivity、ext4 casefold 等“同一 device 内目录语义不同”的情况。identity helper 只从 Workspace Root 内部的非 symlink 现有子项取得 case-semantics 证据；目标为空、内部只有不可用探针或读取失败时返回未验证状态并 fail closed，后续内容出现时允许重新探测。
+
+已验证的 root case identity 在一个 Tracker session/epoch 内缓存，避免每个资源分类都同步枚举同一根；只缓存明确的 `true/false`，不得缓存 `undefined`，因此未验证 root 会继续重试。新 session/epoch 清空缓存。
 
 结构化 exclude 每项包含一个相对于目标根的受限 gitignore 模式：`/foo` 锚定根，slashless 名称按 gitignore 语义作用于任意深度，尾随 `/` 表示目录及后代，`**` 保留递归含义；空模式和 `!` 否定无效。JSON 数组项不使用注释行语义，以 `#` 开头的名称按字面模式处理，尾部空格按实际字符串处理。所有根规则分别求值。
 

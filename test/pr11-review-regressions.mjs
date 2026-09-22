@@ -384,6 +384,7 @@ export function registerPR11ReviewRegressions(h) {
         const t=h.getTracker();
         const identify=t.detectWorkspaceRootCaseSensitivity?.bind(t);
         assert.ok(identify,'tracker should expose the root identity probe to regression tests');
+        t.workspaceRootCaseSensitivityCache?.clear();
         let probes=0;
         const original=fs.readdirSync;
         fs.readdirSync=(value,...args)=>{

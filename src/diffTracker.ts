@@ -312,6 +312,7 @@ export class DiffTracker {
         this.activeExternalOperations.clear();
         this.pendingImportedDirectoryReconciliation.clear();
         this.importedDirectoryResumePromise = undefined;
+        this.workspaceRootCaseSensitivityCache.clear();
         this.activeWriteFiles.clear();
         this.pendingWriteFiles.clear();
         return ++this.sessionEpoch;
@@ -507,6 +508,7 @@ export class DiffTracker {
     // status and live coverage callbacks must still see the committed scope.
     private committedScopeDuringApply?: EffectiveMonitoringScope;
     private readonly canonicalTrackingPaths = new Map<string, string>();
+    private readonly workspaceRootCaseSensitivityCache = new Map<string, boolean>();
     private readonly rootIdentityUnavailableReason = 'Workspace root identity is unverified; prior review is preserved until identity and current state can be reconciled';
     private pendingMonitoringScope?: CanonicalMonitoringScope;
     private pendingScopeSuspendedPaths = new Set<string>();
@@ -1585,12 +1587,23 @@ export class DiffTracker {
             .sort((left, right) => left.localeCompare(right));
     }
 
+    private detectWorkspaceRootCaseSensitivity(rootPath: string): boolean | undefined {
+        const key = path.resolve(rootPath);
+        const cached = this.workspaceRootCaseSensitivityCache.get(key);
+        if (cached !== undefined) { return cached; }
+        const detected = detectLocalPathCaseSensitivity(key);
+        if (typeof detected === 'boolean') {
+            this.workspaceRootCaseSensitivityCache.set(key, detected);
+        }
+        return detected;
+    }
+
     private workspaceRootIdentitiesForPaths(roots: readonly string[]): WorkspaceRootIdentity[] {
         const current = new Map(this.getSupportedWorkspaceFolders()
             .map(folder => [path.resolve(folder.uri.fsPath), {
                 name: folder.name,
                 uri: folder.uri.toString(),
-                caseSensitive: detectLocalPathCaseSensitivity(folder.uri.fsPath)
+                caseSensitive: this.detectWorkspaceRootCaseSensitivity(folder.uri.fsPath)
             }] as const));
         return [...roots]
             .map(root => {
@@ -1598,7 +1611,7 @@ export class DiffTracker {
                 return current.get(normalized) ?? {
                     name: path.basename(normalized) || normalized,
                     uri: vscode.Uri.file(normalized).toString(),
-                    caseSensitive: detectLocalPathCaseSensitivity(normalized)
+                    caseSensitive: this.detectWorkspaceRootCaseSensitivity(normalized)
                 };
             })
             .sort((left, right) => left.uri.localeCompare(right.uri) || left.name.localeCompare(right.name));
@@ -1608,7 +1621,7 @@ export class DiffTracker {
         return {
             name: folder.name,
             uri: folder.uri.toString(),
-            caseSensitive: detectLocalPathCaseSensitivity(folder.uri.fsPath)
+            caseSensitive: this.detectWorkspaceRootCaseSensitivity(folder.uri.fsPath)
         };
     }
 

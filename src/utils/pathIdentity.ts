@@ -87,39 +87,14 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     return undefined;
 }
 
-function rootRequiresInternalCaseProbe(rootPath: string): boolean {
-    const normalized = path.resolve(rootPath);
-    const parent = path.dirname(normalized);
-    try {
-        if (fs.lstatSync(normalized).isSymbolicLink()) { return true; }
-        // Filesystem/volume roots and mount points do not inherit lookup
-        // semantics from the parent path that names the mount.
-        if (parent === normalized) { return true; }
-        const rootStat = fs.statSync(normalized);
-        const parentStat = fs.statSync(parent);
-        if (rootStat.dev !== parentStat.dev) { return true; }
-    } catch {
-        // If the boundary itself cannot be verified, do not use parent lookup
-        // semantics as a substitute for descendant identity.
-        return true;
-    }
-    return false;
-}
-
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
     _platform: NodeJS.Platform = process.platform
 ): boolean | undefined {
-    const internalOnly = rootRequiresInternalCaseProbe(rootPath);
-
-    // Ordinary directory roots can use their own name as evidence. Symlinks,
-    // junctions, filesystem roots and mount points must be probed only from
-    // descendants inside the workspace filesystem.
-    if (!internalOnly) {
-        const rootProbe = probeExistingPath(rootPath);
-        if (rootProbe !== undefined) { return rootProbe; }
-    }
-
+    // The parent directory's lookup of the workspace-root name is never proof
+    // of lookup semantics *inside* that workspace. Per-directory case behavior,
+    // symlink/junction targets and mount points can all differ without a device
+    // boundary that is visible from the parent.
     try {
         const entries = fs.readdirSync(rootPath, { withFileTypes: true });
         for (const entry of entries.slice(0, 128)) {
@@ -131,6 +106,8 @@ export function detectLocalPathCaseSensitivity(
         // Fall through to the fail-closed result below.
     }
 
+    // Empty roots, unreadable roots, or roots without an internally probeable
+    // entry remain unresolved. Callers may retry after workspace contents change.
     return undefined;
 }
 
