@@ -3174,6 +3174,8 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
     const rootA=path.join(root,'scope-root-a'),rootB=path.join(root,'scope-root-b');
     fs.mkdirSync(rootA,{recursive:true});fs.mkdirSync(rootB,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
     const folders=[{uri:Uri.file(rootA),name:'a'},{uri:Uri.file(rootB),name:'b'}];
     const getFolder=uri=>(vscode.workspace.workspaceFolders??[]).find(folder=>{
         const relative=path.relative(folder.uri.fsPath,uri.fsPath);
@@ -3186,10 +3188,13 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
         tracker=new DiffTracker();
         tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
 
-        const caseSensitive=process.platform!=='win32'&&process.platform!=='darwin';
+        const verifiedRoots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(verifiedRoots.length,2);
+        assert.ok(verifiedRoots.every(identity=>typeof identity.caseSensitive==='boolean'),
+            'precondition: root-removal fixture must provide internally verified path identities');
         const initial={
             kind:'configured',mode:'rules',
-            roots:folders.map(folder=>({name:folder.name,uri:folder.uri.toString(),caseSensitive})),
+            roots:verifiedRoots.map(identity=>({...identity})),
             includes:[],excludes:[{scope:'folder',folder:'b',pattern:'private/**'}],
             scopeRevision:''
         };
@@ -3207,9 +3212,11 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
 
         vscode.workspace.workspaceFolders=[folders[0]];
         workspaceChanged({added:[],removed:[folders[1]]});
+        const rootAIdentity=verifiedRoots.find(identity=>identity.name==='a');
+        assert.ok(rootAIdentity);
         const reduced={
             kind:'configured',mode:'rules',
-            roots:[{name:'a',uri:folders[0].uri.toString(),caseSensitive}],
+            roots:[{...rootAIdentity}],
             includes:[],excludes:[],scopeRevision:''
         };
         reduced.scopeRevision=createHash('sha256').update(JSON.stringify({

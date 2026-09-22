@@ -469,9 +469,9 @@ export function registerPR11ReviewRegressions(h) {
 
         const probe=path.join(target,'ProbeName');
         fs.mkdirSync(probe);
-        const targetSemantics=detectLocalPathCaseSensitivity(probe);
+        const targetSemantics=detectLocalPathCaseSensitivity(target);
         assert.equal(typeof targetSemantics,'boolean',
-            'the target child must provide a concrete case-semantics probe on the test filesystem');
+            'the target root must derive concrete case semantics from its internal child');
         assert.equal(detectLocalPathCaseSensitivity(link),targetSemantics,
             'a symlink root must derive case identity from descendant lookup inside its target');
     });
