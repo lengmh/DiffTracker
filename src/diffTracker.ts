@@ -1749,13 +1749,17 @@ export class DiffTracker {
         console.error(message, error);
     }
 
-    private async flushPersistState(completedBaseline = false, transaction?: BaselineTransaction): Promise<boolean> {
+    private async flushPersistState(
+        completedBaseline = false,
+        transaction?: BaselineTransaction,
+        retainFailureMarker = false
+    ): Promise<boolean> {
         const epoch = this.sessionEpoch;
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
             await this.baselineTransaction.done;
             if (epoch !== this.sessionEpoch) { return false; }
-            return this.flushPersistState(completedBaseline);
+            return this.flushPersistState(completedBaseline, undefined, retainFailureMarker);
         }
         // A blocked restore must never erase the evidence during shutdown.
         if (this.recoveryBlocked) { return false; }
@@ -1821,9 +1825,20 @@ export class DiffTracker {
                 if (!transactionCurrent()) { return false; } // Keep the incomplete-write marker.
                 await vscode.workspace.fs.copy(targetUri, backupUri, { overwrite: true });
                 if (!transactionCurrent()) { return false; }
-                if (failureUri) { await this.deletePersistedFile(failureUri); }
+
+                // A scope transaction may durably prepare primary + backup before
+                // its final context validation. Keep the incomplete-write marker
+                // until the caller explicitly commits that prepared publication.
+                if (!retainFailureMarker && failureUri) {
+                    await this.deletePersistedFile(failureUri);
+                }
                 if (!transactionCurrent()) {
-                    if (failureUri) { await vscode.workspace.fs.writeFile(failureUri, new TextEncoder().encode('Session write interrupted')); }
+                    if (!retainFailureMarker && failureUri) {
+                        await vscode.workspace.fs.writeFile(
+                            failureUri,
+                            new TextEncoder().encode('Session write interrupted')
+                        );
+                    }
                     return false;
                 }
                 this.persistenceIssue = undefined;
@@ -1837,6 +1852,43 @@ export class DiffTracker {
         };
 
         this.persistStateWriteQueue = this.persistStateWriteQueue.then(persistTask, persistTask);
+        return this.persistStateWriteQueue;
+    }
+
+    private async commitPreparedScopePersistence(transaction: BaselineTransaction): Promise<boolean> {
+        const epoch = this.sessionEpoch;
+        const storageUri = this.storageUri;
+        if (!storageUri) { return true; }
+        const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+        if (!failureUri) { return true; }
+
+        const commitTask = async (): Promise<boolean> => {
+            const transactionCurrent = (): boolean =>
+                epoch === this.sessionEpoch &&
+                this.baselineTransaction === transaction &&
+                this.isCurrentEpoch(transaction.epoch) &&
+                (transaction.valid?.() ?? true);
+            if (!transactionCurrent()) { return false; }
+            try {
+                // Marker deletion is the durable commit point. All context
+                // validation happens before this operation; after it succeeds,
+                // later events are treated as post-commit activity/new requests.
+                await this.deletePersistedFile(failureUri);
+                this.persistenceIssue = undefined;
+                this.persistenceFailed = false;
+                return true;
+            } catch (error) {
+                if (epoch === this.sessionEpoch) {
+                    this.reportPersistenceIssue(
+                        'Failed to commit prepared monitoring-scope persistence; the uncommitted marker was retained.',
+                        error
+                    );
+                }
+                return false;
+            }
+        };
+
+        this.persistStateWriteQueue = this.persistStateWriteQueue.then(commitTask, commitTask);
         return this.persistStateWriteQueue;
     }
 
@@ -2759,11 +2811,14 @@ export class DiffTracker {
             this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
                 ? undefined
                 : this.ignoreFingerprint;
-            if (!await this.flushPersistState(false, transaction)) {
-                throw new Error('Configured monitoring scope could not be persisted');
+            if (!await this.flushPersistState(false, transaction, true)) {
+                throw new Error('Configured monitoring scope could not be prepared durably');
             }
             if (!scopeContextStillCurrent()) {
-                throw new Error('Monitoring scope or workspace context changed after persistence');
+                throw new Error('Monitoring scope or workspace context changed after durable preparation');
+            }
+            if (!await this.commitPreparedScopePersistence(transaction)) {
+                throw new Error('Configured monitoring scope could not cross the durable commit barrier');
             }
             committed = true;
             this.committedScopeDuringApply = undefined;
