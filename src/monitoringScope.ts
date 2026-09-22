@@ -204,7 +204,7 @@ function hasEnvironmentExpansion(value: string): boolean {
     return /\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(value);
 }
 
-function hasUnsupportedWildcardRun(value: string): boolean {
+function hasUnsupportedGlobStructure(value: string): boolean {
     let stars = 0;
     for (let index = 0; index < value.length; index++) {
         const character = value[index];
@@ -220,7 +220,12 @@ function hasUnsupportedWildcardRun(value: string): boolean {
             stars = 0;
         }
     }
-    return false;
+
+    const body = value.replace(/^\//, '').replace(/\/$/, '');
+    const components = body.split('/');
+    return components.some((component, index) =>
+        component === '**' && components[index + 1] === '**'
+    );
 }
 
 export function canonicalizeIncludePath(value: unknown, platform: NodeJS.Platform = process.platform): string | undefined {
@@ -242,7 +247,7 @@ export function canonicalizeExcludePattern(value: unknown, platform: NodeJS.Plat
     }
     if (value.startsWith('//') || /^[A-Za-z]:/.test(value) ||
         /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || hasEnvironmentExpansion(value) ||
-        hasUnsupportedWildcardRun(value)) {
+        hasUnsupportedGlobStructure(value)) {
         return undefined;
     }
     if (platform === 'win32' && value.includes('\\')) { return undefined; }
@@ -349,7 +354,7 @@ function canonicalizeScopeRequest(
             const target = validateRuleTarget(value, roots, 'exclude', index, errors);
             const pattern = canonicalizeExcludePattern(value.pattern, platform);
             if (pattern === undefined) {
-                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, must not use "!" negation, and must not contain unsupported runs of three or more unescaped "*".' });
+                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, must not use "!" negation, and must not contain unsupported triple-star runs or consecutive "**" components.' });
             }
             if (target && pattern !== undefined) {
                 excludes.push({ ...target, pattern });
