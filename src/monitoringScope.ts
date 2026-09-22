@@ -1,5 +1,7 @@
 import { createHash } from 'crypto';
+import { fileURLToPath } from 'url';
 import ignore from 'ignore';
+import { asciiCaseFold, resolveRelativePathIdentity } from './utils/pathIdentity';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -359,7 +361,7 @@ function includeRulesCollectivelyCover(
     return affectedRoots.length > 0 && affectedRoots.every(root =>
         effectiveRules.some(existing =>
             ruleAppliesToRoot(existing, root.name) &&
-            includeCoversRelativePath(existing.path, requested.path, false, root.caseSensitive)
+            includeCoversRelativePath(existing.path, requested.path, false, root)
         )
     );
 }
@@ -392,18 +394,35 @@ function ruleAppliesToRoot(rule: { scope: MonitoringRuleScope; folder?: string }
 }
 
 function identityPart(value: string, caseSensitive: boolean): string {
-    return caseSensitive ? value : value.toLowerCase();
+    return caseSensitive ? value : asciiCaseFold(value);
+}
+
+function localRootPath(root: WorkspaceRootIdentity): string | undefined {
+    try {
+        const url = new URL(root.uri);
+        return url.protocol === 'file:' ? fileURLToPath(url) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function relativeIdentity(root: WorkspaceRootIdentity, value: string): string {
+    if (root.caseSensitive !== false) { return value; }
+    const rootPath = localRootPath(root);
+    return rootPath
+        ? resolveRelativePathIdentity(rootPath, value, false).identity
+        : value.split('/').map(asciiCaseFold).join('/');
 }
 
 function includeCoversRelativePath(
     includePath: string,
     relativePath: string,
     directory: boolean,
-    caseSensitive: boolean
+    root: WorkspaceRootIdentity
 ): boolean {
-    const includeParts = includePath.split('/').map(part => identityPart(part, caseSensitive));
-    const targetParts = relativePath.replace(/\/$/, '').split('/').filter(Boolean)
-        .map(part => identityPart(part, caseSensitive));
+    const caseSensitive = root.caseSensitive !== false;
+    const includeParts = relativeIdentity(root, includePath).split('/').filter(Boolean);
+    const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, '')).split('/').filter(Boolean);
     if (targetParts.length >= includeParts.length &&
         includeParts.every((part, index) => targetParts[index] === part)) {
         return true;
@@ -464,7 +483,7 @@ export function evaluateConfiguredScope(
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (includeCoversRelativePath(rule.path, rel, directory, caseSensitive)) {
+        if (includeCoversRelativePath(rule.path, rel, directory, root)) {
             return { monitored: true, source: 'explicitInclude' };
         }
     }

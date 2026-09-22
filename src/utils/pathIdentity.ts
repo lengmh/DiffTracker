@@ -1,6 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+export function asciiCaseFold(value: string): string {
+    return value.replace(/[A-Z]/g, character => character.toLowerCase());
+}
+
 function toggleAsciiCase(value: string): string | undefined {
     for (let index = 0; index < value.length; index++) {
         const code = value.charCodeAt(index);
@@ -32,8 +36,8 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
 
 function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
     try {
-        const folded = requested.toLowerCase();
-        return fs.readdirSync(parent).filter(name => name.toLowerCase() === folded);
+        const folded = asciiCaseFold(requested);
+        return fs.readdirSync(parent).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
     }
@@ -130,7 +134,89 @@ export function detectLocalPathCaseSensitivity(
     return undefined;
 }
 
+export interface RelativePathIdentity {
+    identity: string;
+    resolvedRelativePath: string;
+}
+
+export function resolveRelativePathIdentity(
+    rootPath: string,
+    relativePath: string,
+    caseSensitive: boolean
+): RelativePathIdentity {
+    const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '')
+        .split('/').filter(Boolean);
+    if (caseSensitive || parts.length === 0) {
+        const value = parts.join('/');
+        return { identity: value, resolvedRelativePath: value };
+    }
+
+    const identityParts: string[] = [];
+    const resolvedParts: string[] = [];
+    let current = path.resolve(rootPath);
+    let physicalPrefixAvailable = true;
+
+    for (let index = 0; index < parts.length; index++) {
+        const requested = parts[index];
+        let actual: string | undefined;
+
+        if (physicalPrefixAvailable) {
+            try {
+                const entries = fs.readdirSync(current, { withFileTypes: true });
+                const exact = entries.filter(entry => entry.name === requested);
+                if (exact.length === 1) {
+                    actual = exact[0].name;
+                } else if (exact.length > 1) {
+                    physicalPrefixAvailable = false;
+                } else {
+                    // ASCII case-insensitivity is the property established by
+                    // detectLocalPathCaseSensitivity(). Never generalize that
+                    // evidence to ECMAScript's full Unicode lowercasing table.
+                    const asciiMatches = entries.filter(entry =>
+                        asciiCaseFold(entry.name) === asciiCaseFold(requested)
+                    );
+                    if (asciiMatches.length === 1) {
+                        actual = asciiMatches[0].name;
+                    } else {
+                        const requestedPath = path.join(current, requested);
+                        if (fs.existsSync(requestedPath)) {
+                            const resourceMatches = entries.filter(entry =>
+                                sameExistingResource(requestedPath, path.join(current, entry.name)) === true
+                            );
+                            if (resourceMatches.length === 1) {
+                                actual = resourceMatches[0].name;
+                            } else if (resourceMatches.length > 1) {
+                                physicalPrefixAvailable = false;
+                            }
+                        }
+                    }
+                }
+            } catch {
+                physicalPrefixAvailable = false;
+            }
+        }
+
+        if (actual !== undefined) {
+            identityParts.push(actual);
+            resolvedParts.push(actual);
+            current = path.join(current, actual);
+            continue;
+        }
+
+        // No physical entry proves a broader Unicode equivalence. Preserve the
+        // requested Unicode spelling and fold only ASCII for a missing suffix.
+        identityParts.push(asciiCaseFold(requested));
+        resolvedParts.push(requested);
+        physicalPrefixAvailable = false;
+    }
+
+    return {
+        identity: identityParts.join('/'),
+        resolvedRelativePath: resolvedParts.join('/')
+    };
+}
+
 export function pathIdentityText(value: string, caseSensitive: boolean): string {
     const normalized = path.resolve(value);
-    return caseSensitive ? normalized : normalized.toLowerCase();
+    return caseSensitive ? normalized : asciiCaseFold(normalized);
 }

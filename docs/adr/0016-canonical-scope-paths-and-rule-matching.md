@@ -10,6 +10,8 @@ status: accepted
 
 路径身份按每个工作区根的实际资源语义求值：显式 include 使用根级路径身份，Git ignore 尽量遵循有效 `core.ignorecase`，无 Git 根遵循本地文件系统身份；持久化保持真实大小写。S0 必须选择并验证统一的根级 identity helper，不能在不同调用点各自猜测。无法可靠确定根的大小写语义时应显示配置或覆盖问题，不静默采用另一种匹配方式。
 
+case-insensitive 不等于 ECMAScript Unicode `toLowerCase()`。根级 probe 只证明 ASCII case lookup 语义；实际已存在组件必须通过父目录真实 entry spelling 与 same-resource lookup 建立 identity。缺失后缀可以按已证明的 ASCII case-insensitive 语义折叠 ASCII 字母，但不得推断更广的 Unicode 等价。这样即使文件系统允许 `ß` 与 `ẞ` 作为两个独立 entry，显式 include、baseline key 和 review key 也必须保持二者分离；若某文件系统确实把非 ASCII 别名解析到同一资源，则由实际 lookup/same-resource 证据统一它们。
+
 若 Workspace Root 本身是 symlink/junction、文件系统根或 mount point，根名称所在父目录的 lookup 语义不是工作区后代的可靠证据，因为 link/挂载边界与 workspace 内部可以具有不同的文件系统大小写语义。identity helper 对 symlink/junction，以及与父目录 `stat.dev` 不同的挂载根，只能从工作区内部的非 symlink 子项取得 case-semantics 证据；不得直接 probe 该根名称。目标为空、内部只有不可用探针或读取失败时返回未验证状态并 fail closed。
 
 结构化 exclude 每项包含一个相对于目标根的受限 gitignore 模式：`/foo` 锚定根，slashless 名称按 gitignore 语义作用于任意深度，尾随 `/` 表示目录及后代，`**` 保留递归含义；空模式和 `!` 否定无效。JSON 数组项不使用注释行语义，以 `#` 开头的名称按字面模式处理，尾部空格按实际字符串处理。所有根规则分别求值。
