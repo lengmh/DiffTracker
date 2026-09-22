@@ -507,6 +507,36 @@ export function registerPR11ReviewRegressions(h) {
         }finally{t.maxImportedDirectoryWatchers=previousLimit;}
     });
 
+    test('PR11 restored imported-directory coverage gap clears after fresh watch and scan',async()=>{
+        let t=h.getTracker();
+        const storage=file('restored-directory-gap-storage');
+        t.storageUri=Uri.file(storage);
+        t.startRecording();
+        await waitUntil(()=>t.getBaselineState()==='ready');
+
+        const dir=file('restored-directory-gap');
+        fs.mkdirSync(dir);
+        const previousLimit=t.maxImportedDirectoryWatchers;
+        t.maxImportedDirectoryWatchers=0;
+        try{
+            await t.onExternalFileCreated(Uri.file(dir));
+        }finally{
+            t.maxImportedDirectoryWatchers=previousLimit;
+        }
+        assert.equal(t.coverageGaps.get(dir)?.subtree?.reasonCode,'directory-runtime-coverage-gap',
+            'precondition: failed imported-directory watch must persist a subtree coverage gap');
+        assert.equal(await t.flushPendingPersistence(),true);
+
+        await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+        const outcome=await t.restorePersistedState();
+        assert.equal(outcome,'restored');
+        assert.equal(t.importedDirectoryWatchers.get(dir)?.epoch,t.sessionEpoch,
+            'restore must reconstruct the imported-directory watcher obligation and install a fresh watch');
+        assert.equal(t.coverageGaps.get(dir)?.subtree,undefined,
+            'persisted watcher coverage gap must retire only after the fresh watch and restore scan both succeed');
+    });
+
     test('PR11 symlink workspace root derives case identity only from inside the target',async()=>{
         const target=file('case-symlink-target');
         const link=file('case-symlink-root');
