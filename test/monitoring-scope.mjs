@@ -430,8 +430,10 @@ console.log('monitoring scope canonicalization and expansion tests passed');
 
 {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-path-distinct-case-'));
-    const first = path.join(parent, 'CaseProof');
-    const alternate = path.join(parent, 'caseProof');
+    const root = path.join(parent, 'CaseProofRoot');
+    const first = path.join(root, 'CaseProof');
+    const alternate = path.join(root, 'caseProof');
+    fs.mkdirSync(root);
     fs.mkdirSync(first);
     let distinctVariants = false;
     try {
@@ -443,9 +445,9 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     try {
         if (distinctVariants) {
             assert.equal(
-                detectLocalPathCaseSensitivity(first),
+                detectLocalPathCaseSensitivity(root),
                 true,
-                'two distinct resources at toggled casing prove case-sensitive lookup'
+                'two distinct resources inside the workspace at toggled casing prove case-sensitive lookup'
             );
         }
     } finally {
