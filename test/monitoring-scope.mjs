@@ -170,6 +170,63 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
     );
 }
 
+{
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-exclude-case-cache-'));
+    const rootPath = path.join(parent, 'workspace');
+    const flat = path.join(rootPath, 'flat');
+    fs.mkdirSync(flat, { recursive: true });
+    fs.writeFileSync(path.join(flat, 'ProbeName'), 'probe');
+    for (let index = 0; index < 32; index++) {
+        fs.writeFileSync(path.join(flat, `file-${index}.ts`), 'x');
+    }
+
+    try {
+        const rootCaseSensitive = detectLocalPathCaseSensitivity(rootPath);
+        assert.equal(typeof rootCaseSensitive, 'boolean', 'fixture must establish workspace-root case semantics');
+        const rootIdentity = {
+            name: 'workspace',
+            uri: pathToFileURL(rootPath).toString(),
+            caseSensitive: rootCaseSensitive
+        };
+        const checked = validateAndCanonicalizeScope(valid({
+            excludes: [{ scope: 'all', pattern: 'flat/*.log' }]
+        }), [rootIdentity], process.platform);
+        assert.equal(checked.ok, true, JSON.stringify(checked.errors));
+
+        let flatEnumerations = 0;
+        const originalReaddirSync = fs.readdirSync;
+        fs.readdirSync = (value, ...args) => {
+            if (typeof value === 'string' && path.resolve(value) === path.resolve(flat)) {
+                flatEnumerations++;
+            }
+            return originalReaddirSync(value, ...args);
+        };
+        try {
+            for (let index = 0; index < 32; index++) {
+                const decision = evaluateConfiguredScope(
+                    checked.scope, rootIdentity, `flat/file-${index}.ts`, false
+                );
+                assert.deepEqual(decision, { monitored: true, source: 'ordinaryPolicy' });
+            }
+            const afterBatch = flatEnumerations;
+            assert.ok(afterBatch <= 6,
+                `verified per-directory case semantics must be cached during exclusion scans; got ${afterBatch} enumerations`);
+
+            const beforeMutation = fs.statSync(flat);
+            fs.writeFileSync(path.join(flat, 'cache-invalidation.tmp'), 'mutation');
+            const forced = new Date(Math.max(Date.now(), beforeMutation.mtimeMs + 5000));
+            fs.utimesSync(flat, forced, forced);
+            evaluateConfiguredScope(checked.scope, rootIdentity, 'flat/file-0.ts', false);
+            assert.ok(flatEnumerations > afterBatch,
+                'directory metadata changes must invalidate the verified case-semantics cache');
+        } finally {
+            fs.readdirSync = originalReaddirSync;
+        }
+    } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+    }
+}
+
 console.log('monitoring scope canonicalization and expansion tests passed');
 
 {
