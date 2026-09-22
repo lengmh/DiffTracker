@@ -97,8 +97,18 @@ assert.equal(canonicalizeIncludePath('private-data/model.bin', 'linux'), 'privat
 assert.equal(canonicalizeIncludePath('literal\\name', 'linux'), 'literal\\name');
 assert.equal(canonicalizeIncludePath('literal\\name', 'win32'), undefined);
 
-for (const value of ['', '!secret/**', 'C:/secret/**', 'file:///tmp/**', '$HOME/**']) {
+for (const value of [
+    '', '!secret/**', 'C:/secret/**', 'file:///tmp/**', '$HOME/**',
+    '.', './secrets/**', '../secrets/**', 'a/../secrets/**', 'secrets//key', '/'
+]) {
     assert.equal(canonicalizeExcludePattern(value, 'linux'), undefined, `invalid exclude accepted: ${value}`);
+}
+{
+    const result = validateAndCanonicalizeScope(valid({
+        excludes: [{ scope: 'all', pattern: './secrets/**' }]
+    }), roots, 'linux');
+    assert.equal(result.ok, false, 'non-canonical explicit excludes must reject the whole scope request');
+    assert.equal(result.scope, undefined);
 }
 assert.equal(canonicalizeExcludePattern('/generated/**', 'linux'), '/generated/**');
 assert.equal(canonicalizeExcludePattern('#literal-name', 'linux'), '#literal-name');
