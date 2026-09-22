@@ -313,7 +313,11 @@ export class MonitoringScopeController implements vscode.Disposable {
             (legacyRules.length > 0 || committedRules.some(([, patterns]) => patterns.length > 0));
         const migrationComplete = !migrationRequired ||
             this.migrationRecordMatches(validatedScope.scopeRevision);
-        const expectedLegacySourceFingerprint = effective.kind === 'legacyV3' && legacyRules.length > 0
+        // Any legacyV3 migration that can replace Workspace watchExclude
+        // is a destructive source transition. Bind it to the exact Workspace
+        // source snapshot even when only committed compatibility evidence
+        // survives and the live legacy string list is currently empty.
+        const expectedLegacySourceFingerprint = effective.kind === 'legacyV3' && migrationRequired
             ? options?.expectedLegacySourceFingerprint ?? this.getLegacySourceFingerprint(validatedScope.roots)
             : undefined;
         const legacySourceStillCurrent = (): boolean =>
@@ -452,7 +456,21 @@ export class MonitoringScopeController implements vscode.Disposable {
     public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
         const approvedSource = this.getLegacySourceSnapshot();
         const approvedSourceFingerprint = createLegacySourceFingerprint(approvedSource);
-        const preview = previewLegacyWatchExcludeMigration(this.getLegacyWatchRules());
+        const liveRules = this.getLegacyWatchRules();
+        const committedRules = this.getCommittedLegacyRules()
+            .filter(([, patterns]) => patterns.length > 0);
+        // If the live legacy source has already disappeared but committed
+        // compatibility policy still protects paths, there is no trustworthy
+        // automatic source-to-target translation. Require the user to review
+        // the structured target explicitly instead of synthesizing an empty one.
+        if (liveRules.length === 0 && committedRules.length > 0) {
+            return {
+                status: 'manual',
+                manual: committedRules.flatMap(([, patterns]) => patterns),
+                reason: 'Committed legacy monitoring policy survives after the live Workspace source changed; review and save the structured migration target explicitly.'
+            };
+        }
+        const preview = previewLegacyWatchExcludeMigration(liveRules);
         if (preview.manual.length > 0) {
             return { status: 'manual', manual: preview.manual, reason: 'Some legacy watch rules require manual migration to preserve downstream policy semantics.' };
         }
@@ -509,9 +527,10 @@ export class MonitoringScopeController implements vscode.Disposable {
             try {
                 requested = await this.saveRequestedScope(reviewedTarget, {
                     allowLegacyMigrationWrite: true,
-                    expectedLegacySourceFingerprint: this.getLegacyWatchRules().length > 0
-                        ? createLegacySourceFingerprint(approvedSource)
-                        : undefined
+                    // The approved source may be committed-only, but the
+                    // mutable Workspace value still has to remain exactly as
+                    // reviewed until its destructive replacement.
+                    expectedLegacySourceFingerprint: createLegacySourceFingerprint(approvedSource)
                 });
             } catch (error) {
                 return {
