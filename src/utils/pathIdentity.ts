@@ -87,65 +87,28 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     return undefined;
 }
 
-const localCaseSensitivityCache = new Map<string, { signature: string; value: boolean }>();
-
-function directoryIdentitySignature(directory: string): string {
-    const stat = fs.statSync(directory);
-    return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-}
-
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
     _platform: NodeJS.Platform = process.platform
 ): boolean | undefined {
-    // Only verified results are cached, and every reuse first checks directory
-    // identity/metadata. This keeps repeated exclusion classification O(N)
-    // instead of synchronously re-enumerating the same directory per candidate.
-    const cacheKey = path.resolve(rootPath);
-    let before: string | undefined;
-    try {
-        before = directoryIdentitySignature(rootPath);
-        const cached = localCaseSensitivityCache.get(cacheKey);
-        if (cached?.signature === before) { return cached.value; }
-        if (cached) { localCaseSensitivityCache.delete(cacheKey); }
-    } catch {
-        // An unreadable/non-directory path remains fail-closed and uncached.
-    }
-
     // The parent directory's lookup of the workspace-root name is never proof
     // of lookup semantics *inside* that workspace. Per-directory case behavior,
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
-    let result: boolean | undefined;
     try {
         const entries = fs.readdirSync(rootPath, { withFileTypes: true });
         for (const entry of entries.slice(0, 128)) {
             if (entry.isSymbolicLink()) { continue; }
             const probe = probeExistingPath(path.join(rootPath, entry.name));
-            if (probe !== undefined) {
-                result = probe;
-                break;
-            }
+            if (probe !== undefined) { return probe; }
         }
     } catch {
         // Fall through to the fail-closed result below.
     }
 
-    if (result !== undefined && before !== undefined) {
-        try {
-            const after = directoryIdentitySignature(rootPath);
-            if (after === before) {
-                if (localCaseSensitivityCache.size >= 4096) { localCaseSensitivityCache.clear(); }
-                localCaseSensitivityCache.set(cacheKey, { signature: after, value: result });
-            }
-        } catch {
-            // Never cache a result if directory identity changed or vanished.
-        }
-    }
-
     // Empty roots, unreadable roots, or roots without an internally probeable
     // entry remain unresolved. Callers may retry after workspace contents change.
-    return result;
+    return undefined;
 }
 
 export interface RelativePathIdentity {
@@ -160,11 +123,15 @@ export interface RelativePathIdentity {
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
 const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
 function directoryEntries(directory: string): fs.Dirent[] {
-    const before = directoryIdentitySignature(directory);
+    const signature = (): string => {
+        const stat = fs.statSync(directory);
+        return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    };
+    const before = signature();
     const cached = directoryEntriesCache.get(directory);
     if (cached?.signature === before) { return cached.entries; }
     const entries = fs.readdirSync(directory, { withFileTypes: true });
-    if (directoryIdentitySignature(directory) === before) {
+    if (signature() === before) {
         if (directoryEntriesCache.size >= 4096) { directoryEntriesCache.clear(); }
         directoryEntriesCache.set(directory, { signature: before, entries });
     }
