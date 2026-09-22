@@ -517,11 +517,13 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(pending(child)?.isDeleted,false);
 
         const policy=file('.gitignore');
-        fs.writeFileSync(policy,`${path.basename(dir)}/\n`);
+        fs.writeFileSync(policy,`${path.basename(dir)}\n`);
         h.setListedIgnores([Uri.file(policy)]);
         await t.refreshIgnoreMatchers();
         assert.equal(t.getRetainedReviewPaths().includes(child),true,
             'precondition: ordinary ignore retains the existing child review');
+        assert.equal(t.isPathIgnored(Uri.file(dir)),true,
+            'precondition: slashless ordinary ignore must trigger the parent-path short circuit under test');
 
         t.isRecording=true;
         t.externalWatcherEnabled=true;
