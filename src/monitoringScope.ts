@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import * as path from 'path';
+import * as fs from 'fs';
 import ignore from 'ignore';
 import { asciiCaseFold, detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
 
@@ -488,6 +489,36 @@ function literalPatternComponent(component: string): string | undefined {
     return literal;
 }
 
+const exclusionDirectoryCaseCache = new Map<string, { signature: string; value: boolean }>();
+
+function exclusionDirectorySignature(directory: string): string | undefined {
+    try {
+        const stat = fs.statSync(directory);
+        return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch {
+        return undefined;
+    }
+}
+
+function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
+    const key = path.resolve(directory);
+    const before = exclusionDirectorySignature(directory);
+    if (before !== undefined) {
+        const cached = exclusionDirectoryCaseCache.get(key);
+        if (cached?.signature === before) { return cached.value; }
+        if (cached) { exclusionDirectoryCaseCache.delete(key); }
+    }
+
+    const value = detectLocalPathCaseSensitivity(directory);
+    if (value === undefined || before === undefined) { return value; }
+    const after = exclusionDirectorySignature(directory);
+    if (after === before) {
+        if (exclusionDirectoryCaseCache.size >= 4096) { exclusionDirectoryCaseCache.clear(); }
+        exclusionDirectoryCaseCache.set(key, { signature: after, value });
+    }
+    return value;
+}
+
 function explicitExcludeMatches(
     pattern: string, relativePath: string, directory: boolean, root: WorkspaceRootIdentity
 ): boolean {
@@ -513,7 +544,7 @@ function explicitExcludeMatches(
                 requested.identity === target.slice(0, index + 1).join('/');
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
-        const sensitive = parent ? detectLocalPathCaseSensitivity(parent) : root.caseSensitive;
+        const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent) : root.caseSensitive;
         return sensitive !== true && ignore({ ignorecase: true })
             .add('/' + explicitPatternForIgnore(component)).ignores(target[index]);
     };
