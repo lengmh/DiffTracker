@@ -529,6 +529,76 @@ export function registerPR11ReviewRegressions(h) {
         });
     }
 
+    test('PR11 empty stopped configured scope survives reload before pending Apply',async()=>{
+        let t=h.getTracker();
+        const storage=file('empty-stopped-configured-storage');
+        await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+
+        const effective=scope();
+        const requested=scope([], [{scope:'all',pattern:'future-private/'}]);
+        assert.notEqual(effective.scopeRevision,requested.scopeRevision);
+        assert.equal((await t.applyConfiguredMonitoringScope(effective)).status,'applied');
+        assert.equal(t.getIsRecording(),false);
+        assert.equal(t.snapshotInitialized,false);
+        t.setPendingMonitoringScope(requested);
+        assert.equal(await t.flushPendingPersistence(),true);
+
+        await t.dispose();
+        t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+        t.setPendingMonitoringScope(requested);
+        assert.equal(await t.restorePersistedState(),'restored',
+            'configured effective scope must keep an otherwise empty stopped V4 session durable');
+        assert.equal(t.getEffectiveMonitoringScope().kind,'configured');
+        assert.equal(t.getEffectiveMonitoringScope().scopeRevision,effective.scopeRevision,
+            'reload must preserve the old effective scope rather than collapsing to the pending request');
+        assert.notEqual(t.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+        assert.equal(t.getIsRecording(),false);
+    });
+
+    test('PR11 explicit include enumeration prunes explicitly excluded directories',async()=>{
+        let t=h.getTracker();
+        await t.dispose();
+        t=new DiffTracker();h.setTracker(t);
+        t.isRecording=true;
+        t.externalWatcherEnabled=true;
+        t.snapshotInitialized=true;
+        t.baselineBuilding=false;
+
+        const src=file('explicit-prune-src');
+        const vendor=path.join(src,'vendor');
+        const keep=path.join(src,'keep.txt');
+        const secret=path.join(vendor,'secret.txt');
+        fs.mkdirSync(vendor,{recursive:true});
+        fs.writeFileSync(keep,'keep baseline');
+        fs.writeFileSync(secret,'secret baseline');
+
+        const requested=scope(
+            [{scope:'all',path:relative(src)}],
+            [{scope:'all',pattern:`/${relative(vendor)}/`}]
+        );
+        const originalReaddir=fs.promises.readdir;
+        let vendorReads=0;
+        fs.promises.readdir=async(value,...args)=>{
+            if(path.resolve(String(value))===path.resolve(vendor)){
+                vendorReads++;
+                const error=Object.assign(new Error('excluded vendor is unreadable'),{code:'EACCES'});
+                throw error;
+            }
+            return originalReaddir.call(fs.promises,value,...args);
+        };
+        try{
+            const result=await t.applyConfiguredMonitoringScope(requested);
+            assert.equal(result.status,'applied',JSON.stringify(result));
+            assert.equal(vendorReads,0,
+                'explicitly excluded directory must be pruned before recursive enumeration');
+            assert.equal(t.getOriginalContent(keep),'keep baseline');
+            assert.equal(t.getOriginalContent(secret),undefined);
+        }finally{
+            fs.promises.readdir=originalReaddir;
+        }
+    });
+
     for(const priorBaseline of [false,true]) test(`PR11 stopped apply defers new include baseline (prior=${priorBaseline})`,async()=>{
         let t=h.getTracker(); const storage=file('stopped-storage');
         await t.dispose();t=new DiffTracker(Uri.file(storage));h.setTracker(t);
