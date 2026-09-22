@@ -547,8 +547,8 @@ export function registerPR11ReviewRegressions(h) {
         await t.dispose();
         t=new DiffTracker(Uri.file(storage));h.setTracker(t);
         t.setPendingMonitoringScope(requested);
-        assert.equal(await t.restorePersistedState(),'restored',
-            'configured effective scope must keep an otherwise empty stopped V4 session durable');
+        assert.equal(await t.restorePersistedState(),'incomplete',
+            'configured effective scope must keep an otherwise empty stopped V4 session durable and paused');
         assert.equal(t.getEffectiveMonitoringScope().kind,'configured');
         assert.equal(t.getEffectiveMonitoringScope().scopeRevision,effective.scopeRevision,
             'reload must preserve the old effective scope rather than collapsing to the pending request');
@@ -617,7 +617,7 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(t.baselineBuilding,false);assert.equal(t.scanCoverage,undefined);
             await t.flushPendingPersistence();await t.dispose();
             t=new DiffTracker(Uri.file(storage));h.setTracker(t);
-            assert.equal(await t.restorePersistedState(),'restored',
+            assert.equal(await t.restorePersistedState(),priorBaseline?'restored':'incomplete',
                 'configured effective scope keeps even an empty stopped session durable');
             assert.equal(t.getOriginalContent(target),undefined);
             assert.equal(pending(target),undefined);
