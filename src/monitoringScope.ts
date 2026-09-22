@@ -265,10 +265,11 @@ function dedupeAndSort<T extends MonitoringIncludeRule | MonitoringExcludeRule>(
     return [...byKey.values()].sort((a, b) => compareText(canonicalRuleKey(a), canonicalRuleKey(b)));
 }
 
-export function validateAndCanonicalizeScope(
+function canonicalizeScopeRequest(
     request: unknown,
     rootsInput: readonly WorkspaceRootIdentity[],
-    platform: NodeJS.Platform = process.platform
+    platform: NodeJS.Platform,
+    validateLiveHardBoundaries: boolean
 ): ScopeValidationResult {
     const errors: ScopeValidationError[] = [];
     const warnings: string[] = [];
@@ -305,7 +306,7 @@ export function validateAndCanonicalizeScope(
                     ? roots
                     : roots.filter(root => root.name === target.folder)
                 : [];
-            const hardBoundary = !!includePath && targetRoots.some(root =>
+            const hardBoundary = validateLiveHardBoundaries && !!includePath && targetRoots.some(root =>
                 isHardUnmonitorableRelativePath(includePath, root)
             );
             if (hardBoundary) {
@@ -361,6 +362,24 @@ export function validateAndCanonicalizeScope(
             scopeRevision: stableHash(identity)
         }
     };
+}
+
+export function validateAndCanonicalizeScope(
+    request: unknown,
+    rootsInput: readonly WorkspaceRootIdentity[],
+    platform: NodeJS.Platform = process.platform
+): ScopeValidationResult {
+    return canonicalizeScopeRequest(request, rootsInput, platform, true);
+}
+
+function canonicalizePersistedScope(
+    request: unknown,
+    rootsInput: readonly WorkspaceRootIdentity[],
+    platform: NodeJS.Platform = process.platform
+): ScopeValidationResult {
+    // Persisted state validation must be deterministic from serialized bytes.
+    // Current path existence/case identity is reconciled later during restore.
+    return canonicalizeScopeRequest(request, rootsInput, platform, false);
 }
 
 function sameRule(left: MonitoringExcludeRule, right: MonitoringExcludeRule): boolean {
@@ -811,7 +830,7 @@ export function parseEffectiveMonitoringScope(raw: unknown): EffectiveMonitoring
         return parsed.scopeRevision === candidate.scopeRevision ? parsed : undefined;
     }
     if (candidate.kind !== 'configured') { return undefined; }
-    const validated = validateAndCanonicalizeScope({
+    const validated = canonicalizePersistedScope({
         mode: candidate.mode,
         includes: candidate.includes,
         excludes: candidate.excludes
