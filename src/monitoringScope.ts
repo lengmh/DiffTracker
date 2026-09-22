@@ -724,8 +724,15 @@ function excludeRuleCoversOnRoot(
     const recursive = raw.startsWith('**/') ? literal(raw.slice(3)) : undefined;
     const ordinary = literal(raw);
     const subtree = raw.endsWith('/**') ? literal(raw.slice(0, -3)) : undefined;
-    const equal = (left: string, right: string) => root.caseSensitive
-        ? left === right : left.toLowerCase() === right.toLowerCase();
+    const equal = (left: string, right: string) => {
+        if (left === right) { return true; }
+        if (root.caseSensitive) { return false; }
+        // The root probe establishes ASCII case-insensitive lookup only. Do
+        // not use ECMAScript's broader Unicode case table to prove exclusion
+        // containment; an unproved non-ASCII spelling change is an expansion.
+        return /^[\x00-\x7F]+$/.test(left) && /^[\x00-\x7F]+$/.test(right) &&
+            asciiCaseFold(left) === asciiCaseFold(right);
+    };
 
     if (!effective.anchored) {
         const name = ordinary && !ordinary.anchored ? ordinary :

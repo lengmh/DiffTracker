@@ -22,4 +22,6 @@ include 和 exclude 各自是顺序无关的集合。Scope Revision 对规范化
 
 scope expansion 的证明也按集合语义执行：对每个受影响且仍存在的 Workspace Root，分别判断规则集合的并集是否覆盖原授权/原排除集合，而不是要求某一条 candidate rule 单独覆盖所有 roots。因此 `all:src` 与“每个 root 各一条等价 `folder:src`”在同一 roots 集合上可以证明等价；exclude 同理。无法逐 root 结构化证明的 glob 关系继续 fail closed，仍视为 expansion。
 
+exclusion containment 的大小写等价证明不得使用 ECMAScript Unicode `toLowerCase()`。完全相同组件可以直接相等；已验证 case-insensitive root 仅允许对 ASCII 组件做 case fold。非 ASCII 的不同拼写若没有文件系统 same-resource 证据，则保守视为不同 exclusion，因此可能多一次 expansion consent，但不能把实际重新暴露的路径误判为仍被排除。
+
 空路径、`.` 或等价根 include 被禁止，避免通过 include 偷渡每根独立的全工作区模式；需要全部根时使用 Whole Workspace。显式 exclude 可以合法地将某一工作区根排空：该根仍属于工作区、范围授权和根集合，只是有效资源集合为空，界面应显示“此根已被显式排除”，而不是伪装成 watcher 故障。已有待审按保留审阅或放弃确认规则处理。
