@@ -2386,8 +2386,12 @@ export class DiffTracker {
     }
 
     private pendingScopeEvidenceKind(record: CoverageGapRecord | undefined): 'file' | 'subtree' | undefined {
-        if (record?.subtree?.reasonCode === 'pending-scope-deferred-event') { return 'subtree'; }
+        if (record?.subtree?.reasonCode === 'pending-scope-deferred-event' ||
+            record?.subtree?.reasonCode === 'pending-scope-deferred-delete') {
+            return 'subtree';
+        }
         if (record?.file?.reasonCode === 'pending-scope-deferred-event' ||
+            record?.file?.reasonCode === 'pending-scope-deferred-delete' ||
             record?.file?.reasonCode === 'pending-explicit-exclusion') {
             return 'file';
         }
@@ -2431,9 +2435,9 @@ export class DiffTracker {
                 const stat = fs.lstatSync(uri.fsPath);
                 targetIsDirectory = stat.isDirectory() && !stat.isSymbolicLink();
             } catch {
-                // A missing/racing path is conservatively recorded as file-level
-                // uncertainty. Creation events for real directories are still
-                // classified before any content read.
+                // A missing/racing non-delete path remains conservatively
+                // file-level. Delete events use historical subtree provenance
+                // through deferPendingScopeDeletion() below.
             }
         }
         if (!this.pendingScopeExplicitlyExcludes(uri, targetIsDirectory)) { return false; }
@@ -2445,6 +2449,55 @@ export class DiffTracker {
         } else {
             this.setFileCoverageGap(uri.fsPath, 'pending-scope-deferred-event', reason);
         }
+        return true;
+    }
+
+    private knownFileEvidenceUnder(root: string): string[] {
+        const normalizedRoot = path.resolve(root);
+        const values = new Set<string>([
+            ...this.fileSnapshots.keys(),
+            ...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys(),
+            ...this.trackedChanges.keys()
+        ]);
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (record.file) { values.add(targetPath); }
+        }
+        return [...values].filter(filePath =>
+            path.resolve(filePath) !== normalizedRoot &&
+            this.pathBelongsToRoot(filePath, normalizedRoot)
+        );
+    }
+
+    private hasHistoricalDirectoryProvenance(root: string): boolean {
+        const normalizedRoot = path.resolve(root);
+        if (this.coverageGaps.get(normalizedRoot)?.subtree) { return true; }
+        for (const directory of this.importedDirectoryWatchers.keys()) {
+            if (this.pathBelongsToRoot(directory, normalizedRoot)) { return true; }
+        }
+        return this.knownFileEvidenceUnder(normalizedRoot).length > 0;
+    }
+
+    private deferPendingScopeDeletion(uri: vscode.Uri): boolean {
+        const directory = this.hasHistoricalDirectoryProvenance(uri.fsPath);
+        if (!directory) { return this.deferPendingScopeEvent(uri); }
+        if (!this.pendingScopeExplicitlyExcludes(uri, true)) { return false; }
+
+        const root = path.resolve(uri.fsPath);
+        const reason =
+            'A known directory subtree was deleted while an explicit exclusion awaited confirmation; descendant state requires review';
+        this.pendingScopeSuspendedPaths.add(root);
+        // A missing directory must never be projected as a file review merely
+        // because lstat can no longer classify the deleted path.
+        this.clearCoverageGap(root, 'file', false);
+        this.setSubtreeCoverageGap(root, 'pending-scope-deferred-delete', reason);
+
+        for (const filePath of this.knownFileEvidenceUnder(root)) {
+            this.pendingScopeSuspendedPaths.add(filePath);
+            this.setFileCoverageGap(filePath, 'pending-scope-deferred-delete', reason);
+            this.markFileUnavailable(filePath, reason);
+        }
+        this.schedulePersistState();
         return true;
     }
 
@@ -4824,7 +4877,7 @@ export class DiffTracker {
             this.preserveDeferredScopeApplyEvent(uri.fsPath);
             return;
         }
-        if (this.deferPendingScopeEvent(uri)) { return; }
+        if (this.deferPendingScopeDeletion(uri)) { return; }
         if (this.isPathIgnored(uri)) { return; }
         if (this.retainCoverageGapReview(uri.fsPath)) { return; }
         const operationId = this.beginExternalOperation(uri, 'delete');

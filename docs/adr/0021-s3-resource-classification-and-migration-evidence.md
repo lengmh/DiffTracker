@@ -16,6 +16,8 @@ PR #11 的 hardening 继续遵守 ADR-0003、ADR-0014 和 ADR-0015，并冻结�
 
 pending explicit exclusion 只暂停读取，不得抹去“事件已经发生”的事实。任何在 pending exclusion 下被 deferred 的新文件或目录事件都写入 Session V4 的 typed coverage evidence：文件使用 file gap，真实目录使用 subtree gap；内存中的 suspended-path 集合可以作为运行时索引，但不能是唯一 provenance。重启时由 durable reason code 重建 suspended-path 索引；若请求仍排除该资源则继续暂停，若请求已撤回则文件转为 unknown review、目录保留独立 subtree diagnostic。
 
+delete event 不能依赖删除后的 `lstat` 来判断资源种类。若 imported-directory watcher、已有 subtree diagnostic 或已知 baseline/review descendants 能证明被删路径历史上是目录，则父 delete 必须记录 subtree-level deferred-deletion provenance，并同时把所有已知 descendant file evidence 标记为 durable deferred deletion；即使后端只上报父目录一次 delete，也不能生成父目录 phantom file review 或丢失子文件删除证据。
+
 ## 旧规则迁移授权
 
 迁移完成不是长期布尔值。迁移授权必须绑定：
