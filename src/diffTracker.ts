@@ -7,7 +7,7 @@ import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
 import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
-import { CanonicalMonitoringScope, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, WorkspaceRootIdentity } from './monitoringScope';
+import { CanonicalMonitoringScope, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -688,21 +688,33 @@ export class DiffTracker {
         this.disposeFileWatchers();
 
         const currentRoots = this.getWorkspaceRoots();
+        const currentRootIdentities = this.currentWorkspaceRootIdentities();
         this.sessionWorkspaceRoots = [...state.workspaceRoots];
         const rootsMatch = this.sameStringSet(state.workspaceRoots, currentRoots);
         const scopeRootsMatch = this.sameWorkspaceRootIdentities(
             state.effectiveMonitoringScope.roots,
-            this.currentWorkspaceRootIdentities()
+            currentRootIdentities
         );
         const wholeWorkspaceNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
             state.effectiveMonitoringScope.mode === 'wholeWorkspace';
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
+        const configuredScopeNeedsReconciliation = state.effectiveMonitoringScope.kind === 'configured'
+            ? (() => {
+                const live = validateAndCanonicalizeScope({
+                    mode: state.effectiveMonitoringScope.mode,
+                    includes: state.effectiveMonitoringScope.includes,
+                    excludes: state.effectiveMonitoringScope.excludes
+                }, currentRootIdentities);
+                return !live.ok || !live.scope ||
+                    live.scope.scopeRevision !== state.effectiveMonitoringScope.scopeRevision;
+            })()
+            : false;
         const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
             state.effectiveMonitoringScope.mode === 'rules'
             ? this.explicitIncludeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
             : undefined;
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
-            wholeWorkspaceNeedsS4 || !!watcherCoverageNeedsS4;
+            configuredScopeNeedsReconciliation || wholeWorkspaceNeedsS4 || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
@@ -824,7 +836,9 @@ export class DiffTracker {
                         ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
                         : !scopeRootsMatch
                             ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
-                            : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
+                            : configuredScopeNeedsReconciliation
+                                ? 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.'
+                                : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
