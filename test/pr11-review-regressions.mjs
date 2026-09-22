@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { detectScopeExpansion, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
+import { detectScopeExpansion, evaluateConfiguredScope, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR11ReviewRegressions(h) {
@@ -601,6 +601,49 @@ export function registerPR11ReviewRegressions(h) {
         vscode.workspace.getConfiguration=(...args)=>{const config=old(...args);return {...config,get:(key,fallback)=>key==='watchExclude'?['private/',{scope:'all',pattern:'other/'}]:config.get(key,fallback)};};
         try{await assert.rejects(h.getTracker().refreshIgnoreMatchers(),/legacy|watchExclude/i);}
         finally{vscode.workspace.getConfiguration=old;}
+    });
+
+    test('PR11 case-insensitive Unicode identity follows filesystem entries rather than JS lowercasing',async()=>{
+        const t=h.getTracker();
+        const parent=file('unicode-collation');
+        const sharpS=path.join(parent,'ß');
+        const capitalSharpS=path.join(parent,'ẞ');
+        fs.mkdirSync(sharpS,{recursive:true});
+        fs.mkdirSync(capitalSharpS,{recursive:true});
+        const sharpFile=path.join(sharpS,'item.txt');
+        const capitalFile=path.join(capitalSharpS,'item.txt');
+        fs.writeFileSync(sharpFile,'lower sharp s');
+        fs.writeFileSync(capitalFile,'capital sharp s');
+
+        const roots=t.currentWorkspaceRootIdentities().map(rootIdentity=>({...rootIdentity,caseSensitive:false}));
+        const checked=validateAndCanonicalizeScope({
+            mode:'rules',
+            includes:[{scope:'all',path:relative(sharpS)}],
+            excludes:[]
+        },roots);
+        assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+        const requested=checked.scope;
+        assert.equal(
+            evaluateConfiguredScope(requested,roots[0],relative(sharpS),false,true).source,
+            'explicitInclude'
+        );
+        assert.notEqual(
+            evaluateConfiguredScope(requested,roots[0],relative(capitalSharpS),false,true).source,
+            'explicitInclude',
+            'JS Unicode lowercasing must not authorize a distinct filesystem entry'
+        );
+
+        const identify=t.workspaceRootIdentityForFolder;
+        t.workspaceRootIdentityForFolder=folder=>({...identify.call(t,folder),caseSensitive:false});
+        t.canonicalTrackingPaths.clear();
+        try{
+            const first=t.canonicalTrackingPath(sharpFile,true);
+            const second=t.canonicalTrackingPath(capitalFile,true);
+            assert.notEqual(first,second,
+                'restore-time tracking identity must keep distinct Unicode filesystem entries separate');
+        }finally{
+            t.workspaceRootIdentityForFolder=identify;
+        }
     });
 
     test('PR11 canonical spelling comes from directory entries, not realpath input casing',async()=>{
