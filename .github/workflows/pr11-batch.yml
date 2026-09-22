@@ -1,0 +1,59 @@
+name: PR11 bounded batch
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/pr11-batch.yml'
+      - 'scripts/pr11-batch.patch'
+permissions:
+  contents: write
+jobs:
+  batch:
+    if: github.event.pull_request.number == 11 && github.event.pull_request.head.repo.full_name == 'lengmh/DiffTracker' && github.event.pull_request.head.ref == 'feat/0.8-s3-monitoring-scope-v4'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply reviewed batch patch
+        id: patch
+        shell: bash
+        run: |
+          if test -f scripts/pr11-batch.patch; then
+            git apply --check scripts/pr11-batch.patch
+            git apply scripts/pr11-batch.patch
+            echo 'applied=true' >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.patch.outputs.applied == 'true'
+        run: npm run lint && npm test && npm run test:performance
+      - name: Export offline verification workspace
+        if: always()
+        shell: bash
+        run: tar --exclude=.git --exclude=.vscode-test -czf "$RUNNER_TEMP/pr11-workspace.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr11-verification-workspace
+          path: ${{ runner.temp }}/pr11-workspace.tar.gz
+          retention-days: 2
+      - name: Commit tested batch on unchanged PR head
+        if: steps.patch.outputs.applied == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current=$(gh api repos/lengmh/DiffTracker/pulls/11 --jq '.head.sha')
+          test "$current" = "$EXPECTED_HEAD"
+          rm scripts/pr11-batch.patch
+          git add src test scripts/pr11-batch.patch
+          git -c user.name='lengmh' -c user.email='47114200+lengmh@users.noreply.github.com' commit -m 'fix(scope): close path identity and pending-scope review findings'
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/feat/0.8-s3-monitoring-scope-v4
