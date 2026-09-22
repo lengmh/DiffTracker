@@ -742,6 +742,10 @@ export class DiffTracker {
                 return 'blocked';
             }
         }
+        // Persisted subtree gaps are also restart obligations. Rebuild their
+        // runtime watcher entries after the general workspace watcher is live,
+        // then let ignore reconciliation install/validate the direct watches.
+        this.restoreImportedDirectoryCoverageObligations();
         try {
             await this.refreshIgnoreMatchers();
         } catch (error) {
@@ -785,6 +789,9 @@ export class DiffTracker {
                 return 'blocked';
             }
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+            // A persisted imported-directory diagnostic can retire only after
+            // both its fresh direct watch and this restore scan have succeeded.
+            this.reconcileImportedDirectoryCoverageAfterSuccessfulScan(epoch);
         } else {
             this.externalWatcherEnabled = false;
         }
@@ -1319,6 +1326,69 @@ export class DiffTracker {
                 // Retain discovery/provenance, not an active OS resource.
                 entry.epoch = -1;
             }
+        }
+    }
+
+    private isImportedDirectoryCoverageGap(record: CoverageGapRecord | undefined): boolean {
+        const reasonCode = record?.subtree?.reasonCode;
+        return reasonCode === 'directory-scan-coverage-gap' ||
+            reasonCode === 'directory-runtime-coverage-gap';
+    }
+
+    private restoreImportedDirectoryCoverageObligations(): void {
+        for (const [targetPath, record] of this.coverageGaps) {
+            if (!this.isImportedDirectoryCoverageGap(record)) { continue; }
+            const directory = path.resolve(targetPath);
+            const provenAbsent = record.subtree?.reasonCode === 'directory-runtime-coverage-gap';
+            const existing = this.importedDirectoryWatchers.get(directory);
+            if (existing) {
+                existing.provenAbsent = provenAbsent;
+                if (existing.epoch === this.sessionEpoch) {
+                    this.pendingImportedDirectoryReconciliation.add(directory);
+                }
+                continue;
+            }
+            // Persistence stores the uncertainty, not an OS handle. A no-op
+            // placeholder is enough for resumeImportedDirectoryWatchers() to
+            // rebuild the direct watch before the gap can be retired.
+            this.importedDirectoryWatchers.set(directory, {
+                watcher: { dispose: () => undefined },
+                epoch: -1,
+                provenAbsent
+            });
+        }
+    }
+
+    private reconcileImportedDirectoryCoverageAfterSuccessfulScan(
+        epoch: number,
+        directories?: readonly string[]
+    ): void {
+        const targets = directories ?? [...this.pendingImportedDirectoryReconciliation];
+        for (const targetPath of targets) {
+            const directory = path.resolve(targetPath);
+            const record = this.coverageGaps.get(directory);
+            if (!this.isImportedDirectoryCoverageGap(record)) {
+                this.pendingImportedDirectoryReconciliation.delete(targetPath);
+                this.pendingImportedDirectoryReconciliation.delete(directory);
+                continue;
+            }
+            const entry = this.importedDirectoryWatchers.get(directory);
+            if (entry?.epoch !== epoch || this.validateResourceTarget(directory)) {
+                // Keep the obligation pending: a later refresh may restore the
+                // direct watch, and only a subsequent successful scan may clear it.
+                continue;
+            }
+            try {
+                if (!fs.lstatSync(directory).isDirectory()) { continue; }
+            } catch {
+                continue;
+            }
+            this.clearCoverageGap(directory, 'subtree');
+            if (this.fileSnapshots.has(directory) && !this.baselineExistingFiles.has(directory)) {
+                this.clearAbsentDirectorySentinel(directory);
+            }
+            this.pendingImportedDirectoryReconciliation.delete(targetPath);
+            this.pendingImportedDirectoryReconciliation.delete(directory);
         }
     }
 
@@ -3270,7 +3340,7 @@ export class DiffTracker {
             this.restoringEpoch !== undefined || this.baselineBuilding || !this.snapshotInitialized) { return; }
         const restored = [...this.pendingImportedDirectoryReconciliation];
         const restoredMarkers = new Set(restored.filter(directory =>
-            this.coverageGaps.get(directory)?.subtree !== undefined
+            this.isImportedDirectoryCoverageGap(this.coverageGaps.get(path.resolve(directory)))
         ));
         try {
             // A same-fingerprint retry must reconcile the gap too. Retain this
@@ -3293,16 +3363,7 @@ export class DiffTracker {
             return;
         }
         if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
-        for (const directory of restoredMarkers) {
-            const entry = this.importedDirectoryWatchers.get(directory);
-            if (entry?.epoch !== epoch || this.validateResourceTarget(directory)) { continue; }
-            try { if (!fs.lstatSync(directory).isDirectory()) { continue; } } catch { continue; }
-            this.clearCoverageGap(directory, 'subtree');
-            if (this.fileSnapshots.has(directory) && !this.baselineExistingFiles.has(directory)) {
-                this.clearAbsentDirectorySentinel(directory);
-            }
-        }
-        restored.forEach(directory => this.pendingImportedDirectoryReconciliation.delete(directory));
+        this.reconcileImportedDirectoryCoverageAfterSuccessfulScan(epoch, restored);
     }
 
     private getDefaultExcludePatterns(): string[] {
