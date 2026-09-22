@@ -352,6 +352,57 @@ export function registerPR11ReviewRegressions(h) {
         }
     });
 
+    test('PR11 workspace-root case semantics prefer an internal entry over parent lookup',async()=>{
+        const workspace=file('per-directory-case-root');
+        fs.mkdirSync(workspace);
+        const child=path.join(workspace,'ProbeChild');
+        fs.writeFileSync(child,'probe');
+
+        const originalExists=fs.existsSync;
+        const originalStat=fs.statSync;
+        const alternateRoot=path.join(path.dirname(workspace),path.basename(workspace).replace(/[A-Z]/,m=>m.toLowerCase()));
+        fs.existsSync=value=>{
+            if(typeof value==='string'&&path.resolve(value)===path.resolve(alternateRoot)) return true;
+            return originalExists(value);
+        };
+        fs.statSync=(value,...args)=>{
+            if(typeof value==='string'&&path.resolve(value)===path.resolve(alternateRoot)){
+                return originalStat(workspace,...args);
+            }
+            return originalStat(value,...args);
+        };
+        try{
+            assert.equal(detectLocalPathCaseSensitivity(workspace),true,
+                'root identity must come from lookup inside the workspace, not the parent lookup of the root name');
+        }finally{
+            fs.existsSync=originalExists;
+            fs.statSync=originalStat;
+        }
+    });
+
+    test('PR11 verified workspace-root case identity is cached per tracker session',async()=>{
+        const t=h.getTracker();
+        const identify=t.detectWorkspaceRootCaseSensitivity?.bind(t);
+        assert.ok(identify,'tracker should expose the root identity probe to regression tests');
+        let probes=0;
+        const original=fs.readdirSync;
+        fs.readdirSync=(value,...args)=>{
+            if(typeof value==='string'&&path.resolve(value)===path.resolve(root)) probes++;
+            return original(value,...args);
+        };
+        try{
+            const first=t.currentWorkspaceRootIdentities()[0]?.caseSensitive;
+            const afterFirst=probes;
+            assert.equal(typeof first,'boolean','precondition: test root identity is verified');
+            assert.ok(afterFirst>0,'first lookup should probe the root filesystem');
+            for(let i=0;i<20;i++) t.currentWorkspaceRootIdentities();
+            assert.equal(probes,afterFirst,
+                'verified root identity must be reused instead of re-enumerating the workspace on every classification');
+        }finally{
+            fs.readdirSync=original;
+        }
+    });
+
     test('PR11 simulated mount-point root skips parent-boundary case probe',async()=>{
         const mount=file('case-mount-root');
         fs.mkdirSync(mount);
