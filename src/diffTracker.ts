@@ -4878,13 +4878,29 @@ export class DiffTracker {
             return;
         }
         if (this.deferPendingScopeDeletion(uri)) { return; }
-        if (this.isPathIgnored(uri)) { return; }
-        if (this.retainCoverageGapReview(uri.fsPath)) { return; }
         const operationId = this.beginExternalOperation(uri, 'delete');
         try {
             // Remove watches only for a confirmed missing subtree.
             const confirmedMissing = !fs.existsSync(uri.fsPath);
             if (confirmedMissing) { this.removeImportedDirectoryWatchers(uri.fsPath); }
+
+            const parentIgnored = this.isPathIgnored(uri);
+            if (parentIgnored) {
+                // Ordinary policy may ignore the parent while an already-pending
+                // child review is deliberately retained outside target scope.
+                // Reconcile only those retained resources; do not enumerate or
+                // discover new descendants in the ignored subtree.
+                const root = path.resolve(uri.fsPath);
+                const retainedDescendants = [...this.retainedReviewPaths]
+                    .filter(filePath => path.resolve(filePath) !== root && this.pathBelongsToRoot(filePath, root));
+                for (const filePath of retainedDescendants) {
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+                }
+                return;
+            }
+
+            if (this.retainCoverageGapReview(uri.fsPath)) { return; }
             // A delete notification may race an atomic replacement; confirm actual state.
             const baselinePaths = new Set([...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys()]);
             const targets = new Set([uri.fsPath, ...[...baselinePaths].filter(filePath => {

@@ -18,6 +18,8 @@ pending explicit exclusion 只暂停读取，不得抹去“事件已经发生�
 
 delete event 不能依赖删除后的 `lstat` 来判断资源种类。若 imported-directory watcher、已有 subtree diagnostic 或已知 baseline/review descendants 能证明被删路径历史上是目录，则父 delete 必须记录 subtree-level deferred-deletion provenance，并同时把所有已知 descendant file evidence 标记为 durable deferred deletion；即使后端只上报父目录一次 delete，也不能生成父目录 phantom file review 或丢失子文件删除证据。
 
+ordinary policy 收缩不会自动承认已有 review。若父目录已被 `.gitignore` / exclude 等 ordinary policy 忽略，但其中仍有显式 retained review，父目录 delete 事件不得在 parent-level ignore check 处直接丢弃；必须先只核对这些已 retained descendants 的当前状态。该例外不允许递归扫描 ignored subtree、发现新资源或恢复普通监控，只为保持已经存在的审阅证据与实际删除状态一致。
+
 ## 旧规则迁移授权
 
 迁移完成不是长期布尔值。迁移授权必须绑定：
