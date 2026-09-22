@@ -224,6 +224,19 @@ export function canonicalizeExcludePattern(value: unknown, platform: NodeJS.Plat
         return undefined;
     }
     if (platform === 'win32' && value.includes('\\')) { return undefined; }
+
+    // A single leading slash is meaningful to ignore() as a root anchor and a
+    // single trailing slash is meaningful as a directory-only rule. Validate
+    // the path-like body without stripping either semantic marker from the
+    // published pattern.
+    const body = value.startsWith('/') ? value.slice(1) : value;
+    if (body.length === 0) { return undefined; }
+    const segmentsBody = body.endsWith('/') ? body.slice(0, -1) : body;
+    if (segmentsBody.length === 0) { return undefined; }
+    const parts = segmentsBody.split('/');
+    if (parts.some(part => part.length === 0 || part === '.' || part === '..')) {
+        return undefined;
+    }
     return value;
 }
 
