@@ -1688,10 +1688,11 @@ export class DiffTracker {
             [...this.committedLegacyWatchExcludeByRoot.entries()].some(([rootUri, patterns]) =>
                 effectiveRootUris.has(rootUri) && patterns.length > 0
             );
+        const hasConfiguredScopeEvidence = this.effectiveMonitoringScope.kind === 'configured';
 
         if (!this.isRecording && !this.baselineBuilding && !this.snapshotInitialized && this.fileSnapshots.size === 0 &&
             this.unresolvedBaselineFiles.size === 0 && this.opaqueBaselineFiles.size === 0 &&
-            !hasCommittedLegacyPolicyEvidence) {
+            !hasCommittedLegacyPolicyEvidence && !hasConfiguredScopeEvidence) {
             return undefined;
         }
 
@@ -2566,7 +2567,11 @@ export class DiffTracker {
         })).digest('hex');
     }
 
-    private async enumerateExplicitIncludeFiles(rootPath: string, epoch: number): Promise<string[]> {
+    private async enumerateExplicitIncludeFiles(
+        rootPath: string,
+        scope: CanonicalMonitoringScope,
+        epoch: number
+    ): Promise<string[]> {
         const files: string[] = [];
         const pending = [rootPath];
         while (pending.length > 0) {
@@ -2578,6 +2583,8 @@ export class DiffTracker {
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean' ||
                 isHardUnmonitorableRelativePath(relative, rootIdentity.caseSensitive, true)) { continue; }
+            const currentDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, true);
+            if (currentDecision.source === 'explicitExclude') { continue; }
 
             let entries: fs.Dirent[];
             try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
@@ -2591,10 +2598,13 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return files; }
                 const child = path.join(current, entry.name);
                 const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                const rootIdentity = this.workspaceRootIdentityForFolder(folder);
                 if (typeof rootIdentity.caseSensitive !== 'boolean' ||
                     isHardUnmonitorableRelativePath(childRelative, rootIdentity.caseSensitive, entry.isDirectory()) ||
                     entry.isSymbolicLink()) { continue; }
+                const childDecision = evaluateConfiguredScope(
+                    scope, rootIdentity, childRelative, false, entry.isDirectory()
+                );
+                if (childDecision.source === 'explicitExclude') { continue; }
                 if (entry.isDirectory()) {
                     pending.push(child);
                 } else if (entry.isFile()) {
@@ -2653,7 +2663,7 @@ export class DiffTracker {
                     continue;
                 }
                 if (!stat.isDirectory()) { continue; }
-                const files = await this.enumerateExplicitIncludeFiles(target, epoch);
+                const files = await this.enumerateExplicitIncludeFiles(target, scope, epoch);
                 if (!this.isCurrentEpoch(epoch)) { return captured; }
                 for (const filePath of files) {
                     if (!this.pathBelongsToRoot(filePath, target)) { continue; }

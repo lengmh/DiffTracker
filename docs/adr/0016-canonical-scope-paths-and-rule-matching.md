@@ -20,6 +20,8 @@ Workspace Root 名称所在父目录的 lookup 语义从不作为工作区内部
 
 include 和 exclude 各自是顺序无关的集合。Scope Revision 对规范化规则排序去重，UI 可以保留输入顺序但不改变语义；重复或冗余规则可以警告但不使配置无效，扩展不自动改写 settings 删除它们。所有 exclude 的并集高于所有 include 的并集，不采用“最后匹配者胜出”。
 
+显式 include 的基线枚举必须在递归进入目录或读取文件之前按 candidate configured scope 求值。若当前目录或 child 的 source 是 `explicitExclude`，立即剪枝：不得 `readdir` 该子树，也不得把其中资源加入 capture 队列。这样 unreadable 的已排除目录不会回滚 Apply，大型排除树也不会产生无意义扫描；该剪枝不改变 exclude-over-include 的既有优先级。
+
 scope expansion 的证明也按集合语义执行：对每个受影响且仍存在的 Workspace Root，分别判断规则集合的并集是否覆盖原授权/原排除集合，而不是要求某一条 candidate rule 单独覆盖所有 roots。因此 `all:src` 与“每个 root 各一条等价 `folder:src`”在同一 roots 集合上可以证明等价；exclude 同理。无法逐 root 结构化证明的 glob 关系继续 fail closed，仍视为 expansion。
 
 exclusion containment 的大小写等价证明不得使用 ECMAScript Unicode `toLowerCase()`。完全相同组件可以直接相等；已验证 case-insensitive root 仅允许对 ASCII 组件做 case fold。非 ASCII 的不同拼写若没有文件系统 same-resource 证据，则保守视为不同 exclusion，因此可能多一次 expansion consent，但不能把实际重新暴露的路径误判为仍被排除。
