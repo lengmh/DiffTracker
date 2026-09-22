@@ -2904,7 +2904,13 @@ for(const source of ['setting','gitignore']) test(`ROUND27 ${source} changes rec
 for(const restore of [false,true]) test(`ROUND27 deleting a failed-watch tree clears its persisted marker (restore=${restore})`,async()=>{
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.maxImportedDirectoryWatchers=0;
     const dir=file('failed-watch-delete'),p=path.join(dir,'child.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(pending(dir),undefined);assert.ok(subtreeGap(dir));
-    if(restore){await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(subtreeGap(dir));assert.equal(pending(dir),undefined);}
+    if(restore){
+        await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(subtreeGap(dir),undefined,
+            'fresh direct watch plus successful restore scan must retire the persisted coverage gap');
+        assert.equal(pending(dir),undefined);
+    }
     fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(dir),false);
     await tracker.flushPendingPersistence();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));listedFiles=[];assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);
 });
@@ -2932,7 +2938,13 @@ for(const restore of [false,true]) for(const kind of ['error','unnamed']) test(`
     tracker.storageUri=Uri.file(file('storage'));const storage=tracker.storageUri;const dir=file('async-watch'),sub=path.join(dir,'deep');fs.mkdirSync(sub,{recursive:true});await tracker.onExternalFileCreated(Uri.file(dir));
     const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===sub);assert.ok(watcher);if(kind==='error')watcher.error(error('ENOSPC'));else watcher.listener('rename',null);
     await waitUntil(()=>!!subtreeGap(sub));assert.equal(tracker.getOriginalContent(sub),undefined);assert.equal(pending(sub),undefined);
-    if(restore){await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');assert.ok(subtreeGap(sub));assert.equal(pending(sub),undefined);}
+    if(restore){
+        await tracker.dispose();tracker=new DiffTracker(storage);
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(subtreeGap(sub),undefined,
+            'a recovered direct watch plus successful restore scan must retire the persisted asynchronous watcher gap');
+        assert.equal(pending(sub),undefined);
+    }
     fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(subtreeGap(sub),undefined);assert.equal(pending(sub),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(sub),false);
 });
 
