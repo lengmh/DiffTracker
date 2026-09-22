@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import ignore from 'ignore';
 import path from 'node:path';
@@ -279,6 +280,31 @@ console.log('monitoring scope canonicalization and expansion tests passed');
     }), roots, 'linux').scope;
     const persisted = { kind: 'configured', ...configured };
     assert.deepEqual(parseEffectiveMonitoringScope(persisted), persisted);
+}
+{
+    const persistedRoots = [...roots];
+    const excludes = [{ scope: 'all', pattern: 'a\\*' }];
+    const identity = {
+        model: 1,
+        mode: 'rules',
+        roots: persistedRoots,
+        includes: [],
+        excludes
+    };
+    const persisted = {
+        kind: 'configured',
+        mode: 'rules',
+        roots: persistedRoots,
+        includes: [],
+        excludes,
+        scopeRevision: createHash('sha256').update(JSON.stringify(identity)).digest('hex')
+    };
+    assert.deepEqual(parseEffectiveMonitoringScope(persisted), persisted,
+        'persisted pre-closure structured scopes remain structurally readable even when live grammar now rejects escapes');
+    assert.equal(validateAndCanonicalizeScope({
+        mode: 'rules', includes: [], excludes
+    }, persistedRoots, 'linux').ok, false,
+        'the same escaped syntax must be rejected for new live requests');
 }
 
 {
