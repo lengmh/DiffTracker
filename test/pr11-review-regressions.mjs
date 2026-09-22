@@ -856,6 +856,16 @@ export function registerPR11ReviewRegressions(h) {
             const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
             assert.equal(saved.effectiveMonitoringScope.scopeRevision,candidate.scopeRevision,
                 'fixture proves disk can still contain the rejected candidate when compensation is unwritable');
+
+            const restarted=new DiffTracker(Uri.file(storage));
+            try{
+                assert.equal(await restarted.restorePersistedState(),'blocked',
+                    'restart must reject an uncommitted candidate even when primary and backup contain valid V4 JSON');
+                assert.notEqual(restarted.getEffectiveMonitoringScope().scopeRevision,candidate.scopeRevision,
+                    'a rejected candidate must never become effective after restart');
+            }finally{
+                await restarted.dispose();
+            }
         }finally{
             isolated.flushPersistState=originalFlushPersist;
             isolated.flushPendingPersistence=originalFlushPending;
