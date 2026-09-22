@@ -178,6 +178,50 @@ export function registerStateSchemaCompatibility(harness) {
         });
     }
 
+    test('SCHEMA-V4 parses saved configured scope without consulting mutable filesystem paths', async () => {
+        if (process.platform === 'win32') {
+            console.log('SKIP SCHEMA-V4 mutable-path parser fixture requires a case-sensitive host');
+            return;
+        }
+        const scopeParent = file('persisted-scope-case');
+        const caseDistinct = path.join(scopeParent, 'src', '.GIT');
+        fs.mkdirSync(caseDistinct, { recursive: true });
+        fs.writeFileSync(path.join(caseDistinct, 'HEAD'), 'case-distinct\n');
+        const rootIdentity = {
+            name: 'test',
+            uri: Uri.file(root).toString(),
+            caseSensitive: true
+        };
+        const relativeInclude = path.relative(root, path.join(caseDistinct, 'HEAD')).split(path.sep).join('/');
+        const checked = validateAndCanonicalizeScope({
+            mode: 'rules',
+            includes: [{ scope: 'all', path: relativeInclude }],
+            excludes: []
+        }, [rootIdentity]);
+        assert.equal(checked.ok, true, JSON.stringify(checked.errors));
+
+        const { state } = fixture();
+        state.effectiveMonitoringScope = { kind: 'configured', ...checked.scope };
+        state.isRecording = true;
+        fs.rmSync(scopeParent, { recursive: true, force: true });
+
+        assert.ok(getTracker().parsePersistedState(state),
+            'durable scope parsing must remain structural after the referenced path disappears');
+
+        const storage = file('persisted-scope-case-storage');
+        fs.mkdirSync(storage);
+        for (const name of ['session-state.json', 'session-state.last-good.json']) {
+            fs.writeFileSync(path.join(storage, name), JSON.stringify(state));
+        }
+        const tracker = new DiffTracker(Uri.file(storage));
+        setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(), 'incomplete',
+            'current filesystem identity uncertainty must pause restoration rather than mark durable state corrupt');
+        assert.equal(tracker.getIsRecording(), false);
+        assert.equal(tracker.recoveryBlocked, false,
+            'mutable path identity failure is recoverable context drift, not persisted-state corruption');
+    });
+
     test('SCHEMA-V4 migrates a pre-fix directory sentinel into subtree diagnostics without a file review', async () => {
         const directory = file('legacy-directory-sentinel');
         fs.mkdirSync(directory);
