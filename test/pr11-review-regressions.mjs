@@ -502,6 +502,44 @@ export function registerPR11ReviewRegressions(h) {
         } finally {vscode.workspace.fs.readFile=original;}
     });
 
+    test('PR11 parent-only delete reconciles retained child before ignored-parent short circuit',async()=>{
+        const t=h.getTracker();
+        assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
+
+        const dir=file('retained-parent-delete');
+        const child=path.join(dir,'child.txt');
+        fs.mkdirSync(dir,{recursive:true});
+        fs.writeFileSync(child,'changed');
+        t.fileSnapshots.set(child,'baseline');
+        t.baselineExistingFiles.add(child);
+        await t.readFileAndUpdate(child,Uri.file(child));
+        assert.equal(pending(child)?.reviewKind,'text');
+        assert.equal(pending(child)?.isDeleted,false);
+
+        const policy=file('.gitignore');
+        fs.writeFileSync(policy,`${path.basename(dir)}/\n`);
+        h.setListedIgnores([Uri.file(policy)]);
+        await t.refreshIgnoreMatchers();
+        assert.equal(t.getRetainedReviewPaths().includes(child),true,
+            'precondition: ordinary ignore retains the existing child review');
+
+        t.isRecording=true;
+        t.externalWatcherEnabled=true;
+        fs.rmSync(dir,{recursive:true,force:true});
+
+        // Emulate a watcher backend that reports only the ignored parent delete.
+        await t.onExternalFileDeleted(Uri.file(dir));
+
+        const review=pending(child);
+        assert.ok(review,'retained child review must survive parent-only delete');
+        assert.equal(review.reviewKind,'text');
+        assert.equal(review.isDeleted,true,
+            'retained child must reconcile to deleted even though the parent path itself is ignored');
+        assert.equal(review.currentExists,false);
+        assert.equal(review.currentContent,'');
+        assert.equal(pending(dir),undefined,'ignored directory must not become a file review');
+    });
+
     for(const source of ['files.exclude','search.exclude','gitignore','git-exclude']) for(const kind of ['text','opaque','unknown']) test(`PR11 ordinary scope contraction ${source} retains ${kind} through reload`,async()=>{
         let t=h.getTracker(); const storage=file('retain-storage');t.storageUri=Uri.file(storage);
         assert.equal((await t.applyConfiguredMonitoringScope(scope())).status,'applied');
