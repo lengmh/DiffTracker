@@ -361,8 +361,10 @@ export function registerPR11ReviewRegressions(h) {
         const originalExists=fs.existsSync;
         const originalStat=fs.statSync;
         const alternateRoot=path.join(path.dirname(workspace),path.basename(workspace).replace(/[A-Z]/,m=>m.toLowerCase()));
+        const alternateChild=path.join(workspace,'probeChild');
         fs.existsSync=value=>{
             if(typeof value==='string'&&path.resolve(value)===path.resolve(alternateRoot)) return true;
+            if(typeof value==='string'&&path.resolve(value)===path.resolve(alternateChild)) return false;
             return originalExists(value);
         };
         fs.statSync=(value,...args)=>{
@@ -481,6 +483,7 @@ export function registerPR11ReviewRegressions(h) {
         fs.mkdirSync(parent);
         const actual=path.join(parent,'Foo');
         fs.mkdirSync(actual);
+        fs.writeFileSync(path.join(actual,'ProbeName'),'probe');
         const query=path.join(parent,'FOO');
         const names=fs.readdirSync(parent);
         if(!fs.existsSync(query)||names.includes('FOO')){
