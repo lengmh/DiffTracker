@@ -353,7 +353,7 @@ export function registerPR11ReviewRegressions(h) {
     });
 
     test('PR11 workspace-root case semantics prefer an internal entry over parent lookup',async()=>{
-        const workspace=file('per-directory-case-root');
+        const workspace=file('PerDirectoryCaseRoot');
         fs.mkdirSync(workspace);
         const child=path.join(workspace,'ProbeChild');
         fs.writeFileSync(child,'probe');
