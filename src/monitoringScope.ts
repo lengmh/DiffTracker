@@ -204,6 +204,25 @@ function hasEnvironmentExpansion(value: string): boolean {
     return /\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(value);
 }
 
+function hasUnsupportedWildcardRun(value: string): boolean {
+    let stars = 0;
+    for (let index = 0; index < value.length; index++) {
+        const character = value[index];
+        if (character === '\\' && index + 1 < value.length) {
+            index++;
+            stars = 0;
+            continue;
+        }
+        if (character === '*') {
+            stars++;
+            if (stars >= 3) { return true; }
+        } else {
+            stars = 0;
+        }
+    }
+    return false;
+}
+
 export function canonicalizeIncludePath(value: unknown, platform: NodeJS.Platform = process.platform): string | undefined {
     if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) { return undefined; }
     if (value === '.' || value.startsWith('./') || value.startsWith('/') || value.startsWith('//') ||
@@ -222,7 +241,8 @@ export function canonicalizeExcludePattern(value: unknown, platform: NodeJS.Plat
         return undefined;
     }
     if (value.startsWith('//') || /^[A-Za-z]:/.test(value) ||
-        /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || hasEnvironmentExpansion(value)) {
+        /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || hasEnvironmentExpansion(value) ||
+        hasUnsupportedWildcardRun(value)) {
         return undefined;
     }
     if (platform === 'win32' && value.includes('\\')) { return undefined; }
@@ -329,7 +349,7 @@ function canonicalizeScopeRequest(
             const target = validateRuleTarget(value, roots, 'exclude', index, errors);
             const pattern = canonicalizeExcludePattern(value.pattern, platform);
             if (pattern === undefined) {
-                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, and must not use "!" negation.' });
+                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, must not use "!" negation, and must not contain unsupported runs of three or more unescaped "*".' });
             }
             if (target && pattern !== undefined) {
                 excludes.push({ ...target, pattern });
