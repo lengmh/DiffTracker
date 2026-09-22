@@ -114,7 +114,8 @@ for (const value of [
 }
 for (const value of [
     'a/***', '/a/***', 'a/****', 'a/***/b',
-    '**/**', '/**/**', '**/**/', 'a/**/**', 'a/**/**/b', '**/**/*.txt', 'a/**/**/*.txt'
+    '**/**', '/**/**', '**/**/', 'a/**/**', 'a/**/**/b', '**/**/*.txt', 'a/**/**/*.txt',
+    '\\*/', 'a\\*/', 'a\\*', 'file\\[1]', 'a\\?', '\\#name'
 ]) {
     assert.equal(canonicalizeExcludePattern(value, 'linux'), undefined,
         `unsupported glob structure accepted: ${value}`);
@@ -131,6 +132,13 @@ for (const value of [
 assert.equal(canonicalizeExcludePattern('/generated/**', 'linux'), '/generated/**');
 assert.equal(canonicalizeExcludePattern('#literal-name', 'linux'), '#literal-name');
 assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailing spaces are semantic input');
+{
+    const preview = previewLegacyWatchExcludeMigration(['\\*/'], 'linux');
+    assert.deepEqual(preview.excludes, [],
+        'legacy escaped metacharacters must not be auto-published into the structured grammar');
+    assert.deepEqual(preview.manual, ['\\*/'],
+        'legacy escaped metacharacters remain available for explicit manual migration');
+}
 
 {
     const ambiguousRoots = [
@@ -635,8 +643,8 @@ const identity={name:'oracle',uri:pathToFileURL(root).href,caseSensitive:true};
 const names=['a','b','aa','ab','secret','a.txt','b.txt','a.log','.hidden','#note','café','file[1]'];
 const paths=[...names,...names.flatMap(a=>names.map(b=>`${a}/${b}`)),...['a','b'].flatMap(a=>['a','b','secret'].flatMap(b=>names.map(c=>`${a}/${b}/${c}`)))];
 for(const rel of paths)fs.mkdirSync(path.join(root,rel),{recursive:true});
-const patterns=['*','**','**/','a','/a','a/','/a/','a/**','a/**/','**/a','**/a/','a/**/b','a/**/b/','**/a/**/b','a/*','a/*/','*/a','*/a/','*/a/**','*.txt','**/*.txt','a/*.txt','[ab]','[!a]','[a-z]*','a?','a**','**a','a/**b','a**/b','**/*/**','file\\[1]','#note','café','a\\.txt','a\\*',' a','name   ','a[bc]','a/??','a/ab/**','a/**/','**/a/**'];
-const rejectedPatterns=['***','a/***/b','**/**','**/**/','**/**/*.txt','a/**/**/b'];
+const patterns=['*','**','**/','a','/a','a/','/a/','a/**','a/**/','**/a','**/a/','a/**/b','a/**/b/','**/a/**/b','a/*','a/*/','*/a','*/a/','*/a/**','*.txt','**/*.txt','a/*.txt','[ab]','[!a]','[a-z]*','a?','a**','**a','a/**b','a**/b','**/*/**','#note','café',' a','name   ','a[bc]','a/??','a/ab/**','a/**/','**/a/**'];
+const rejectedPatterns=['***','a/***/b','**/**','**/**/','**/**/*.txt','a/**/**/b','\\*/','a\\*/','a\\*','file\\[1]','a\\?','\\#name'];
 for(const pattern of rejectedPatterns){
  assert.equal(canonicalizeExcludePattern(pattern,'linux'),undefined,
    `oracle unsupported pattern must be rejected before matching: ${pattern}`);
