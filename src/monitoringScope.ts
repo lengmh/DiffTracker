@@ -241,21 +241,19 @@ export function canonicalizeIncludePath(value: unknown, platform: NodeJS.Platfor
     return parts.join('/');
 }
 
-export function canonicalizeExcludePattern(value: unknown, platform: NodeJS.Platform = process.platform): string | undefined {
+function canonicalizeExcludePatternStructure(value: unknown): string | undefined {
     if (typeof value !== 'string' || value.length === 0 || value.includes('\0') || value.startsWith('!')) {
         return undefined;
     }
     if (value.startsWith('//') || /^[A-Za-z]:/.test(value) ||
-        /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || hasEnvironmentExpansion(value) ||
-        hasUnsupportedGlobStructure(value)) {
+        /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || hasEnvironmentExpansion(value)) {
         return undefined;
     }
-    if (platform === 'win32' && value.includes('\\')) { return undefined; }
 
     // A single leading slash is meaningful to ignore() as a root anchor and a
-    // single trailing slash is meaningful as a directory-only rule. Validate
-    // the path-like body without stripping either semantic marker from the
-    // published pattern.
+    // single trailing slash is meaningful as a directory-only rule. Structural
+    // persisted-state parsing preserves the serialized pattern exactly; current
+    // supported-grammar checks happen only for live requests/restoration.
     const body = value.startsWith('/') ? value.slice(1) : value;
     if (body.length === 0) { return undefined; }
     const segmentsBody = body.endsWith('/') ? body.slice(0, -1) : body;
@@ -265,6 +263,18 @@ export function canonicalizeExcludePattern(value: unknown, platform: NodeJS.Plat
         return undefined;
     }
     return value;
+}
+
+export function canonicalizeExcludePattern(value: unknown, _platform: NodeJS.Platform = process.platform): string | undefined {
+    const structural = canonicalizeExcludePatternStructure(value);
+    if (structural === undefined) { return undefined; }
+    // Structured S3 excludes deliberately do not expose backslash-escape
+    // semantics. Segment splitting plus directory-only handling cannot safely
+    // reproduce the full ignore parser for escaped metacharacters.
+    if (structural.includes('\\') || hasUnsupportedGlobStructure(structural)) {
+        return undefined;
+    }
+    return structural;
 }
 
 function canonicalRuleKey(rule: MonitoringIncludeRule | MonitoringExcludeRule): string {
@@ -294,7 +304,8 @@ function canonicalizeScopeRequest(
     request: unknown,
     rootsInput: readonly WorkspaceRootIdentity[],
     platform: NodeJS.Platform,
-    validateLiveHardBoundaries: boolean
+    validateLiveHardBoundaries: boolean,
+    persistedStructureOnly = false
 ): ScopeValidationResult {
     const errors: ScopeValidationError[] = [];
     const warnings: string[] = [];
@@ -322,7 +333,19 @@ function canonicalizeScopeRequest(
             }
             const value = entry as { scope?: unknown; folder?: unknown; path?: unknown };
             const target = validateRuleTarget(value, roots, 'include', index, errors);
-            const includePath = canonicalizeIncludePath(value.path, platform);
+            const includePath = persistedStructureOnly
+                ? (() => {
+                    if (typeof value.path !== 'string' || value.path.length === 0 || value.path.includes('\0')) { return undefined; }
+                    if (value.path === '.' || value.path.startsWith('./') || value.path.startsWith('/') || value.path.startsWith('//') ||
+                        /^[A-Za-z]:/.test(value.path) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value.path) ||
+                        value.path === '~' || value.path.startsWith('~/') || hasEnvironmentExpansion(value.path)) {
+                        return undefined;
+                    }
+                    const parts = value.path.split('/');
+                    if (parts.some(part => part.length === 0 || part === '.' || part === '..')) { return undefined; }
+                    return parts.join('/');
+                })()
+                : canonicalizeIncludePath(value.path, platform);
             if (!includePath) {
                 errors.push({ field: 'include', index, message: 'Include path must be a non-root workspace-relative literal path using "/" separators.' });
             }
@@ -352,9 +375,11 @@ function canonicalizeScopeRequest(
             }
             const value = entry as { scope?: unknown; folder?: unknown; pattern?: unknown };
             const target = validateRuleTarget(value, roots, 'exclude', index, errors);
-            const pattern = canonicalizeExcludePattern(value.pattern, platform);
+            const pattern = persistedStructureOnly
+                ? canonicalizeExcludePatternStructure(value.pattern)
+                : canonicalizeExcludePattern(value.pattern, platform);
             if (pattern === undefined) {
-                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, must not use "!" negation, and must not contain unsupported triple-star runs or consecutive "**" components.' });
+                errors.push({ field: 'exclude', index, message: 'Exclude pattern must be non-empty, workspace-relative, must not use "!" negation or backslash escapes, and must not contain unsupported triple-star runs or consecutive "**" components.' });
             }
             if (target && pattern !== undefined) {
                 excludes.push({ ...target, pattern });
@@ -404,7 +429,7 @@ function canonicalizePersistedScope(
 ): ScopeValidationResult {
     // Persisted state validation must be deterministic from serialized bytes.
     // Current path existence/case identity is reconciled later during restore.
-    return canonicalizeScopeRequest(request, rootsInput, platform, false);
+    return canonicalizeScopeRequest(request, rootsInput, platform, false, true);
 }
 
 function sameRule(left: MonitoringExcludeRule, right: MonitoringExcludeRule): boolean {
