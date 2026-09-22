@@ -352,6 +352,51 @@ export function registerPR11ReviewRegressions(h) {
         }
     });
 
+    test('PR11 scope-apply preflight parent delete preserves subtree provenance',async()=>{
+        const t=h.getTracker();
+        const dir=file('preflight-pending-delete-dir');
+        const child=path.join(dir,'child.txt');
+        const nested=path.join(dir,'sub');
+        const grand=path.join(nested,'grand.txt');
+        fs.mkdirSync(nested,{recursive:true});
+        fs.writeFileSync(child,'child baseline');
+        fs.writeFileSync(grand,'grand baseline');
+        t.fileSnapshots.set(child,'child baseline');
+        t.fileSnapshots.set(grand,'grand baseline');
+        t.baselineExistingFiles.add(child);
+        t.baselineExistingFiles.add(grand);
+        t.isRecording=true;
+        t.externalWatcherEnabled=true;
+        t.snapshotInitialized=true;
+        t.baselineBuilding=false;
+
+        const requested=scope([], [{scope:'all',pattern:relative(dir)}]);
+        t.setPendingMonitoringScope(requested);
+        fs.rmSync(dir,{recursive:true,force:true});
+
+        t.scopeApplyPreflight=true;
+        try{
+            // Emulate a parent-only watcher delete arriving while Apply is
+            // draining events observed under the still-committed old scope.
+            await t.onExternalFileDeleted(Uri.file(dir));
+        }finally{
+            t.scopeApplyPreflight=false;
+        }
+
+        const parentGap=t.coverageGaps.get(dir);
+        assert.equal(parentGap?.file,undefined,
+            'preflight must not project a deleted known directory as a phantom file');
+        assert.equal(parentGap?.subtree?.reasonCode,'pending-scope-deferred-delete',
+            'preflight deletion must retain historical subtree provenance');
+        assert.equal(pending(dir),undefined,
+            'a deleted directory is diagnostic provenance, not an actionable file review');
+        for(const filePath of [child,grand]){
+            assert.equal(t.coverageGaps.get(filePath)?.file?.reasonCode,'pending-scope-deferred-delete',
+                'preflight parent deletion must retain every known baseline descendant');
+            assert.equal(t.pendingScopeSuspendedPaths.has(filePath),true);
+        }
+    });
+
     test('PR11 workspace-root case semantics prefer an internal entry over parent lookup',async()=>{
         const workspace=file('PerDirectoryCaseRoot');
         fs.mkdirSync(workspace);
