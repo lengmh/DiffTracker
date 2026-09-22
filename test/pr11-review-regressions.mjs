@@ -658,6 +658,36 @@ export function registerPR11ReviewRegressions(h) {
         finally{vscode.workspace.getConfiguration=old;}
     });
 
+    test('PR11 exclusion expansion keeps distinct Unicode filesystem entries separate',async()=>{
+        const parent=file('unicode-exclusion-collation');
+        const sharpS=path.join(parent,'ß');
+        const capitalSharpS=path.join(parent,'ẞ');
+        fs.mkdirSync(sharpS,{recursive:true});
+        fs.mkdirSync(capitalSharpS,{recursive:true});
+
+        const roots=h.getTracker().currentWorkspaceRootIdentities().map(identity=>({...identity,caseSensitive:false}));
+        const canonical=request=>{
+            const checked=validateAndCanonicalizeScope(request,roots);
+            assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+            return checked.scope;
+        };
+        const effective=canonical({
+            mode:'rules',
+            includes:[],
+            excludes:[{scope:'all',pattern:`/${relative(sharpS)}`}]
+        });
+        const requested=canonical({
+            mode:'rules',
+            includes:[],
+            excludes:[{scope:'all',pattern:`/${relative(capitalSharpS)}`}]
+        });
+
+        const expansion=detectScopeExpansion(effective,requested);
+        assert.equal(expansion.expands,true,
+            'replacing /ß with /ẞ must expose /ß when those are distinct filesystem entries');
+        assert.ok(expansion.reasons.some(reason=>reason.includes('Explicit exclude removed or changed')));
+    });
+
     test('PR11 case-insensitive Unicode identity follows filesystem entries rather than JS lowercasing',async()=>{
         const t=h.getTracker();
         const parent=file('unicode-collation');
