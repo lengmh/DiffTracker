@@ -222,6 +222,35 @@ export interface MonitoringScopeApplyResult {
     capturedBaselines: number;
 }
 
+export interface MonitoringScopePreflightDirectorySummary {
+    root: string;
+    path: string;
+    entries: number;
+}
+
+export interface MonitoringScopePreflightDiagnostic {
+    root: string;
+    path: string;
+    reason: string;
+}
+
+export interface MonitoringScopePreflightResult {
+    status: 'ready' | 'conflict' | 'failed';
+    scopeRevision: string;
+    inspectedEntries: number;
+    candidateFiles: number;
+    candidateDirectories: number;
+    skippedSymlinks: number;
+    skippedHardBoundaries: number;
+    skippedExplicitExclusions: number;
+    truncated: boolean;
+    entryLimit: number;
+    unreadableDirectoryCount: number;
+    unreadableDirectories: MonitoringScopePreflightDiagnostic[];
+    largestDirectories: MonitoringScopePreflightDirectorySummary[];
+    reason?: string;
+}
+
 type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
@@ -543,6 +572,12 @@ export class DiffTracker {
     private readonly persistedStateArchiveFileName = 'session-state.archive.json';
     private readonly maxPersistedSnapshots = 10000;
     private readonly maxPersistedBytes = 50 * 1024 * 1024;
+    // Preflight is advisory discovery, not a project-size rejection threshold.
+    // Hitting this bound returns a truncated lower-fidelity estimate rather than
+    // publishing a partial scope or silently dropping resources.
+    private readonly maxScopePreflightEntries = 10000;
+    private readonly maxScopePreflightDiagnostics = 20;
+    private readonly maxScopePreflightDirectorySummaries = 10;
     private readonly maxRevertHistory = 10;
     private nextRevertRecordId = 1;
     private revertHistory: PersistedRevertRecord[] = [];
@@ -2649,6 +2684,149 @@ export class DiffTracker {
         return createHash('sha256').update(JSON.stringify({
             epoch: this.sessionEpoch, scopeRevision: scope.scopeRevision, entries
         })).digest('hex');
+    }
+
+    public async preflightConfiguredMonitoringScope(
+        scope: CanonicalMonitoringScope,
+        requestStillCurrent: () => boolean = () => true
+    ): Promise<MonitoringScopePreflightResult> {
+        const result: MonitoringScopePreflightResult = {
+            status: 'ready',
+            scopeRevision: scope.scopeRevision,
+            inspectedEntries: 0,
+            candidateFiles: 0,
+            candidateDirectories: 0,
+            skippedSymlinks: 0,
+            skippedHardBoundaries: 0,
+            skippedExplicitExclusions: 0,
+            truncated: false,
+            entryLimit: this.maxScopePreflightEntries,
+            unreadableDirectoryCount: 0,
+            unreadableDirectories: [],
+            largestDirectories: []
+        };
+        const conflict = (reason: string): MonitoringScopePreflightResult => ({
+            ...result, status: 'conflict', reason
+        });
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
+            return conflict('Monitoring scope preflight is blocked by recovery or another baseline transaction.');
+        }
+        if (!requestStillCurrent()) {
+            return conflict('Monitoring scope request changed before preflight started.');
+        }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) { return conflict(identityIssue); }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
+            return conflict('Requested scope roots do not match the current local workspace identity.');
+        }
+
+        const epoch = this.sessionEpoch;
+        const pending = this.getSupportedWorkspaceFolders().map(folder => ({
+            folder,
+            directory: path.resolve(folder.uri.fsPath)
+        }));
+        const directorySummaries: MonitoringScopePreflightDirectorySummary[] = [];
+        const rememberUnreadable = (folder: vscode.WorkspaceFolder, directory: string, error: unknown): void => {
+            result.unreadableDirectoryCount++;
+            if (result.unreadableDirectories.length >= this.maxScopePreflightDiagnostics) { return; }
+            const relative = this.toPosixPath(path.relative(folder.uri.fsPath, directory)) || '.';
+            result.unreadableDirectories.push({
+                root: folder.name,
+                path: relative,
+                reason: error instanceof Error ? error.message : String(error)
+            });
+        };
+        const contextStillCurrent = (): boolean =>
+            this.isCurrentEpoch(epoch) && requestStillCurrent() &&
+            this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
+
+        while (pending.length > 0) {
+            if (!contextStillCurrent()) {
+                return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
+            }
+            const { folder, directory } = pending.pop()!;
+            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof rootIdentity.caseSensitive !== 'boolean') {
+                return conflict('Workspace path case-sensitivity could not be verified during preflight.');
+            }
+            const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (relativeDirectory && isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true)) {
+                result.skippedHardBoundaries++;
+                continue;
+            }
+            if (relativeDirectory) {
+                const directoryDecision = evaluateConfiguredScope(
+                    scope, rootIdentity, relativeDirectory, false, true
+                );
+                if (directoryDecision.source === 'explicitExclude') {
+                    result.skippedExplicitExclusions++;
+                    continue;
+                }
+                if (directoryDecision.source === 'hardBoundary' || directoryDecision.source === 'identityUnknown') {
+                    result.skippedHardBoundaries++;
+                    continue;
+                }
+            }
+
+            let directoryEntries = 0;
+            try {
+                const handle = await fs.promises.opendir(directory);
+                for await (const entry of handle) {
+                    if (!contextStillCurrent()) {
+                        return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
+                    }
+                    if (result.inspectedEntries >= this.maxScopePreflightEntries) {
+                        result.truncated = true;
+                        break;
+                    }
+                    result.inspectedEntries++;
+                    directoryEntries++;
+
+                    const child = path.join(directory, entry.name);
+                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                    if (entry.isSymbolicLink()) {
+                        result.skippedSymlinks++;
+                        continue;
+                    }
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) {
+                        result.skippedHardBoundaries++;
+                        continue;
+                    }
+                    const decision = evaluateConfiguredScope(
+                        scope, rootIdentity, relative, false, entry.isDirectory()
+                    );
+                    if (decision.source === 'explicitExclude') {
+                        result.skippedExplicitExclusions++;
+                        continue;
+                    }
+                    if (decision.source === 'hardBoundary' || decision.source === 'identityUnknown') {
+                        result.skippedHardBoundaries++;
+                        continue;
+                    }
+                    if (entry.isDirectory()) {
+                        result.candidateDirectories++;
+                        pending.push({ folder, directory: child });
+                    } else if (entry.isFile()) {
+                        result.candidateFiles++;
+                    }
+                }
+            } catch (error) {
+                if (!this.isFileNotFound(error)) { rememberUnreadable(folder, directory, error); }
+            }
+
+            directorySummaries.push({
+                root: folder.name,
+                path: relativeDirectory || '.',
+                entries: directoryEntries
+            });
+            if (result.truncated) { break; }
+        }
+
+        result.largestDirectories = directorySummaries
+            .sort((left, right) => right.entries - left.entries ||
+                left.root.localeCompare(right.root) || left.path.localeCompare(right.path))
+            .slice(0, this.maxScopePreflightDirectorySummaries);
+        return result;
     }
 
     private async enumerateExplicitIncludeFiles(

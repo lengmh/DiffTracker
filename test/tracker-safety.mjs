@@ -3071,6 +3071,110 @@ test('S3 broad include defers when watcherExclude can hide a descendant',async()
 });
 
 
+test('S4-A bounded preflight discovers Whole Workspace candidates without reading contents or mutating baseline',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-preflight-workspace');
+    const keptDir=path.join(workspaceRoot,'kept');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    const gitDir=path.join(workspaceRoot,'.git');
+    fs.mkdirSync(keptDir,{recursive:true});
+    fs.mkdirSync(excludedDir,{recursive:true});
+    fs.mkdirSync(gitDir,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const keptFile=path.join(keptDir,'visible.txt');
+    fs.writeFileSync(keptFile,'visible');
+    fs.writeFileSync(path.join(excludedDir,'secret.txt'),'secret');
+    fs.writeFileSync(path.join(gitDir,'config'),'git metadata');
+    faults.set(keptFile,{read:error('preflight-must-not-read-content')});
+
+    const folder={uri:Uri.file(workspaceRoot),name:'preflight'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(roots.length,1);
+        assert.equal(typeof roots[0].caseSensitive,'boolean');
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],
+            scopeRevision:'s4a-preflight-whole'
+        };
+        const before={
+            text:tracker.fileSnapshots.size,
+            opaque:tracker.opaqueBaselineFiles.size,
+            unresolved:tracker.unresolvedBaselineFiles.size,
+            effective:tracker.getEffectiveMonitoringScope()
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.truncated,false);
+        assert.equal(result.candidateFiles,2,'ProbeName and kept/visible.txt are Whole Workspace candidates');
+        assert.ok(result.skippedExplicitExclusions>=1,'explicitly excluded descendants are pruned');
+        assert.ok(result.skippedHardBoundaries>=1,'.git remains an unmonitorable hard boundary');
+        assert.equal(tracker.fileSnapshots.size,before.text);
+        assert.equal(tracker.opaqueBaselineFiles.size,before.opaque);
+        assert.equal(tracker.unresolvedBaselineFiles.size,before.unresolved);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before.effective,
+            'preflight must not publish the candidate scope or establish baseline state');
+    } finally {
+        faults.delete(keptFile);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A bounded preflight truncates at its work budget and invalidates stale requests',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-preflight-limit');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    for(let index=0;index<8;index++) fs.writeFileSync(path.join(workspaceRoot,`file-${index}.txt`),'x');
+    const folder={uri:Uri.file(workspaceRoot),name:'preflight-limit'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[],scopeRevision:'s4a-preflight-limit'
+        };
+        const bounded=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(bounded.status,'ready',JSON.stringify(bounded));
+        assert.equal(bounded.truncated,true);
+        assert.equal(bounded.entryLimit,3);
+        assert.equal(bounded.inspectedEntries,3);
+        assert.ok(bounded.candidateFiles<=3);
+        const stale=await tracker.preflightConfiguredMonitoringScope(scope,()=>false);
+        assert.equal(stale.status,'conflict');
+        assert.equal(stale.inspectedEntries,0);
+        assert.match(stale.reason,/changed before preflight/i);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A contract keeps Whole Workspace behind bounded preparation without partial publication',async()=>{
     const roots=tracker.currentWorkspaceRootIdentities();
     assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
