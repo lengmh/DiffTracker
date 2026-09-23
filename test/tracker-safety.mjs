@@ -3175,46 +3175,112 @@ test('S4-A bounded preflight truncates at its work budget and invalidates stale 
     }
 });
 
-test('S4-A contract keeps Whole Workspace behind bounded preparation without partial publication',async()=>{
-    const roots=tracker.currentWorkspaceRootIdentities();
-    assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
-    const before=tracker.getEffectiveMonitoringScope();
-    const scope={
-        kind:'configured',mode:'wholeWorkspace',
-        roots:roots.map(identity=>({...identity})),
-        includes:[],excludes:[],scopeRevision:'s4a-whole-workspace-contract'
+test('S4-A Whole Workspace publishes only after candidate baselines are durably prepared',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-whole-apply');
+    const storage=file('s4a-whole-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const ordinary=path.join(workspaceRoot,'ordinary-ignored.txt');
+    const visible=path.join(workspaceRoot,'visible.txt');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    fs.mkdirSync(excludedDir,{recursive:true});
+    const excluded=path.join(excludedDir,'secret.txt');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    fs.writeFileSync(gitignore,'ordinary-ignored.txt\n');
+    fs.writeFileSync(ordinary,'ordinary baseline');
+    fs.writeFileSync(visible,'visible baseline');
+    fs.writeFileSync(excluded,'secret');
+    const folder={uri:Uri.file(workspaceRoot),name:'whole'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
     };
-    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'requiresS4',JSON.stringify(result));
-    assert.match(result.reason,/Whole Workspace preparation and coverage belong to S4-W/i);
-    assert.equal(result.capturedBaselines,0);
-    assert.equal(result.releasedBaselines,0);
-    assert.equal(result.retainedReviews,0);
-    assert.equal(result.discardedReviews,0);
-    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before,
-        'the S4 gate must not publish any part of the requested Whole Workspace scope');
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],
+            scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+        assert.equal(tracker.getOriginalContent(ordinary),'ordinary baseline',
+            'Whole Workspace overrides ordinary ignore policy during candidate capture');
+        assert.equal(tracker.getOriginalContent(visible),'visible baseline');
+        assert.equal(tracker.getOriginalContent(excluded),undefined,'explicit exclusions remain outside Whole Workspace');
+        assert.equal(pending(ordinary),undefined);
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        assert.equal(saved.effectiveMonitoringScope.mode,'wholeWorkspace');
+        assert.ok(saved.fileSnapshots.some(([filePath])=>filePath===ordinary),
+            'candidate baseline must be durable before effective scope publication returns applied');
+    } finally {
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
 });
 
-test('S4-A contract keeps exclude-removal expansion behind bounded preparation',async()=>{
+test('S4-A exclude-removal expansion captures newly admitted resources before publication',async()=>{
+    const generated=file('s4a-generated');
+    fs.mkdirSync(generated,{recursive:true});
+    const admitted=path.join(generated,'new.txt');
+    fs.writeFileSync(admitted,'newly admitted baseline');
     const roots=tracker.currentWorkspaceRootIdentities();
     assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
+    const relativeGenerated=path.relative(root,generated).split(path.sep).join('/');
     const effective={
         kind:'configured',mode:'rules',
         roots:roots.map(identity=>({...identity})),
-        includes:[],excludes:[{scope:'all',pattern:'generated/**'}],
-        scopeRevision:'s4a-effective-with-exclude'
+        includes:[],excludes:[{scope:'all',pattern:`${relativeGenerated}/**`}],
+        scopeRevision:''
     };
+    effective.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:effective.mode,roots:effective.roots,includes:effective.includes,excludes:effective.excludes
+    })).digest('hex');
     tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(effective));
     const requested={
         kind:'configured',mode:'rules',
         roots:roots.map(identity=>({...identity})),
-        includes:[],excludes:[],scopeRevision:'s4a-request-without-exclude'
+        includes:[],excludes:[],scopeRevision:''
     };
+    requested.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:requested.mode,roots:requested.roots,includes:requested.includes,excludes:requested.excludes
+    })).digest('hex');
     const result=await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(admitted),'newly admitted baseline');
+    assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+});
+
+test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const before=tracker.getEffectiveMonitoringScope();
+    vscodeExcludes['files.watcherExclude']={'**/node_modules/*/**':true};
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[],scopeRevision:'s4a-whole-watcher-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
     assert.equal(result.status,'requiresS4',JSON.stringify(result));
-    assert.match(result.reason,/broader bounded preparation in S4-W/i);
-    assert.deepEqual(tracker.getEffectiveMonitoringScope(),effective,
-        'a broader configured scope must remain atomic until S4-A preparation exists');
+    assert.match(result.reason,/S4-B supplemental observation coverage/i);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
 });
 
 test('S3 restore-prefixed ordinary files are not treated as watcher hard boundaries',async()=>{

@@ -2755,8 +2755,10 @@ export class DiffTracker {
                 continue;
             }
             if (relativeDirectory) {
+                const directoryMatcher = this.ignoreMatchers.get(folder.uri.fsPath);
+                const ordinaryDirectoryIgnored = directoryMatcher?.ignores(relativeDirectory + '/') ?? false;
                 const directoryDecision = evaluateConfiguredScope(
-                    scope, rootIdentity, relativeDirectory, false, true
+                    scope, rootIdentity, relativeDirectory, ordinaryDirectoryIgnored, true
                 );
                 if (directoryDecision.source === 'explicitExclude') {
                     result.skippedExplicitExclusions++;
@@ -2792,8 +2794,10 @@ export class DiffTracker {
                         result.skippedHardBoundaries++;
                         continue;
                     }
+                    const ordinaryMatcher = this.ignoreMatchers.get(folder.uri.fsPath);
+                    const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (entry.isDirectory() ? '/' : '')) ?? false;
                     const decision = evaluateConfiguredScope(
-                        scope, rootIdentity, relative, false, entry.isDirectory()
+                        scope, rootIdentity, relative, ordinaryIgnored, entry.isDirectory()
                     );
                     if (decision.source === 'explicitExclude') {
                         result.skippedExplicitExclusions++;
@@ -2936,6 +2940,74 @@ export class DiffTracker {
         return captured;
     }
 
+    private async enumerateConfiguredCandidateFiles(
+        scope: CanonicalMonitoringScope,
+        epoch: number
+    ): Promise<string[]> {
+        const files: string[] = [];
+        const pending = this.getSupportedWorkspaceFolders().map(folder => ({
+            folder,
+            directory: path.resolve(folder.uri.fsPath)
+        }));
+        while (pending.length > 0) {
+            if (!this.isCurrentEpoch(epoch)) { return files; }
+            const { folder, directory } = pending.pop()!;
+            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof rootIdentity.caseSensitive !== 'boolean') {
+                throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
+            }
+            const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (relativeDirectory && (
+                isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true) ||
+                this.isPathIgnored(vscode.Uri.file(directory), true, false, false)
+            )) { continue; }
+
+            let entries: fs.Dirent[];
+            try { entries = await fs.promises.readdir(directory, { withFileTypes: true }); }
+            catch (error) {
+                if (this.isFileNotFound(error)) { continue; }
+                throw error;
+            }
+            if (!this.isCurrentEpoch(epoch)) { return files; }
+
+            for (const entry of entries) {
+                if (!this.isCurrentEpoch(epoch)) { return files; }
+                if (entry.isSymbolicLink()) { continue; }
+                const child = path.join(directory, entry.name);
+                const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) { continue; }
+                if (this.isPathIgnored(vscode.Uri.file(child), entry.isDirectory(), false, false)) { continue; }
+                if (entry.isDirectory()) { pending.push({ folder, directory: child }); }
+                else if (entry.isFile()) { files.push(child); }
+            }
+        }
+        return files;
+    }
+
+    private async captureConfiguredExpansionBaselines(
+        scope: CanonicalMonitoringScope,
+        epoch: number
+    ): Promise<number> {
+        let captured = 0;
+        const files = await this.enumerateConfiguredCandidateFiles(scope, epoch);
+        if (!this.isCurrentEpoch(epoch)) { return captured; }
+        for (let filePath of files) {
+            if (!this.isCurrentEpoch(epoch)) { return captured; }
+            filePath = this.canonicalTrackingPath(filePath);
+            if (this.hasCapturedBaseline(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) ||
+                this.trackedChanges.has(filePath) ||
+                this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)) { continue; }
+            const targetError = this.validateSnapshotTarget(filePath);
+            if (targetError) { continue; }
+            const state = await this.readCurrentFileState(filePath);
+            if (!this.isCurrentEpoch(epoch)) { return captured; }
+            this.recordScannedBaseline(filePath, state, 'workspace');
+            captured++;
+        }
+        return captured;
+    }
+
     public async applyConfiguredMonitoringScope(
         scope: CanonicalMonitoringScope,
         discardExplicitlyExcludedReviews = false,
@@ -2955,9 +3027,6 @@ export class DiffTracker {
         if (!requestStillCurrent()) {
             return empty('conflict', 'Monitoring scope request changed before preparation started.');
         }
-        if (scope.mode === 'wholeWorkspace') {
-            return empty('requiresS4', 'Whole Workspace preparation and coverage belong to S4-W.');
-        }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) {
             return empty('conflict', identityIssue);
@@ -2965,18 +3034,28 @@ export class DiffTracker {
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
             return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
         }
-        const watcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
-        if (watcherExcludedInclude) {
+        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
+        if (supplementalCoverageIssue) {
             return empty('requiresS4',
-                `Explicit include ${watcherExcludedInclude} intersects files.watcherExclude and requires S4-W supplemental observation coverage.`);
+                `Monitoring scope requires S4-B supplemental observation coverage at ${supplementalCoverageIssue}.`);
         }
-        if (this.effectiveMonitoringScope.kind === 'configured') {
-            const expansion = detectScopeExpansion(this.effectiveMonitoringScope, scope);
-            if (expansion.reasons.some(reason =>
+        const expansion = this.effectiveMonitoringScope.kind === 'configured'
+            ? detectScopeExpansion(this.effectiveMonitoringScope, scope)
+            : undefined;
+        const needsBroadPreparation = scope.mode === 'wholeWorkspace' ||
+            !!expansion?.reasons.some(reason =>
                 reason.startsWith('New workspace root:') ||
                 reason.startsWith('Explicit exclude removed or changed:') ||
-                reason.startsWith('Whole Workspace mode'))) {
-                return empty('requiresS4', 'This scope expansion requires broader bounded preparation in S4-W.');
+                reason.startsWith('Whole Workspace mode'));
+        if (needsBroadPreparation) {
+            const preflight = await this.preflightConfiguredMonitoringScope(scope, requestStillCurrent);
+            if (preflight.status !== 'ready') {
+                return empty(preflight.status === 'conflict' ? 'conflict' : 'failed',
+                    preflight.reason ?? 'Monitoring scope bounded preflight failed.');
+            }
+            if (preflight.unreadableDirectoryCount > 0) {
+                return empty('failed',
+                    `Monitoring scope preflight could not enumerate ${preflight.unreadableDirectoryCount} director${preflight.unreadableDirectoryCount === 1 ? 'y' : 'ies'}; the previous effective scope remains active.`);
             }
         }
         const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
@@ -3063,7 +3142,7 @@ export class DiffTracker {
             requestStillCurrent() &&
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
-            !this.explicitIncludeNeedsSupplementalCoverage(scope) &&
+            !this.configuredScopeNeedsSupplementalCoverage(scope) &&
             discardApprovalStillCurrent() &&
             (transaction.observedEvents?.size ?? 0) === 0 &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
@@ -3127,11 +3206,14 @@ export class DiffTracker {
             // Apply is not Start: stopped sessions must not acquire new
             // before-images or enumerate newly included resource contents.
             result.capturedBaselines = this.isRecording
-                ? await this.captureConfiguredIncludeBaselines(scope, epoch) : 0;
-            const lateWatcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
-            if (lateWatcherExcludedInclude) {
+                ? needsBroadPreparation
+                    ? await this.captureConfiguredExpansionBaselines(scope, epoch)
+                    : await this.captureConfiguredIncludeBaselines(scope, epoch)
+                : 0;
+            const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
+            if (lateSupplementalCoverageIssue) {
                 requiresS4Reason =
-                    `Explicit include ${lateWatcherExcludedInclude} now intersects files.watcherExclude and requires S4-W supplemental observation coverage.`;
+                    `Monitoring scope now requires S4-B supplemental observation coverage at ${lateSupplementalCoverageIssue}.`;
                 throw new Error(requiresS4Reason);
             }
             if (!scopeContextStillCurrent()) {
@@ -3800,10 +3882,30 @@ export class DiffTracker {
         return undefined;
     }
 
+    private configuredScopeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
+        const includeIssue = this.explicitIncludeNeedsSupplementalCoverage(scope);
+        if (includeIssue) { return includeIssue; }
+        if (scope.mode !== 'wholeWorkspace') { return undefined; }
+
+        for (const folder of this.getSupportedWorkspaceFolders()) {
+            const identity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof identity.caseSensitive !== 'boolean') {
+                return `${folder.name}:unverified-path-identity`;
+            }
+            const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
+                .flatMap(pattern => this.expandSimpleBraceGlob(pattern))
+                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern));
+            if (patterns.length > 0) {
+                return `${folder.name}:Whole Workspace intersects files.watcherExclude (${patterns[0]})`;
+            }
+        }
+        return undefined;
+    }
+
     private invalidateConfiguredScopeForWatcherCoverage(): void {
         const committedScope = this.getEffectiveMonitoringScope();
-        if (committedScope.kind !== 'configured' || committedScope.mode !== 'rules') { return; }
-        const issue = this.explicitIncludeNeedsSupplementalCoverage(committedScope);
+        if (committedScope.kind !== 'configured') { return; }
+        const issue = this.configuredScopeNeedsSupplementalCoverage(committedScope);
         if (!issue) { return; }
 
         const alreadyPaused = !this.isRecording && this.baselineBuilding && !this.snapshotInitialized;
@@ -3821,7 +3923,7 @@ export class DiffTracker {
 
         if (!alreadyPaused) {
             void vscode.window.showWarningMessage(
-                `Code Diff Tracker: Effective include ${issue} now intersects files.watcherExclude. Review is paused; narrow the scope or restore watcher coverage, then rebuild the baseline.`
+                `Code Diff Tracker: Effective monitoring scope now requires supplemental coverage at ${issue}. Review is paused; narrow the scope or restore watcher coverage, then rebuild the baseline.`
             );
         }
     }
