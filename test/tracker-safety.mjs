@@ -1935,6 +1935,36 @@ test('AUDIT-18 directory creation during ignore discovery cannot accept its chil
     fs.mkdirSync(dir);fs.writeFileSync(p,'new child');emitWatcher('create',Uri.file(dir));gate.release();
     await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
 });
+test('S4-A startup ignores a lone stale create proven to predate watcher activation',async()=>{
+    const p=file('startup-preexisting-create.txt');
+    fs.writeFileSync(p,'before start');
+    await new Promise(resolve=>setTimeout(resolve,5));
+    listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');
+    tracker.startRecording();
+    await gate.entered;
+    emitWatcher('create',Uri.file(p));
+    gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),'before start');
+    assert.equal(pending(p),undefined);
+});
+
+test('S4-A startup keeps a genuine post-Start create unresolved',async()=>{
+    const p=file('startup-post-create.txt');
+    const gate=pause(root,'ignoreScan');
+    tracker.startRecording();
+    await gate.entered;
+    await new Promise(resolve=>setTimeout(resolve,5));
+    fs.writeFileSync(p,'created after start');
+    listedFiles=[Uri.file(p)];
+    emitWatcher('create',Uri.file(p));
+    gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.ok(pending(p)?.unavailableReason);
+});
+
 for(const resource of ['directory','file']) test(`AUDIT-19 startup transient ${resource} leaves no persistent review entry`,async()=>{
     const p=file('transient'),storage=file('storage');tracker.storageUri=Uri.file(storage);
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;

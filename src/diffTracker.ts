@@ -277,6 +277,7 @@ export class DiffTracker {
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
     private initialIgnoreEpoch?: number;
+    private initialWatchBoundaryMs?: number;
     private initialIgnoreEvents = new Map<string, StartupEvent>();
     private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
     // Only same-session post-baseline notifications can be resolved by a later
@@ -335,6 +336,7 @@ export class DiffTracker {
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
         this.restoringEpoch = undefined;
         this.initialIgnoreEpoch = undefined;
+        this.initialWatchBoundaryMs = undefined;
         this.initialIgnoreEvents.clear();
         this.restoreEvents.clear();
         this.postBaselineUnknownFiles.clear();
@@ -940,6 +942,10 @@ export class DiffTracker {
         try {
             // Watch immediately, but classify paths and capture documents only
             // after ignore discovery. Startup events cannot establish a before-image.
+            // The wall-clock boundary is used only to reject a synthetic/late
+            // create when file birth/content metadata proves it predates watcher
+            // activation. Ambiguous timestamps remain conservative uncertainty.
+            this.initialWatchBoundaryMs = Date.now();
             this.initialIgnoreEpoch = epoch;
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
             void this.initializeWorkspaceSnapshots().catch(() => {
@@ -948,6 +954,7 @@ export class DiffTracker {
                 }
             });
         } catch (error) {
+            this.initialWatchBoundaryMs = undefined;
             this.disposeFileWatchers();
             this.externalWatcherEnabled = false;
             vscode.window.showWarningMessage('Code Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
@@ -4571,6 +4578,21 @@ export class DiffTracker {
         if (removedFiles.length > 0) { this.emitTrackChangesEvent({ removedFiles }); }
     }
 
+    private startupCreatePredatesWatchBoundary(
+        event: StartupEvent,
+        boundaryMs: number | undefined
+    ): boolean {
+        if (boundaryMs === undefined || event.firstKind !== 'create' || event.kind !== 'create' ||
+            event.uri.scheme !== 'file') { return false; }
+        try {
+            const stat = fs.statSync(event.uri.fsPath);
+            const timestamps = [stat.birthtimeMs, stat.mtimeMs, stat.ctimeMs];
+            return timestamps.every(value => Number.isFinite(value) && value > 0 && value < boundaryMs);
+        } catch {
+            return false;
+        }
+    }
+
     private async initializeWorkspaceSnapshots(transaction?: BaselineTransaction): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
@@ -4618,10 +4640,20 @@ export class DiffTracker {
                     classified.set(uri.fsPath, { event, state });
                 }
             }
+            const initialWatchBoundaryMs = this.initialWatchBoundaryMs;
             this.initialIgnoreEpoch = undefined;
+            this.initialWatchBoundaryMs = undefined;
             this.initialIgnoreEvents.clear();
             for (const [filePath, { event, state }] of classified) {
                 if (state === 'ignored') { continue; }
+                if ((state === 'other' || state === 'directory') &&
+                    this.startupCreatePredatesWatchBoundary(event, initialWatchBoundaryMs)) {
+                    // Some watcher backends report an existing path as "create"
+                    // when a new watcher starts. Only a single create whose
+                    // birth/content metadata is strictly older than the watcher
+                    // activation boundary can be discarded as stale.
+                    continue;
+                }
                 // Even a transient parent must not cause surviving children or
                 // pre-existing open documents to be accepted as a fresh baseline.
                 this.scanUncertainFiles.add(filePath);
