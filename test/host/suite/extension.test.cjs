@@ -205,15 +205,26 @@ module.exports = async function runExtensionHostScenario() {
         await delay(500);
         await scopeConfig.update('watchInclude', [], vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
+
+        // Existing-before-Start but ordinary-policy-ignored is the precise
+        // expansion fixture: Rules must not baseline it, while Whole Workspace
+        // must adopt its current contents as the candidate before-image.
+        const recordingWholePath = path.join(workspacePath, 'node_modules', 's4-recording-whole.txt');
+        const recordingWholeTrackedPath = vscode.Uri.file(recordingWholePath).fsPath;
+        fs.mkdirSync(path.dirname(recordingWholePath), { recursive: true });
+        fs.writeFileSync(recordingWholePath, 'recording whole baseline\n');
+
         await delay(250);
         assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
             'Rules recording must restart after fixture watcher exclusions are made coverage-safe');
         await until('Rules baseline before recording Whole Workspace Apply',
             async () => (await state()).baselineState === 'ready');
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', recordingWholeTrackedPath),
+            undefined,
+            'Rules baseline must not include the ordinary-policy-ignored expansion fixture'
+        );
 
-        const recordingWholePath = path.join(workspacePath, 's4-recording-whole.txt');
-        const recordingWholeTrackedPath = vscode.Uri.file(recordingWholePath).fsPath;
-        fs.writeFileSync(recordingWholePath, 'recording whole baseline\n');
         await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
         const recordingWholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true
