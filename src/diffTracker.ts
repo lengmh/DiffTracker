@@ -3022,9 +3022,18 @@ export class DiffTracker {
                 this.isPathIgnored(vscode.Uri.file(directory), true, false, false)
             )) { continue; }
 
+            let handle: fs.Dir | undefined;
             try {
-                const handle = await fs.promises.opendir(directory);
-                for await (const entry of handle) {
+                handle = await fs.promises.opendir(directory);
+                // Keep the traversal streaming, but do not yield between every
+                // directory entry. Per-entry async iteration lets watcher events
+                // interleave with startup baseline discovery and can turn a
+                // pre-existing stopped-session file into scan-time uncertainty.
+                // readSync() preserves the earlier readdir scheduling boundary
+                // while still avoiding an unbounded Dirent[] allocation.
+                while (true) {
+                    const entry = handle.readSync();
+                    if (!entry) { break; }
                     if (!this.isCurrentEpoch(epoch)) { return files; }
                     if (preparationBudget.remainingEntries <= 0) {
                         throw new Error(
@@ -3053,14 +3062,20 @@ export class DiffTracker {
                         }
                         // Capacity accounting uses canonical identity, but discovery
                         // keeps the raw directory-entry path. Downstream callers
-                        // already canonicalize at their established boundary; doing
-                        // it here changes baseline-discovery timing on real hosts.
+                        // already canonicalize at their established boundary.
                         files.push(child);
                     }
                 }
             } catch (error) {
                 if (this.isFileNotFound(error)) { continue; }
                 throw error;
+            } finally {
+                if (handle) {
+                    try { handle.closeSync(); }
+                    catch (error) {
+                        if (!this.isFileNotFound(error)) { throw error; }
+                    }
+                }
             }
         }
         return files;
