@@ -3070,6 +3070,49 @@ test('S3 broad include defers when watcherExclude can hide a descendant',async()
     assert.equal(result.status,'requiresS4',JSON.stringify(result));
 });
 
+
+test('S4-A contract keeps Whole Workspace behind bounded preparation without partial publication',async()=>{
+    const roots=tracker.currentWorkspaceRootIdentities();
+    assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
+    const before=tracker.getEffectiveMonitoringScope();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[],scopeRevision:'s4a-whole-workspace-contract'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/Whole Workspace preparation and coverage belong to S4-W/i);
+    assert.equal(result.capturedBaselines,0);
+    assert.equal(result.releasedBaselines,0);
+    assert.equal(result.retainedReviews,0);
+    assert.equal(result.discardedReviews,0);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before,
+        'the S4 gate must not publish any part of the requested Whole Workspace scope');
+});
+
+test('S4-A contract keeps exclude-removal expansion behind bounded preparation',async()=>{
+    const roots=tracker.currentWorkspaceRootIdentities();
+    assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
+    const effective={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:'generated/**'}],
+        scopeRevision:'s4a-effective-with-exclude'
+    };
+    tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(effective));
+    const requested={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[],scopeRevision:'s4a-request-without-exclude'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/broader bounded preparation in S4-W/i);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),effective,
+        'a broader configured scope must remain atomic until S4-A preparation exists');
+});
+
 test('S3 restore-prefixed ordinary files are not treated as watcher hard boundaries',async()=>{
     const includeDir=file('scope-restore-prefix');
     fs.mkdirSync(includeDir,{recursive:true});
