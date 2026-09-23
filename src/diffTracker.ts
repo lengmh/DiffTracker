@@ -3845,9 +3845,17 @@ export class DiffTracker {
 
         for (const uri of gitignoreFiles.sort((a, b) => a.fsPath.localeCompare(b.fsPath))) {
             // Explicit scope exclusions are a read boundary, including while a
-            // candidate scope is being applied. Do not inspect ignore metadata
-            // from a subtree the user has excluded.
-            if (this.scopeExplicitlyExcludesIgnoreFile(uri)) { continue; }
+            // candidate scope is being applied. A nested .gitignore can only be
+            // skipped when its whole containing subtree is also excluded; if
+            // only the metadata file is excluded, treating its policy as empty
+            // could expose files that its rules would otherwise protect.
+            const disposition = this.excludedIgnoreFileDisposition(uri);
+            if (disposition === 'skip') { continue; }
+            if (disposition === 'block') {
+                throw new Error(
+                    'Explicitly excluded .gitignore cannot be ignored while its parent subtree remains monitored; nested ignore policy is unavailable'
+                );
+            }
             const content = await vscode.workspace.fs.readFile(uri);
             const text = new TextDecoder('utf-8').decode(content);
             const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
@@ -3860,23 +3868,25 @@ export class DiffTracker {
         return ig;
     }
 
-    private scopeExplicitlyExcludesIgnoreFile(uri: vscode.Uri): boolean {
-        if (uri.scheme !== 'file') { return true; }
+    private excludedIgnoreFileDisposition(uri: vscode.Uri): 'read' | 'skip' | 'block' {
+        if (uri.scheme !== 'file') { return 'block'; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
-        if (!folder || folder.uri.scheme !== 'file') { return true; }
+        if (!folder || folder.uri.scheme !== 'file') { return 'block'; }
         const scope = this.pendingMonitoringScope ??
             (this.effectiveMonitoringScope.kind === 'configured'
                 ? this.effectiveMonitoringScope as CanonicalMonitoringScope
                 : undefined);
-        if (!scope) { return false; }
+        if (!scope) { return 'read'; }
+
+        const rootIdentity = this.workspaceRootIdentityForFolder(folder);
         const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
-        return evaluateConfiguredScope(
-            scope,
-            this.workspaceRootIdentityForFolder(folder),
-            relative,
-            false,
-            false
-        ).source === 'explicitExclude';
+        const fileDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, false);
+        if (fileDecision.source !== 'explicitExclude') { return 'read'; }
+
+        const relativeDir = path.posix.dirname(relative);
+        const parentRelative = relativeDir === '.' ? '' : `${relativeDir}/`;
+        const parentDecision = evaluateConfiguredScope(scope, rootIdentity, parentRelative, false, true);
+        return parentDecision.source === 'explicitExclude' ? 'skip' : 'block';
     }
 
     private async getGitignoreFiles(folder: vscode.WorkspaceFolder): Promise<vscode.Uri[]> {
