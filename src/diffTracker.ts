@@ -2989,13 +2989,23 @@ export class DiffTracker {
 
     private async enumerateConfiguredCandidateFiles(
         scope: CanonicalMonitoringScope,
-        epoch: number
+        epoch: number,
+        scanRoot?: string
     ): Promise<string[]> {
         const files: string[] = [];
-        const pending = this.getSupportedWorkspaceFolders().map(folder => ({
-            folder,
-            directory: path.resolve(folder.uri.fsPath)
-        }));
+        const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
+        const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
+            ? (() => {
+                const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(requestedRoot));
+                return folder?.uri.scheme === 'file' &&
+                    this.pathBelongsToRoot(requestedRoot, folder.uri.fsPath)
+                    ? [{ folder, directory: requestedRoot }]
+                    : [];
+            })()
+            : this.getSupportedWorkspaceFolders().map(folder => ({
+                folder,
+                directory: path.resolve(folder.uri.fsPath)
+            }));
         while (pending.length > 0) {
             if (!this.isCurrentEpoch(epoch)) { return files; }
             const { folder, directory } = pending.pop()!;
@@ -3750,15 +3760,24 @@ export class DiffTracker {
 
         const wholeWorkspaceDiscovery = this.effectiveMonitoringScope.kind === 'configured' &&
             this.effectiveMonitoringScope.mode === 'wholeWorkspace';
-        add(await vscode.workspace.findFiles(
-            new vscode.RelativePattern(patternBase, '**/*'),
-            new vscode.RelativePattern(
-                patternBase,
-                wholeWorkspaceDiscovery
-                    ? '**/{.git,.difftracker-restore-*}/**'
-                    : '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**'
-            )
-        ));
+        if (wholeWorkspaceDiscovery) {
+            // VS Code findFiles/search indexing can lag resources created while
+            // recording is stopped and can inherit host search exclusions. Whole
+            // Workspace rebuilds therefore use the same direct filesystem scope
+            // enumeration as transactional expansion preparation.
+            const files = await this.enumerateConfiguredCandidateFiles(
+                this.effectiveMonitoringScope as CanonicalMonitoringScope,
+                this.sessionEpoch,
+                rootPath
+            );
+            add(files.map(filePath => vscode.Uri.file(filePath)));
+        } else {
+            add(await vscode.workspace.findFiles(
+                new vscode.RelativePattern(patternBase, '**/*'),
+                new vscode.RelativePattern(patternBase,
+                    '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
+            ));
+        }
 
         if (this.effectiveMonitoringScope.kind === 'configured') {
             const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
