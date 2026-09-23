@@ -2991,7 +2991,8 @@ export class DiffTracker {
         scope: CanonicalMonitoringScope,
         epoch: number,
         scanRoot?: string,
-        capacityGuard?: { remaining: number; exemptPaths: ReadonlySet<string> }
+        capacityGuard?: { remaining: number; exemptPaths: ReadonlySet<string> },
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
     ): Promise<string[]> {
         const files: string[] = [];
         const countedCandidates = new Set<string>();
@@ -3021,40 +3022,45 @@ export class DiffTracker {
                 this.isPathIgnored(vscode.Uri.file(directory), true, false, false)
             )) { continue; }
 
-            let entries: fs.Dirent[];
-            try { entries = await fs.promises.readdir(directory, { withFileTypes: true }); }
-            catch (error) {
+            try {
+                const handle = await fs.promises.opendir(directory);
+                for await (const entry of handle) {
+                    if (!this.isCurrentEpoch(epoch)) { return files; }
+                    if (preparationBudget.remainingEntries <= 0) {
+                        throw new Error(
+                            `Monitoring scope preparation work budget would exceed ${this.maxScopePreflightEntries} inspected directory entries; add explicit exclusions or narrow the scope before retrying.`
+                        );
+                    }
+                    preparationBudget.remainingEntries--;
+
+                    if (entry.isSymbolicLink()) { continue; }
+                    const child = path.join(directory, entry.name);
+                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) { continue; }
+                    if (this.isPathIgnored(vscode.Uri.file(child), entry.isDirectory(), false, false)) { continue; }
+                    if (entry.isDirectory()) {
+                        pending.push({ folder, directory: child });
+                    } else if (entry.isFile()) {
+                        const canonical = this.canonicalTrackingPath(child);
+                        if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
+                            !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
+                            countedCandidates.add(canonical);
+                            if (countedCandidates.size > capacityGuard.remaining) {
+                                throw new Error(
+                                    `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+                                );
+                            }
+                        }
+                        // Capacity accounting uses canonical identity, but discovery
+                        // keeps the raw directory-entry path. Downstream callers
+                        // already canonicalize at their established boundary; doing
+                        // it here changes baseline-discovery timing on real hosts.
+                        files.push(child);
+                    }
+                }
+            } catch (error) {
                 if (this.isFileNotFound(error)) { continue; }
                 throw error;
-            }
-            if (!this.isCurrentEpoch(epoch)) { return files; }
-
-            for (const entry of entries) {
-                if (!this.isCurrentEpoch(epoch)) { return files; }
-                if (entry.isSymbolicLink()) { continue; }
-                const child = path.join(directory, entry.name);
-                const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) { continue; }
-                if (this.isPathIgnored(vscode.Uri.file(child), entry.isDirectory(), false, false)) { continue; }
-                if (entry.isDirectory()) {
-                    pending.push({ folder, directory: child });
-                } else if (entry.isFile()) {
-                    const canonical = this.canonicalTrackingPath(child);
-                    if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
-                        !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
-                        countedCandidates.add(canonical);
-                        if (countedCandidates.size > capacityGuard.remaining) {
-                            throw new Error(
-                                `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
-                            );
-                        }
-                    }
-                    // Capacity accounting uses canonical identity, but discovery
-                    // keeps the raw directory-entry path. Downstream callers
-                    // already canonicalize at their established boundary; doing
-                    // it here changes baseline-discovery timing on real hosts.
-                    files.push(child);
-                }
             }
         }
         return files;
@@ -3761,7 +3767,10 @@ export class DiffTracker {
         ];
     }
 
-    private async findScopeFilesUnderDirectory(rootPath: string): Promise<vscode.Uri[]> {
+    private async findScopeFilesUnderDirectory(
+        rootPath: string,
+        wholeWorkspacePreparationBudget?: { remainingEntries: number }
+    ): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
         const normalizedRootPath = path.resolve(rootPath);
         const workspaceRoot = this.getSupportedWorkspaceFolders()
@@ -3804,7 +3813,8 @@ export class DiffTracker {
                 {
                     remaining: Math.max(0, this.maxPersistedSnapshots - durableResourceCount),
                     exemptPaths: capacityExemptPaths
-                }
+                },
+                wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries }
             );
             add(files.map(filePath => vscode.Uri.file(filePath)));
         } else {
@@ -4542,6 +4552,11 @@ export class DiffTracker {
 
         const scanFingerprint = this.ignoreFingerprint;
         const scanIgnoreVersion = this.ignoreRefreshVersion;
+        const wholeWorkspacePreparationBudget =
+            this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace'
+                ? { remainingEntries: this.maxScopePreflightEntries }
+                : undefined;
         if (this.initialIgnoreEpoch === epoch) {
             const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
             // Keep each path's first event across I/O rounds. An event arriving
@@ -4593,7 +4608,10 @@ export class DiffTracker {
                 return;
             }
 
-            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
+            const files = await this.findScopeFilesUnderDirectory(
+                folder.uri.fsPath,
+                wholeWorkspacePreparationBudget
+            );
             if (!this.isCurrentEpoch(epoch)) { return; }
 
             const candidates = files.filter(uri => {

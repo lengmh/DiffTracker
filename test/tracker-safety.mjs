@@ -3357,16 +3357,16 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
         return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
             ? folder : undefined;
     };
-    const originalReaddir=fs.promises.readdir;
-    let readdirCalls=0;
+    const originalOpendir=fs.promises.opendir;
+    let opendirCalls=0;
     try{
         vscode.workspace.workspaceFolders=[folder];
         vscode.workspace.getWorkspaceFolder=getFolder;
         faults.set(guarded,{read:error('candidate-content-read-should-not-happen')});
-        fs.promises.readdir=async(...args)=>{
-            readdirCalls++;
-            if(readdirCalls>1) throw error('enumeration-continued-past-capacity');
-            return originalReaddir(...args);
+        fs.promises.opendir=async(...args)=>{
+            opendirCalls++;
+            if(opendirCalls>1) throw error('enumeration-continued-past-capacity');
+            return originalOpendir(...args);
         };
         await tracker.dispose();
         tracker=new DiffTracker();
@@ -3386,11 +3386,57 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
         assert.match(result.reason,/snapshot capacity.*exceed/i);
         assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
         assert.equal(tracker.getOriginalContent(guarded),undefined);
-        assert.equal(readdirCalls,1,
+        assert.equal(opendirCalls,1,
             'candidate enumeration must fail at capacity without descending into later directories');
     } finally {
-        fs.promises.readdir=originalReaddir;
+        fs.promises.opendir=originalOpendir;
         faults.delete(guarded);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A candidate preparation bounds directory-only traversal after truncated preflight',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-directory-budget-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    for(let index=0;index<8;index++){
+        fs.mkdirSync(path.join(workspaceRoot,`empty-${index}`),{recursive:true});
+    }
+    const folder={uri:Uri.file(workspaceRoot),name:'directory-budget'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.truncated,true,'precondition: advisory preflight reaches its entry budget');
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason,/preparation work budget.*directory entries/i);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before,
+            'bounded preparation failure must not publish any part of Whole Workspace');
+    } finally {
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }
