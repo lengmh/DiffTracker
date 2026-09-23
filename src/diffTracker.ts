@@ -3844,6 +3844,10 @@ export class DiffTracker {
         const gitignoreFiles = await this.getGitignoreFiles(folder);
 
         for (const uri of gitignoreFiles.sort((a, b) => a.fsPath.localeCompare(b.fsPath))) {
+            // Explicit scope exclusions are a read boundary, including while a
+            // candidate scope is being applied. Do not inspect ignore metadata
+            // from a subtree the user has excluded.
+            if (this.scopeExplicitlyExcludesIgnoreFile(uri)) { continue; }
             const content = await vscode.workspace.fs.readFile(uri);
             const text = new TextDecoder('utf-8').decode(content);
             const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
@@ -3854,6 +3858,25 @@ export class DiffTracker {
         }
 
         return ig;
+    }
+
+    private scopeExplicitlyExcludesIgnoreFile(uri: vscode.Uri): boolean {
+        if (uri.scheme !== 'file') { return true; }
+        const folder = vscode.workspace.getWorkspaceFolder(uri);
+        if (!folder || folder.uri.scheme !== 'file') { return true; }
+        const scope = this.pendingMonitoringScope ??
+            (this.effectiveMonitoringScope.kind === 'configured'
+                ? this.effectiveMonitoringScope as CanonicalMonitoringScope
+                : undefined);
+        if (!scope) { return false; }
+        const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
+        return evaluateConfiguredScope(
+            scope,
+            this.workspaceRootIdentityForFolder(folder),
+            relative,
+            false,
+            false
+        ).source === 'explicitExclude';
     }
 
     private async getGitignoreFiles(folder: vscode.WorkspaceFolder): Promise<vscode.Uri[]> {
