@@ -7,7 +7,7 @@ import { createHash } from 'crypto';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
 import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
-import { CanonicalMonitoringScope, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
+import { CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -3884,9 +3884,11 @@ export class DiffTracker {
         if (fileDecision.source !== 'explicitExclude') { return 'read'; }
 
         const relativeDir = path.posix.dirname(relative);
-        const parentRelative = relativeDir === '.' ? '' : `${relativeDir}/`;
-        const parentDecision = evaluateConfiguredScope(scope, rootIdentity, parentRelative, false, true);
-        return parentDecision.source === 'explicitExclude' ? 'skip' : 'block';
+        return configuredScopeExplicitlyExcludesSubtree(
+            scope,
+            rootIdentity,
+            relativeDir === '.' ? '' : relativeDir
+        ) ? 'skip' : 'block';
     }
 
     private async getGitignoreFiles(folder: vscode.WorkspaceFolder): Promise<vscode.Uri[]> {
