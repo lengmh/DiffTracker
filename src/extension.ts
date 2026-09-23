@@ -13,6 +13,7 @@ import { WebviewDiffPanel } from './webviewDiffPanel';
 import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
 import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
+import { MonitoringScopeController } from './monitoringScopeController';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -63,17 +64,38 @@ function isDeletedReview(filePath: string, filePathOrItem: string | any): boolea
 export async function activate(context: vscode.ExtensionContext) {
     const runningExtensionTests = context.extensionMode === vscode.ExtensionMode.Test;
 
+    // Test-only observability for the command context published by this extension.
+    // This does not change the production context-key contract; it only records
+    // the value passed through the same setContext call so Host regressions can
+    // compare UI projection with backend recording state.
+    let testRecordingContext: boolean | undefined;
+    const setRecordingContext = (value: boolean): void => {
+        if (runningExtensionTests) { testRecordingContext = value; }
+        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', value);
+    };
+
     // Initialize services
     diffTracker = new DiffTracker(context.storageUri);
+    // Install requested-scope gating before restoration so a pending explicit
+    // exclusion cannot be read while V4/V3 state is being reconciled.
+    const monitoringScopeController = new MonitoringScopeController(context, diffTracker);
+    context.subscriptions.push(monitoringScopeController);
     // Commands and restored review views must never precede Git reconciliation.
     diffTracker.setGitContextPending(true);
     const restoreOutcome = await diffTracker.restorePersistedState();
+    monitoringScopeController.reconcileRequestedScope();
     decorationManager = new DecorationManager(diffTracker);
     statusBarManager = new StatusBarManager(diffTracker);
     originalContentProvider = new OriginalContentProvider(diffTracker);
     inlineContentProvider = new InlineContentProvider(diffTracker);
     codeLensProvider = new DiffCodeLensProvider(diffTracker);
     settingsTreeDataProvider = new SettingsTreeDataProvider();
+    // A fresh workspace with no legacy Global rules can safely adopt the default
+    // Rules scope before recording starts. Restored V1/V2/V3 sessions remain in
+    // compatibility mode until the user explicitly migrates/applies them.
+    if (restoreOutcome === 'absent' && monitoringScopeController.getLegacyWatchRules().length === 0) {
+        await monitoringScopeController.applyPendingScope();
+    }
 
     // Register tree view provider for activity bar
     diffTreeDataProvider = new DiffTreeDataProvider(diffTracker);
@@ -113,6 +135,32 @@ export async function activate(context: vscode.ExtensionContext) {
         // a late context onto snapshots that might predate a checkout.
         if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
         if (request !== recordingRequest) { return false; }
+        const scopeStatus = monitoringScopeController.getStatus();
+        if (!scopeStatus.requested.ok) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: The requested monitoring scope is invalid. Recording remains paused until the Workspace settings are corrected or the effective scope configuration is restored.'
+            );
+            return false;
+        }
+        if (scopeStatus.expansionReasons.length > 0 && !scopeStatus.consented) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: The requested monitoring scope expands local access and is not authorized on this host. Apply it from Manage Monitoring Scope before starting recording.'
+            );
+            return false;
+        }
+        const requestedScope = scopeStatus.requested.scope;
+        const checkedScopeRevision = requestedScope?.scopeRevision;
+        const requestedMatchesEffective = requestedScope &&
+            scopeStatus.effective.kind === 'configured' &&
+            requestedScope.scopeRevision === scopeStatus.effective.scopeRevision;
+        const configuredScopeMismatch = scopeStatus.effective.kind === 'configured' && !requestedMatchesEffective;
+        const explicitPendingScope = scopeStatus.workspaceRequestPresent && !requestedMatchesEffective;
+        if (configuredScopeMismatch || explicitPendingScope) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: The requested monitoring scope differs from the effective scope. Apply the request (or restore the effective configuration) before rebuilding the recording baseline.'
+            );
+            return false;
+        }
         if (diffTracker.isRecoveryBlocked()) {
             const answer = await vscode.window.showErrorMessage(
                 'Code Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
@@ -130,18 +178,43 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer !== 'Rebuild Baseline') { return false; }
         }
+
+        // A recovery/rebuild confirmation can remain open while Workspace
+        // Settings change. Never let approval for the earlier state rebuild a
+        // baseline under a different or newly pending scope revision.
+        const latestScopeStatus = monitoringScopeController.getStatus();
+        const latestRequestedScope = latestScopeStatus.requested.scope;
+        const latestRequestedMatchesEffective = latestRequestedScope &&
+            latestScopeStatus.effective.kind === 'configured' &&
+            latestRequestedScope.scopeRevision === latestScopeStatus.effective.scopeRevision;
+        if (!latestScopeStatus.requested.ok ||
+            latestRequestedScope?.scopeRevision !== checkedScopeRevision ||
+            (latestScopeStatus.expansionReasons.length > 0 && !latestScopeStatus.consented) ||
+            (!latestRequestedMatchesEffective &&
+                (latestScopeStatus.effective.kind === 'configured' || latestScopeStatus.workspaceRequestPresent))) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: Monitoring scope changed while recording confirmation was open. Review and apply the current scope before starting.'
+            );
+            return false;
+        }
+
+        return startRecordingAfterPrechecks();
+    };
+
+    const startRecordingAfterPrechecks = (): boolean => {
         diffTracker.startRecording();
-        if (gitContextMonitor?.isReady()) {
+        const started = diffTracker.getIsRecording();
+        if (started && gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
         }
-        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', true);
-        return diffTracker.getIsRecording();
+        setRecordingContext(started);
+        return started;
     };
 
     const stopRecordingFlow = () => {
         ++recordingRequest;
         diffTracker.stopRecording();
-        void vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', false);
+        setRecordingContext(false);
     };
 
     // Register toggle setting command
@@ -322,13 +395,23 @@ export async function activate(context: vscode.ExtensionContext) {
         context.subscriptions.push(
             vscode.commands.registerCommand('diffTracker._testState', () => ({
                 isRecording: diffTracker.getIsRecording(),
+                recordingContext: testRecordingContext,
                 baselineState: diffTracker.getBaselineState(),
                 reviewTokens: diffTracker.getReviewTokens(),
                 opaqueReviewTokens: diffTracker.getOpaqueReviewTokens(),
                 unknownReviewPaths: diffTracker.getUnknownReviewPaths(),
                 trackedChanges: diffTracker.getTrackedChanges(),
-                gitPauses: diffTracker.getPausedGitRepositories()
+                gitPauses: diffTracker.getPausedGitRepositories(),
+                effectiveMonitoringScope: diffTracker.getEffectiveMonitoringScope(),
+                retainedReviewPaths: diffTracker.getRetainedReviewPaths(),
+                coverageGaps: diffTracker.getCoverageGaps(),
+                subtreeCoverageGaps: diffTracker.getSubtreeCoverageGaps(),
+                policyFingerprint: diffTracker.getPolicyFingerprint(),
+                coverageGeneration: diffTracker.getCoverageGeneration()
             })),
+            vscode.commands.registerCommand('diffTracker._testOriginalContent', (filePath: string) =>
+                diffTracker.getOriginalContent(filePath)
+            ),
             vscode.commands.registerCommand('diffTracker._testRevertFile', (filePath: string) => {
                 const token = diffTracker.getReviewToken(filePath);
                 return token ? diffTracker.revertFile(filePath, token) : undefined;
@@ -361,7 +444,19 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.commands.registerCommand('diffTracker._testRebuildGitBaseline', (repoRoot: string) => {
                 const snapshot = gitContextMonitor?.getSnapshot(repoRoot);
                 return snapshot ? diffTracker.rebuildRepositoryBaseline(repoRoot, snapshot) : false;
-            })
+            }),
+            vscode.commands.registerCommand('diffTracker._testMonitoringScopeStatus', () =>
+                monitoringScopeController.getStatus()
+            ),
+            vscode.commands.registerCommand('diffTracker._testApplyMonitoringScope', (options?: { grantConsent?: boolean; discardExplicitlyExcludedReviews?: boolean }) =>
+                monitoringScopeController.applyPendingScope(options)
+            ),
+            vscode.commands.registerCommand('diffTracker._testMigrateLegacyScope', () =>
+                monitoringScopeController.migrateLegacyWatchRules()
+            ),
+            vscode.commands.registerCommand('diffTracker._testStartRecordingAfterPrechecks', () =>
+                startRecordingAfterPrechecks()
+            )
         );
     }
 
@@ -864,9 +959,45 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    const openMonitoringScopeManager = () => {
+        WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+    };
+
     context.subscriptions.push(
-        vscode.commands.registerCommand('diffTracker.editWatchExcludes', () => {
-            WatchExcludePanel.createOrShow(context.extensionUri, diffTracker);
+        vscode.commands.registerCommand('diffTracker.manageMonitoringScope', openMonitoringScopeManager),
+        // Compatibility alias retained for existing keybindings/scripts.
+        vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager),
+        vscode.commands.registerCommand('diffTracker.applyPendingScope', async () => {
+            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+            await panel.applyInteractively();
+        }),
+        vscode.commands.registerCommand('diffTracker.retryScopePreparation', async () => {
+            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+            await panel.applyInteractively();
+        }),
+        vscode.commands.registerCommand('diffTracker.migrateLegacyWatchRules', async () => {
+            const outcome = await monitoringScopeController.migrateLegacyWatchRules();
+            if (outcome.status === 'migrated') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Legacy Global watch rules migrated into this workspace request.');
+            } else {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`);
+                openMonitoringScopeManager();
+            }
+            settingsTreeDataProvider.refresh();
+            return outcome;
+        }),
+        vscode.commands.registerCommand('diffTracker.restoreEffectiveScopeConfiguration', async () => {
+            const answer = await vscode.window.showWarningMessage(
+                'Restore Workspace Settings to the currently effective DiffTracker monitoring scope?',
+                { modal: true },
+                'Restore Effective Scope'
+            );
+            if (answer === 'Restore Effective Scope') {
+                await monitoringScopeController.restoreEffectiveScopeConfiguration();
+                settingsTreeDataProvider.refresh();
+                return true;
+            }
+            return false;
         })
     );
 
@@ -917,6 +1048,10 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         diffTracker.onDidChangeBaselineState(() => {
             refreshChangesTree();
+            // Baseline startup/recovery can fail asynchronously after Start
+            // returned. Keep command visibility projected from the backend's
+            // current state rather than from the user's earlier intent.
+            setRecordingContext(diffTracker.getIsRecording());
         })
     );
 
@@ -938,7 +1073,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     refreshChangesTree();
-    await vscode.commands.executeCommand('setContext', 'diffTracker.isRecording', diffTracker.getIsRecording());
+    setRecordingContext(diffTracker.getIsRecording());
 
     if (restoreOutcome === 'restored' || restoreOutcome === 'recovered' || restoreOutcome === 'incomplete') {
         updateVisibleDecorations();

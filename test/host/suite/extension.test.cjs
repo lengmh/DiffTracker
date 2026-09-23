@@ -60,6 +60,189 @@ module.exports = async function runExtensionHostScenario() {
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
         assert.equal((await state()).isRecording, true);
 
+        // S3: a fresh workspace with no legacy Global watch rules adopts the
+        // default configured Rules scope before automatic recording starts.
+        const configuredScope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+        assert.equal(configuredScope.effective.kind, 'configured');
+        assert.equal(configuredScope.effective.mode, 'rules');
+        assert.equal(configuredScope.legacyMigrationComplete, true);
+        assert.equal(configuredScope.requested.scope.scopeRevision, configuredScope.effective.scopeRevision);
+        console.log('PASS HOST-S3 fresh workspace starts with configured Rules scope');
+
+        // Explicit includes must baseline existing resources hidden by ordinary
+        // default exclusions. Do not require subsequent watcher events here:
+        // supplemental observation coverage for host-excluded subtrees is S4-W.
+        const privateDir = path.join(workspacePath, 'dist', 's3-private');
+        const privatePath = path.join(privateDir, 'existing.txt');
+        const privateTrackedPath = vscode.Uri.file(privatePath).fsPath;
+        fs.mkdirSync(privateDir, { recursive: true });
+        fs.writeFileSync(privatePath, 's3 private baseline\n');
+        const primaryFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(privatePath));
+        assert.ok(primaryFolder, 'primary host workspace folder must be resolvable');
+        const privateInclude = {
+            scope: 'folder',
+            folder: primaryFolder.name,
+            path: 'dist/s3-private/existing.txt'
+        };
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privateTrackedPath),
+            undefined,
+            'ordinary excluded path must not already have a baseline'
+        );
+        const scopeConfig = vscode.workspace.getConfiguration('diffTracker');
+        await scopeConfig.update('watchInclude', [privateInclude],
+            vscode.ConfigurationTarget.Workspace);
+        const includeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(includeApply.status, 'applied', JSON.stringify(includeApply));
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', privateTrackedPath),
+            's3 private baseline\n',
+            'explicit include must capture the existing ignored resource as its current baseline'
+        );
+        console.log('PASS HOST-S3 explicit include baselines resources hidden by ordinary exclusions');
+
+        // S3 can baseline an ordinary ignored subtree, but it must not publish
+        // an include whose future events are suppressed by files.watcherExclude.
+        const filesConfig = vscode.workspace.getConfiguration('files');
+        const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
+
+        // The Start command must project the backend's actual post-start state.
+        // Create a real S3 refusal: an already-effective explicit include becomes
+        // unobservable because files.watcherExclude changes after publication.
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        await filesConfig.update('watcherExclude', { '**/dist/s3-private/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        const refusedStart = await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks');
+        assert.equal(refusedStart, false, 'backend must refuse Start while the effective include lacks observation coverage');
+        const refusedStartState = await state();
+        assert.equal(refusedStartState.isRecording, false);
+        assert.equal(refusedStartState.recordingContext, false,
+            'the command context must remain false when DiffTracker.startRecording() refuses');
+        await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
+            'restoring observation coverage must leave a valid recovery path');
+        await until('Ready baseline after rejected Start recovery', async () => (await state()).baselineState === 'ready');
+        console.log('PASS HOST-S3 rejected Start keeps recording command context false');
+
+        await filesConfig.update('watcherExclude', { '**/watcher-hidden/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [
+            privateInclude,
+            { scope: 'folder', folder: primaryFolder.name, path: 'watcher-hidden/private' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const watcherExcludedApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(watcherExcludedApply.status, 'requiresS4', JSON.stringify(watcherExcludedApply));
+
+        await filesConfig.update('watcherExclude', { '**/generated/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [{
+            scope: 'folder',
+            folder: primaryFolder.name,
+            path: 'dist/s3-private'
+        }], vscode.ConfigurationTarget.Workspace);
+        const descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(descendantWatcherApply.status, 'requiresS4', JSON.stringify(descendantWatcherApply));
+
+        await scopeConfig.update('watchInclude', [privateInclude],
+            vscode.ConfigurationTarget.Workspace);
+        await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 watcher-excluded explicit include remains pending for S4-W');
+
+        // Confirmation must be bound to the exact scope revision shown to the
+        // user. A settings edit while the modal is open invalidates that approval.
+        const stableIncludes = [privateInclude];
+        await scopeConfig.update('watchInclude', [
+            ...stableIncludes,
+            { scope: 'all', path: 'dist/revision-a' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const stalePrompt = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(stalePrompt.status, 'needsConsent', JSON.stringify(stalePrompt));
+        assert.ok(stalePrompt.scopeRevision);
+        await scopeConfig.update('watchInclude', [
+            ...stableIncludes,
+            { scope: 'all', path: 'dist/revision-b' }
+        ], vscode.ConfigurationTarget.Workspace);
+        const staleApproval = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true,
+            expectedScopeRevision: stalePrompt.scopeRevision
+        });
+        assert.equal(staleApproval.status, 'conflict', JSON.stringify(staleApproval));
+        await scopeConfig.update('watchInclude', stableIncludes, vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 stale scope approval cannot authorize a newer revision');
+
+        // Whole Workspace is a valid request in S3 but cannot become effective
+        // until S4-W can atomically establish preparation and observation coverage.
+        await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
+        const wholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(wholeApply.status, 'requiresS4', JSON.stringify(wholeApply));
+        assert.equal((await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')).effective.mode, 'rules');
+        await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
+        console.log('PASS HOST-S3 Whole Workspace request stays pending until S4-W coverage exists');
+
+        // A directly edited explicit exclusion is only a requested scope until
+        // Apply. Pause new reads for the affected path, and if the request is
+        // withdrawn surface the observed gap conservatively instead of silently
+        // treating it as unchanged.
+        const pendingExcludeDoc = await vscode.workspace.openTextDocument(uri('existing.txt'));
+        await scopeConfig.update('watchExclude', [{ scope: 'all', pattern: 'existing.txt' }],
+            vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        const excludedEdit = new vscode.WorkspaceEdit();
+        excludedEdit.replace(
+            uri('existing.txt'),
+            new vscode.Range(
+                pendingExcludeDoc.positionAt(0),
+                pendingExcludeDoc.positionAt(pendingExcludeDoc.getText().length)
+            ),
+            'pending scope exclusion edit\n'
+        );
+        assert.equal(await vscode.workspace.applyEdit(excludedEdit), true);
+        assert.equal(await pendingExcludeDoc.save(), true);
+        await delay(500);
+        const pausedReview = await pending('existing.txt');
+        assert.equal(pausedReview?.reviewKind, 'unknown',
+            'pending explicit exclusion must preserve the prior baseline as unverified review');
+        assert.match(pausedReview?.unavailableReason ?? '', /pending explicit exclusion|paused.*exclusion/i);
+        assert.equal((await state()).reviewTokens.some(token => token.filePath === uri('existing.txt').fsPath), false,
+            'unverified pending-exclusion review must not expose a text action token');
+
+        await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
+        const gapReview = await untilStable(
+            'pending-scope gap becomes visible after request withdrawal',
+            () => pending('existing.txt')
+        );
+        assert.equal(gapReview.reviewKind, 'unknown');
+        assert.match(gapReview.unavailableReason ?? gapReview.reviewReason ?? '', /paused.*exclusion|requires review/i);
+
+        const restoreEdit = new vscode.WorkspaceEdit();
+        restoreEdit.replace(
+            uri('existing.txt'),
+            new vscode.Range(
+                pendingExcludeDoc.positionAt(0),
+                pendingExcludeDoc.positionAt(pendingExcludeDoc.getText().length)
+            ),
+            'base\n'
+        );
+        assert.equal(await vscode.workspace.applyEdit(restoreEdit), true);
+        assert.equal(await pendingExcludeDoc.save(), true);
+        await delay(300);
+        assert.equal((await pending('existing.txt'))?.reviewKind, 'unknown',
+            'ordinary reads must not silently erase a durable pending-scope coverage gap');
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
+        await untilStable('pending-scope gap clears only after explicit baseline rebuild',
+            async () => (await state()).baselineState === 'ready' && !(await pending('existing.txt')));
+        console.log('PASS HOST-S3 pending explicit exclusion preserves a conservative evidence gap');
+
         // Stable watcher contract used by S0/W1 planning:
         // recursive RelativePattern watchers inherit files.watcherExclude, while
         // a non-recursive RelativePattern can subscribe to otherwise excluded

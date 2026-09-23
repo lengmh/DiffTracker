@@ -132,11 +132,138 @@ for(const dispose of [false,true]) test(`delayed Git readiness releases fresh-st
     if(dispose)monitor.dispose();else{gitApi.state='initialized';apiState.fire('initialized');}
     assert.equal(await waiter,!dispose);monitor.dispose();
 });
+test('production start blocks invalid monitoring scope configuration',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    const sandbox={
+        recordingRequest:0,
+        restoreOutcome:'absent',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:false,errors:[{message:'invalid'}]},
+            effective:{kind:'configured',scopeRevision:'effective'},
+            workspaceRequestPresent:true,
+            expansionReasons:[],
+            consented:false
+        })},
+        diffTracker:{
+            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,[]);
+});
+
+test('production start revalidates scope after rebuild confirmation',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    let status={
+        requested:{ok:true,scope:{scopeRevision:'scope-a'}},
+        effective:{kind:'configured',scopeRevision:'scope-a'},
+        workspaceRequestPresent:true,
+        expansionReasons:[],
+        consented:true
+    };
+    const sandbox={
+        restoreOutcome:'restored',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>status},
+        diffTracker:{
+            isRecoveryBlocked:()=>true,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            discardRecoveryState:async()=>{calls.push('discard');return true;},
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{
+            showWarningMessage:async()=>undefined,
+            showErrorMessage:async()=>{
+                status={
+                    requested:{ok:true,scope:{scopeRevision:'scope-b'}},
+                    effective:{kind:'configured',scopeRevision:'scope-a'},
+                    workspaceRequestPresent:true,
+                    expansionReasons:[],
+                    consented:true
+                };
+                return 'Discard Saved Session and Rebuild';
+            }
+        }}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,['discard']);
+});
+
+test('production start blocks reset Workspace scope when configured effective differs',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    const sandbox={
+        restoreOutcome:'restored',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:true,scope:{scopeRevision:'default-rules'}},
+            effective:{kind:'configured',scopeRevision:'old-explicit-include'},
+            workspaceRequestPresent:false,
+            expansionReasons:[],
+            consented:false
+        })},
+        diffTracker:{
+            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,[]);
+});
+
+test('production start blocks an unapplied configured scope revision',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
+    assert.equal(declarations.length,1);
+    const calls=[];
+    const sandbox={
+        restoreOutcome:'restored',
+        runningExtensionTests:true,
+        gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:true,scope:{scopeRevision:'requested-new'}},
+            effective:{kind:'configured',scopeRevision:'effective-old'},
+            workspaceRequestPresent:true,
+            expansionReasons:[],
+            consented:true
+        })},
+        diffTracker:{
+            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
+            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+        },
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+    assert.equal(await sandbox.startRecordingFlow(),false);
+    assert.deepEqual(calls,[]);
+});
+
 for(const scenario of ['fresh','stopped','restored']) test(`production activation coordinates late Git readiness (${scenario})`,async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
-    const names=new Set(['startRecordingFlow','stopRecordingFlow','handleGitContextEvent']),declarations=[];
+    const names=new Set(['setRecordingContext','startRecordingFlow','startRecordingAfterPrechecks','stopRecordingFlow','handleGitContextEvent']),declarations=[];
     const visit=node=>{if(ts.isVariableDeclaration(node)&&names.has(node.name.getText(source)))declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
-    assert.equal(declarations.length,3);
+    assert.equal(declarations.length,5);
     let release;const ready=new Promise(resolve=>{release=resolve;});const calls=[];let recording=scenario==='restored';
     const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
         diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',
@@ -144,8 +271,15 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
             setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
             setGitContextPending:()=>calls.push('release')},
         gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},
-        vscode:{commands:{executeCommand:async()=>{}}}};
-    vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
+        monitoringScopeController:{getStatus:()=>({
+            requested:{ok:true,scope:{scopeRevision:'same'}},
+            effective:{kind:'configured',scopeRevision:'same'},
+            workspaceRequestPresent:false,
+            expansionReasons:[],
+            consented:true
+        })},
+        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
+    vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0,testRecordingContext;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
     if(scenario==='stopped')sandbox.flows.stopRecordingFlow();
     await sandbox.flows.handleGitContextEvent({kind:'ready',contexts:[context()]});release(true);if(start)await start;
@@ -162,7 +296,11 @@ for(const scenario of ['delayed','immediate','unavailable','recovered','incomple
     const handler=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='handleGitContextEvent')handler.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
     const calls=[];let callback,pending=false,releaseStart;const starting=new Promise(resolve=>{releaseStart=resolve;});
     const restored=scenario==='recovered'||scenario==='incomplete'?scenario:'restored';
-    const sandbox={context:{subscriptions:[],storageUri:undefined},runningExtensionTests:true,
+    const sandbox={context:{subscriptions:[],storageUri:undefined,workspaceState:{get:()=>undefined,update:async()=>{}}},runningExtensionTests:true,
+        MonitoringScopeController:class {
+            constructor(){}
+            reconcileRequestedScope(){}
+        },
         DiffTracker:class {
             setGitContextPending(value){pending=value;calls.push(value?'pause':'release');}
             async restorePersistedState(){assert.equal(pending,true);return restored;}

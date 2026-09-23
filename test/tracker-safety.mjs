@@ -1,3 +1,4 @@
+import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
 /** Production regression tests. Only the VS Code API boundary is faked.
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
  * DT_SOURCE may point at an archived baseline source for red/green comparison.
@@ -24,6 +25,7 @@ let listedFiles=[];
 let listedIgnores=[];
 let vscodeExcludes={};
 let workspaceChanged;
+let configurationChanged;
 let workspaceFilesCreated;
 const docs = [];
 const watcherInstances = [];
@@ -62,7 +64,15 @@ async function waitUntil(predicate, timeoutMs=1000) {
     const deadline=Date.now()+timeoutMs;
     while(!predicate()) { if(Date.now()>=deadline) throw new Error('Timed out waiting for test condition'); await new Promise(resolve=>setTimeout(resolve,5)); }
 }
-class Emitter { event = noopEvent; fire() {} dispose() {} }
+class Emitter {
+    listeners = new Set();
+    event = listener => {
+        this.listeners.add(listener);
+        return { dispose: () => this.listeners.delete(listener) };
+    };
+    fire(value) { for (const listener of [...this.listeners]) listener(value); }
+    dispose() { this.listeners.clear(); }
+}
 class Uri {
     constructor(p) { this.fsPath = p; this.path = p; this.scheme = 'file'; }
     static file(p) { return new Uri(p); }
@@ -119,6 +129,7 @@ function document(p) {
 }
 const vscode = {
     EventEmitter: Emitter, Uri, Range, Position, WorkspaceEdit,
+    ConfigurationTarget: { Global:1, Workspace:2, WorkspaceFolder:3 },
     RelativePattern:class {
         constructor(base,pattern){
             if (base instanceof Uri) throw new Error('VS Code 1.80 RelativePattern does not accept Uri');
@@ -141,7 +152,7 @@ const vscode = {
         onDidChangeTextDocument:noopEvent, onDidOpenTextDocument:noopEvent,
         onWillSaveTextDocument:noopEvent, onDidSaveTextDocument:noopEvent,
         onDidCreateFiles:handler=>{workspaceFilesCreated=handler;return {dispose(){}};},
-        onDidChangeConfiguration:noopEvent,
+        onDidChangeConfiguration:handler=>{configurationChanged=handler;return {dispose(){}};},
         onDidChangeWorkspaceFolders:handler=>{workspaceChanged=handler;return {dispose(){}};},
         findFiles:async pattern=>{if(pattern.pattern!=='**/*') await boundary(root,'ignoreScan');return pattern.pattern==='**/*'?listedFiles:pattern.pattern==='**/.gitignore'?listedIgnores:[];},
         createFileSystemWatcher:createWatcher,
@@ -213,6 +224,7 @@ function seed(p,baseline,current=baseline,exists=true) {
 }
 async function scan(p) { await tracker.readFileAndUpdate(p,Uri.file(p)); }
 function pending(p) { return tracker.getTrackedChanges().find(c=>c.filePath===p); }
+function subtreeGap(p) { return tracker.coverageGaps.get(path.resolve(p))?.subtree; }
 function disk(p) { return fs.readFileSync(p,'utf8'); }
 
 test('DT-02 nonempty → empty Keep → write → Revert preserves existing empty file',async()=>{
@@ -582,7 +594,7 @@ test('existing V1 persistence preserves absent versus empty baseline and paused 
     const storage=path.join(root,`storage-${index++}`); tracker.storageUri=Uri.file(storage); tracker.isRecording=false;
     await tracker.flushPersistState();
     const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
-    assert.equal(saved.version,3); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
+    assert.equal(saved.version,4); assert.equal(saved.isRecording,false); assert.equal(saved.baselineState,'ready');
     const loaded=await tracker.loadPersistedState(); assert.equal(loaded.isRecording,false);
     assert.ok(loaded.baselineExistingFiles.includes(empty)); assert.equal(loaded.baselineExistingFiles.includes(absent),false);
     assert.ok(loaded.fileSnapshots.some(([p,t])=>p===absent&&t===''));
@@ -594,7 +606,7 @@ test('DT-06 atomic persistence keeps a last-good state and recovers a corrupted 
     const primary=path.join(storage,'session-state.json');
     const backup=path.join(storage,'session-state.last-good.json');
     assert.equal(fs.existsSync(backup),true);
-    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,3);
+    const valid=JSON.parse(fs.readFileSync(backup,'utf8')); assert.equal(valid.version,4);
     fs.writeFileSync(primary,'{"version":2,');
 
     tracker=new DiffTracker(Uri.file(storage));
@@ -711,7 +723,7 @@ test('DT-08 queued Undo calls cannot mutate after the recording session stops',a
     assert.equal(results.reduce((total,result)=>total+result.succeeded,0),0);
     assert.equal(disk(p),'baseline');assert.equal(tracker.revertHistory.length,1);
 });
-test('DT-06 valid V1 state migrates in memory and the next durable write is strict V3',async()=>{
+test('DT-06 valid V1 state migrates in memory and the next durable write is strict V4',async()=>{
     const p=file(); fs.writeFileSync(p,'changed');
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
     fs.writeFileSync(path.join(storage,'session-state.json'),JSON.stringify({
@@ -720,7 +732,7 @@ test('DT-06 valid V1 state migrates in memory and the next durable write is stri
     tracker.storageUri=Uri.file(storage); assert.equal(await tracker.restorePersistedState(),'restored');
     assert.equal(tracker.getOriginalContent(p),'baseline'); assert.ok(pending(p));
     assert.equal(await tracker.flushPendingPersistence(),true);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,3);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8')).version,4);
 });
 test('DT-06 explicit discard is required before a blocked session can start',async()=>{
     const storage=path.join(root,`storage-${index++}`); fs.mkdirSync(storage);
@@ -2402,14 +2414,18 @@ for(const entry of ['file','batch','undo']) test(`AUDIT-20 ${entry} recovery cre
         assert.equal(fs.statSync(dir).mode&0o777,0o700);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);assert.equal(fs.statSync(p).mode&0o777,0o644);
     }finally{process.umask(previous);}
 });
-for(const restart of [false,true]) test(`AUDIT-20 completed staging exclusions expire${restart?' across restart':''}`,async()=>{
+for(const restart of [false,true]) test(`AUDIT-20 completed staging ownership expires but reserved path stays hard-excluded${restart?' across restart':''}`,async()=>{
     tracker.creationTempGraceMs=20;
     for(let i=0;i<3;i++){const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));assert.ok(succeeded(await tracker.revertFile(p)));}
     const roots=[...tracker.creationTempRoots];assert.ok(roots.length>0);
     for(const dir of roots){assert.equal(fs.existsSync(dir),false);assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),true);}
     if(restart){tracker.stopRecording();tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');}
     await waitUntil(()=>tracker.creationTempRoots.size===0,300);
-    for(const dir of roots)assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),false);
+    for(const dir of roots)assert.equal(
+        tracker.isPathIgnored(Uri.file(path.join(dir,'content'))),
+        true,
+        'ADR-0006 keeps .difftracker-restore-* paths permanently unmonitorable after dynamic staging state expires'
+    );
 });
 test('AUDIT-20 existing parent permissions remain unchanged',async()=>{
     if(process.platform==='win32')return;
@@ -2417,7 +2433,7 @@ test('AUDIT-20 existing parent permissions remain unchanged',async()=>{
     fs.rmSync(path.dirname(p),{recursive:true});await tracker.onExternalFileDeleted(Uri.file(path.dirname(p)));
     assert.ok(succeeded(await tracker.revertFile(p)));assert.equal(fs.statSync(dir).mode&0o777,0o750);assert.equal(fs.statSync(path.dirname(p)).mode&0o777,0o700);
 });
-for(const ending of ['success','failure','restart','dispose','unexpected-child']) test(`AUDIT-20 active staging survives grace interval then cleans up on ${ending}`,async()=>{
+for(const ending of ['success','failure','restart','dispose','unexpected-child']) test(`AUDIT-20 active staging ownership survives grace interval then cleans up on ${ending}`,async()=>{
     tracker.creationTempGraceMs=20;
     const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
     const gate=pause(p,'publish'),op=tracker.revertFile(p);await gate.entered;
@@ -2432,7 +2448,14 @@ for(const ending of ['success','failure','restart','dispose','unexpected-child']
     gate.release();const result=await op;
     assert.equal(succeeded(result),ending==='success'||ending==='unexpected-child');
     await waitUntil(()=>tracker.creationTempRoots.size===0,300);assert.equal(tracker.creationTempExpiryTimers.size,0);
-    if(ending==='unexpected-child'){assert.equal(disk(path.join(staging,'other')),'preserve me');assert.equal(tracker.isPathIgnored(Uri.file(path.join(staging,'other'))),false);}
+    if(ending==='unexpected-child'){
+        assert.equal(disk(path.join(staging,'other')),'preserve me');
+        assert.equal(
+            tracker.isPathIgnored(Uri.file(path.join(staging,'other'))),
+            true,
+            'unexpected staging children remain preserved on disk but permanently outside monitoring per ADR-0006'
+        );
+    }
 });
 test('AUDIT-20 dispose before staging allocation returns cannot resurrect exclusion timers',async()=>{
     const p=file();seed(p,'base');fs.unlinkSync(p);await tracker.onExternalFileDeleted(Uri.file(p));
@@ -2798,7 +2821,7 @@ test('ROUND26 directory event observed during scan remains unknown after scan co
 });
 test('ROUND26 directory scan failure is visible and never accepts its children',async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('failed-dir');fs.mkdirSync(dir);const find=vscode.workspace.findFiles;vscode.workspace.findFiles=async pattern=>{if(pattern.base===dir)throw error('EACCES');return find(pattern);};
-    try{await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),'');assert.equal(succeeded(await tracker.keepAllChangesInFile(dir)),false);assert.equal(succeeded(await tracker.revertFile(dir)),false);}finally{vscode.workspace.findFiles=find;}
+    try{await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(pending(dir),undefined);assert.equal(tracker.getOriginalContent(dir),undefined);assert.match(subtreeGap(dir)?.reason??'',/could not be scanned/i);assert.equal(succeeded(await tracker.keepAllChangesInFile(dir)),false);assert.equal(succeeded(await tracker.revertFile(dir)),false);}finally{vscode.workspace.findFiles=find;}
 });
 test('ROUND26 overlapping ignore refresh retains directory creation evidence before stat completes',async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('racing-dir'),p=path.join(dir,'child.txt'),rule=path.join(dir,'.gitignore');fs.mkdirSync(dir);fs.writeFileSync(p,'new');fs.writeFileSync(rule,'*.log');listedFiles=[Uri.file(p)];listedIgnores=[Uri.file(rule)];
@@ -2862,7 +2885,8 @@ for(const failure of ['limit','quota','read']) test(`ROUND27 watcher ${failure} 
         for(let attempt=0;attempt<2;attempt++){
             await tracker.onExternalFileCreated(Uri.file(dir));
             assert.equal(pending(p)?.currentContent,'imported');assert.equal(pending(p)?.unavailableReason,undefined);
-            assert.match(pending(dir)?.unavailableReason??'',/watch coverage is incomplete/);
+            assert.equal(pending(dir),undefined);
+            assert.match(subtreeGap(dir)?.reason??'',/watch coverage is incomplete/);
             assert.deepEqual(nativeDirectoryWatchers.filter(w=>w.active).map(w=>w.directory),[existing]);
         }
     }finally{fs.watch=originalWatch;fs.promises.readdir=originalRead;}
@@ -2879,18 +2903,24 @@ for(const source of ['setting','gitignore']) test(`ROUND27 ${source} changes rec
 });
 for(const restore of [false,true]) test(`ROUND27 deleting a failed-watch tree clears its persisted marker (restore=${restore})`,async()=>{
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.maxImportedDirectoryWatchers=0;
-    const dir=file('failed-watch-delete'),p=path.join(dir,'child.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);
-    if(restore){await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));assert.equal(await tracker.restorePersistedState(),'restored');}
-    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(dir),false);
-    await tracker.flushPendingPersistence();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));listedFiles=[];assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);
+    const dir=file('failed-watch-delete'),p=path.join(dir,'child.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'new');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(pending(dir),undefined);assert.ok(subtreeGap(dir));
+    if(restore){
+        await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(subtreeGap(dir),undefined,
+            'fresh direct watch plus successful restore scan must retire the persisted coverage gap');
+        assert.equal(pending(dir),undefined);
+    }
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(dir),false);
+    await tracker.flushPendingPersistence();await tracker.dispose();tracker=new DiffTracker(Uri.file(storage));listedFiles=[];assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(pending(p),undefined);
 });
 
 
-for(const uncertainty of ['scan','older']) test(`ROUND27 failed directory coverage preserves ${uncertainty} uncertainty`,async()=>{
+for(const uncertainty of ['scan','older']) test(`ROUND27 failed directory coverage preserves ${uncertainty} uncertainty as a subtree diagnostic`,async()=>{
     const dir=file('unknown-watch');fs.mkdirSync(dir);tracker.maxImportedDirectoryWatchers=0;
     if(uncertainty==='scan')tracker.snapshotInitialized=false;else tracker.recordUnresolvedBaseline(dir,'pre-existing unknown path');
-    await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(tracker.getOriginalContent(dir),undefined);assert.ok(pending(dir)?.unavailableReason);
-    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.ok(pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
+    await tracker.onExternalFileCreated(Uri.file(dir));assert.equal(tracker.getOriginalContent(dir),undefined);assert.equal(pending(dir),undefined);assert.ok(subtreeGap(dir));
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(tracker.getOriginalContent(dir),undefined);
 });
 
 
@@ -2907,9 +2937,15 @@ for(const source of ['setting','gitignore']) test(`ROUND27 unignoring ${source} 
 for(const restore of [false,true]) for(const kind of ['error','unnamed']) test(`ROUND27 asynchronous watcher ${kind} records deletable absence (restore=${restore})`,async()=>{
     tracker.storageUri=Uri.file(file('storage'));const storage=tracker.storageUri;const dir=file('async-watch'),sub=path.join(dir,'deep');fs.mkdirSync(sub,{recursive:true});await tracker.onExternalFileCreated(Uri.file(dir));
     const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===sub);assert.ok(watcher);if(kind==='error')watcher.error(error('ENOSPC'));else watcher.listener('rename',null);
-    await waitUntil(()=>!!pending(sub)?.unavailableReason);assert.equal(tracker.getOriginalContent(sub),'');
-    if(restore){await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');}
-    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(pending(sub),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(sub),false);
+    await waitUntil(()=>!!subtreeGap(sub));assert.equal(tracker.getOriginalContent(sub),undefined);assert.equal(pending(sub),undefined);
+    if(restore){
+        await tracker.dispose();tracker=new DiffTracker(storage);
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(subtreeGap(sub),undefined,
+            'a recovered direct watch plus successful restore scan must retire the persisted asynchronous watcher gap');
+        assert.equal(pending(sub),undefined);
+    }
+    fs.rmSync(dir,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(dir));assert.equal(subtreeGap(sub),undefined);assert.equal(pending(sub),undefined);assert.equal(tracker.unresolvedBaselineFiles.has(sub),false);
 });
 
 
@@ -2920,30 +2956,30 @@ test('ROUND27 failed watch resume retains discovery for a later successful retry
 });
 test('ROUND27 asynchronous failure during scan never certifies absence',async()=>{
     tracker.snapshotInitialized=false;const dir=file('scan-async');fs.mkdirSync(dir);await tracker.onExternalFileCreated(Uri.file(dir));const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));
-    await waitUntil(()=>!!pending(dir)?.unavailableReason);assert.equal(tracker.getOriginalContent(dir),undefined);
+    await waitUntil(()=>!!subtreeGap(dir));assert.equal(tracker.getOriginalContent(dir),undefined);assert.equal(pending(dir),undefined);
 });
 
 
 for(const failScan of [false,true]) test(`ROUND27 same-fingerprint watch retry reconciles gap and clears durable marker (scanRetry=${failScan})`,async()=>{
     tracker.storageUri=Uri.file(file('storage'));const storage=tracker.storageUri;tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
     const dir=file('gap'),sub=path.join(dir,'deep'),p=path.join(sub,'known.txt'),deleted=path.join(sub,'deleted.txt');fs.mkdirSync(sub,{recursive:true});for(const f of [p,deleted])fs.writeFileSync(f,'base');listedFiles=[p,deleted].map(Uri.file);await tracker.onExternalFileCreated(Uri.file(dir));for(const f of [p,deleted])assert.equal((await tracker.keepAllChangesInFile(f)).status,'success');
-    watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();watchExclude=[];tracker.maxImportedDirectoryWatchers=0;await tracker.refreshIgnoreMatchers();assert.ok(pending(dir)?.unavailableReason);
+    watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();watchExclude=[];tracker.maxImportedDirectoryWatchers=0;await tracker.refreshIgnoreMatchers();assert.ok(subtreeGap(dir));assert.equal(pending(dir),undefined);
     fs.writeFileSync(p,'gap edit');fs.unlinkSync(deleted);const q=path.join(sub,'gap-new.txt');fs.writeFileSync(q,'gap new');listedFiles=[p,q].map(Uri.file);const fingerprint=tracker.ignoreFingerprint;tracker.maxImportedDirectoryWatchers=256;
     const find=vscode.workspace.findFiles;
-    if(failScan){vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*')throw error('scan failed');return find(pattern);};try{await assert.rejects(tracker.refreshIgnoreMatchers());}finally{vscode.workspace.findFiles=find;}assert.ok(pending(dir)?.unavailableReason);}
-    await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint);assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason,'unobserved gap creation keeps unknown before-image');assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);
-    await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(pending(dir),undefined);assert.equal(pending(p)?.currentContent,'gap edit');assert.ok(pending(q)?.unavailableReason);
+    if(failScan){vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*')throw error('scan failed');return find(pattern);};try{await assert.rejects(tracker.refreshIgnoreMatchers());}finally{vscode.workspace.findFiles=find;}assert.ok(subtreeGap(dir));assert.equal(pending(dir),undefined);}
+    await tracker.refreshIgnoreMatchers();assert.equal(tracker.ignoreFingerprint,fingerprint);assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason,'unobserved gap creation keeps unknown before-image');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);
+    await tracker.dispose();tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(pending(p)?.currentContent,'gap edit');assert.ok(pending(q)?.unavailableReason);
 });
 
 
 for(const failResume of [false,true]) test(`ROUND27 stale failed ${failResume?'watch resume':'reconciliation'} cannot overwrite a newer success`,async()=>{
     tracker.storageUri=Uri.file(file('storage'));tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('stale-reconcile'),p=path.join(dir,'known.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));await tracker.keepAllChangesInFile(p);
-    const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));await waitUntil(()=>!!pending(dir)?.unavailableReason);
+    const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));await waitUntil(()=>!!subtreeGap(dir));assert.equal(pending(dir),undefined);
     const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,read=fs.promises.readdir;let first=true;
     if(failResume)fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return read(directory,...args);};
     else vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*'&&first){first=false;entered.resolve();await release.promise;throw error('old scan');}return find(pattern);};
     const old=tracker.refreshIgnoreMatchers();const oldResult=old.then(()=>null,e=>e);
-    try{await entered.promise;if(failResume){nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir).error(error('ENOSPC'));}fs.writeFileSync(p,'latest');const latest=tracker.refreshIgnoreMatchers();if(failResume)release.resolve();await latest;assert.equal(pending(p)?.currentContent,'latest');assert.equal(pending(dir),undefined);release.resolve();assert.equal(await oldResult,null);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);}
+    try{await entered.promise;if(failResume){nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir).error(error('ENOSPC'));}fs.writeFileSync(p,'latest');const latest=tracker.refreshIgnoreMatchers();if(failResume)release.resolve();await latest;assert.equal(pending(p)?.currentContent,'latest');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);release.resolve();assert.equal(await oldResult,null);assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);}
     finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.readdir=read;}
 });
 
@@ -2963,6 +2999,257 @@ registerOpaqueBaselineInvariants({
     setListedFiles: value => { listedFiles = value; }
 });
 
+
+test('S3 scope apply is blocked while baseline scan is building',async()=>{
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const requested={kind:'configured',mode:'rules',roots,includes:[],excludes:[],scopeRevision:'building-test'};
+    tracker.baselineBuilding=true;
+    tracker.isRecording=true;
+    const before=tracker.getEffectiveMonitoringScope();
+    const result=await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal(result.status,'conflict');
+    assert.match(result.reason,/baseline scan.*building/i);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    tracker.baselineBuilding=false;
+});
+
+test('S3 scope apply rolls back when Git context pauses during include preparation',async()=>{
+    const includeDir=file('scope-git-include');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const p=path.join(includeDir,'captured.txt');
+    fs.writeFileSync(p,'candidate baseline');
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',
+        mode:'rules',
+        roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],
+        scopeRevision:''
+    };
+    const identity={model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes};
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+
+    const before=tracker.getEffectiveMonitoringScope();
+    const gate=pause(p,'read');
+    const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    await gate.entered;
+    tracker.pausedGitRepositories.set(root,'Git context changed during scope preparation');
+    gate.release();
+    const result=await applying;
+    assert.notEqual(result.status,'applied',JSON.stringify(result));
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    tracker.pausedGitRepositories.clear();
+});
+
+
+test('S3 broad include defers when watcherExclude can hide a descendant',async()=>{
+    const includeDir=file('scope-descendant');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    vscodeExcludes['files.watcherExclude']={'**/generated/**':true};
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'descendant-watch-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+});
+
+test('S3 restore-prefixed ordinary files are not treated as watcher hard boundaries',async()=>{
+    const includeDir=file('scope-restore-prefix');
+    fs.mkdirSync(includeDir,{recursive:true});
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    vscodeExcludes['files.watcherExclude']={'**/.difftracker-restore-*':true};
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeDir).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'restore-prefix-watch-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+});
+
+test('S3 missing explicit include that becomes a directory drops its absent-file sentinel across restore',async()=>{
+    const target=file('scope-later-directory');
+    const storage=file('scope-later-directory-storage');
+    tracker.storageUri=Uri.file(storage);
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,target).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    assert.equal(tracker.fileSnapshots.has(target),true,'missing include starts with an absent-file sentinel');
+    assert.equal(tracker.baselineExistingFiles.has(target),false);
+
+    fs.mkdirSync(target);
+    await tracker.onExternalFileCreated(Uri.file(target));
+    assert.equal(tracker.fileSnapshots.has(target),false,'directory observation removes the file sentinel');
+    assert.equal(pending(target),undefined);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.fileSnapshots.has(target),false);
+    assert.equal(pending(target),undefined,'restoring the directory must not create a Resource is a directory review');
+});
+
+test('S3 watcherExclude change pauses an already-effective include and persists the gap',async()=>{
+    const includeFile=file('scope-dynamic.txt');
+    fs.writeFileSync(includeFile,'baseline');
+    const storage=file('scope-dynamic-storage');
+    tracker.storageUri=Uri.file(storage);
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeFile).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+
+    vscodeExcludes['files.watcherExclude']={[`**/${path.basename(includeFile)}`]:true};
+    configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
+    await waitUntil(()=>!tracker.getIsRecording()&&tracker.baselineBuilding&&!tracker.snapshotInitialized);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+    assert.equal(saved.isRecording,false);
+    assert.equal(saved.baselineState,'building');
+
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'incomplete');
+    assert.equal(tracker.getIsRecording(),false);
+});
+
+test('S3 watcherExclude changing during scope preparation cannot publish the candidate',async()=>{
+    const includeFile=file('scope-race.txt');
+    fs.writeFileSync(includeFile,'candidate baseline');
+    const roots=[{
+        name:'test',
+        uri:Uri.file(root).toString(),
+        caseSensitive:process.platform!=='win32'&&process.platform!=='darwin'
+    }];
+    const scope={
+        kind:'configured',mode:'rules',roots,
+        includes:[{scope:'all',path:path.relative(root,includeFile).split(path.sep).join('/')}],
+        excludes:[],scopeRevision:'race-watch-gap'
+    };
+    const before=tracker.getEffectiveMonitoringScope();
+    const gate=pause(includeFile,'read');
+    const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    await gate.entered;
+    vscodeExcludes['files.watcherExclude']={[`**/${path.basename(includeFile)}`]:true};
+    configurationChanged({affectsConfiguration:key=>key==='files.watcherExclude'});
+    gate.release();
+    const result=await applying;
+    assert.notEqual(result.status,'applied',JSON.stringify(result));
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+});
+
+test('S3 pure workspace-root removal can publish a configured contraction without clearing pending review',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=path.join(root,'scope-root-a'),rootB=path.join(root,'scope-root-b');
+    fs.mkdirSync(rootA,{recursive:true});fs.mkdirSync(rootB,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
+    const folders=[{uri:Uri.file(rootA),name:'a'},{uri:Uri.file(rootB),name:'b'}];
+    const getFolder=uri=>(vscode.workspace.workspaceFolders??[]).find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative);
+    });
+    try{
+        vscode.workspace.workspaceFolders=folders;
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+
+        const verifiedRoots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(verifiedRoots.length,2);
+        assert.ok(verifiedRoots.every(identity=>typeof identity.caseSensitive==='boolean'),
+            'precondition: root-removal fixture must provide internally verified path identities');
+        const initial={
+            kind:'configured',mode:'rules',
+            roots:verifiedRoots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'folder',folder:'b',pattern:'private/**'}],
+            scopeRevision:''
+        };
+        initial.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:initial.mode,roots:initial.roots,includes:initial.includes,excludes:initial.excludes
+        })).digest('hex');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(initial,false,()=>true)).status,'applied');
+
+        const removedPending=path.join(rootB,'pending.txt');
+        fs.writeFileSync(removedPending,'changed');
+        tracker.fileSnapshots.set(removedPending,'baseline');
+        tracker.baselineExistingFiles.add(removedPending);
+        tracker.updateTrackedDiff(removedPending,'changed');
+        assert.ok(pending(removedPending));
+
+        vscode.workspace.workspaceFolders=[folders[0]];
+        workspaceChanged({added:[],removed:[folders[1]]});
+        const rootAIdentity=verifiedRoots.find(identity=>identity.name==='a');
+        assert.ok(rootAIdentity);
+        const reduced={
+            kind:'configured',mode:'rules',
+            roots:[{...rootAIdentity}],
+            includes:[],excludes:[],scopeRevision:''
+        };
+        reduced.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:reduced.mode,roots:reduced.roots,includes:reduced.includes,excludes:reduced.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(reduced,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,reduced.scopeRevision);
+        assert.equal(tracker.workspaceContextChanged,true,'review remains paused until explicit rebuild');
+        assert.ok(pending(removedPending),'scope reconciliation itself must not destructively clear pending review');
+
+        tracker.startRecording();
+        await waitUntil(()=>tracker.getBaselineState()==='ready');
+        assert.equal(tracker.getIsRecording(),true,'explicit rebuild can resume recording after the contraction is applied');
+        assert.equal(tracker.workspaceContextChanged,false);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 registerStateSchemaCompatibility({
     test, root, Uri, DiffTracker, faults, file, pending,
     getTracker: () => tracker,
@@ -2970,7 +3257,29 @@ registerStateSchemaCompatibility({
     setListedFiles: value => { listedFiles = value; }
 });
 
+registerPR11ReviewRegressions({
+    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document,
+    getTracker: () => tracker, setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; },
+    setListedIgnores: value => { listedIgnores = value; },
+    createScopeController: context => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try { const { MonitoringScopeController }=require('../out/monitoringScopeController.js'); return new MonitoringScopeController(context,tracker); }
+        finally { Module._load=originalLoad; }
+    },
+    createScopePanel: controller => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try {
+            const { WatchExcludePanel }=require('../out/watchExcludePanel.js');
+            return Object.assign(Object.create(WatchExcludePanel.prototype),{scopeController:controller});
+        } finally {Module._load=originalLoad;}
+    },
+    setVsCodeExcludes: value => { vscodeExcludes = value; },
+    fireConfigurationChanged: key => configurationChanged({affectsConfiguration: name => name === key})
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
+if(process.env.DT_EXPECT_LEGACY_REJECTION==='1') { const selected=tests.filter(t=>t.name.startsWith('SCHEMA-DOWNGRADE '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('AUDIT-'));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}

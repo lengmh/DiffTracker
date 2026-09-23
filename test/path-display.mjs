@@ -75,6 +75,7 @@ for (const [style, root, file] of [
             originalContent: 'before', currentContent: 'after' };
         const tracker = {
             getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
+            getSubtreeCoverageGaps:()=>[],
             getTrackedChanges: () => [tracked], getBaselineState: () => 'ready',
             getChangeBlocks: () => []
         };
@@ -122,6 +123,7 @@ await test('multi-root duplicate names remain separate resources and preserve ca
     const files = ['/a/src/Sample.m', '/a/src/sample.m', '/b/src/sample.m'];
     const provider = new (load('diffTreeView.ts').DiffTreeDataProvider)({
         getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
+        getSubtreeCoverageGaps:()=>[],
         getBaselineState: () => 'ready',
         getTrackedChanges: () => files.map(filePath => ({ filePath, fileName: 'sample.m' }))
     });

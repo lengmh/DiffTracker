@@ -14,7 +14,7 @@ const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
-    const state = { changes: change ? [change] : [], result: { status: 'success' }, error: undefined };
+    const state = { changes: change ? [change] : [], subtreeCoverageGaps: [], result: { status: 'success' }, error: undefined };
     const vscode = {
         Uri: {
             file: value => ({ fsPath: value }),
@@ -73,7 +73,8 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         },getUnknownReviewPaths:()=> {
             const change = state.changes[0];
             return change?.reviewKind === 'unknown' ? [filePath] : [];
-        },getIsRecording:()=>true,
+        },getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
+        getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
     const panel = Object.create(load('webviewDiffPanel.ts').WebviewDiffPanel.prototype);
@@ -236,6 +237,26 @@ await test('unknown state is visible in generated DOM, tree and incremental payl
     ui.receive({ ...h.messages[0], reviewKind: 'text', reviewReason: undefined, unavailableReason: undefined });
     assert.match(ui.notice(), /Empty file created/);
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+});
+
+await test('subtree coverage diagnostics are visible and actionable without becoming file review items', async () => {
+    const h = harness(null);
+    h.state.subtreeCoverageGaps = [{
+        targetPath: '/workspace/imported-tree',
+        reasonCode: 'directory-runtime-coverage-gap',
+        reason: 'Imported directory watcher failed'
+    }];
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const roots = await tree.getChildren();
+    const diagnostic = roots.find(item => item.label === 'Monitoring Coverage Limited');
+    assert.ok(diagnostic, 'coverage-limited state must be visible in the Changes Tree');
+    assert.equal(diagnostic.description, '1 subtree(s)');
+    assert.equal(diagnostic.filePath, undefined, 'subtree diagnostics are not file review resources');
+    assert.equal(diagnostic.children.length, 1);
+    assert.equal(diagnostic.children[0].command.command, 'diffTracker.manageMonitoringScope');
+    assert.match(diagnostic.children[0].tooltip, /Imported directory watcher failed/);
+    assert.equal(roots.some(item => item.label === 'Pending Review'), false,
+        'coverage diagnostics must not fabricate a file review summary');
 });
 
 await test('opaque file review is visible, read-only and carries identity metadata', async () => {
