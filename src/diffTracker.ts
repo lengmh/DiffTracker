@@ -3748,9 +3748,16 @@ export class DiffTracker {
             }
         };
 
+        const wholeWorkspaceDiscovery = this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace';
         add(await vscode.workspace.findFiles(
             new vscode.RelativePattern(patternBase, '**/*'),
-            new vscode.RelativePattern(patternBase, '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
+            new vscode.RelativePattern(
+                patternBase,
+                wholeWorkspaceDiscovery
+                    ? '**/{.git,.difftracker-restore-*}/**'
+                    : '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**'
+            )
         ));
 
         if (this.effectiveMonitoringScope.kind === 'configured') {
