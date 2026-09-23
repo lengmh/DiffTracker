@@ -1635,6 +1635,62 @@ export class DiffTracker {
         this.markFileUnavailable(filePath, reason);
     }
 
+    private configuredScopeMonitorsPath(
+        scope: CanonicalMonitoringScope,
+        uri: vscode.Uri,
+        directory = false
+    ): boolean {
+        if (uri.scheme !== 'file') { return false; }
+        const folder = vscode.workspace.getWorkspaceFolder(uri);
+        if (!folder || folder.uri.scheme !== 'file') { return false; }
+        const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+        if (typeof rootIdentity.caseSensitive !== 'boolean') { return false; }
+        const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
+        const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
+        const ordinaryIgnored = matcher?.ignores(relative) ?? false;
+        return evaluateConfiguredScope(scope, rootIdentity, relative, ordinaryIgnored, directory).monitored;
+    }
+
+    private preserveRejectedScopePreparationEvent(event: StartupEvent): void {
+        const filePath = this.canonicalTrackingPath(event.uri.fsPath);
+        let directory = false;
+        if (event.kind === 'delete') {
+            directory = this.hasHistoricalDirectoryProvenance(filePath);
+            if (!directory && !this.fileSnapshots.has(filePath) &&
+                !this.opaqueBaselineFiles.has(filePath) && !this.unresolvedBaselineFiles.has(filePath)) {
+                // The rejected candidate never committed a file/directory identity.
+                // Preserve uncertainty as subtree evidence rather than recreating
+                // the historical "Resource is a directory" phantom file review.
+                this.setSubtreeCoverageGap(
+                    filePath,
+                    'scope-preparation-delete-unknown-kind',
+                    'A resource disappeared during rejected monitoring-scope preparation; its prior kind and contents are unknown'
+                );
+                return;
+            }
+        } else {
+            try { directory = fs.lstatSync(filePath).isDirectory(); }
+            catch { directory = false; }
+        }
+        if (directory) {
+            this.setSubtreeCoverageGap(
+                filePath,
+                'scope-preparation-event',
+                'A directory changed during rejected monitoring-scope preparation; descendant state requires reconciliation'
+            );
+            return;
+        }
+
+        const reason =
+            'A file changed during rejected monitoring-scope preparation before a reliable before-image was committed';
+        if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
+            this.unresolvedBaselineFiles.set(filePath, reason);
+        }
+        this.setFileCoverageGap(filePath, 'scope-preparation-event', reason);
+        this.retainedReviewPaths.add(filePath);
+        this.markFileUnavailable(filePath, reason);
+    }
+
     private async drainDeferredScopeApplyEvents(epoch: number): Promise<boolean> {
         const deadline = Date.now() + 5000;
         this.scopeApplyPreflight = true;
@@ -2991,7 +3047,26 @@ export class DiffTracker {
         let captured = 0;
         const files = await this.enumerateConfiguredCandidateFiles(scope, epoch);
         if (!this.isCurrentEpoch(epoch)) { return captured; }
-        for (let filePath of files) {
+        const durableResourcePaths = new Set([
+            ...this.fileSnapshots.keys(),
+            ...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys()
+        ]);
+        const candidatePaths = [...new Set(files.map(filePath => this.canonicalTrackingPath(filePath)))]
+            .filter(filePath =>
+                !durableResourcePaths.has(filePath) &&
+                !this.trackedChanges.has(filePath) &&
+                !this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)
+            );
+        // Before reading bytes, assume every newly admitted resource may require a
+        // text snapshot. This intentionally rejects conservatively instead of
+        // reading a partial candidate and hoping some files later classify opaque.
+        if (durableResourcePaths.size + candidatePaths.length > this.maxPersistedSnapshots) {
+            throw new Error(
+                `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+            );
+        }
+        for (let filePath of candidatePaths) {
             if (!this.isCurrentEpoch(epoch)) { return captured; }
             filePath = this.canonicalTrackingPath(filePath);
             if (this.hasCapturedBaseline(filePath) ||
@@ -3244,6 +3319,18 @@ export class DiffTracker {
             try { await this.refreshIgnoreMatchers(); } catch { /* retain previous memory and report failure below */ }
             for (const event of observed.values()) {
                 if (!this.isCurrentEpoch(epoch)) { break; }
+                let directory = false;
+                if (event.kind !== 'delete') {
+                    try { directory = fs.lstatSync(event.uri.fsPath).isDirectory(); } catch { directory = false; }
+                } else {
+                    directory = this.hasHistoricalDirectoryProvenance(event.uri.fsPath);
+                }
+                const candidateMonitored = this.configuredScopeMonitorsPath(scope, event.uri, directory);
+                const ignoredByRestoredScope = this.isPathIgnored(event.uri, directory, false, false);
+                if (candidateMonitored && ignoredByRestoredScope) {
+                    this.preserveRejectedScopePreparationEvent(event);
+                    continue;
+                }
                 if (event.kind === 'delete') { await this.onExternalFileDeleted(event.uri); }
                 else if (event.kind === 'create' || event.firstKind === 'create') { await this.onExternalFileCreated(event.uri); }
                 else { this.pendingExternalChanges.add(event.uri.fsPath); }

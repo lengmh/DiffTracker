@@ -3268,6 +3268,156 @@ test('S4-A exclude-removal expansion captures newly admitted resources before pu
     assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
 });
 
+test('S4-A capacity rejection happens before candidate file contents are read',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-capacity-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const guarded=path.join(workspaceRoot,'guarded.txt');
+    fs.writeFileSync(guarded,'must not be read');
+    const folder={uri:Uri.file(workspaceRoot),name:'capacity'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        faults.set(guarded,{read:error('candidate-content-read-should-not-happen')});
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=1;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason,/snapshot capacity.*exceed/i);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.getOriginalContent(guarded),undefined);
+    } finally {
+        faults.delete(guarded);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A persisted-byte capacity failure restores the prior durable scope atomically',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-byte-workspace');
+    const storage=file('s4a-byte-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const large=path.join(workspaceRoot,'large.txt');
+    fs.writeFileSync(large,'x'.repeat(4096));
+    const folder={uri:Uri.file(workspaceRoot),name:'bytes'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const primary=path.join(storage,'session-state.json');
+        const beforeRaw=fs.readFileSync(primary,'utf8');
+        const beforeState=JSON.parse(beforeRaw);
+        tracker.maxPersistedBytes=Buffer.byteLength(beforeRaw,'utf8')+512;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason,/durably|persist|state exceeds/i);
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,beforeState.effectiveMonitoringScope.scopeRevision);
+        assert.equal(tracker.getOriginalContent(large),undefined);
+        const afterState=JSON.parse(fs.readFileSync(primary,'utf8'));
+        assert.equal(afterState.effectiveMonitoringScope.scopeRevision,beforeState.effectiveMonitoringScope.scopeRevision);
+        assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false,
+            'safe rollback clears the candidate incomplete-write marker');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A rollback retains candidate-only change evidence instead of accepting it on retry',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-event-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    const candidateOnly=path.join(workspaceRoot,'candidate-only.txt');
+    fs.writeFileSync(gitignore,'candidate-only.txt\n');
+    fs.writeFileSync(candidateOnly,'before preparation');
+    const folder={uri:Uri.file(workspaceRoot),name:'event'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.testIgnorePath(candidateOnly).ignored,true,'precondition: old Rules scope ignores the file');
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const before=tracker.getEffectiveMonitoringScope();
+        const gate=pause(candidateOnly,'read');
+        const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        await gate.entered;
+        fs.writeFileSync(candidateOnly,'changed during preparation');
+        await tracker.onExternalFileChanged(Uri.file(candidateOnly));
+        gate.release();
+        const result=await applying;
+        assert.notEqual(result.status,'applied',JSON.stringify(result));
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        const review=pending(candidateOnly);
+        assert.equal(review?.reviewKind,'unknown');
+        assert.match(review?.unavailableReason??'',/rejected monitoring-scope preparation/i);
+        assert.ok(tracker.getRetainedReviewPaths().includes(candidateOnly),
+            'candidate-only uncertainty remains retained outside the restored Rules scope');
+        assert.equal(tracker.getOriginalContent(candidateOnly),undefined,
+            'the changed bytes must never become an accepted baseline during rollback');
+    } finally {
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{
     const roots=tracker.currentWorkspaceRootIdentities();
     const before=tracker.getEffectiveMonitoringScope();
