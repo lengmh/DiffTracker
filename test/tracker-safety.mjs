@@ -3348,16 +3348,26 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
     fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
     const guarded=path.join(workspaceRoot,'guarded.txt');
     fs.writeFileSync(guarded,'must not be read');
+    const trapDir=path.join(workspaceRoot,'trap');
+    fs.mkdirSync(trapDir,{recursive:true});
+    fs.writeFileSync(path.join(trapDir,'late.txt'),'late candidate');
     const folder={uri:Uri.file(workspaceRoot),name:'capacity'};
     const getFolder=uri=>{
         const relative=path.relative(workspaceRoot,uri.fsPath);
         return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
             ? folder : undefined;
     };
+    const originalReaddir=fs.promises.readdir;
+    let readdirCalls=0;
     try{
         vscode.workspace.workspaceFolders=[folder];
         vscode.workspace.getWorkspaceFolder=getFolder;
         faults.set(guarded,{read:error('candidate-content-read-should-not-happen')});
+        fs.promises.readdir=async(...args)=>{
+            readdirCalls++;
+            if(readdirCalls>1) throw error('enumeration-continued-past-capacity');
+            return originalReaddir(...args);
+        };
         await tracker.dispose();
         tracker=new DiffTracker();
         tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
@@ -3376,7 +3386,10 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
         assert.match(result.reason,/snapshot capacity.*exceed/i);
         assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
         assert.equal(tracker.getOriginalContent(guarded),undefined);
+        assert.equal(readdirCalls,1,
+            'candidate enumeration must fail at capacity without descending into later directories');
     } finally {
+        fs.promises.readdir=originalReaddir;
         faults.delete(guarded);
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -3488,6 +3501,37 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }
+});
+
+test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explicit exclusions',async()=>{
+    const storage=file('s4a-covered-watcher-storage');
+    tracker.storageUri=Uri.file(storage);
+    const vendor=file('vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'ignored.txt'),'ignored');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const before=tracker.getEffectiveMonitoringScope();
+    vscodeExcludes['files.watcherExclude']={'vendor/**':true};
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:'vendor/**'}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(path.join(vendor,'ignored.txt')),undefined,
+        'the explicitly excluded blind spot remains outside target scope');
+    assert.notDeepEqual(tracker.getEffectiveMonitoringScope(),before);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    const restored=await tracker.restorePersistedState();
+    assert.equal(restored,'restored',
+        'an explicitly excluded watcher blind spot must not pause a persisted Whole Workspace scope');
+    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
 });
 
 test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{

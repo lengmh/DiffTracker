@@ -2990,9 +2990,11 @@ export class DiffTracker {
     private async enumerateConfiguredCandidateFiles(
         scope: CanonicalMonitoringScope,
         epoch: number,
-        scanRoot?: string
+        scanRoot?: string,
+        capacityGuard?: { remaining: number; exemptPaths: ReadonlySet<string> }
     ): Promise<string[]> {
         const files: string[] = [];
+        const countedCandidates = new Set<string>();
         const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
         const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
             ? (() => {
@@ -3034,8 +3036,21 @@ export class DiffTracker {
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                 if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) { continue; }
                 if (this.isPathIgnored(vscode.Uri.file(child), entry.isDirectory(), false, false)) { continue; }
-                if (entry.isDirectory()) { pending.push({ folder, directory: child }); }
-                else if (entry.isFile()) { files.push(child); }
+                if (entry.isDirectory()) {
+                    pending.push({ folder, directory: child });
+                } else if (entry.isFile()) {
+                    const canonical = this.canonicalTrackingPath(child);
+                    if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
+                        !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
+                        countedCandidates.add(canonical);
+                        if (countedCandidates.size > capacityGuard.remaining) {
+                            throw new Error(
+                                `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+                            );
+                        }
+                    }
+                    files.push(canonical);
+                }
             }
         }
         return files;
@@ -3046,27 +3061,29 @@ export class DiffTracker {
         epoch: number
     ): Promise<number> {
         let captured = 0;
-        const files = await this.enumerateConfiguredCandidateFiles(scope, epoch);
-        if (!this.isCurrentEpoch(epoch)) { return captured; }
         const durableResourcePaths = new Set([
             ...this.fileSnapshots.keys(),
             ...this.unresolvedBaselineFiles.keys(),
             ...this.opaqueBaselineFiles.keys()
         ]);
-        const candidatePaths = [...new Set(files.map(filePath => this.canonicalTrackingPath(filePath)))]
+        const capacityExemptPaths = new Set([
+            ...durableResourcePaths,
+            ...this.trackedChanges.keys()
+        ]);
+        const remaining = Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size);
+        const files = await this.enumerateConfiguredCandidateFiles(
+            scope,
+            epoch,
+            undefined,
+            { remaining, exemptPaths: capacityExemptPaths }
+        );
+        if (!this.isCurrentEpoch(epoch)) { return captured; }
+        const candidatePaths = [...new Set(files)]
             .filter(filePath =>
                 !durableResourcePaths.has(filePath) &&
                 !this.trackedChanges.has(filePath) &&
                 !this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)
             );
-        // Before reading bytes, assume every newly admitted resource may require a
-        // text snapshot. This intentionally rejects conservatively instead of
-        // reading a partial candidate and hoping some files later classify opaque.
-        if (durableResourcePaths.size + candidatePaths.length > this.maxPersistedSnapshots) {
-            throw new Error(
-                `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
-            );
-        }
         for (let filePath of candidatePaths) {
             if (!this.isCurrentEpoch(epoch)) { return captured; }
             filePath = this.canonicalTrackingPath(filePath);
@@ -3765,10 +3782,25 @@ export class DiffTracker {
             // recording is stopped and can inherit host search exclusions. Whole
             // Workspace rebuilds therefore use the same direct filesystem scope
             // enumeration as transactional expansion preparation.
+            const capacityExemptPaths = new Set([
+                ...this.fileSnapshots.keys(),
+                ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys(),
+                ...this.trackedChanges.keys()
+            ]);
+            const durableResourceCount = new Set([
+                ...this.fileSnapshots.keys(),
+                ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys()
+            ]).size;
             const files = await this.enumerateConfiguredCandidateFiles(
                 this.effectiveMonitoringScope as CanonicalMonitoringScope,
                 this.sessionEpoch,
-                rootPath
+                rootPath,
+                {
+                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourceCount),
+                    exemptPaths: capacityExemptPaths
+                }
             );
             add(files.map(filePath => vscode.Uri.file(filePath)));
         } else {
@@ -3986,6 +4018,27 @@ export class DiffTracker {
         return undefined;
     }
 
+    private watcherPatternCoveredByExplicitScopeExclusion(
+        scope: CanonicalMonitoringScope,
+        identity: WorkspaceRootIdentity,
+        pattern: string
+    ): boolean {
+        const normalized = pattern.replace(/\\/g, '/')
+            .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const segments = normalized.split('/').filter(Boolean);
+        const literalPrefix: string[] = [];
+        for (const segment of segments) {
+            if (segment === '**' || /[*?\[\]{}]/.test(segment)) { break; }
+            literalPrefix.push(segment);
+        }
+        if (literalPrefix.length === 0) { return false; }
+        return configuredScopeExplicitlyExcludesSubtree(
+            scope,
+            identity,
+            literalPrefix.join('/')
+        );
+    }
+
     private configuredScopeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
         const includeIssue = this.explicitIncludeNeedsSupplementalCoverage(scope);
         if (includeIssue) { return includeIssue; }
@@ -3998,7 +4051,8 @@ export class DiffTracker {
             }
             const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
                 .flatMap(pattern => this.expandSimpleBraceGlob(pattern))
-                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern));
+                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern))
+                .filter(pattern => !this.watcherPatternCoveredByExplicitScopeExclusion(scope, identity, pattern));
             if (patterns.length > 0) {
                 return `${folder.name}:Whole Workspace intersects files.watcherExclude (${patterns[0]})`;
             }
