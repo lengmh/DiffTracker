@@ -644,6 +644,54 @@ function explicitExcludeMatches(
     return anchored ? matches(0, 0) : target.some((_, index) => matches(0, index));
 }
 
+export function configuredScopeExplicitlyExcludesSubtree(
+    scope: CanonicalMonitoringScope,
+    rootIdentity: string | WorkspaceRootIdentity,
+    relativeDirectory: string
+): boolean {
+    const rel = relativeDirectory.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
+    const root = typeof rootIdentity === 'string'
+        ? scope.roots.find(candidate => candidate.name === rootIdentity)
+        : rootIdentity;
+    const rootName = typeof rootIdentity === 'string' ? rootIdentity : rootIdentity.name;
+    if (!root || typeof root.caseSensitive !== 'boolean') { return false; }
+
+    const directoryPath = rel ? `${rel}/` : '';
+    for (const rule of scope.excludes) {
+        if (!ruleAppliesToRoot(rule, rootName)) { continue; }
+
+        // A rule that excludes the directory node itself necessarily makes its
+        // descendants unreachable to configured-scope discovery.
+        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root)) {
+            return true;
+        }
+
+        // Trailing universal child forms cover every strict descendant even
+        // when they intentionally do not match the prefix directory node.
+        // Preserve anchoring from the original slash-containing pattern while
+        // proving the literal/glob prefix against this exact directory.
+        const suffix = rule.pattern.endsWith('/**/*') ? '/**/*'
+            : rule.pattern.endsWith('/**') ? '/**'
+                : rule.pattern.endsWith('/*') ? '/*'
+                    : undefined;
+        if (!suffix) {
+            if (!rel && (rule.pattern === '*' || rule.pattern === '**')) { return true; }
+            continue;
+        }
+        const prefix = rule.pattern.slice(0, -suffix.length)
+            .replace(/^\/+/, '').replace(/\/+$/, '');
+        if (!rel) {
+            if (!prefix || prefix === '**') { return true; }
+            continue;
+        }
+        if (!prefix) { continue; }
+        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export function evaluateConfiguredScope(
     scope: CanonicalMonitoringScope,
     rootIdentity: string | WorkspaceRootIdentity,
