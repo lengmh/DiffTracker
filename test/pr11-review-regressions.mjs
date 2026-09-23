@@ -15,6 +15,35 @@ export function registerPR11ReviewRegressions(h) {
     };
     const relative = p => path.relative(root,p).split(path.sep).join('/');
 
+    test('PR11 excluded .gitignore files are skipped before content reads',async()=>{
+        const tracker=h.getTracker();
+        const folder=vscode.workspace.workspaceFolders?.[0];
+        assert.ok(folder);
+        const excluded=file('secrets/.gitignore');
+        fs.mkdirSync(path.dirname(excluded),{recursive:true});
+        fs.writeFileSync(excluded,'*.secret\n');
+        const oldFind=vscode.workspace.findFiles;
+        const oldRead=vscode.workspace.fs.readFile;
+        let reads=0;
+        tracker.pendingMonitoringScope=scope([],[{scope:'all',pattern:'secrets/**'}]);
+        vscode.workspace.findFiles=async()=>[Uri.file(excluded)];
+        vscode.workspace.fs.readFile=async uri=>{
+            if(path.resolve(uri.fsPath)===path.resolve(excluded)){
+                reads++;
+                throw new Error('excluded .gitignore must not be read');
+            }
+            return oldRead.call(vscode.workspace.fs,uri);
+        };
+        try{
+            await tracker.readIgnoreMatcher(folder,[]);
+            assert.equal(reads,0,'explicitly excluded .gitignore must be filtered before readFile');
+        }finally{
+            tracker.pendingMonitoringScope=undefined;
+            vscode.workspace.findFiles=oldFind;
+            vscode.workspace.fs.readFile=oldRead;
+        }
+    });
+
     test('PR11 subtree coverage failure publishes an immediate UI refresh signal',async()=>{
         const t=h.getTracker(),dir=file('visible-subtree-gap');fs.mkdirSync(dir);
         let fullRefreshes=0;
