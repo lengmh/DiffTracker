@@ -3682,6 +3682,9 @@ test('S4-A restore filters out-of-scope open editors before charging shared capa
             model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
         })).digest('hex');
         tracker.effectiveMonitoringScope=scope;
+        // Real restore refreshes ignore/scope matchers before offline discovery.
+        // Preserve that production precondition for this custom workspace fixture.
+        await tracker.refreshIgnoreMatchers();
 
         tracker.fileSnapshots.set(probe,'probe');
         tracker.fileSnapshots.set(baseline,'baseline');
