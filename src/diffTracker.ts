@@ -3049,7 +3049,11 @@ export class DiffTracker {
                             );
                         }
                     }
-                    files.push(canonical);
+                    // Capacity accounting uses canonical identity, but discovery
+                    // keeps the raw directory-entry path. Downstream callers
+                    // already canonicalize at their established boundary; doing
+                    // it here changes baseline-discovery timing on real hosts.
+                    files.push(child);
                 }
             }
         }
@@ -3078,7 +3082,7 @@ export class DiffTracker {
             { remaining, exemptPaths: capacityExemptPaths }
         );
         if (!this.isCurrentEpoch(epoch)) { return captured; }
-        const candidatePaths = [...new Set(files)]
+        const candidatePaths = [...new Set(files.map(filePath => this.canonicalTrackingPath(filePath)))]
             .filter(filePath =>
                 !durableResourcePaths.has(filePath) &&
                 !this.trackedChanges.has(filePath) &&
