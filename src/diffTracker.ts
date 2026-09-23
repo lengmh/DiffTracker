@@ -5048,8 +5048,10 @@ export class DiffTracker {
             for (const uri of files) { candidates.set(uri.fsPath, uri); }
         }
         for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.scheme !== 'file') { continue; }
+            if (doc.uri.scheme !== 'file' || this.isPathIgnored(doc.uri)) { continue; }
             const canonical = this.canonicalTrackingPath(doc.uri.fsPath);
+            const canonicalUri = vscode.Uri.file(canonical);
+            if (this.isPathIgnored(canonicalUri)) { continue; }
             if (wholeWorkspaceCapacityGuard &&
                 !wholeWorkspaceCapacityGuard.exemptPaths.has(canonical) &&
                 !this.trackedChanges.has(canonical) &&
@@ -5062,7 +5064,7 @@ export class DiffTracker {
                 wholeWorkspaceCapacityGuard.countedCandidates.add(canonical);
                 wholeWorkspaceCapacityGuard.remaining--;
             }
-            candidates.set(canonical, vscode.Uri.file(canonical));
+            candidates.set(canonical, canonicalUri);
         }
         let added = false;
         for (const uri of candidates.values()) {

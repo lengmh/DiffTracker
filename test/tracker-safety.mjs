@@ -3643,6 +3643,66 @@ test('S4-A Whole Workspace restore shares traversal and capacity budgets across 
     }
 });
 
+test('S4-A restore filters out-of-scope open editors before charging shared capacity',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('restore-open-filter-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    const probe=path.join(workspaceRoot,'ProbeName');
+    const baseline=path.join(workspaceRoot,'baseline.txt');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    const excluded=path.join(excludedDir,'open.txt');
+    const external=file('restore-open-filter-external.txt');
+    fs.mkdirSync(excludedDir,{recursive:true});
+    fs.writeFileSync(probe,'probe');
+    fs.writeFileSync(baseline,'baseline');
+    fs.writeFileSync(excluded,'excluded open');
+    fs.writeFileSync(external,'external open');
+
+    const folder={uri:Uri.file(workspaceRoot),name:'restore-open-filter'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.fileSnapshots.set(baseline,'baseline');
+        tracker.baselineExistingFiles.add(probe);
+        tracker.baselineExistingFiles.add(baseline);
+        tracker.maxPersistedSnapshots=2;
+
+        document(excluded);
+        document(external);
+
+        await tracker.discoverRestoredFiles(tracker.sessionEpoch);
+        assert.equal(tracker.fileSnapshots.size,2,
+            'out-of-scope open editors must not consume capacity or become restore candidates');
+        assert.equal(tracker.getOriginalContent(excluded),undefined);
+        assert.equal(tracker.getOriginalContent(external),undefined);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A watcher-excluded include shadowed by explicit exclusion does not require S4-B',async()=>{
     const storage=file('s4a-shadowed-include-storage');
     tracker.storageUri=Uri.file(storage);
