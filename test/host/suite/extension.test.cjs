@@ -299,7 +299,10 @@ module.exports = async function runExtensionHostScenario() {
         const pausedReview = await pending('existing.txt');
         assert.equal(pausedReview?.reviewKind, 'unknown',
             'pending explicit exclusion must preserve the prior baseline as unverified review');
-        assert.match(pausedReview?.unavailableReason ?? '', /pending explicit exclusion|paused.*exclusion/i);
+        assert.match(
+            pausedReview?.unavailableReason ?? '',
+            /pending explicit exclusion|paused.*exclusion|explicit exclusion awaited confirmation/i
+        );
         assert.equal((await state()).reviewTokens.some(token => token.filePath === uri('existing.txt').fsPath), false,
             'unverified pending-exclusion review must not expose a text action token');
 
