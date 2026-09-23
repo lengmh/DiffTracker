@@ -3268,6 +3268,57 @@ test('S4-A exclude-removal expansion captures newly admitted resources before pu
     assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
 });
 
+test('S4-A stopped Whole Workspace apply publishes scope without acquiring before-images, then Start rebuilds them',async()=>{
+    const candidate=file('s4a-stopped-candidate.txt');
+    fs.writeFileSync(candidate,'stopped candidate');
+    tracker.stopRecording();
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(result.capturedBaselines,0);
+    assert.equal(tracker.getOriginalContent(candidate),undefined,
+        'Apply while stopped must not acquire a new before-image');
+    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+    listedFiles=[Uri.file(candidate)];
+    tracker.startRecording();
+    await waitUntil(()=>tracker.getBaselineState()==='ready',2000);
+    assert.equal(tracker.getIsRecording(),true);
+    assert.equal(tracker.getOriginalContent(candidate),'stopped candidate',
+        'Start must rebuild the Whole Workspace baseline under the already-effective scope');
+});
+
+test('S4-A persisted Whole Workspace recording restores when no supplemental coverage gap exists',async()=>{
+    const storage=file('s4a-whole-restore-storage');
+    const candidate=file('s4a-whole-restore.txt');
+    fs.writeFileSync(candidate,'whole restore baseline');
+    tracker.storageUri=Uri.file(storage);
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    assert.equal(tracker.getOriginalContent(candidate),'whole restore baseline');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    const outcome=await tracker.restorePersistedState();
+    assert.equal(outcome,'restored');
+    assert.equal(tracker.getIsRecording(),true);
+    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+    assert.equal(tracker.getOriginalContent(candidate),'whole restore baseline');
+});
+
 test('S4-A capacity rejection happens before candidate file contents are read',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;

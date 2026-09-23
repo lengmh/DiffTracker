@@ -730,8 +730,6 @@ export class DiffTracker {
             state.effectiveMonitoringScope.roots,
             currentRootIdentities
         );
-        const wholeWorkspaceNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
-            state.effectiveMonitoringScope.mode === 'wholeWorkspace';
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
         const configuredScopeNeedsReconciliation = state.effectiveMonitoringScope.kind === 'configured'
             ? (() => {
@@ -744,12 +742,11 @@ export class DiffTracker {
                     live.scope.scopeRevision !== state.effectiveMonitoringScope.scopeRevision;
             })()
             : false;
-        const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
-            state.effectiveMonitoringScope.mode === 'rules'
-            ? this.explicitIncludeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
+        const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured'
+            ? this.configuredScopeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
             : undefined;
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
-            configuredScopeNeedsReconciliation || wholeWorkspaceNeedsS4 || !!watcherCoverageNeedsS4;
+            configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
@@ -864,16 +861,14 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
             this.persistenceIssue = watcherCoverageNeedsS4
-                ? `Effective include ${watcherCoverageNeedsS4} intersects files.watcherExclude; review is paused until the scope is narrowed or S4-W coverage exists, then the baseline is rebuilt.`
+                ? `Effective monitoring scope requires supplemental coverage at ${watcherCoverageNeedsS4}; review is paused until the scope is narrowed or S4-B coverage exists, then the baseline is rebuilt.`
                 : state.baselineState === 'building'
                     ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
                     : !rootsMatch
                         ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
                         : !scopeRootsMatch
                             ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
-                            : configuredScopeNeedsReconciliation
-                                ? 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.'
-                                : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
+                            : 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
@@ -894,15 +889,11 @@ export class DiffTracker {
             vscode.window.showWarningMessage(`Code Diff Tracker: ${identityIssue}. Recording remains paused.`);
             return;
         }
-        if (this.effectiveMonitoringScope.kind === 'configured' && this.effectiveMonitoringScope.mode === 'wholeWorkspace') {
-            vscode.window.showWarningMessage('Code Diff Tracker: Whole Workspace preparation requires the S4-W coverage path before recording can start.');
-            return;
-        }
         if (this.effectiveMonitoringScope.kind === 'configured') {
-            const watcherCoverageIssue = this.explicitIncludeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
+            const watcherCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
             if (watcherCoverageIssue) {
                 vscode.window.showWarningMessage(
-                    `Code Diff Tracker: Effective include ${watcherCoverageIssue} intersects files.watcherExclude. Narrow the scope or wait for S4-W supplemental coverage before rebuilding.`
+                    `Code Diff Tracker: Effective monitoring scope requires supplemental coverage at ${watcherCoverageIssue}. Narrow the scope or wait for S4-B supplemental coverage before rebuilding.`
                 );
                 return;
             }
