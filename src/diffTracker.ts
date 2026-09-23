@@ -114,6 +114,12 @@ interface ImportedDirectoryWatch {
     provenAbsent: boolean;
 }
 
+interface CandidateCapacityGuard {
+    remaining: number;
+    exemptPaths: ReadonlySet<string>;
+    countedCandidates: Set<string>;
+}
+
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
@@ -2991,11 +2997,11 @@ export class DiffTracker {
         scope: CanonicalMonitoringScope,
         epoch: number,
         scanRoot?: string,
-        capacityGuard?: { remaining: number; exemptPaths: ReadonlySet<string> },
+        capacityGuard?: CandidateCapacityGuard,
         preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
     ): Promise<string[]> {
         const files: string[] = [];
-        const countedCandidates = new Set<string>();
+        const countedCandidates = capacityGuard?.countedCandidates ?? new Set<string>();
         const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
         const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
             ? (() => {
@@ -3053,12 +3059,13 @@ export class DiffTracker {
                         const canonical = this.canonicalTrackingPath(child);
                         if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
                             !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
-                            countedCandidates.add(canonical);
-                            if (countedCandidates.size > capacityGuard.remaining) {
+                            if (capacityGuard.remaining <= 0) {
                                 throw new Error(
                                     `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
                                 );
                             }
+                            countedCandidates.add(canonical);
+                            capacityGuard.remaining--;
                         }
                         // Capacity accounting uses canonical identity, but discovery
                         // keeps the raw directory-entry path. Downstream callers
@@ -3100,7 +3107,7 @@ export class DiffTracker {
             scope,
             epoch,
             undefined,
-            { remaining, exemptPaths: capacityExemptPaths }
+            { remaining, exemptPaths: capacityExemptPaths, countedCandidates: new Set<string>() }
         );
         if (!this.isCurrentEpoch(epoch)) { return captured; }
         const candidatePaths = [...new Set(files.map(filePath => this.canonicalTrackingPath(filePath)))]
@@ -3784,7 +3791,8 @@ export class DiffTracker {
 
     private async findScopeFilesUnderDirectory(
         rootPath: string,
-        wholeWorkspacePreparationBudget?: { remainingEntries: number }
+        wholeWorkspacePreparationBudget?: { remainingEntries: number },
+        wholeWorkspaceCapacityGuard?: CandidateCapacityGuard
     ): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
         const normalizedRootPath = path.resolve(rootPath);
@@ -3810,25 +3818,26 @@ export class DiffTracker {
             // recording is stopped and can inherit host search exclusions. Whole
             // Workspace rebuilds therefore use the same direct filesystem scope
             // enumeration as transactional expansion preparation.
-            const capacityExemptPaths = new Set([
-                ...this.fileSnapshots.keys(),
-                ...this.unresolvedBaselineFiles.keys(),
-                ...this.opaqueBaselineFiles.keys(),
-                ...this.trackedChanges.keys()
-            ]);
-            const durableResourceCount = new Set([
-                ...this.fileSnapshots.keys(),
-                ...this.unresolvedBaselineFiles.keys(),
-                ...this.opaqueBaselineFiles.keys()
-            ]).size;
+            const localCapacityGuard = wholeWorkspaceCapacityGuard ?? (() => {
+                const durableResourcePaths = new Set([
+                    ...this.fileSnapshots.keys(),
+                    ...this.unresolvedBaselineFiles.keys(),
+                    ...this.opaqueBaselineFiles.keys()
+                ]);
+                return {
+                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size),
+                    exemptPaths: new Set([
+                        ...durableResourcePaths,
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                } satisfies CandidateCapacityGuard;
+            })();
             const files = await this.enumerateConfiguredCandidateFiles(
                 this.effectiveMonitoringScope as CanonicalMonitoringScope,
                 this.sessionEpoch,
                 rootPath,
-                {
-                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourceCount),
-                    exemptPaths: capacityExemptPaths
-                },
+                localCapacityGuard,
                 wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries }
             );
             add(files.map(filePath => vscode.Uri.file(filePath)));
@@ -4014,12 +4023,17 @@ export class DiffTracker {
             for (const folder of folders) {
                 const identity = this.workspaceRootIdentityForFolder(folder);
                 if (typeof identity.caseSensitive !== 'boolean') { return `${folder.name}:unverified-path-identity`; }
+                const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+                const directDisposition = evaluateConfiguredScope(scope, identity, rel, false, false);
+                if (directDisposition.source === 'explicitExclude' ||
+                    configuredScopeExplicitlyExcludesSubtree(scope, identity, rel)) {
+                    continue;
+                }
                 const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
                     .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
-                const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
                 if (matcher.ignores(rel) || patterns.some(pattern =>
                     this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
                     return `${folder.name}:${rule.path}`;
@@ -4572,6 +4586,14 @@ export class DiffTracker {
             this.effectiveMonitoringScope.mode === 'wholeWorkspace'
                 ? { remainingEntries: this.maxScopePreflightEntries }
                 : undefined;
+        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
+            wholeWorkspacePreparationBudget
+                ? {
+                    remaining: this.maxPersistedSnapshots,
+                    exemptPaths: new Set<string>(),
+                    countedCandidates: new Set<string>()
+                }
+                : undefined;
         if (this.initialIgnoreEpoch === epoch) {
             const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
             // Keep each path's first event across I/O rounds. An event arriving
@@ -4625,7 +4647,8 @@ export class DiffTracker {
 
             const files = await this.findScopeFilesUnderDirectory(
                 folder.uri.fsPath,
-                wholeWorkspacePreparationBudget
+                wholeWorkspacePreparationBudget,
+                wholeWorkspaceCapacityGuard
             );
             if (!this.isCurrentEpoch(epoch)) { return; }
 
@@ -4994,13 +5017,52 @@ export class DiffTracker {
 
     private async discoverRestoredFiles(epoch: number): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
+        const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace';
+        const wholeWorkspacePreparationBudget = wholeWorkspace
+            ? { remainingEntries: this.maxScopePreflightEntries }
+            : undefined;
+        const durableResourcePaths = wholeWorkspace ? new Set([
+            ...this.fileSnapshots.keys(),
+            ...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys()
+        ]) : undefined;
+        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
+            wholeWorkspace && durableResourcePaths
+                ? {
+                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size),
+                    exemptPaths: new Set([
+                        ...durableResourcePaths,
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                }
+                : undefined;
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
+            const files = await this.findScopeFilesUnderDirectory(
+                folder.uri.fsPath,
+                wholeWorkspacePreparationBudget,
+                wholeWorkspaceCapacityGuard
+            );
             if (!this.isCurrentEpoch(epoch)) { return; }
             for (const uri of files) { candidates.set(uri.fsPath, uri); }
         }
         for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.scheme === 'file') { candidates.set(doc.uri.fsPath, doc.uri); }
+            if (doc.uri.scheme !== 'file') { continue; }
+            const canonical = this.canonicalTrackingPath(doc.uri.fsPath);
+            if (wholeWorkspaceCapacityGuard &&
+                !wholeWorkspaceCapacityGuard.exemptPaths.has(canonical) &&
+                !this.trackedChanges.has(canonical) &&
+                !wholeWorkspaceCapacityGuard.countedCandidates.has(canonical)) {
+                if (wholeWorkspaceCapacityGuard.remaining <= 0) {
+                    throw new Error(
+                        `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+                    );
+                }
+                wholeWorkspaceCapacityGuard.countedCandidates.add(canonical);
+                wholeWorkspaceCapacityGuard.remaining--;
+            }
+            candidates.set(canonical, vscode.Uri.file(canonical));
         }
         let added = false;
         for (const uri of candidates.values()) {

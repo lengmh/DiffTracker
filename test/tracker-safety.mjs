@@ -3586,6 +3586,96 @@ test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explici
     assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
 });
 
+test('S4-A Whole Workspace restore shares traversal and capacity budgets across roots',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=file('restore-budget-root-a');
+    const rootB=file('restore-budget-root-b');
+    fs.mkdirSync(rootA,{recursive:true});
+    fs.mkdirSync(rootB,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
+    const folderA={uri:Uri.file(rootA),name:'restore-a'};
+    const folderB={uri:Uri.file(rootB),name:'restore-b'};
+    const getFolder=uri=>[folderA,folderB].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    try{
+        vscode.workspace.workspaceFolders=[folderA,folderB];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+
+        tracker.maxPersistedSnapshots=1;
+        await assert.rejects(
+            ()=>tracker.discoverRestoredFiles(tracker.sessionEpoch),
+            /snapshot capacity.*exceed/i,
+            'restore capacity must be shared across roots rather than reset per folder'
+        );
+        assert.equal(tracker.fileSnapshots.size,0,
+            'capacity failure happens before restored candidates are published');
+
+        tracker.maxPersistedSnapshots=100;
+        tracker.maxScopePreflightEntries=1;
+        await assert.rejects(
+            ()=>tracker.discoverRestoredFiles(tracker.sessionEpoch),
+            /preparation work budget.*directory entries/i,
+            'restore traversal budget must be shared across roots rather than reset per folder'
+        );
+        assert.equal(tracker.fileSnapshots.size,0,
+            'work-budget failure also leaves restore candidate publication untouched');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A watcher-excluded include shadowed by explicit exclusion does not require S4-B',async()=>{
+    const storage=file('s4a-shadowed-include-storage');
+    tracker.storageUri=Uri.file(storage);
+    const vendor=file('shadowed-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    const shadowed=path.join(vendor,'file.txt');
+    fs.writeFileSync(shadowed,'shadowed');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const relativeFile=path.relative(root,shadowed).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeFile}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],
+        scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(shadowed),undefined,
+        'excluded include target remains outside the effective monitoring scope');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored',
+        'restore must preserve exclusion precedence over the shadowed include');
+});
+
 test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{
     const roots=tracker.currentWorkspaceRootIdentities();
     const before=tracker.getEffectiveMonitoringScope();
