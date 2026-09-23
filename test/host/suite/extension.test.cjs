@@ -197,6 +197,11 @@ module.exports = async function runExtensionHostScenario() {
         );
         await secondRootFilesConfig.update('watcherExclude', coverageSafeSecondRootWatcherExclude,
             vscode.ConfigurationTarget.WorkspaceFolder);
+        // Updating a WorkspaceFolder setting writes secondRoot/.vscode/settings.json,
+        // which is itself a monitored workspace resource. Let that real watcher
+        // event settle before opening the scope transaction; late events must
+        // continue to invalidate preparation rather than being ignored.
+        await delay(500);
         await scopeConfig.update('watchInclude', [], vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
 
