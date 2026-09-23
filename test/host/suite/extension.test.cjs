@@ -188,6 +188,15 @@ module.exports = async function runExtensionHostScenario() {
         );
         await filesConfig.update('watcherExclude', coverageSafeWatcherExclude,
             vscode.ConfigurationTarget.Workspace);
+        const secondRootFilesConfig = vscode.workspace.getConfiguration('files', vscode.Uri.file(secondRoot));
+        const previousSecondRootWatcherExclude =
+            secondRootFilesConfig.inspect('watcherExclude')?.workspaceFolderValue;
+        const mergedSecondRootWatcherExclude = secondRootFilesConfig.get('watcherExclude', {});
+        const coverageSafeSecondRootWatcherExclude = Object.fromEntries(
+            Object.keys(mergedSecondRootWatcherExclude).map(pattern => [pattern, false])
+        );
+        await secondRootFilesConfig.update('watcherExclude', coverageSafeSecondRootWatcherExclude,
+            vscode.ConfigurationTarget.WorkspaceFolder);
         await scopeConfig.update('watchInclude', [], vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
 
@@ -236,6 +245,8 @@ module.exports = async function runExtensionHostScenario() {
         await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
         const restoreRulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
         assert.equal(restoreRulesApply.status, 'applied', JSON.stringify(restoreRulesApply));
+        await secondRootFilesConfig.update('watcherExclude', previousSecondRootWatcherExclude,
+            vscode.ConfigurationTarget.WorkspaceFolder);
         await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
 
         // A directly edited explicit exclusion is only a requested scope until
