@@ -182,6 +182,7 @@ module.exports = async function runExtensionHostScenario() {
         // fixture, Whole Workspace can publish transactionally. Recording Apply
         // baselines current resources immediately; stopped Apply publishes only
         // the scope, and the next Start rebuilds under that effective scope.
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
         const mergedWatcherExclude = filesConfig.get('watcherExclude', {});
         const coverageSafeWatcherExclude = Object.fromEntries(
             Object.keys(mergedWatcherExclude).map(pattern => [pattern, false])
@@ -204,6 +205,11 @@ module.exports = async function runExtensionHostScenario() {
         await delay(500);
         await scopeConfig.update('watchInclude', [], vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
+            'Rules recording must restart after fixture watcher exclusions are made coverage-safe');
+        await until('Rules baseline before recording Whole Workspace Apply',
+            async () => (await state()).baselineState === 'ready');
 
         const recordingWholePath = path.join(workspacePath, 's4-recording-whole.txt');
         const recordingWholeTrackedPath = vscode.Uri.file(recordingWholePath).fsPath;
@@ -250,9 +256,14 @@ module.exports = async function runExtensionHostScenario() {
         await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
         const restoreRulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
         assert.equal(restoreRulesApply.status, 'applied', JSON.stringify(restoreRulesApply));
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
         await secondRootFilesConfig.update('watcherExclude', previousSecondRootWatcherExclude,
             vscode.ConfigurationTarget.WorkspaceFolder);
         await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true);
+        await until('Rules baseline after restoring watcher fixture',
+            async () => (await state()).baselineState === 'ready');
 
         // A directly edited explicit exclusion is only a requested scope until
         // Apply. Pause new reads for the affected path, and if the request is
