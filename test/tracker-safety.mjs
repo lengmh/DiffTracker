@@ -3509,13 +3509,14 @@ test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explici
     const vendor=file('vendor');
     fs.mkdirSync(vendor,{recursive:true});
     fs.writeFileSync(path.join(vendor,'ignored.txt'),'ignored');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
     const roots=tracker.currentWorkspaceRootIdentities();
     const before=tracker.getEffectiveMonitoringScope();
-    vscodeExcludes['files.watcherExclude']={'vendor/**':true};
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
     const scope={
         kind:'configured',mode:'wholeWorkspace',
         roots:roots.map(identity=>({...identity})),
-        includes:[],excludes:[{scope:'all',pattern:'vendor/**'}],scopeRevision:''
+        includes:[],excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
     };
     scope.scopeRevision=createHash('sha256').update(JSON.stringify({
         model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
