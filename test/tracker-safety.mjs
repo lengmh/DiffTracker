@@ -3364,8 +3364,13 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
         vscode.workspace.getWorkspaceFolder=getFolder;
         faults.set(guarded,{read:error('candidate-content-read-should-not-happen')});
         fs.promises.opendir=async(...args)=>{
-            opendirCalls++;
-            if(opendirCalls>1) throw error('enumeration-continued-past-capacity');
+            // A2 preflight also streams with opendir. This regression targets
+            // the A3 candidate-preparation traversal only, after the baseline
+            // transaction has been established.
+            if(tracker.baselineTransaction){
+                opendirCalls++;
+                if(opendirCalls>1) throw error('enumeration-continued-past-capacity');
+            }
             return originalOpendir(...args);
         };
         await tracker.dispose();
