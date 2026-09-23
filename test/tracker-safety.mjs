@@ -3269,29 +3269,50 @@ test('S4-A exclude-removal expansion captures newly admitted resources before pu
 });
 
 test('S4-A stopped Whole Workspace apply publishes scope without acquiring before-images, then Start rebuilds them',async()=>{
-    const candidate=file('s4a-stopped-candidate.txt');
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-stopped-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const candidate=path.join(workspaceRoot,'candidate.txt');
     fs.writeFileSync(candidate,'stopped candidate');
-    tracker.stopRecording();
-    const roots=tracker.currentWorkspaceRootIdentities();
-    const scope={
-        kind:'configured',mode:'wholeWorkspace',
-        roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+    const folder={uri:Uri.file(workspaceRoot),name:'stopped-whole'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
     };
-    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
-        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
-    })).digest('hex');
-    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'applied',JSON.stringify(result));
-    assert.equal(result.capturedBaselines,0);
-    assert.equal(tracker.getOriginalContent(candidate),undefined,
-        'Apply while stopped must not acquire a new before-image');
-    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
-    listedFiles=[Uri.file(candidate)];
-    tracker.startRecording();
-    await waitUntil(()=>tracker.getBaselineState()==='ready',2000);
-    assert.equal(tracker.getIsRecording(),true);
-    assert.equal(tracker.getOriginalContent(candidate),'stopped candidate',
-        'Start must rebuild the Whole Workspace baseline under the already-effective scope');
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.stopRecording();
+        const roots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(roots.length,1);
+        assert.equal(typeof roots[0].caseSensitive,'boolean');
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(result.capturedBaselines,0);
+        assert.equal(tracker.getOriginalContent(candidate),undefined,
+            'Apply while stopped must not acquire a new before-image');
+        assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+        tracker.startRecording();
+        await waitUntil(()=>tracker.getBaselineState()==='ready',2000);
+        assert.equal(tracker.getIsRecording(),true);
+        assert.equal(tracker.getOriginalContent(candidate),'stopped candidate',
+            'Start must rebuild the Whole Workspace baseline under the already-effective scope');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
 });
 
 test('S4-A persisted Whole Workspace recording restores when no supplemental coverage gap exists',async()=>{
