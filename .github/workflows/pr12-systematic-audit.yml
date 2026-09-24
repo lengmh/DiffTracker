@@ -36,6 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           python /tmp/pr12-audit/repair.py tests
+          python /tmp/pr12-audit/refinements.py tests
           npm run compile
           set +e
           DT_TEST_FILTER='PR12 AUDIT' timeout 120 node test/tracker-safety.mjs > /tmp/pr12-red.log 2>&1
@@ -68,7 +69,7 @@ jobs:
           test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$BASE"
           git config user.name 'lengmh'
           git config user.email '47114200+lengmh@users.noreply.github.com'
-          git add src/diffTracker.ts test/tracker-safety.mjs test/pr12-bounded-invariants.mjs test/pr11-review-regressions.mjs docs/pr12-systematic-audit-2026-09-25.md
+          git add src/diffTracker.ts src/utils/pathIdentity.ts test/tracker-safety.mjs test/pr12-bounded-invariants.mjs test/pr11-review-regressions.mjs test/pr11-final-scope-regressions.mjs docs/pr12-systematic-audit-2026-09-25.md
           git commit -m 'fix(s4a): unify bounded policy discovery and baseline budget accounting'
           RESULT="repair/pr12-audit-verified-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git push origin "HEAD:refs/heads/$RESULT"
