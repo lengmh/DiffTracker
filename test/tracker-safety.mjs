@@ -3995,6 +3995,55 @@ test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explici
     assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
 });
 
+for(const scenario of [
+    {name:'identical wildcard exclusion',watcher:'**/generated/**',exclude:'**/generated/**',visible:true},
+    {name:'universal wildcard exclusion',watcher:'**/generated/**',exclude:'**',visible:false}
+]) test(`S4-A Whole Workspace accepts ${scenario.name} covering watcher blind spots`,async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('wildcard-watch-workspace');
+    const generated=path.join(workspaceRoot,'generated');
+    fs.mkdirSync(generated,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(path.join(generated,'hidden.txt'),'hidden');
+    const visible=path.join(workspaceRoot,'visible.txt');
+    fs.writeFileSync(visible,'visible');
+    const folder={uri:Uri.file(workspaceRoot),name:'wildcard-watch'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        vscodeExcludes['files.watcherExclude']={[scenario.watcher]:true};
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:scenario.exclude}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getOriginalContent(path.join(generated,'hidden.txt')),undefined,
+            'watcher-hidden resources must also be outside the configured scope');
+        assert.equal(tracker.getOriginalContent(visible),scenario.visible?'visible':undefined);
+    } finally {
+        vscodeExcludes['files.watcherExclude']={};
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A exact watcher prefix is not covered by a descendant-only exclusion',async()=>{
     const vendor=file('exact-watcher-vendor');
     fs.mkdirSync(vendor,{recursive:true});
