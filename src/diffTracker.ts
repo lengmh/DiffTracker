@@ -4039,8 +4039,10 @@ export class DiffTracker {
             if (patternIndex === patternSegments.length) {
                 result = targetIndex === targetSegments.length;
             } else if (patternSegments[patternIndex] === '**') {
-                result = visit(patternIndex + 1, targetIndex) ||
-                    (targetIndex < targetSegments.length && visit(patternIndex, targetIndex + 1));
+                result = patternIndex === patternSegments.length - 1
+                    ? targetIndex < targetSegments.length
+                    : visit(patternIndex + 1, targetIndex) ||
+                        (targetIndex < targetSegments.length && visit(patternIndex, targetIndex + 1));
             } else if (targetIndex === targetSegments.length) {
                 result = false;
             } else {
