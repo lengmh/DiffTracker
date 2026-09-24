@@ -3291,6 +3291,14 @@ export class DiffTracker {
         return Buffer.byteLength(serialized, 'utf8') + (entryCount > 0 ? 1 : 0);
     }
 
+    private serializedArrayRemovalBytes(entryCount: number, value: unknown): number {
+        const serialized = JSON.stringify(value);
+        if (serialized === undefined) {
+            throw new Error('Monitoring scope candidate persistence value could not be serialized');
+        }
+        return Buffer.byteLength(serialized, 'utf8') + (entryCount > 1 ? 1 : 0);
+    }
+
     private consumeCandidatePersistenceBudget(
         filePath: string,
         plan: CandidateBaselinePlan,
@@ -3302,9 +3310,18 @@ export class DiffTracker {
         };
         if (budget.failedReason) { throw new Error(budget.failedReason); }
         filePath = this.canonicalTrackingPath(filePath);
+        const existingUnresolvedReason = this.unresolvedBaselineFiles.get(filePath);
+        const replacingUnresolved = existingUnresolvedReason !== undefined;
         let addedBytes = 0;
         let nextMode: number | undefined;
         let addsExistingPath = false;
+
+        if (replacingUnresolved && plan.kind !== 'unresolved') {
+            addedBytes -= this.serializedArrayRemovalBytes(
+                budget.unresolvedBaselineFiles,
+                [filePath, existingUnresolvedReason]
+            );
+        }
 
         if (plan.kind === 'text') {
             if (budget.fileSnapshots >= this.maxPersistedSnapshots) {
@@ -3349,6 +3366,16 @@ export class DiffTracker {
                     fingerprint: plan.state.fingerprint
                 }]
             );
+        } else if (replacingUnresolved) {
+            const previousBytes = Buffer.byteLength(
+                JSON.stringify([filePath, existingUnresolvedReason]),
+                'utf8'
+            );
+            const nextBytes = Buffer.byteLength(
+                JSON.stringify([filePath, plan.reason]),
+                'utf8'
+            );
+            addedBytes += nextBytes - previousBytes;
         } else {
             if (budget.unresolvedBaselineFiles >= this.maxPersistedSnapshots) {
                 fail(
@@ -3372,13 +3399,16 @@ export class DiffTracker {
         }
 
         budget.remainingBytes -= addedBytes;
+        if (replacingUnresolved && plan.kind !== 'unresolved') {
+            budget.unresolvedBaselineFiles--;
+        }
         if (plan.kind === 'text') {
             budget.fileSnapshots++;
             if (nextMode !== undefined && !this.fileSnapshots.has(filePath)) { budget.fileModes++; }
             if (addsExistingPath) { budget.baselineExistingFiles++; }
         } else if (plan.kind === 'opaque') {
             budget.opaqueBaselineFiles++;
-        } else {
+        } else if (!replacingUnresolved) {
             budget.unresolvedBaselineFiles++;
         }
     }
@@ -5078,7 +5108,6 @@ export class DiffTracker {
                     return false;
                 }
                 return !this.fileSnapshots.has(filePath) &&
-                    !this.unresolvedBaselineFiles.has(filePath) &&
                     !this.opaqueBaselineFiles.has(filePath);
             });
 
@@ -5097,7 +5126,6 @@ export class DiffTracker {
                     }
                     const filePath = this.canonicalTrackingPath(uri.fsPath);
                     if (this.fileSnapshots.has(filePath) ||
-                        this.unresolvedBaselineFiles.has(filePath) ||
                         this.opaqueBaselineFiles.has(filePath)) {
                         return;
                     }
@@ -5112,7 +5140,6 @@ export class DiffTracker {
                     if (this.pendingScopeExplicitlyExcludes(uri) ||
                         this.isPathIgnored(uri) ||
                         this.fileSnapshots.has(filePath) ||
-                        this.unresolvedBaselineFiles.has(filePath) ||
                         this.opaqueBaselineFiles.has(filePath)) {
                         return;
                     }
