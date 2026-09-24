@@ -4117,7 +4117,7 @@ export class DiffTracker {
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
-                if (matcher.ignores(rel) || patterns.some(pattern =>
+                if (patterns.some(pattern =>
                     this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
                     return `${folder.name}:${rule.path}`;
                 }
