@@ -3677,12 +3677,13 @@ test('S4-A Whole Workspace Start does not charge a candidate excluded while its 
             relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
         ) ? folder : undefined;
     };
-    const originalFind=tracker.findScopeFilesUnderDirectory?.bind(tracker);
+    let originalFind;
     try{
         vscode.workspace.workspaceFolders=[folder];
         vscode.workspace.getWorkspaceFolder=getFolder;
         await tracker.dispose();
         tracker=new DiffTracker(Uri.file(file('start-late-exclusion-storage')));
+        originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
         tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
         const roots=tracker.currentWorkspaceRootIdentities();
         const scope={
