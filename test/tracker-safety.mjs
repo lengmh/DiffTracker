@@ -3355,6 +3355,7 @@ test('S4-A Whole Workspace publishes only after candidate baselines are durably 
         assert.ok(saved.fileSnapshots.some(([filePath])=>filePath===ordinary),
             'candidate baseline must be durable before effective scope publication returns applied');
     } finally {
+        faults.delete(guarded);
         listedIgnores=[];
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -3701,8 +3702,10 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
     fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
     const gitignore=path.join(workspaceRoot,'.gitignore');
     const candidateOnly=path.join(workspaceRoot,'candidate-only.txt');
-    fs.writeFileSync(gitignore,'candidate-only.txt\n');
+    const guarded=path.join(workspaceRoot,'guarded-after-event.txt');
+    fs.writeFileSync(gitignore,'candidate-only.txt\nguarded-after-event.txt\n');
     fs.writeFileSync(candidateOnly,'before preparation');
+    fs.writeFileSync(guarded,'must not be read after invalidation');
     const folder={uri:Uri.file(workspaceRoot),name:'event'};
     const getFolder=uri=>{
         const relative=path.relative(workspaceRoot,uri.fsPath);
@@ -3727,6 +3730,9 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
             model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
         })).digest('hex');
         const before=tracker.getEffectiveMonitoringScope();
+        const originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[candidateOnly,guarded];
+        faults.set(guarded,{read:error('continued-reading-after-transaction-invalidated')});
         const gate=pause(candidateOnly,'read');
         const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
         await gate.entered;
@@ -3734,7 +3740,9 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
         await tracker.onExternalFileChanged(Uri.file(candidateOnly));
         gate.release();
         const result=await applying;
+        tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
         assert.notEqual(result.status,'applied',JSON.stringify(result));
+        assert.doesNotMatch(result.reason??'',/continued-reading-after-transaction-invalidated/);
         assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
         const review=pending(candidateOnly);
         assert.equal(review?.reviewKind,'unknown');
@@ -3745,6 +3753,77 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
             'the changed bytes must never become an accepted baseline during rollback');
     } finally {
         listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A broad preparation aborts traversal immediately after transaction invalidation',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-invalidated-enumeration');
+    const nested=path.join(workspaceRoot,'late');
+    fs.mkdirSync(nested,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const trigger=path.join(workspaceRoot,'trigger.txt');
+    fs.writeFileSync(trigger,'before');
+    for(let index=0;index<8;index++) fs.writeFileSync(path.join(nested,`file-${index}.txt`),'x');
+    const folder={uri:Uri.file(workspaceRoot),name:'invalidated-enumeration'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let enteredResolve,releaseResolve;
+    const entered=new Promise(resolve=>{enteredResolve=resolve;});
+    const release=new Promise(resolve=>{releaseResolve=resolve;});
+    let nestedReads=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            const handle=await originalOpendir(target,...args);
+            if(tracker.baselineTransaction && path.resolve(String(target))===path.resolve(nested)){
+                enteredResolve();
+                await release;
+                const originalRead=handle.readSync.bind(handle);
+                handle.readSync=(...readArgs)=>{
+                    nestedReads++;
+                    return originalRead(...readArgs);
+                };
+            }
+            return handle;
+        };
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        await entered;
+        fs.writeFileSync(trigger,'changed during enumeration');
+        await tracker.onExternalFileChanged(Uri.file(trigger));
+        releaseResolve();
+        const result=await applying;
+        assert.notEqual(result.status,'applied',JSON.stringify(result));
+        assert.match(result.reason??'',/invalidated|workspace activity|preparation/i);
+        assert.equal(nestedReads,0,
+            'the directory returned after invalidation must not be inspected');
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    } finally {
+        releaseResolve?.();
+        fs.promises.opendir=originalOpendir;
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }

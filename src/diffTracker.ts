@@ -3076,7 +3076,8 @@ export class DiffTracker {
         epoch: number,
         scanRoot?: string,
         capacityGuard?: CandidateCapacityGuard,
-        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries },
+        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch)
     ): Promise<string[]> {
         const files: string[] = [];
         const countedCandidates = capacityGuard?.countedCandidates ?? new Set<string>();
@@ -3094,6 +3095,9 @@ export class DiffTracker {
             }));
         while (pending.length > 0) {
             if (!this.isCurrentEpoch(epoch)) { return files; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
             const { folder, directory } = pending.pop()!;
             if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
@@ -3109,6 +3113,10 @@ export class DiffTracker {
             let handle: fs.Dir | undefined;
             try {
                 handle = await fs.promises.opendir(directory);
+                if (!this.isCurrentEpoch(epoch)) { return files; }
+                if (!preparationStillCurrent()) {
+                    throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+                }
                 // Keep the traversal streaming, but do not yield between every
                 // directory entry. Per-entry async iteration lets watcher events
                 // interleave with startup baseline discovery and can turn a
@@ -3171,7 +3179,8 @@ export class DiffTracker {
 
     private async captureConfiguredExpansionBaselines(
         scope: CanonicalMonitoringScope,
-        epoch: number
+        epoch: number,
+        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch)
     ): Promise<number> {
         let captured = 0;
         const durableResourcePaths = new Set([
@@ -3188,9 +3197,14 @@ export class DiffTracker {
             scope,
             epoch,
             undefined,
-            { remaining, exemptPaths: capacityExemptPaths, countedCandidates: new Set<string>() }
+            { remaining, exemptPaths: capacityExemptPaths, countedCandidates: new Set<string>() },
+            { remainingEntries: this.maxScopePreflightEntries },
+            preparationStillCurrent
         );
         if (!this.isCurrentEpoch(epoch)) { return captured; }
+        if (!preparationStillCurrent()) {
+            throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+        }
         const candidatePaths = [...new Set(files.map(filePath => this.canonicalTrackingPath(filePath)))]
             .filter(filePath =>
                 !durableResourcePaths.has(filePath) &&
@@ -3199,6 +3213,9 @@ export class DiffTracker {
             );
         for (let filePath of candidatePaths) {
             if (!this.isCurrentEpoch(epoch)) { return captured; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
             filePath = this.canonicalTrackingPath(filePath);
             if (this.hasCapturedBaseline(filePath) ||
                 this.unresolvedBaselineFiles.has(filePath) ||
@@ -3208,6 +3225,9 @@ export class DiffTracker {
             if (targetError) { continue; }
             const state = await this.readCurrentFileState(filePath);
             if (!this.isCurrentEpoch(epoch)) { return captured; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
             this.recordScannedBaseline(filePath, state, 'workspace');
             captured++;
         }
@@ -3413,7 +3433,7 @@ export class DiffTracker {
             // before-images or enumerate newly included resource contents.
             result.capturedBaselines = this.isRecording
                 ? needsBroadPreparation
-                    ? await this.captureConfiguredExpansionBaselines(scope, epoch)
+                    ? await this.captureConfiguredExpansionBaselines(scope, epoch, scopeContextStillCurrent)
                     : await this.captureConfiguredIncludeBaselines(scope, epoch)
                 : 0;
             const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
