@@ -3355,7 +3355,6 @@ test('S4-A Whole Workspace publishes only after candidate baselines are durably 
         assert.ok(saved.fileSnapshots.some(([filePath])=>filePath===ordinary),
             'candidate baseline must be durable before effective scope publication returns applied');
     } finally {
-        faults.delete(guarded);
         listedIgnores=[];
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -3707,6 +3706,7 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
     fs.writeFileSync(candidateOnly,'before preparation');
     fs.writeFileSync(guarded,'must not be read after invalidation');
     const folder={uri:Uri.file(workspaceRoot),name:'event'};
+    let originalEnumerate;
     const getFolder=uri=>{
         const relative=path.relative(workspaceRoot,uri.fsPath);
         return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
@@ -3730,7 +3730,7 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
             model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
         })).digest('hex');
         const before=tracker.getEffectiveMonitoringScope();
-        const originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
         tracker.enumerateConfiguredCandidateFiles=async()=>[candidateOnly,guarded];
         faults.set(guarded,{read:error('continued-reading-after-transaction-invalidated')});
         const gate=pause(candidateOnly,'read');
@@ -3740,7 +3740,6 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
         await tracker.onExternalFileChanged(Uri.file(candidateOnly));
         gate.release();
         const result=await applying;
-        tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
         assert.notEqual(result.status,'applied',JSON.stringify(result));
         assert.doesNotMatch(result.reason??'',/continued-reading-after-transaction-invalidated/);
         assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
@@ -3752,6 +3751,8 @@ test('S4-A rollback retains candidate-only change evidence instead of accepting 
         assert.equal(tracker.getOriginalContent(candidateOnly),undefined,
             'the changed bytes must never become an accepted baseline during rollback');
     } finally {
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
+        faults.delete(guarded);
         listedIgnores=[];
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
