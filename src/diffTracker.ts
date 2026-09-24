@@ -278,6 +278,8 @@ export class DiffTracker {
     private restoringEpoch?: number;
     private initialIgnoreEpoch?: number;
     private initialWatchBoundaryMs?: number;
+    private initialWatchBoundaryMonotonicNs?: bigint;
+    private readonly startupTimestampSafetyMarginMs = 2000;
     private initialIgnoreEvents = new Map<string, StartupEvent>();
     private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
     // Only same-session post-baseline notifications can be resolved by a later
@@ -337,6 +339,7 @@ export class DiffTracker {
         this.restoringEpoch = undefined;
         this.initialIgnoreEpoch = undefined;
         this.initialWatchBoundaryMs = undefined;
+        this.initialWatchBoundaryMonotonicNs = undefined;
         this.initialIgnoreEvents.clear();
         this.restoreEvents.clear();
         this.postBaselineUnknownFiles.clear();
@@ -946,6 +949,7 @@ export class DiffTracker {
             // create when file birth/content metadata proves it predates watcher
             // activation. Ambiguous timestamps remain conservative uncertainty.
             this.initialWatchBoundaryMs = Date.now();
+            this.initialWatchBoundaryMonotonicNs = process.hrtime.bigint();
             this.initialIgnoreEpoch = epoch;
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
             void this.initializeWorkspaceSnapshots().catch(() => {
@@ -955,6 +959,7 @@ export class DiffTracker {
             });
         } catch (error) {
             this.initialWatchBoundaryMs = undefined;
+            this.initialWatchBoundaryMonotonicNs = undefined;
             this.disposeFileWatchers();
             this.externalWatcherEnabled = false;
             vscode.window.showWarningMessage('Code Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
@@ -2828,6 +2833,9 @@ export class DiffTracker {
                     result.skippedHardBoundaries++;
                     continue;
                 }
+                if (!directoryDecision.monitored) {
+                    continue;
+                }
             }
 
             let directoryEntries = 0;
@@ -2865,6 +2873,9 @@ export class DiffTracker {
                     }
                     if (decision.source === 'hardBoundary' || decision.source === 'identityUnknown') {
                         result.skippedHardBoundaries++;
+                        continue;
+                    }
+                    if (!decision.monitored) {
                         continue;
                     }
                     if (entry.isDirectory()) {
@@ -4580,14 +4591,31 @@ export class DiffTracker {
 
     private startupCreatePredatesWatchBoundary(
         event: StartupEvent,
-        boundaryMs: number | undefined
+        boundaryMs: number | undefined,
+        boundaryMonotonicNs: bigint | undefined
     ): boolean {
-        if (boundaryMs === undefined || event.firstKind !== 'create' || event.kind !== 'create' ||
+        if (boundaryMs === undefined || boundaryMonotonicNs === undefined ||
+            event.firstKind !== 'create' || event.kind !== 'create' ||
             event.uri.scheme !== 'file') { return false; }
+
+        const nowWallMs = Date.now();
+        const elapsedMonotonicMs = Number(process.hrtime.bigint() - boundaryMonotonicNs) / 1_000_000;
+        const elapsedWallMs = nowWallMs - boundaryMs;
+        if (!Number.isFinite(elapsedMonotonicMs) || !Number.isFinite(elapsedWallMs) ||
+            elapsedMonotonicMs < 0 || elapsedWallMs < 0 ||
+            Math.abs(elapsedWallMs - elapsedMonotonicMs) > this.startupTimestampSafetyMarginMs) {
+            // Wall-clock jumps make file timestamps incomparable with the
+            // activation boundary. Preserve uncertainty instead of guessing.
+            return false;
+        }
+
         try {
             const stat = fs.statSync(event.uri.fsPath);
+            const latestSafeTimestamp = boundaryMs - this.startupTimestampSafetyMarginMs;
             const timestamps = [stat.birthtimeMs, stat.mtimeMs, stat.ctimeMs];
-            return timestamps.every(value => Number.isFinite(value) && value > 0 && value < boundaryMs);
+            return timestamps.every(value =>
+                Number.isFinite(value) && value > 0 && value < latestSafeTimestamp
+            );
         } catch {
             return false;
         }
@@ -4641,13 +4669,19 @@ export class DiffTracker {
                 }
             }
             const initialWatchBoundaryMs = this.initialWatchBoundaryMs;
+            const initialWatchBoundaryMonotonicNs = this.initialWatchBoundaryMonotonicNs;
             this.initialIgnoreEpoch = undefined;
             this.initialWatchBoundaryMs = undefined;
+            this.initialWatchBoundaryMonotonicNs = undefined;
             this.initialIgnoreEvents.clear();
             for (const [filePath, { event, state }] of classified) {
                 if (state === 'ignored') { continue; }
                 if ((state === 'other' || state === 'directory') &&
-                    this.startupCreatePredatesWatchBoundary(event, initialWatchBoundaryMs)) {
+                    this.startupCreatePredatesWatchBoundary(
+                        event,
+                        initialWatchBoundaryMs,
+                        initialWatchBoundaryMonotonicNs
+                    )) {
                     // Some watcher backends report an existing path as "create"
                     // when a new watcher starts. Only a single create whose
                     // birth/content metadata is strictly older than the watcher

@@ -1938,7 +1938,7 @@ test('AUDIT-18 directory creation during ignore discovery cannot accept its chil
 test('S4-A startup ignores a lone stale create proven to predate watcher activation',async()=>{
     const p=file('startup-preexisting-create.txt');
     fs.writeFileSync(p,'before start');
-    await new Promise(resolve=>setTimeout(resolve,5));
+    await new Promise(resolve=>setTimeout(resolve,2100));
     listedFiles=[Uri.file(p)];
     const gate=pause(root,'ignoreScan');
     tracker.startRecording();
@@ -1963,6 +1963,36 @@ test('S4-A startup keeps a genuine post-Start create unresolved',async()=>{
     await waitUntil(()=>tracker.getBaselineState()==='ready');
     assert.equal(tracker.getOriginalContent(p),undefined);
     assert.ok(pending(p)?.unavailableReason);
+});
+
+test('S4-A startup rounded-back timestamps remain ambiguous inside the safety margin',async()=>{
+    const p=file('startup-rounded-create.txt');
+    fs.writeFileSync(p,'rounded');
+    const boundaryMs=Date.now();
+    const boundaryMono=process.hrtime.bigint();
+    const event={uri:Uri.file(p),firstKind:'create',kind:'create'};
+    const originalStatSync=fs.statSync;
+    try{
+        fs.statSync=(target,...args)=>{
+            const stat=originalStatSync(target,...args);
+            if(path.resolve(String(target))!==path.resolve(p)) return stat;
+            const rounded=Object.create(stat);
+            const value=boundaryMs-1000;
+            Object.defineProperties(rounded,{
+                birthtimeMs:{value,configurable:true},
+                mtimeMs:{value,configurable:true},
+                ctimeMs:{value,configurable:true}
+            });
+            return rounded;
+        };
+        assert.equal(
+            tracker.startupCreatePredatesWatchBoundary(event,boundaryMs,boundaryMono),
+            false,
+            'timestamps only one second before activation are ambiguous under the 2s safety margin'
+        );
+    } finally {
+        fs.statSync=originalStatSync;
+    }
 });
 
 for(const resource of ['directory','file']) test(`AUDIT-19 startup transient ${resource} leaves no persistent review entry`,async()=>{
@@ -3158,6 +3188,71 @@ test('S4-A bounded preflight discovers Whole Workspace candidates without readin
             'preflight must not publish the candidate scope or establish baseline state');
     } finally {
         faults.delete(keptFile);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Rules preflight prunes ordinary-policy ignored directories unless explicitly included',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-rules-preflight-ignore');
+    const ignoredDir=path.join(workspaceRoot,'node_modules');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    fs.mkdirSync(ignoredDir,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(path.join(ignoredDir,'needed.txt'),'needed');
+    fs.writeFileSync(gitignore,'node_modules/\n');
+    const folder={uri:Uri.file(workspaceRoot),name:'rules-preflight'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let ignoredOpendirAttempts=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        await tracker.refreshIgnoreMatchers();
+        const roots=tracker.currentWorkspaceRootIdentities();
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(ignoredDir)){
+                ignoredOpendirAttempts++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+
+        const ordinaryScope={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[],scopeRevision:'rules-ignore-prune'
+        };
+        const ordinary=await tracker.preflightConfiguredMonitoringScope(ordinaryScope,()=>true);
+        assert.equal(ordinary.status,'ready',JSON.stringify(ordinary));
+        assert.equal(ordinary.unreadableDirectoryCount,0,
+            'ordinary-policy ignored directories must not be opened during Rules preflight');
+        assert.equal(ignoredOpendirAttempts,0);
+
+        const includedScope={
+            ...ordinaryScope,
+            includes:[{scope:'all',path:'node_modules/needed.txt'}],
+            scopeRevision:'rules-ignore-explicit-include'
+        };
+        const included=await tracker.preflightConfiguredMonitoringScope(includedScope,()=>true);
+        assert.equal(included.status,'ready',JSON.stringify(included));
+        assert.equal(included.unreadableDirectoryCount,1,
+            'explicit include keeps traversal obligation through an ordinarily ignored directory');
+        assert.equal(ignoredOpendirAttempts,1);
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        listedIgnores=[];
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }

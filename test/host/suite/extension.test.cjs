@@ -256,6 +256,10 @@ module.exports = async function runExtensionHostScenario() {
             undefined,
             'stopped scope Apply must not acquire a new before-image'
         );
+        // Stable Linux watchers can emit an existing path as a create when the
+        // new watcher starts. The product only treats that as stale when the
+        // filesystem timestamps predate activation by the full safety margin.
+        await delay(2100);
         assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true);
         await until('Whole Workspace baseline after stopped Apply', async () => (await state()).baselineState === 'ready');
         assert.equal(
