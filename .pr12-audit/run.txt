@@ -1,1 +1,1 @@
-Run 3: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; complete original race tests with early-operation-result diagnostics.
+Run 4: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; trace the original callback test without changing assertions or bypassing execution.
