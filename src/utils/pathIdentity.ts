@@ -1,6 +1,23 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+const maxIdentityDirectoryEntries = 10000;
+
+function readIdentityDirectoryEntries(directory: string): fs.Dirent[] {
+    const handle = fs.opendirSync(directory);
+    try {
+        const entries: fs.Dirent[] = [];
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { return entries; }
+            if (entries.length >= maxIdentityDirectoryEntries) {
+                throw new Error('Directory identity discovery exceeded its bounded entry limit');
+            }
+            entries.push(entry);
+        }
+    } finally { handle.closeSync(); }
+}
+
 export function asciiCaseFold(value: string): string {
     return value.replace(/[A-Z]/g, character => character.toLowerCase());
 }
@@ -37,7 +54,7 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
 function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
     try {
         const folded = asciiCaseFold(requested);
-        return fs.readdirSync(parent).filter(name => asciiCaseFold(name) === folded);
+        return directoryEntries(parent).map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
     }
@@ -96,7 +113,7 @@ export function detectLocalPathCaseSensitivity(
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
     try {
-        const entries = fs.readdirSync(rootPath, { withFileTypes: true });
+        const entries = directoryEntries(rootPath);
         for (const entry of entries.slice(0, 128)) {
             if (entry.isSymbolicLink()) { continue; }
             const probe = probeExistingPath(path.join(rootPath, entry.name));
@@ -122,6 +139,7 @@ export interface RelativePathIdentity {
 // parent identity/metadata; each selected entry is still lstat'ed. In particular,
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
 const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
+let cachedDirectoryEntryCount = 0;
 function directoryEntries(directory: string): fs.Dirent[] {
     const signature = (): string => {
         const stat = fs.statSync(directory);
@@ -130,10 +148,18 @@ function directoryEntries(directory: string): fs.Dirent[] {
     const before = signature();
     const cached = directoryEntriesCache.get(directory);
     if (cached?.signature === before) { return cached.entries; }
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    const entries = readIdentityDirectoryEntries(directory);
     if (signature() === before) {
-        if (directoryEntriesCache.size >= 4096) { directoryEntriesCache.clear(); }
+        const previousCount = cached?.entries.length ?? 0;
+        if (directoryEntriesCache.size >= 4096 ||
+            cachedDirectoryEntryCount - previousCount + entries.length > maxIdentityDirectoryEntries) {
+            directoryEntriesCache.clear();
+            cachedDirectoryEntryCount = 0;
+        } else {
+            cachedDirectoryEntryCount -= previousCount;
+        }
         directoryEntriesCache.set(directory, { signature: before, entries });
+        cachedDirectoryEntryCount += entries.length;
     }
     return entries;
 }

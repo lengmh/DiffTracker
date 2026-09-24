@@ -20,7 +20,7 @@ export async function withLookups(aliases, denied, run) {
         return value;
     };
     const native = fs.realpathSync.native;
-    for (const name of ['existsSync', 'statSync', 'lstatSync', 'readdirSync', 'realpathSync']) {
+    for (const name of ['existsSync', 'statSync', 'lstatSync', 'readdirSync', 'opendirSync', 'realpathSync']) {
         originals[name] = fs[name];
         fs[name] = (value, ...args) => {
             try { return originals[name](translate(value), ...args); }

@@ -219,12 +219,12 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
         assert.equal(checked.ok, true, JSON.stringify(checked.errors));
 
         let flatEnumerations = 0;
-        const originalReaddirSync = fs.readdirSync;
-        fs.readdirSync = (value, ...args) => {
+        const originalOpendirSync = fs.opendirSync;
+        fs.opendirSync = (value, ...args) => {
             if (typeof value === 'string' && path.resolve(value) === path.resolve(flat)) {
                 flatEnumerations++;
             }
-            return originalReaddirSync(value, ...args);
+            return originalOpendirSync(value, ...args);
         };
         try {
             for (let index = 0; index < 32; index++) {
@@ -245,7 +245,7 @@ assert.equal(canonicalizeExcludePattern('name   ', 'linux'), 'name   ', 'trailin
             assert.ok(flatEnumerations > afterBatch,
                 'directory metadata changes must invalidate the verified case-semantics cache');
         } finally {
-            fs.readdirSync = originalReaddirSync;
+            fs.opendirSync = originalOpendirSync;
         }
     } finally {
         fs.rmSync(parent, { recursive: true, force: true });

@@ -1,3 +1,4 @@
+import { registerPR12BoundedInvariants } from './pr12-bounded-invariants.mjs';
 import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
 /** Production regression tests. Only the VS Code API boundary is faked.
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
@@ -19,6 +20,17 @@ const barriers = new Map();
 function deferred() { let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve}; }
 function pause(p,operation) { const entered=deferred(),release=deferred(); barriers.set(`${p}:${operation}`,{entered,release}); return {entered:entered.promise,release:release.resolve}; }
 async function boundary(p,operation) { const key=`${p}:${operation}`, barrier=barriers.get(key); if(barrier){barriers.delete(key); barrier.entered.resolve(); await barrier.release.promise;} }
+const policyNativeOpen=fs.promises.open;
+fs.promises.open=async(target,...args)=>{
+    const handle=await policyNativeOpen(target,...args);
+    if(path.basename(String(target))==='.gitignore'||String(target).endsWith(path.join('.git','info','exclude'))){
+        const read=handle.read.bind(handle);
+        handle.read=async(...readArgs)=>{fault(String(target),'read');const result=await read(...readArgs);await boundary(String(target),'read');return result;};
+    }
+    return handle;
+};
+const policyNativeOpendir=fs.promises.opendir;
+fs.promises.opendir=async(...args)=>{await boundary(root,'ignoreScan');return policyNativeOpendir(...args);};
 let automationOnly=false;
 let watchExclude=[];
 let listedFiles=[];
@@ -5174,6 +5186,12 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }
+});
+
+registerPR12BoundedInvariants({
+    test, vscode, Uri, DiffTracker, file, document,
+    getTracker: () => tracker, setTracker: value => { tracker=value; },
+    setListedIgnores: value => { listedIgnores=value; }
 });
 
 registerStateSchemaCompatibility({
