@@ -3752,6 +3752,7 @@ test('S4-A Whole Workspace Start does not double-charge existing unresolved star
         })).digest('hex');
         tracker.effectiveMonitoringScope=scope;
         tracker.unresolvedBaselineFiles.set(candidate,'File changed during ignore discovery; before-image is unknown');
+        tracker.scanUncertainFiles.add(candidate);
         originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
         tracker.findScopeFilesUnderDirectory=async()=>[Uri.file(candidate)];
 
