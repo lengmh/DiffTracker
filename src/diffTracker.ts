@@ -4107,10 +4107,11 @@ export class DiffTracker {
                 if (typeof identity.caseSensitive !== 'boolean') { return `${folder.name}:unverified-path-identity`; }
                 const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
                 const directDisposition = evaluateConfiguredScope(scope, identity, rel, false, false);
-                if (directDisposition.source === 'explicitExclude' ||
-                    configuredScopeExplicitlyExcludesSubtree(scope, identity, rel)) {
+                if (directDisposition.source === 'explicitExclude') {
                     continue;
                 }
+                const descendantsExplicitlyExcluded =
+                    configuredScopeExplicitlyExcludesSubtree(scope, identity, rel);
                 const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
                     .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
                 if (patterns.length === 0) { continue; }
@@ -4119,6 +4120,12 @@ export class DiffTracker {
                 if (matcher.ignores(rel) || patterns.some(pattern =>
                     this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
                     return `${folder.name}:${rule.path}`;
+                }
+                if (descendantsExplicitlyExcluded) {
+                    // A descendant-only exclusion such as vendor/** does not
+                    // exclude a monitorable file named vendor. The direct target
+                    // was checked above; only descendant coverage can be skipped.
+                    continue;
                 }
 
                 let mayHaveDescendants = true;

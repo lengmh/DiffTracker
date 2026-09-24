@@ -4045,6 +4045,34 @@ test('S4-A watcher-excluded include shadowed by explicit exclusion does not requ
         'restore must preserve exclusion precedence over the shadowed include');
 });
 
+test('S4-A Rules include prefix still requires coverage when only descendants are excluded',async()=>{
+    const vendor=file('rules-prefix-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeVendor}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],
+        scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const exact=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(exact.status,'requiresS4',JSON.stringify(exact));
+    assert.match(exact.reason,/watcherExclude|supplemental/i,
+        'descendant-only exclusion must not hide a blind spot at the include prefix itself');
+
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
+    const descendantsOnly=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(descendantsOnly.status,'applied',JSON.stringify(descendantsOnly));
+});
+
 test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{
     const roots=tracker.currentWorkspaceRootIdentities();
     const before=tracker.getEffectiveMonitoringScope();
