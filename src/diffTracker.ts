@@ -4367,6 +4367,32 @@ export class DiffTracker {
     ): boolean {
         const normalized = pattern.replace(/\\/g, '/')
             .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+
+        // A universal configured exclusion is sufficient regardless of whether
+        // the host watcher blind spot has any literal prefix.
+        if (configuredScopeExplicitlyExcludesSubtree(scope, identity, '')) {
+            return true;
+        }
+
+        // Wildcard-prefixed watcher patterns cannot be reduced to a literal
+        // subtree witness. An identical supported structured exclusion is still
+        // a direct proof: both sides use the same segment/globstar vocabulary,
+        // and explicit exclusions have higher precedence than Whole Workspace.
+        // Do not equate directory-only structured rules (trailing slash) with
+        // watcher patterns, whose coverage helper strips that marker.
+        const comparable = (value: string): string =>
+            value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        const watcherKey = identity.caseSensitive ? normalized : normalized.toLowerCase();
+        const identicalExplicitExclusion = scope.excludes.some(rule => {
+            if (rule.scope === 'folder' && rule.folder !== identity.name) { return false; }
+            if (rule.pattern.endsWith('/')) { return false; }
+            const ruleKey = comparable(rule.pattern);
+            return (identity.caseSensitive ? ruleKey : ruleKey.toLowerCase()) === watcherKey;
+        });
+        if (identicalExplicitExclusion) {
+            return true;
+        }
+
         const segments = normalized.split('/').filter(Boolean);
         const literalPrefix: string[] = [];
         for (const segment of segments) {
