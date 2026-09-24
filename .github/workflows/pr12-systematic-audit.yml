@@ -51,6 +51,7 @@ jobs:
           set -euo pipefail
           python /tmp/pr12-audit/repair.py source
           python /tmp/pr12-audit/refinements.py source
+          python /tmp/pr12-audit/fixture-compat.py
           npm run lint
           npm run compile
           DT_TEST_FILTER='PR12 AUDIT' timeout 120 node test/tracker-safety.mjs | tee /tmp/pr12-green.log
