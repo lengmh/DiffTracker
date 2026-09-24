@@ -859,9 +859,12 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
     const repoDir=path.join(root,'repo-rebuild-byte-budget');
     fs.mkdirSync(repoDir,{recursive:true});
     const existing=path.join(repoDir,'existing.m');
-    const a=path.join(repoDir,'a.m'),b=path.join(repoDir,'b.m'),c=path.join(repoDir,'c.m');
+    const candidates=Array.from({length:20},(_,candidateIndex)=>{
+        const target=path.join(repoDir,`candidate-${candidateIndex}.m`);
+        fs.writeFileSync(target,String(candidateIndex%10).repeat(900));
+        return target;
+    });
     seed(existing,'old baseline','branch content');
-    for(const [n,p] of [[1,a],[2,b],[3,c]]) fs.writeFileSync(p,String(n).repeat(900));
     const base={repoRoot:repoDir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
     const current={...base,headName:'feature',headCommit:'bbb'};
     tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
@@ -871,9 +874,18 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
     const beforeBytes=Buffer.byteLength(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),'utf8');
     tracker.maxPersistedBytes=beforeBytes+1700;
     const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
-    tracker.findScopeFilesUnderDirectory=async()=>[a,b,c].map(Uri.file);
+    const originalReadFile=vscode.workspace.fs.readFile;
+    let candidateReads=0;
+    tracker.findScopeFilesUnderDirectory=async()=>candidates.map(Uri.file);
+    vscode.workspace.fs.readFile=async uri=>{
+        if(candidates.includes(uri.fsPath)) candidateReads++;
+        return originalReadFile(uri);
+    };
     try{
         assert.equal(await tracker.rebuildRepositoryBaseline(repoDir,current),false);
+        await new Promise(resolve=>setTimeout(resolve,25));
+        assert.ok(candidateReads<candidates.length,
+            'failed rebuild budget must stop before reading the entire candidate set');
         assert.equal(tracker.getOriginalContent(existing),'old baseline',
             'failed rebuild must restore the archived baseline');
         const state=tracker.buildPersistedState();
@@ -881,6 +893,7 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
         assert.ok(Buffer.byteLength(JSON.stringify(state),'utf8')<=tracker.maxPersistedBytes,
             'rebuild candidate must not retain content beyond the persistence byte budget');
     } finally {
+        vscode.workspace.fs.readFile=originalReadFile;
         tracker.findScopeFilesUnderDirectory=originalFind;
     }
 });
@@ -3478,9 +3491,9 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
     const storage=file('s4a-start-byte-storage');
     fs.mkdirSync(workspaceRoot,{recursive:true});
     fs.mkdirSync(storage,{recursive:true});
-    const files=['a.txt','b.txt','c.txt'].map((name,indexValue)=>{
-        const target=path.join(workspaceRoot,name);
-        fs.writeFileSync(target,String(indexValue).repeat(900));
+    const files=Array.from({length:20},(_,indexValue)=>{
+        const target=path.join(workspaceRoot,`candidate-${indexValue}.txt`);
+        fs.writeFileSync(target,String(indexValue%10).repeat(900));
         return target;
     });
     fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
@@ -3492,6 +3505,8 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
         ) ? folder : undefined;
     };
     let originalFind;
+    const originalReadFile=vscode.workspace.fs.readFile;
+    let candidateReads=0;
     try{
         vscode.workspace.workspaceFolders=[folder];
         vscode.workspace.getWorkspaceFolder=getFolder;
@@ -3514,17 +3529,25 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
         tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(state),'utf8')+1500;
         originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
         tracker.findScopeFilesUnderDirectory=async()=>files.map(Uri.file);
+        vscode.workspace.fs.readFile=async uri=>{
+            if(files.includes(uri.fsPath)) candidateReads++;
+            return originalReadFile(uri);
+        };
 
         await assert.rejects(
             ()=>tracker.initializeWorkspaceSnapshots(),
             /persisted byte capacity|exceed.*bytes/i
         );
+        await new Promise(resolve=>setTimeout(resolve,25));
+        assert.ok(candidateReads<files.length,
+            'a failed Start budget must stop workers before the full candidate set is read');
         const retained=tracker.buildPersistedState();
         assert.ok(retained);
         assert.ok(Buffer.byteLength(JSON.stringify(retained),'utf8')<=tracker.maxPersistedBytes,
             'Start must stop retaining baselines before the durable byte limit is exceeded');
         assert.equal(tracker.getBaselineState(),'building');
     } finally {
+        vscode.workspace.fs.readFile=originalReadFile;
         if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
