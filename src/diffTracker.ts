@@ -115,9 +115,21 @@ interface ImportedDirectoryWatch {
 }
 
 interface CandidateCapacityGuard {
+    // Coarse pre-read bound only. A candidate's durable category is unknown
+    // until its current state has been read, so category limits are enforced
+    // separately before the baseline is retained.
     remaining: number;
     exemptPaths: ReadonlySet<string>;
     countedCandidates: Set<string>;
+}
+
+interface CandidatePersistenceBudget {
+    remainingBytes: number;
+    fileSnapshots: number;
+    fileModes: number;
+    baselineExistingFiles: number;
+    unresolvedBaselineFiles: number;
+    opaqueBaselineFiles: number;
 }
 
 interface BaselineTransaction {
@@ -261,6 +273,11 @@ type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
     | { kind: 'unavailable'; reason: string; reasonCode?: string; targetKind?: 'file' | 'directory'; size?: number; mtime?: number; fingerprint?: string };
+
+type CandidateBaselinePlan =
+    | { kind: 'text'; content: string; mode?: number; baselineExists: boolean }
+    | { kind: 'opaque'; state: Extract<CurrentFileState, { kind: 'unavailable' }> & { size: number; mtime: number } }
+    | { kind: 'unresolved'; reason: string };
 
 export class DiffTracker {
     private sessionEpoch = 0;
@@ -3177,6 +3194,163 @@ export class DiffTracker {
         return files;
     }
 
+    private remainingCandidatePersistenceSlots(): number {
+        return Math.max(0, this.maxPersistedSnapshots - this.fileSnapshots.size) +
+            Math.max(0, this.maxPersistedSnapshots - this.unresolvedBaselineFiles.size) +
+            Math.max(0, this.maxPersistedSnapshots - this.opaqueBaselineFiles.size);
+    }
+
+    private createCandidatePersistenceBudget(projectedScanCoverage = this.scanCoverage): CandidatePersistenceBudget {
+        const state = this.buildPersistedState();
+        let remainingBytes = Number.POSITIVE_INFINITY;
+        let fileModes = [...this.fileModes.keys()].filter(filePath => this.fileSnapshots.has(filePath)).length;
+        let baselineExistingFiles = this.baselineExistingFiles.size;
+        if (state) {
+            // Scope Apply clears scanCoverage during preparation and restores the
+            // ready coverage fingerprint immediately before persistence. Reserve
+            // those final bytes now so candidate capture cannot fill the payload
+            // right up to the limit and defer rejection to final serialization.
+            state.scanCoverage = projectedScanCoverage;
+            const usedBytes = Buffer.byteLength(JSON.stringify(state), 'utf8');
+            if (usedBytes > this.maxPersistedBytes) {
+                throw new Error(
+                    'Monitoring scope persisted byte capacity already exceeds ' +
+                    this.maxPersistedBytes +
+                    ' bytes before candidate capture; narrow the scope before retrying.'
+                );
+            }
+            remainingBytes = this.maxPersistedBytes - usedBytes;
+            fileModes = state.fileModes.length;
+            baselineExistingFiles = state.baselineExistingFiles.length;
+        }
+        return {
+            remainingBytes,
+            fileSnapshots: this.fileSnapshots.size,
+            fileModes,
+            baselineExistingFiles,
+            unresolvedBaselineFiles: this.unresolvedBaselineFiles.size,
+            opaqueBaselineFiles: this.opaqueBaselineFiles.size
+        };
+    }
+
+    private planScannedBaseline(
+        filePath: string,
+        state: CurrentFileState,
+        scope: 'workspace' | 'repository'
+    ): CandidateBaselinePlan {
+        const phase = scope === 'repository' ? 'repository baseline rebuild' : 'baseline scan';
+        if (this.hasScanUncertainty(filePath)) {
+            return { kind: 'unresolved', reason: 'File changed during ' + phase + '; before-image is unknown' };
+        }
+        if (state.kind === 'text') {
+            return { kind: 'text', content: state.content, mode: state.mode, baselineExists: true };
+        }
+        if (this.isStableUnsupportedState(state)) {
+            return { kind: 'opaque', state };
+        }
+        return {
+            kind: 'unresolved',
+            reason: state.kind === 'unavailable'
+                ? state.reason
+                : 'File disappeared during ' + phase + '; before-image is unknown'
+        };
+    }
+
+    private serializedArrayAppendBytes(entryCount: number, value: unknown): number {
+        const serialized = JSON.stringify(value);
+        if (serialized === undefined) {
+            throw new Error('Monitoring scope candidate persistence value could not be serialized');
+        }
+        return Buffer.byteLength(serialized, 'utf8') + (entryCount > 0 ? 1 : 0);
+    }
+
+    private consumeCandidatePersistenceBudget(
+        filePath: string,
+        plan: CandidateBaselinePlan,
+        budget: CandidatePersistenceBudget
+    ): void {
+        filePath = this.canonicalTrackingPath(filePath);
+        let addedBytes = 0;
+        let nextMode: number | undefined;
+        let addsExistingPath = false;
+
+        if (plan.kind === 'text') {
+            if (budget.fileSnapshots >= this.maxPersistedSnapshots) {
+                throw new Error(
+                    'Monitoring scope text snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.fileSnapshots,
+                [filePath, plan.content]
+            );
+            nextMode = plan.mode ?? this.fileModes.get(filePath);
+            if (nextMode !== undefined && !this.fileSnapshots.has(filePath)) {
+                addedBytes += this.serializedArrayAppendBytes(
+                    budget.fileModes,
+                    [filePath, nextMode]
+                );
+            }
+            addsExistingPath = plan.baselineExists && !this.baselineExistingFiles.has(filePath);
+            if (addsExistingPath) {
+                addedBytes += this.serializedArrayAppendBytes(
+                    budget.baselineExistingFiles,
+                    filePath
+                );
+            }
+        } else if (plan.kind === 'opaque') {
+            if (budget.opaqueBaselineFiles >= this.maxPersistedSnapshots) {
+                throw new Error(
+                    'Monitoring scope opaque snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.opaqueBaselineFiles,
+                [filePath, {
+                    reason: plan.state.reason,
+                    size: plan.state.size,
+                    mtime: plan.state.mtime,
+                    fingerprint: plan.state.fingerprint
+                }]
+            );
+        } else {
+            if (budget.unresolvedBaselineFiles >= this.maxPersistedSnapshots) {
+                throw new Error(
+                    'Monitoring scope unresolved snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.unresolvedBaselineFiles,
+                [filePath, plan.reason]
+            );
+        }
+
+        if (addedBytes > budget.remainingBytes) {
+            throw new Error(
+                'Monitoring scope persisted byte capacity would exceed ' +
+                this.maxPersistedBytes +
+                ' bytes; add explicit exclusions before retrying.'
+            );
+        }
+
+        budget.remainingBytes -= addedBytes;
+        if (plan.kind === 'text') {
+            budget.fileSnapshots++;
+            if (nextMode !== undefined && !this.fileSnapshots.has(filePath)) { budget.fileModes++; }
+            if (addsExistingPath) { budget.baselineExistingFiles++; }
+        } else if (plan.kind === 'opaque') {
+            budget.opaqueBaselineFiles++;
+        } else {
+            budget.unresolvedBaselineFiles++;
+        }
+    }
+
     private async captureConfiguredExpansionBaselines(
         scope: CanonicalMonitoringScope,
         epoch: number,
@@ -3192,12 +3366,20 @@ export class DiffTracker {
             ...durableResourcePaths,
             ...this.trackedChanges.keys()
         ]);
-        const remaining = Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size);
+        const projectedScanCoverage =
+            !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+                ? undefined
+                : this.ignoreFingerprint;
+        const persistenceBudget = this.createCandidatePersistenceBudget(projectedScanCoverage);
         const files = await this.enumerateConfiguredCandidateFiles(
             scope,
             epoch,
             undefined,
-            { remaining, exemptPaths: capacityExemptPaths, countedCandidates: new Set<string>() },
+            {
+                remaining: this.remainingCandidatePersistenceSlots(),
+                exemptPaths: capacityExemptPaths,
+                countedCandidates: new Set<string>()
+            },
             { remainingEntries: this.maxScopePreflightEntries },
             preparationStillCurrent
         );
@@ -3228,6 +3410,12 @@ export class DiffTracker {
             if (!preparationStillCurrent()) {
                 throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
             }
+            if (this.hasCapturedBaseline(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) ||
+                this.trackedChanges.has(filePath) ||
+                this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)) { continue; }
+            const plan = this.planScannedBaseline(filePath, state, 'workspace');
+            this.consumeCandidatePersistenceBudget(filePath, plan, persistenceBudget);
             this.recordScannedBaseline(filePath, state, 'workspace');
             captured++;
         }
@@ -3926,7 +4114,7 @@ export class DiffTracker {
                     ...this.opaqueBaselineFiles.keys()
                 ]);
                 return {
-                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size),
+                    remaining: this.remainingCandidatePersistenceSlots(),
                     exemptPaths: new Set([
                         ...durableResourcePaths,
                         ...this.trackedChanges.keys()
@@ -5075,24 +5263,19 @@ export class DiffTracker {
         // Recheck after the scanner's await. An editor may have captured a valid
         // before-image in the meantime; neither scanner may overwrite it.
         if (this.hasCapturedBaseline(filePath) || this.isPathIgnored(vscode.Uri.file(filePath))) { return; }
-        const phase = scope === 'repository' ? 'repository baseline rebuild' : 'baseline scan';
-        if (this.hasScanUncertainty(filePath)) {
-            this.recordUnresolvedBaseline(filePath, `File changed during ${phase}; before-image is unknown`);
-            return;
-        }
-        if (state.kind === 'text') {
+        const plan = this.planScannedBaseline(filePath, state, scope);
+        if (plan.kind === 'text') {
             this.unresolvedBaselineFiles.delete(filePath);
-            this.fileSnapshots.set(filePath, state.content);
-            if (state.mode !== undefined) { this.fileModes.set(filePath, state.mode); }
+            this.fileSnapshots.set(filePath, plan.content);
+            if (plan.mode !== undefined) { this.fileModes.set(filePath, plan.mode); }
             this.baselineExistingFiles.add(filePath);
             return;
         }
-        if (this.isStableUnsupportedState(state)) {
-            this.recordOpaqueBaseline(filePath, state);
+        if (plan.kind === 'opaque') {
+            this.recordOpaqueBaseline(filePath, plan.state);
             return;
         }
-        this.recordUnresolvedBaseline(filePath, state.kind === 'unavailable'
-            ? state.reason : `File disappeared during ${phase}; before-image is unknown`);
+        this.recordUnresolvedBaseline(filePath, plan.reason);
     }
 
     private recordOpaqueBaseline(filePath: string, state: Extract<CurrentFileState, { kind: 'unavailable' }>): void {
@@ -5192,10 +5375,13 @@ export class DiffTracker {
             ...this.unresolvedBaselineFiles.keys(),
             ...this.opaqueBaselineFiles.keys()
         ]) : undefined;
+        const persistenceBudget = wholeWorkspace
+            ? this.createCandidatePersistenceBudget()
+            : undefined;
         const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
             wholeWorkspace && durableResourcePaths
                 ? {
-                    remaining: Math.max(0, this.maxPersistedSnapshots - durableResourcePaths.size),
+                    remaining: this.remainingCandidatePersistenceSlots(),
                     exemptPaths: new Set([
                         ...durableResourcePaths,
                         ...this.trackedChanges.keys()
@@ -5223,7 +5409,7 @@ export class DiffTracker {
                 !wholeWorkspaceCapacityGuard.countedCandidates.has(canonical)) {
                 if (wholeWorkspaceCapacityGuard.remaining <= 0) {
                     throw new Error(
-                        `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+                        'Monitoring scope snapshot capacity would exceed the remaining per-category persistence slots; add explicit exclusions before retrying.'
                     );
                 }
                 wholeWorkspaceCapacityGuard.countedCandidates.add(canonical);
@@ -5231,7 +5417,8 @@ export class DiffTracker {
             }
             candidates.set(canonical, canonicalUri);
         }
-        let added = false;
+
+        const plannedAdditions: Array<{ filePath: string; plan: CandidateBaselinePlan }> = [];
         for (const uri of candidates.values()) {
             if (!this.isCurrentEpoch(epoch)) { return; }
             const filePath = uri.fsPath;
@@ -5241,15 +5428,33 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch)) { return; }
             if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath)) { continue; }
             const observedCreation = this.hasObservedCreation(filePath);
-            if (observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)) {
-                this.fileSnapshots.set(filePath, '');
-                this.baselineExistingFiles.delete(filePath);
-            } else {
-                this.recordUnresolvedBaseline(filePath, 'Prior scan coverage is unknown or ignore rules changed; before-image is unknown');
+            const plan: CandidateBaselinePlan =
+                observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)
+                    ? { kind: 'text', content: '', baselineExists: false }
+                    : {
+                        kind: 'unresolved',
+                        reason: 'Prior scan coverage is unknown or ignore rules changed; before-image is unknown'
+                    };
+            if (persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(filePath, plan, persistenceBudget);
             }
-            added = true;
+            plannedAdditions.push({ filePath, plan });
         }
-        if (added && !await this.flushPendingPersistence()) {
+
+        for (const { filePath, plan } of plannedAdditions) {
+            if (plan.kind === 'text') {
+                this.fileSnapshots.set(filePath, plan.content);
+                this.fileModes.delete(filePath);
+                this.baselineExistingFiles.delete(filePath);
+            } else if (plan.kind === 'unresolved') {
+                this.recordUnresolvedBaseline(filePath, plan.reason);
+            } else {
+                // Restore discovery never creates opaque before-images because no
+                // file content is read here; keep this exhaustive for type safety.
+                throw new Error('Unexpected opaque restore candidate');
+            }
+        }
+        if (plannedAdditions.length > 0 && !await this.flushPendingPersistence()) {
             throw new Error('Restored additions could not be persisted');
         }
     }
