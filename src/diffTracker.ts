@@ -2833,6 +2833,10 @@ export class DiffTracker {
                 return conflict('Workspace path case-sensitivity could not be verified during preflight.');
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (!relativeDirectory && configuredScopeExplicitlyExcludesSubtree(scope, rootIdentity, '')) {
+                result.skippedExplicitExclusions++;
+                continue;
+            }
             if (relativeDirectory && isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true)) {
                 result.skippedHardBoundaries++;
                 continue;
@@ -3122,6 +3126,9 @@ export class DiffTracker {
                 throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (!relativeDirectory && configuredScopeExplicitlyExcludesSubtree(scope, rootIdentity, '')) {
+                continue;
+            }
             if (relativeDirectory && (
                 isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true) ||
                 this.isPathIgnored(vscode.Uri.file(directory), true, false, false)
@@ -4949,14 +4956,6 @@ export class DiffTracker {
             this.effectiveMonitoringScope.mode === 'wholeWorkspace'
                 ? { remainingEntries: this.maxScopePreflightEntries }
                 : undefined;
-        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
-            wholeWorkspacePreparationBudget
-                ? {
-                    remaining: this.maxPersistedSnapshots,
-                    exemptPaths: new Set<string>(),
-                    countedCandidates: new Set<string>()
-                }
-                : undefined;
         if (this.initialIgnoreEpoch === epoch) {
             const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
             // Keep each path's first event across I/O rounds. An event arriving
@@ -5019,6 +5018,23 @@ export class DiffTracker {
             });
         }
 
+        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
+            wholeWorkspacePreparationBudget
+                ? {
+                    remaining: this.remainingCandidatePersistenceSlots(),
+                    exemptPaths: new Set([
+                        ...this.fileSnapshots.keys(),
+                        ...this.unresolvedBaselineFiles.keys(),
+                        ...this.opaqueBaselineFiles.keys(),
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                }
+                : undefined;
+        const wholeWorkspacePersistenceBudget = wholeWorkspacePreparationBudget
+            ? this.createCandidatePersistenceBudget(scanFingerprint)
+            : undefined;
+
         for (const folder of folders) {
             if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
                 return;
@@ -5057,6 +5073,10 @@ export class DiffTracker {
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     if (state.kind === 'missing' && transientPaths.has(uri.fsPath)) { return; }
+                    if (wholeWorkspacePersistenceBudget) {
+                        const plan = this.planScannedBaseline(uri.fsPath, state, 'workspace');
+                        this.consumeCandidatePersistenceBudget(uri.fsPath, plan, wholeWorkspacePersistenceBudget);
+                    }
                     this.recordScannedBaseline(uri.fsPath, state, 'workspace');
                 });
 
@@ -5867,7 +5887,26 @@ export class DiffTracker {
                     try { await this.watchImportedTree(filePath, epoch); }
                     catch { watchFailed = true; }
                     if (!creationIsCurrent()) { return; }
-                    const children = await this.findScopeFilesUnderDirectory(filePath);
+                    const durablePaths = new Set([
+                        ...this.fileSnapshots.keys(),
+                        ...this.unresolvedBaselineFiles.keys(),
+                        ...this.opaqueBaselineFiles.keys(),
+                        ...this.trackedChanges.keys()
+                    ]);
+                    const childCapacityGuard: CandidateCapacityGuard = {
+                        remaining: Math.max(
+                            0,
+                            this.maxPersistedSnapshots -
+                                (scanEvent ? this.unresolvedBaselineFiles.size : this.fileSnapshots.size)
+                        ),
+                        exemptPaths: durablePaths,
+                        countedCandidates: new Set<string>()
+                    };
+                    const children = await this.findScopeFilesUnderDirectory(
+                        filePath,
+                        undefined,
+                        childCapacityGuard
+                    );
                     if (!creationIsCurrent()) { return; }
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
@@ -6408,11 +6447,18 @@ export class DiffTracker {
                 this.markLineChangesUpdated(filePath);
             }
 
+            const projectedScanCoverage =
+                previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            const repositoryPersistenceBudget =
+                this.createCandidatePersistenceBudget(projectedScanCoverage);
+
             const files = await this.findScopeFilesUnderDirectory(repoRoot);
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
                 if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+                const plan = this.planScannedBaseline(uri.fsPath, state, 'repository');
+                this.consumeCandidatePersistenceBudget(uri.fsPath, plan, repositoryPersistenceBudget);
                 this.recordScannedBaseline(uri.fsPath, state, 'repository');
             });
 
@@ -6422,7 +6468,7 @@ export class DiffTracker {
                 items: record.items.filter(item => !ownsPath(item.filePath))
             })).filter(record => record.items.length > 0);
             this.baselineGitContexts.set(repoRoot, { ...context });
-            this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            this.scanCoverage = projectedScanCoverage;
             this.resetChangeBlocksCaches();
             this.snapshotInitialized = true;
             await this.processPendingExternalChanges();
