@@ -1,1 +1,1 @@
-Run 4: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; trace the original callback test without changing assertions or bypassing execution.
+Run 5: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; 18 audit probes, transaction rediscovery guard, bounded path-identity allocation, and complete original suite.
