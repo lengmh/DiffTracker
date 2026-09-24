@@ -3526,6 +3526,77 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
     }
 });
 
+test('S4-A Whole Workspace falls back to lstat for unknown Dirent types',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('unknown-dirent-workspace');
+    const nested=path.join(workspaceRoot,'nested');
+    fs.mkdirSync(nested,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const unknownFile=path.join(workspaceRoot,'unknown.txt');
+    const nestedFile=path.join(nested,'child.txt');
+    fs.writeFileSync(unknownFile,'unknown');
+    fs.writeFileSync(nestedFile,'nested');
+    const folder={uri:Uri.file(workspaceRoot),name:'unknown-dirent'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    const unknown=name=>({
+        name,
+        isSymbolicLink:()=>false,
+        isDirectory:()=>false,
+        isFile:()=>false
+    });
+    const knownFile=name=>({
+        name,
+        isSymbolicLink:()=>false,
+        isDirectory:()=>false,
+        isFile:()=>true
+    });
+    const originalOpendir=fs.promises.opendir;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))!==path.resolve(workspaceRoot)){
+                return originalOpendir(target,...args);
+            }
+            const entries=[knownFile('ProbeName'),unknown('unknown.txt'),unknown('nested')];
+            return {
+                readSync:()=>entries.shift()??null,
+                closeSync:()=>{}
+            };
+        };
+
+        const files=await tracker.enumerateConfiguredCandidateFiles(scope,tracker.sessionEpoch);
+        const canonical=new Set(files.map(filePath=>path.resolve(filePath)));
+        assert.ok(canonical.has(path.resolve(unknownFile)),
+            'unknown file Dirent must be classified with lstat');
+        assert.ok(canonical.has(path.resolve(nestedFile)),
+            'unknown directory Dirent must be classified with lstat and traversed');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A candidate preparation bounds directory-only traversal after truncated preflight',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
@@ -3711,6 +3782,59 @@ test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explici
     assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
 });
 
+test('S4-A exact watcher prefix is not covered by a descendant-only exclusion',async()=>{
+    const vendor=file('exact-watcher-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/watcherExclude|supplemental/i);
+});
+
+test('S4-A Whole Workspace discovery skips generic explicit-include findFiles fallback',async()=>{
+    const vendor=file('whole-fallback-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeVendor}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    tracker.effectiveMonitoringScope=scope;
+    await tracker.refreshIgnoreMatchers();
+    const originalFindFiles=vscode.workspace.findFiles;
+    let findCalls=0;
+    vscode.workspace.findFiles=async()=>{
+        findCalls++;
+        throw error('unbounded-include-fallback');
+    };
+    try{
+        const files=await tracker.findScopeFilesUnderDirectory(root);
+        assert.equal(findCalls,0,'Whole Workspace discovery must remain on the bounded direct enumerator');
+        assert.equal(files.some(uri=>uri.fsPath===path.join(vendor,'child.txt')),false,
+            'explicitly excluded descendants remain outside Whole Workspace discovery');
+    } finally {
+        vscode.workspace.findFiles=originalFindFiles;
+    }
+});
+
 test('S4-A Whole Workspace restore shares traversal and capacity budgets across roots',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
@@ -3762,6 +3886,63 @@ test('S4-A Whole Workspace restore shares traversal and capacity budgets across 
         );
         assert.equal(tracker.fileSnapshots.size,0,
             'work-budget failure also leaves restore candidate publication untouched');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace assigns nested paths to the deepest workspace root once',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const parentRoot=file('nested-owner-parent');
+    const childRoot=path.join(parentRoot,'pkg');
+    fs.mkdirSync(childRoot,{recursive:true});
+    fs.writeFileSync(path.join(parentRoot,'ProbeName'),'parent');
+    fs.writeFileSync(path.join(childRoot,'ProbeName'),'child');
+    fs.writeFileSync(path.join(childRoot,'leaf.txt'),'leaf');
+    const parentFolder={uri:Uri.file(parentRoot),name:'parent'};
+    const childFolder={uri:Uri.file(childRoot),name:'child'};
+    const getFolder=uri=>{
+        const inRoot=folder=>{
+            const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+            return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative));
+        };
+        return [childFolder,parentFolder].find(inRoot);
+    };
+    try{
+        vscode.workspace.workspaceFolders=[parentFolder,childFolder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=4;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.truncated,false,'nested child root must not consume the entry budget twice');
+        assert.equal(preflight.inspectedEntries,4);
+
+        const budget={remainingEntries:4};
+        const files=await tracker.enumerateConfiguredCandidateFiles(
+            scope,tracker.sessionEpoch,undefined,undefined,budget
+        );
+        const canonical=new Set(files.map(filePath=>path.resolve(filePath)));
+        assert.equal(canonical.size,3);
+        assert.ok(canonical.has(path.resolve(path.join(parentRoot,'ProbeName'))));
+        assert.ok(canonical.has(path.resolve(path.join(childRoot,'ProbeName'))));
+        assert.ok(canonical.has(path.resolve(path.join(childRoot,'leaf.txt'))));
+        assert.equal(budget.remainingEntries,0);
     } finally {
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;

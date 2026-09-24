@@ -2810,6 +2810,7 @@ export class DiffTracker {
                 return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
             }
             const { folder, directory } = pending.pop()!;
+            if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean') {
                 return conflict('Workspace path case-sensitivity could not be verified during preflight.');
@@ -2853,19 +2854,25 @@ export class DiffTracker {
                     directoryEntries++;
 
                     const child = path.join(directory, entry.name);
-                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                    if (entry.isSymbolicLink()) {
+                    const entryKind = this.classifyDirectoryEntry(directory, entry);
+                    if (entryKind === 'missing' || entryKind === 'other') { continue; }
+                    if (entryKind === 'symlink') {
                         result.skippedSymlinks++;
                         continue;
                     }
-                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) {
+                    const isDirectory = entryKind === 'directory';
+                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                    if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) {
+                        continue;
+                    }
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory)) {
                         result.skippedHardBoundaries++;
                         continue;
                     }
                     const ordinaryMatcher = this.ignoreMatchers.get(folder.uri.fsPath);
-                    const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (entry.isDirectory() ? '/' : '')) ?? false;
+                    const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (isDirectory ? '/' : '')) ?? false;
                     const decision = evaluateConfiguredScope(
-                        scope, rootIdentity, relative, ordinaryIgnored, entry.isDirectory()
+                        scope, rootIdentity, relative, ordinaryIgnored, isDirectory
                     );
                     if (decision.source === 'explicitExclude') {
                         result.skippedExplicitExclusions++;
@@ -2878,10 +2885,10 @@ export class DiffTracker {
                     if (!decision.monitored) {
                         continue;
                     }
-                    if (entry.isDirectory()) {
+                    if (isDirectory) {
                         result.candidateDirectories++;
                         pending.push({ folder, directory: child });
-                    } else if (entry.isFile()) {
+                    } else {
                         result.candidateFiles++;
                     }
                 }
@@ -3011,6 +3018,59 @@ export class DiffTracker {
         return captured;
     }
 
+    private workspaceFolderOwnsTraversalPath(
+        folder: vscode.WorkspaceFolder,
+        targetPath: string
+    ): boolean {
+        const resolvedTarget = path.resolve(targetPath);
+        let owner: vscode.WorkspaceFolder | undefined;
+        let ownerLength = -1;
+        for (const candidate of this.getSupportedWorkspaceFolders()) {
+            const candidateRoot = path.resolve(candidate.uri.fsPath);
+            if (!this.pathBelongsToRoot(resolvedTarget, candidateRoot)) { continue; }
+            if (candidateRoot.length > ownerLength) {
+                owner = candidate;
+                ownerLength = candidateRoot.length;
+            }
+        }
+        return !!owner && path.resolve(owner.uri.fsPath) === path.resolve(folder.uri.fsPath);
+    }
+
+    private owningWorkspaceFolderForTraversal(targetPath: string): vscode.WorkspaceFolder | undefined {
+        const resolvedTarget = path.resolve(targetPath);
+        let owner: vscode.WorkspaceFolder | undefined;
+        let ownerLength = -1;
+        for (const candidate of this.getSupportedWorkspaceFolders()) {
+            const candidateRoot = path.resolve(candidate.uri.fsPath);
+            if (!this.pathBelongsToRoot(resolvedTarget, candidateRoot)) { continue; }
+            if (candidateRoot.length > ownerLength) {
+                owner = candidate;
+                ownerLength = candidateRoot.length;
+            }
+        }
+        return owner;
+    }
+
+    private classifyDirectoryEntry(
+        directory: string,
+        entry: fs.Dirent
+    ): 'file' | 'directory' | 'symlink' | 'other' | 'missing' {
+        if (entry.isSymbolicLink()) { return 'symlink'; }
+        if (entry.isDirectory()) { return 'directory'; }
+        if (entry.isFile()) { return 'file'; }
+        const child = path.join(directory, entry.name);
+        try {
+            const stat = fs.lstatSync(child);
+            if (stat.isSymbolicLink()) { return 'symlink'; }
+            if (stat.isDirectory()) { return 'directory'; }
+            if (stat.isFile()) { return 'file'; }
+            return 'other';
+        } catch (error) {
+            if (this.isFileNotFound(error)) { return 'missing'; }
+            throw error;
+        }
+    }
+
     private async enumerateConfiguredCandidateFiles(
         scope: CanonicalMonitoringScope,
         epoch: number,
@@ -3023,9 +3083,8 @@ export class DiffTracker {
         const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
         const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
             ? (() => {
-                const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(requestedRoot));
-                return folder?.uri.scheme === 'file' &&
-                    this.pathBelongsToRoot(requestedRoot, folder.uri.fsPath)
+                const folder = this.owningWorkspaceFolderForTraversal(requestedRoot);
+                return folder?.uri.scheme === 'file'
                     ? [{ folder, directory: requestedRoot }]
                     : [];
             })()
@@ -3036,6 +3095,7 @@ export class DiffTracker {
         while (pending.length > 0) {
             if (!this.isCurrentEpoch(epoch)) { return files; }
             const { folder, directory } = pending.pop()!;
+            if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean') {
                 throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
@@ -3066,14 +3126,17 @@ export class DiffTracker {
                     }
                     preparationBudget.remainingEntries--;
 
-                    if (entry.isSymbolicLink()) { continue; }
+                    const entryKind = this.classifyDirectoryEntry(directory, entry);
+                    if (entryKind === 'missing' || entryKind === 'other' || entryKind === 'symlink') { continue; }
                     const child = path.join(directory, entry.name);
+                    const isDirectory = entryKind === 'directory';
+                    if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, entry.isDirectory())) { continue; }
-                    if (this.isPathIgnored(vscode.Uri.file(child), entry.isDirectory(), false, false)) { continue; }
-                    if (entry.isDirectory()) {
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory)) { continue; }
+                    if (this.isPathIgnored(vscode.Uri.file(child), isDirectory, false, false)) { continue; }
+                    if (isDirectory) {
                         pending.push({ folder, directory: child });
-                    } else if (entry.isFile()) {
+                    } else {
                         const canonical = this.canonicalTrackingPath(child);
                         if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
                             !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
@@ -3859,6 +3922,7 @@ export class DiffTracker {
                 wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries }
             );
             add(files.map(filePath => vscode.Uri.file(filePath)));
+            return [...candidates.values()];
         } else {
             add(await vscode.workspace.findFiles(
                 new vscode.RelativePattern(patternBase, '**/*'),
@@ -4093,11 +4157,17 @@ export class DiffTracker {
             literalPrefix.push(segment);
         }
         if (literalPrefix.length === 0) { return false; }
-        return configuredScopeExplicitlyExcludesSubtree(
-            scope,
-            identity,
-            literalPrefix.join('/')
-        );
+        const prefix = literalPrefix.join('/');
+        if (!configuredScopeExplicitlyExcludesSubtree(scope, identity, prefix)) {
+            return false;
+        }
+        if (literalPrefix.length === segments.length) {
+            const directTarget = evaluateConfiguredScope(scope, identity, prefix, false, false);
+            if (directTarget.source !== 'explicitExclude') {
+                return false;
+            }
+        }
+        return true;
     }
 
     private configuredScopeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
