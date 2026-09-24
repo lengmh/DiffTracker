@@ -3465,39 +3465,101 @@ test('S4-A persisted Whole Workspace recording restores when no supplemental cov
     assert.equal(tracker.getOriginalContent(candidate),'whole restore baseline');
 });
 
-test('S4-A capacity rejection happens before candidate file contents are read',async()=>{
+test('S4-A persistence capacity remains independent across baseline categories for apply and restore',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
-    const workspaceRoot=file('s4a-capacity-workspace');
+    const workspaceRoot=file('s4a-category-mix-workspace');
     fs.mkdirSync(workspaceRoot,{recursive:true});
-    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
-    const guarded=path.join(workspaceRoot,'guarded.txt');
-    fs.writeFileSync(guarded,'must not be read');
-    const trapDir=path.join(workspaceRoot,'trap');
-    fs.mkdirSync(trapDir,{recursive:true});
-    fs.writeFileSync(path.join(trapDir,'late.txt'),'late candidate');
-    const folder={uri:Uri.file(workspaceRoot),name:'capacity'};
+    const probe=path.join(workspaceRoot,'ProbeName');
+    const opaque=path.join(workspaceRoot,'opaque.bin');
+    const admitted=path.join(workspaceRoot,'admitted.txt');
+    const restoredCandidate=path.join(workspaceRoot,'restored.txt');
+    fs.writeFileSync(probe,'probe');
+    fs.writeFileSync(opaque,Buffer.from([0,1,2,3]));
+    fs.writeFileSync(admitted,'admitted');
+    const folder={uri:Uri.file(workspaceRoot),name:'category-mix'};
     const getFolder=uri=>{
         const relative=path.relative(workspaceRoot,uri.fsPath);
-        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
             ? folder : undefined;
     };
-    const originalOpendir=fs.promises.opendir;
-    let opendirCalls=0;
     try{
         vscode.workspace.workspaceFolders=[folder];
         vscode.workspace.getWorkspaceFolder=getFolder;
-        faults.set(guarded,{read:error('candidate-content-read-should-not-happen')});
-        fs.promises.opendir=async(...args)=>{
-            // A2 preflight also streams with opendir. This regression targets
-            // the A3 candidate-preparation traversal only, after the baseline
-            // transaction has been established.
-            if(tracker.baselineTransaction){
-                opendirCalls++;
-                if(opendirCalls>1) throw error('enumeration-continued-past-capacity');
-            }
-            return originalOpendir(...args);
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=2;
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        const opaqueStat=fs.statSync(opaque);
+        tracker.opaqueBaselineFiles.set(opaque,{
+            reason:'Binary content is unsupported',
+            size:opaqueStat.size,
+            mtime:opaqueStat.mtimeMs,
+            fingerprint:'a'.repeat(64)
+        });
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
         };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const applied=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(applied.status,'applied',JSON.stringify(applied));
+        assert.equal(tracker.getOriginalContent(admitted),'admitted',
+            'one text slot remains even though the combined durable-resource count already equals the per-category limit');
+
+        fs.writeFileSync(restoredCandidate,'restored');
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=2;
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        tracker.opaqueBaselineFiles.set(opaque,{
+            reason:'Binary content is unsupported',
+            size:opaqueStat.size,
+            mtime:opaqueStat.mtimeMs,
+            fingerprint:'a'.repeat(64)
+        });
+        tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(scope));
+        await tracker.refreshIgnoreMatchers();
+        await tracker.discoverRestoredFiles(tracker.sessionEpoch);
+        assert.ok(tracker.unresolvedBaselineFiles.has(admitted));
+        assert.ok(tracker.unresolvedBaselineFiles.has(restoredCandidate),
+            'restore must use the unresolved category capacity instead of a combined global resource count');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A per-category capacity overflow stops later candidate reads',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-category-overflow-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const first=path.join(workspaceRoot,'first.txt');
+    const overflow=path.join(workspaceRoot,'overflow.txt');
+    const guarded=path.join(workspaceRoot,'guarded.txt');
+    fs.writeFileSync(first,'first');
+    fs.writeFileSync(overflow,'overflow');
+    fs.writeFileSync(guarded,'must not be read');
+    const folder={uri:Uri.file(workspaceRoot),name:'category-overflow'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    let originalEnumerate;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
         await tracker.dispose();
         tracker=new DiffTracker();
         tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
@@ -3510,16 +3572,22 @@ test('S4-A capacity rejection happens before candidate file contents are read',a
         scope.scopeRevision=createHash('sha256').update(JSON.stringify({
             model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
         })).digest('hex');
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[first,overflow,guarded];
+        faults.set(guarded,{read:error('later-candidate-read-after-category-overflow')});
+
         const before=tracker.getEffectiveMonitoringScope();
         const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
         assert.equal(result.status,'failed',JSON.stringify(result));
-        assert.match(result.reason,/snapshot capacity.*exceed/i);
+        assert.match(result.reason??'',/text.*snapshot.*capacity|snapshot.*capacity.*text/i);
+        assert.doesNotMatch(result.reason??'',/later-candidate-read-after-category-overflow/);
         assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.getOriginalContent(first),undefined,
+            'category-capacity failure must roll back earlier candidate baselines');
+        assert.equal(tracker.getOriginalContent(overflow),undefined);
         assert.equal(tracker.getOriginalContent(guarded),undefined);
-        assert.equal(opendirCalls,1,
-            'candidate enumeration must fail at capacity without descending into later directories');
     } finally {
-        fs.promises.opendir=originalOpendir;
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
         faults.delete(guarded);
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -3688,6 +3756,71 @@ test('S4-A persisted-byte capacity failure restores the prior durable scope atom
         assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false,
             'safe rollback clears the candidate incomplete-write marker');
     } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A persisted-byte budget aborts candidate capture before later reads',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-byte-early-workspace');
+    const storage=file('s4a-byte-early-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const first=path.join(workspaceRoot,'first.txt');
+    const overflow=path.join(workspaceRoot,'overflow.txt');
+    const guarded=path.join(workspaceRoot,'guarded.txt');
+    fs.writeFileSync(first,'a'.repeat(256));
+    fs.writeFileSync(overflow,'b'.repeat(4096));
+    fs.writeFileSync(guarded,'must not be read');
+    const folder={uri:Uri.file(workspaceRoot),name:'byte-early'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    let originalEnumerate;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const committed=tracker.effectiveMonitoringScope;
+        tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(scope));
+        const candidateBaseBytes=Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
+        tracker.effectiveMonitoringScope=committed;
+        tracker.maxPersistedBytes=candidateBaseBytes+1024;
+
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[first,overflow,guarded];
+        faults.set(guarded,{read:error('later-candidate-read-after-byte-overflow')});
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason??'',/persisted.*byte|byte.*capacity|exceed.*bytes/i);
+        assert.doesNotMatch(result.reason??'',/later-candidate-read-after-byte-overflow/);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.getOriginalContent(first),undefined,
+            'byte-capacity failure must roll back earlier candidate baselines');
+        assert.equal(tracker.getOriginalContent(overflow),undefined);
+        assert.equal(tracker.getOriginalContent(guarded),undefined);
+    } finally {
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
+        faults.delete(guarded);
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
     }
