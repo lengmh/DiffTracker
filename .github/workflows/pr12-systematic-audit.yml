@@ -1,0 +1,82 @@
+name: PR12 isolated systematic audit
+on:
+  push:
+    branches: [repair/pr12-systematic-audit-20260925]
+    paths: [.pr12-audit/run.txt]
+permissions:
+  contents: write
+concurrency:
+  group: pr12-isolated-systematic-audit
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'lengmh/DiffTracker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE: 8c81dc889c80e8f655b07e66bd752a35fec0a2b6
+      TARGET: feat/0.8-s4a-whole-workspace-preparation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Preserve audit inputs and check exact base
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R .pr12-audit /tmp/pr12-audit
+          test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$BASE"
+          git checkout --detach "$BASE"
+          npm ci
+      - name: Add focused regression tests and establish red baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/pr12-audit/repair.py tests
+          npm run compile
+          set +e
+          DT_TEST_FILTER='PR12 AUDIT' timeout 120 node test/tracker-safety.mjs > /tmp/pr12-red.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/pr12-red.log
+          test "$result" = 1
+          grep -q '^FAIL PR12 AUDIT' /tmp/pr12-red.log
+      - name: Apply repair and run focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/pr12-audit/repair.py source
+          npm run lint
+          npm run compile
+          DT_TEST_FILTER='PR12 AUDIT' timeout 120 node test/tracker-safety.mjs | tee /tmp/pr12-green.log
+      - name: Full production regressions and performance
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test > /tmp/pr12-full.log 2>&1 || { tail -200 /tmp/pr12-full.log; exit 1; }
+          tail -15 /tmp/pr12-full.log
+          npm run test:performance | tee /tmp/pr12-performance.log
+          git diff --check
+      - name: Publish verified source commit to a separate result branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$BASE"
+          git config user.name 'lengmh'
+          git config user.email '47114200+lengmh@users.noreply.github.com'
+          git add src/diffTracker.ts test/tracker-safety.mjs test/pr12-bounded-invariants.mjs docs/pr12-systematic-audit-2026-09-25.md
+          git commit -m 'fix(s4a): unify bounded policy discovery and baseline budget accounting'
+          RESULT="repair/pr12-audit-verified-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git push origin "HEAD:refs/heads/$RESULT"
+          printf 'VERIFIED_COMMIT=%s\nRESULT_BRANCH=%s\n' "$(git rev-parse HEAD)" "$RESULT" | tee /tmp/pr12-result.txt
+          git show --stat --oneline HEAD
+      - name: Upload audit execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr12-audit-execution
+          path: /tmp/pr12-*.log
+          if-no-files-found: ignore
