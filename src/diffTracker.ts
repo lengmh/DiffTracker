@@ -2791,6 +2791,9 @@ export class DiffTracker {
         const conflict = (reason: string): MonitoringScopePreflightResult => ({
             ...result, status: 'conflict', reason
         });
+        const failed = (reason: string): MonitoringScopePreflightResult => ({
+            ...result, status: 'failed', reason
+        });
         if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
             return conflict('Monitoring scope preflight is blocked by recovery or another baseline transaction.');
         }
@@ -2804,6 +2807,30 @@ export class DiffTracker {
         }
 
         const epoch = this.sessionEpoch;
+        const contextStillCurrent = (): boolean =>
+            this.isCurrentEpoch(epoch) && requestStillCurrent() &&
+            this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
+        const preflightIgnoreMatchers = new Map(this.ignoreMatchers);
+        for (const folder of this.getSupportedWorkspaceFolders()) {
+            if (preflightIgnoreMatchers.has(folder.uri.fsPath)) { continue; }
+            try {
+                const matcher = await this.buildIgnoreMatcher(
+                    folder,
+                    [],
+                    undefined,
+                    scope,
+                    false
+                );
+                if (!contextStillCurrent()) {
+                    return conflict('Monitoring scope request, session, or workspace identity changed while loading preflight ignore policy.');
+                }
+                preflightIgnoreMatchers.set(folder.uri.fsPath, matcher);
+            } catch (error) {
+                return failed(
+                    `Monitoring scope preflight could not load ordinary ignore policy for ${folder.name}: ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+        }
         const pending = this.getSupportedWorkspaceFolders().map(folder => ({
             folder,
             directory: path.resolve(folder.uri.fsPath)
@@ -2819,10 +2846,6 @@ export class DiffTracker {
                 reason: error instanceof Error ? error.message : String(error)
             });
         };
-        const contextStillCurrent = (): boolean =>
-            this.isCurrentEpoch(epoch) && requestStillCurrent() &&
-            this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
-
         while (pending.length > 0) {
             if (!contextStillCurrent()) {
                 return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
@@ -2843,7 +2866,7 @@ export class DiffTracker {
                 continue;
             }
             if (relativeDirectory) {
-                const directoryMatcher = this.ignoreMatchers.get(folder.uri.fsPath);
+                const directoryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                 const ordinaryDirectoryIgnored = directoryMatcher?.ignores(relativeDirectory + '/') ?? false;
                 const directoryDecision = evaluateConfiguredScope(
                     scope, rootIdentity, relativeDirectory, ordinaryDirectoryIgnored, true
@@ -2891,7 +2914,7 @@ export class DiffTracker {
                         result.skippedHardBoundaries++;
                         continue;
                     }
-                    const ordinaryMatcher = this.ignoreMatchers.get(folder.uri.fsPath);
+                    const ordinaryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                     const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (isDirectory ? '/' : '')) ?? false;
                     const decision = evaluateConfiguredScope(
                         scope, rootIdentity, relative, ordinaryIgnored, isDirectory
@@ -3099,7 +3122,11 @@ export class DiffTracker {
         scanRoot?: string,
         capacityGuard?: CandidateCapacityGuard,
         preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries },
-        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch)
+        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch),
+        traversalOptions: {
+            seedOverlappingWorkspaceRoots?: boolean;
+            skipTraversalPath?: (targetPath: string) => boolean;
+        } = {}
     ): Promise<string[]> {
         const files: string[] = [];
         const countedCandidates = capacityGuard?.countedCandidates ?? new Set<string>();
@@ -3112,14 +3139,16 @@ export class DiffTracker {
                     seeds.push({ folder: owner, directory: requestedRoot });
                 }
 
-                // A repository scan root may be an ancestor of one or more
-                // opened workspace folders. Seed every such workspace slice
-                // explicitly because parent traversal intentionally stops when
-                // ownership crosses into a deeper workspace root.
-                for (const folder of this.getSupportedWorkspaceFolders()) {
-                    const folderRoot = path.resolve(folder.uri.fsPath);
-                    if (!this.pathBelongsToRoot(folderRoot, requestedRoot)) { continue; }
-                    seeds.push({ folder, directory: folderRoot });
+                if (traversalOptions.seedOverlappingWorkspaceRoots) {
+                    // Repository scans may start above the opened workspace.
+                    // Seed each overlapping workspace slice explicitly because
+                    // parent traversal intentionally stops at nested ownership
+                    // boundaries. Per-folder Start/restore scans leave this off.
+                    for (const folder of this.getSupportedWorkspaceFolders()) {
+                        const folderRoot = path.resolve(folder.uri.fsPath);
+                        if (!this.pathBelongsToRoot(folderRoot, requestedRoot)) { continue; }
+                        seeds.push({ folder, directory: folderRoot });
+                    }
                 }
 
                 const seen = new Set<string>();
@@ -3140,6 +3169,7 @@ export class DiffTracker {
                 throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
             }
             const { folder, directory } = pending.pop()!;
+            if (traversalOptions.skipTraversalPath?.(directory)) { continue; }
             if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean') {
@@ -3171,6 +3201,8 @@ export class DiffTracker {
                     const entry = handle.readSync();
                     if (!entry) { break; }
                     if (!this.isCurrentEpoch(epoch)) { return files; }
+                    const child = path.join(directory, entry.name);
+                    if (traversalOptions.skipTraversalPath?.(child)) { continue; }
                     if (preparationBudget.remainingEntries <= 0) {
                         throw new Error(
                             `Monitoring scope preparation work budget would exceed ${this.maxScopePreflightEntries} inspected directory entries; add explicit exclusions or narrow the scope before retrying.`
@@ -3180,7 +3212,6 @@ export class DiffTracker {
 
                     const entryKind = this.classifyDirectoryEntry(directory, entry);
                     if (entryKind === 'missing' || entryKind === 'other' || entryKind === 'symlink') { continue; }
-                    const child = path.join(directory, entry.name);
                     const isDirectory = entryKind === 'directory';
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
@@ -4143,7 +4174,11 @@ export class DiffTracker {
     private async findScopeFilesUnderDirectory(
         rootPath: string,
         wholeWorkspacePreparationBudget?: { remainingEntries: number },
-        wholeWorkspaceCapacityGuard?: CandidateCapacityGuard
+        wholeWorkspaceCapacityGuard?: CandidateCapacityGuard,
+        traversalOptions: {
+            seedOverlappingWorkspaceRoots?: boolean;
+            skipTraversalPath?: (targetPath: string) => boolean;
+        } = {}
     ): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
         const normalizedRootPath = path.resolve(rootPath);
@@ -4189,7 +4224,9 @@ export class DiffTracker {
                 this.sessionEpoch,
                 rootPath,
                 localCapacityGuard,
-                wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries }
+                wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries },
+                undefined,
+                traversalOptions
             );
             add(files.map(filePath => vscode.Uri.file(filePath)));
             return [...candidates.values()];
@@ -4391,6 +4428,13 @@ export class DiffTracker {
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
                 if (patterns.some(pattern =>
                     this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
+                    return `${folder.name}:${rule.path}`;
+                }
+                const includeSegments = rel.split('/').filter(Boolean);
+                const includeAncestors = includeSegments.slice(0, -1)
+                    .map((_segment, index) => includeSegments.slice(0, index + 1).join('/'));
+                if (patterns.some(pattern => includeAncestors.some(ancestor =>
+                    this.watcherPatternMatchesPath(pattern, ancestor, identity.caseSensitive!)))) {
                     return `${folder.name}:${rule.path}`;
                 }
                 if (descendantsExplicitlyExcluded) {
@@ -4668,13 +4712,21 @@ export class DiffTracker {
     private async buildIgnoreMatcher(
         folder: vscode.WorkspaceFolder,
         evidence: string[],
-        legacyPolicyCandidate?: Map<string, string[]>
+        legacyPolicyCandidate?: Map<string, string[]>,
+        scopeOverride?: CanonicalMonitoringScope,
+        includeLegacyWatchExclude = true
     ): Promise<Ignore> {
         const epoch = this.sessionEpoch;
         for (let attempt = 0; ; attempt++) {
             const candidateEvidence: string[] = [];
             try {
-                const matcher = await this.readIgnoreMatcher(folder, candidateEvidence, legacyPolicyCandidate);
+                const matcher = await this.readIgnoreMatcher(
+                    folder,
+                    candidateEvidence,
+                    legacyPolicyCandidate,
+                    scopeOverride,
+                    includeLegacyWatchExclude
+                );
                 evidence.push(...candidateEvidence);
                 return matcher;
             } catch (error) {
@@ -4691,10 +4743,14 @@ export class DiffTracker {
     private async readIgnoreMatcher(
         folder: vscode.WorkspaceFolder,
         evidence: string[],
-        legacyPolicyCandidate?: Map<string, string[]>
+        legacyPolicyCandidate?: Map<string, string[]>,
+        scopeOverride?: CanonicalMonitoringScope,
+        includeLegacyWatchExclude = true
     ): Promise<Ignore> {
         const ig = ignore();
-        const watchExcludes = this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate);
+        const watchExcludes = includeLegacyWatchExclude
+            ? this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate)
+            : [];
         const basePatterns = [
             ...this.getDefaultExcludePatterns(),
             ...this.getVsCodeExcludePatterns(folder.uri),
@@ -4723,7 +4779,7 @@ export class DiffTracker {
             // skipped when its whole containing subtree is also excluded; if
             // only the metadata file is excluded, treating its policy as empty
             // could expose files that its rules would otherwise protect.
-            const disposition = this.excludedIgnoreFileDisposition(uri);
+            const disposition = this.excludedIgnoreFileDisposition(uri, scopeOverride);
             if (disposition === 'skip') { continue; }
             if (disposition === 'block') {
                 throw new Error(
@@ -4742,11 +4798,14 @@ export class DiffTracker {
         return ig;
     }
 
-    private excludedIgnoreFileDisposition(uri: vscode.Uri): 'read' | 'skip' | 'block' {
+    private excludedIgnoreFileDisposition(
+        uri: vscode.Uri,
+        scopeOverride?: CanonicalMonitoringScope
+    ): 'read' | 'skip' | 'block' {
         if (uri.scheme !== 'file') { return 'block'; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') { return 'block'; }
-        const scope = this.pendingMonitoringScope ??
+        const scope = scopeOverride ?? this.pendingMonitoringScope ??
             (this.effectiveMonitoringScope.kind === 'configured'
                 ? this.effectiveMonitoringScope as CanonicalMonitoringScope
                 : undefined);
@@ -6522,7 +6581,21 @@ export class DiffTracker {
             const repositoryPersistenceBudget =
                 this.createCandidatePersistenceBudget(projectedScanCoverage);
 
-            const files = await this.findScopeFilesUnderDirectory(repoRoot);
+            const normalizedRepoRoot = path.resolve(repoRoot);
+            const nestedRepositoryRootSet = new Set(
+                this.getRepositoryRoots()
+                    .map(root => path.resolve(root))
+                    .filter(root => root !== normalizedRepoRoot && this.pathBelongsToRoot(root, normalizedRepoRoot))
+            );
+            const files = await this.findScopeFilesUnderDirectory(
+                repoRoot,
+                undefined,
+                undefined,
+                {
+                    seedOverlappingWorkspaceRoots: true,
+                    skipTraversalPath: targetPath => nestedRepositoryRootSet.has(path.resolve(targetPath))
+                }
+            );
             if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
             await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
                 const state = await this.readFileSnapshot(uri);
