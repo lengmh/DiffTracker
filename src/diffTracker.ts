@@ -2810,9 +2810,12 @@ export class DiffTracker {
         const contextStillCurrent = (): boolean =>
             this.isCurrentEpoch(epoch) && requestStillCurrent() &&
             this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
-        const preflightIgnoreMatchers = new Map(this.ignoreMatchers);
+        // Preflight must evaluate ordinary ignore policy against the
+        // requested scope, not the committed matcher snapshot. Existing-root
+        // matchers may have skipped nested .gitignore files inside a subtree
+        // that the requested scope is now expanding back into.
+        const preflightIgnoreMatchers = new Map<string, Ignore>();
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            if (preflightIgnoreMatchers.has(folder.uri.fsPath)) { continue; }
             try {
                 const matcher = await this.buildIgnoreMatcher(
                     folder,
