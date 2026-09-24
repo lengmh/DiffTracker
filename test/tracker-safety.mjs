@@ -855,6 +855,36 @@ test('DT-07 explicit archive-and-rebuild resets only the changed repository',asy
     const archive=JSON.parse(fs.readFileSync(path.join(storage,'session-state.archive.json'),'utf8'));
     assert.ok(archive.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='base'));
 });
+test('S4-A repository rebuild enforces persisted-byte budget before durable publication',async()=>{
+    const repoDir=path.join(root,'repo-rebuild-byte-budget');
+    fs.mkdirSync(repoDir,{recursive:true});
+    const existing=path.join(repoDir,'existing.m');
+    const a=path.join(repoDir,'a.m'),b=path.join(repoDir,'b.m'),c=path.join(repoDir,'c.m');
+    seed(existing,'old baseline','branch content');
+    for(const [n,p] of [[1,a],[2,b],[3,c]]) fs.writeFileSync(p,String(n).repeat(900));
+    const base={repoRoot:repoDir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};
+    tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    const storage=path.join(root,`storage-${index++}`);
+    tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const beforeBytes=Buffer.byteLength(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),'utf8');
+    tracker.maxPersistedBytes=beforeBytes+1700;
+    const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+    tracker.findScopeFilesUnderDirectory=async()=>[a,b,c].map(Uri.file);
+    try{
+        assert.equal(await tracker.rebuildRepositoryBaseline(repoDir,current),false);
+        assert.equal(tracker.getOriginalContent(existing),'old baseline',
+            'failed rebuild must restore the archived baseline');
+        const state=tracker.buildPersistedState();
+        assert.ok(state);
+        assert.ok(Buffer.byteLength(JSON.stringify(state),'utf8')<=tracker.maxPersistedBytes,
+            'rebuild candidate must not retain content beyond the persistence byte budget');
+    } finally {
+        tracker.findScopeFilesUnderDirectory=originalFind;
+    }
+});
+
 test('DT-07 repository rebuild watches files already captured while later files are scanning',async()=>{
     const repo=path.join(root,'repo-rebuild-watcher-gap');fs.mkdirSync(repo);
     const p=path.join(repo,'first.m'),q=path.join(repo,'blocked.m');seed(p,'old','branch baseline');seed(q,'old','branch baseline');
@@ -2852,6 +2882,54 @@ for(const scopeName of ['sub[1]','#scope','!scope']) test(`ROUND26 nested ignore
     try{tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');for(const p of files){const result=spawnSync('git',['check-ignore','--no-index','-q','--',path.relative(dir,p)],{cwd:dir});assert.ok(result.status===0||result.status===1);assert.equal(tracker.testIgnorePath(p).ignored,result.status===0,path.relative(dir,p));assert.equal(tracker.getOriginalContent(p),result.status===0?undefined:'content',path.relative(dir,p));}}
     finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getWorkspaceFolder=folderFor;}
 });
+test('S4-A populated Whole Workspace creation stops at remaining text-snapshot capacity',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-created-capacity-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'created-capacity'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+        tracker.maxPersistedSnapshots=1;
+        const probe=path.join(workspaceRoot,'ProbeName');
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        const dir=path.join(workspaceRoot,'copied');
+        const child=path.join(dir,'child.txt');
+        fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(child,'new');
+        await tracker.onExternalFileCreated(Uri.file(dir));
+        assert.equal(tracker.fileSnapshots.has(child),false,
+            'a populated create must not consume unused opaque/unresolved slots when text capacity is full');
+        assert.equal(pending(child),undefined);
+        assert.match(subtreeGap(dir)?.reason??'',/could not be scanned|coverage/i);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('ROUND26 populated directory notification records every included descendant without rule changes',async()=>{
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
     const dir=file('copied'),a=path.join(dir,'a.txt'),b=path.join(dir,'deep','empty.txt');fs.mkdirSync(path.dirname(b),{recursive:true});fs.writeFileSync(a,'copied');fs.writeFileSync(b,'');listedFiles=[Uri.file(a),Uri.file(b)];
@@ -3391,6 +3469,118 @@ test('S4-A exclude-removal expansion captures newly admitted resources before pu
     assert.equal(result.status,'applied',JSON.stringify(result));
     assert.equal(tracker.getOriginalContent(admitted),'newly admitted baseline');
     assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+});
+
+test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-start-byte-workspace');
+    const storage=file('s4a-start-byte-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    const files=['a.txt','b.txt','c.txt'].map((name,indexValue)=>{
+        const target=path.join(workspaceRoot,name);
+        fs.writeFileSync(target,String(indexValue).repeat(900));
+        return target;
+    });
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'start-byte'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    let originalFind;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+        const projected=tracker.ignoreFingerprint;
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=projected;
+        tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(state),'utf8')+1500;
+        originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        tracker.findScopeFilesUnderDirectory=async()=>files.map(Uri.file);
+
+        await assert.rejects(
+            ()=>tracker.initializeWorkspaceSnapshots(),
+            /persisted byte capacity|exceed.*bytes/i
+        );
+        const retained=tracker.buildPersistedState();
+        assert.ok(retained);
+        assert.ok(Buffer.byteLength(JSON.stringify(retained),'utf8')<=tracker.maxPersistedBytes,
+            'Start must stop retaining baselines before the durable byte limit is exceeded');
+        assert.equal(tracker.getBaselineState(),'building');
+    } finally {
+        if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A universal root exclusion prunes preflight and candidate traversal before opendir',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-universal-prune-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    for(let n=0;n<5;n++) fs.writeFileSync(path.join(workspaceRoot,`entry-${n}.txt`),'x');
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'universal-prune'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let rootOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=1;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],
+            excludes:[{scope:'all',pattern:'**'}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(workspaceRoot)) rootOpens++;
+            return originalOpendir(target,...args);
+        };
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.inspectedEntries,0);
+        assert.equal(preflight.truncated,false);
+        const files=await tracker.enumerateConfiguredCandidateFiles(
+            scope,tracker.sessionEpoch,undefined,undefined,{remainingEntries:1}
+        );
+        assert.deepEqual(files,[]);
+        assert.equal(rootOpens,0,'universally excluded roots must be pruned before opening the directory');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
 });
 
 test('S4-A stopped Whole Workspace apply publishes scope without acquiring before-images, then Start rebuilds them',async()=>{
