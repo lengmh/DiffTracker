@@ -3463,6 +3463,78 @@ test('S4-A Rules preflight prunes ordinary-policy ignored directories unless exp
     }
 });
 
+test('S4-A Rules preflight rebuilds existing-root matcher when an explicit subtree exclusion is removed',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('preflight-existing-root-scope-expansion');
+    const vendor=path.join(workspaceRoot,'vendor');
+    const generated=path.join(vendor,'generated');
+    const gitignore=path.join(vendor,'.gitignore');
+    fs.mkdirSync(generated,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(gitignore,'generated/\n');
+    fs.writeFileSync(path.join(generated,'bulk.txt'),'ignored by nested policy');
+    const folder={uri:Uri.file(workspaceRoot),name:'existing-scope-expansion'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let generatedOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+
+        const committed={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],
+            excludes:[{scope:'all',pattern:'vendor/**'}],scopeRevision:''
+        };
+        committed.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:committed.mode,roots:committed.roots,includes:committed.includes,excludes:committed.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=committed;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.ignoreMatchers.get(workspaceRoot)?.ignores('vendor/generated/'),false,
+            'committed matcher must omit nested policy from the explicitly excluded subtree');
+
+        const requested={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        requested.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:requested.mode,roots:requested.roots,includes:requested.includes,excludes:requested.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(generated)){
+                generatedOpens++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.unreadableDirectoryCount,0,
+            'candidate-scope nested ignore policy must prune generated before traversal');
+        assert.equal(generatedOpens,0);
+        assert.equal(tracker.ignoreMatchers.get(workspaceRoot)?.ignores('vendor/generated/'),false,
+            'candidate matcher must remain local to preflight and not overwrite committed matcher state');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A Rules preflight loads ordinary ignore policy for a newly added workspace root',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
