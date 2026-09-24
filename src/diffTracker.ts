@@ -130,6 +130,7 @@ interface CandidatePersistenceBudget {
     baselineExistingFiles: number;
     unresolvedBaselineFiles: number;
     opaqueBaselineFiles: number;
+    failedReason?: string;
 }
 
 interface BaselineTransaction {
@@ -3276,6 +3277,11 @@ export class DiffTracker {
         plan: CandidateBaselinePlan,
         budget: CandidatePersistenceBudget
     ): void {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
         filePath = this.canonicalTrackingPath(filePath);
         let addedBytes = 0;
         let nextMode: number | undefined;
@@ -3283,7 +3289,7 @@ export class DiffTracker {
 
         if (plan.kind === 'text') {
             if (budget.fileSnapshots >= this.maxPersistedSnapshots) {
-                throw new Error(
+                fail(
                     'Monitoring scope text snapshot capacity would exceed ' +
                     this.maxPersistedSnapshots +
                     ' entries; add explicit exclusions before retrying.'
@@ -3309,7 +3315,7 @@ export class DiffTracker {
             }
         } else if (plan.kind === 'opaque') {
             if (budget.opaqueBaselineFiles >= this.maxPersistedSnapshots) {
-                throw new Error(
+                fail(
                     'Monitoring scope opaque snapshot capacity would exceed ' +
                     this.maxPersistedSnapshots +
                     ' entries; add explicit exclusions before retrying.'
@@ -3326,7 +3332,7 @@ export class DiffTracker {
             );
         } else {
             if (budget.unresolvedBaselineFiles >= this.maxPersistedSnapshots) {
-                throw new Error(
+                fail(
                     'Monitoring scope unresolved snapshot capacity would exceed ' +
                     this.maxPersistedSnapshots +
                     ' entries; add explicit exclusions before retrying.'
@@ -3339,7 +3345,7 @@ export class DiffTracker {
         }
 
         if (addedBytes > budget.remainingBytes) {
-            throw new Error(
+            fail(
                 'Monitoring scope persisted byte capacity would exceed ' +
                 this.maxPersistedBytes +
                 ' bytes; add explicit exclusions before retrying.'
