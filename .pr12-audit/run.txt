@@ -1,1 +1,1 @@
-Run 6: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; all 18 audit probes plus original cache reuse/invalidation and full production regressions.
+Run 7: exact-base 8c81dc889c80e8f655b07e66bd752a35fec0a2b6; all 18 cross-product probes and the original suite with real .gitignore fixtures and native streaming counters.
