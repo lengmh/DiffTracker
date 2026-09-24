@@ -3106,10 +3106,29 @@ export class DiffTracker {
         const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
         const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
             ? (() => {
-                const folder = this.owningWorkspaceFolderForTraversal(requestedRoot);
-                return folder?.uri.scheme === 'file'
-                    ? [{ folder, directory: requestedRoot }]
-                    : [];
+                const seeds: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = [];
+                const owner = this.owningWorkspaceFolderForTraversal(requestedRoot);
+                if (owner?.uri.scheme === 'file') {
+                    seeds.push({ folder: owner, directory: requestedRoot });
+                }
+
+                // A repository scan root may be an ancestor of one or more
+                // opened workspace folders. Seed every such workspace slice
+                // explicitly because parent traversal intentionally stops when
+                // ownership crosses into a deeper workspace root.
+                for (const folder of this.getSupportedWorkspaceFolders()) {
+                    const folderRoot = path.resolve(folder.uri.fsPath);
+                    if (!this.pathBelongsToRoot(folderRoot, requestedRoot)) { continue; }
+                    seeds.push({ folder, directory: folderRoot });
+                }
+
+                const seen = new Set<string>();
+                return seeds.filter(({ folder, directory }) => {
+                    const key = path.resolve(folder.uri.fsPath) + '\0' + path.resolve(directory);
+                    if (seen.has(key)) { return false; }
+                    seen.add(key);
+                    return true;
+                });
             })()
             : this.getSupportedWorkspaceFolders().map(folder => ({
                 folder,
@@ -5054,10 +5073,13 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch)) { return; }
 
             const candidates = files.filter(uri => {
-                if (this.isPathIgnored(uri)) {
+                const filePath = this.canonicalTrackingPath(uri.fsPath);
+                if (this.isPathIgnored(uri) || this.pendingScopeExplicitlyExcludes(uri)) {
                     return false;
                 }
-                return !this.fileSnapshots.has(uri.fsPath);
+                return !this.fileSnapshots.has(filePath) &&
+                    !this.unresolvedBaselineFiles.has(filePath) &&
+                    !this.opaqueBaselineFiles.has(filePath);
             });
 
             const batchSize = 50;
@@ -5073,17 +5095,32 @@ export class DiffTracker {
                     if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
                         return;
                     }
-                    if (this.fileSnapshots.has(uri.fsPath)) {
+                    const filePath = this.canonicalTrackingPath(uri.fsPath);
+                    if (this.fileSnapshots.has(filePath) ||
+                        this.unresolvedBaselineFiles.has(filePath) ||
+                        this.opaqueBaselineFiles.has(filePath)) {
                         return;
                     }
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     if (state.kind === 'missing' && transientPaths.has(uri.fsPath)) { return; }
-                    if (wholeWorkspacePersistenceBudget) {
-                        const plan = this.planScannedBaseline(uri.fsPath, state, 'workspace');
-                        this.consumeCandidatePersistenceBudget(uri.fsPath, plan, wholeWorkspacePersistenceBudget);
+
+                    // Eligibility can change while readFileSnapshot awaits:
+                    // startup evidence may become durable or a pending/effective
+                    // exclusion may remove the path. Charge only a baseline that
+                    // recordScannedBaseline can actually publish synchronously.
+                    if (this.pendingScopeExplicitlyExcludes(uri) ||
+                        this.isPathIgnored(uri) ||
+                        this.fileSnapshots.has(filePath) ||
+                        this.unresolvedBaselineFiles.has(filePath) ||
+                        this.opaqueBaselineFiles.has(filePath)) {
+                        return;
                     }
-                    this.recordScannedBaseline(uri.fsPath, state, 'workspace');
+                    if (wholeWorkspacePersistenceBudget) {
+                        const plan = this.planScannedBaseline(filePath, state, 'workspace');
+                        this.consumeCandidatePersistenceBudget(filePath, plan, wholeWorkspacePersistenceBudget);
+                    }
+                    this.recordScannedBaseline(filePath, state, 'workspace');
                 });
 
                 if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
