@@ -3490,6 +3490,7 @@ test('S4-A Rules preflight loads ordinary ignore policy for a newly added worksp
         await tracker.dispose();
         tracker=new DiffTracker();
         tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        vscodeExcludes['files.exclude']={node_modules:true};
         await tracker.refreshIgnoreMatchers();
         assert.equal(tracker.ignoreMatchers.has(rootB),false);
 
