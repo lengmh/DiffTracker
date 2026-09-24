@@ -898,6 +898,64 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
     }
 });
 
+test('S4-A parent repository rebuild prunes nested repositories before charging traversal budget',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const repoRoot=file('parent-repo-prune');
+    const nestedRepo=path.join(repoRoot,'nested-repo');
+    fs.mkdirSync(nestedRepo,{recursive:true});
+    const parentProbe=path.join(repoRoot,'ProbeName');
+    const parentFile=path.join(repoRoot,'parent.txt');
+    const nestedFile=path.join(nestedRepo,'nested.txt');
+    fs.writeFileSync(parentProbe,'probe');
+    fs.writeFileSync(parentFile,'parent branch baseline');
+    fs.writeFileSync(nestedFile,'nested current');
+    for(let i=0;i<8;i++) fs.writeFileSync(path.join(nestedRepo,`bulk-${i}.txt`),'nested');
+    const folder={uri:Uri.file(repoRoot),name:'parent-repo'};
+    const getFolder=uri=>{
+        const relative=path.relative(repoRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(file('parent-repo-prune-storage')));
+        tracker.isRecording=false;tracker.externalWatcherEnabled=false;tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        tracker.fileSnapshots.set(parentFile,'parent old baseline');
+        tracker.fileSnapshots.set(nestedFile,'nested old baseline');
+        tracker.baselineExistingFiles.add(parentFile);
+        tracker.baselineExistingFiles.add(nestedFile);
+
+        const parentBase={repoRoot,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+        const nestedBase={repoRoot:nestedRepo,kind:'repository',headName:'main',headCommit:'nnn',detached:false,inProgress:false};
+        const parentCurrent={...parentBase,headName:'feature',headCommit:'bbb'};
+        tracker.setBaselineGitContexts([parentBase,nestedBase]);
+        tracker.observeGitContext(parentCurrent);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+
+        assert.equal(await tracker.rebuildRepositoryBaseline(repoRoot,parentCurrent),true);
+        assert.equal(tracker.getOriginalContent(parentFile),'parent branch baseline');
+        assert.equal(tracker.getOriginalContent(nestedFile),'nested old baseline',
+            'parent rebuild must preserve baselines owned by the nested repository');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 for(const layout of ['ancestor-repo','repo-workspace-with-nested-root']) test(`S4-A repository rebuild scans all overlapping workspace slices: ${layout}`,async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
@@ -3405,6 +3463,68 @@ test('S4-A Rules preflight prunes ordinary-policy ignored directories unless exp
     }
 });
 
+test('S4-A Rules preflight loads ordinary ignore policy for a newly added workspace root',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=file('preflight-existing-root');
+    const rootB=file('preflight-added-root');
+    const ignoredDir=path.join(rootB,'node_modules');
+    fs.mkdirSync(rootA,{recursive:true});
+    fs.mkdirSync(ignoredDir,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
+    fs.writeFileSync(path.join(ignoredDir,'package.txt'),'ignored');
+    const folderA={uri:Uri.file(rootA),name:'existing'};
+    const folderB={uri:Uri.file(rootB),name:'added'};
+    const getFolder=uri=>[folderA,folderB].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    const originalOpendir=fs.promises.opendir;
+    let ignoredOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folderA];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.ignoreMatchers.has(rootB),false);
+
+        vscode.workspace.workspaceFolders=[folderA,folderB];
+        workspaceChanged({added:[folderB],removed:[]});
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(ignoredDir)){
+                ignoredOpens++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.unreadableDirectoryCount,0,
+            'new-root node_modules must be pruned by ordinary policy before traversal');
+        assert.equal(ignoredOpens,0);
+        assert.equal(tracker.ignoreMatchers.has(rootB),false,
+            'preflight may build a local matcher but must not publish candidate matcher state');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A bounded preflight truncates at its work budget and invalidates stale requests',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
@@ -4472,6 +4592,61 @@ test('S4-A Whole Workspace discovery skips generic explicit-include findFiles fa
     }
 });
 
+test('S4-A per-folder Whole Workspace scans do not reseed nested roots into the shared work budget',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const outerRoot=file('per-folder-outer');
+    const nestedRoot=path.join(outerRoot,'nested');
+    fs.mkdirSync(nestedRoot,{recursive:true});
+    const outerProbe=path.join(outerRoot,'ProbeName');
+    const outerFile=path.join(outerRoot,'outer.txt');
+    const nestedProbe=path.join(nestedRoot,'ProbeName');
+    const nestedFile=path.join(nestedRoot,'nested.txt');
+    fs.writeFileSync(outerProbe,'outer probe');
+    fs.writeFileSync(outerFile,'outer');
+    fs.writeFileSync(nestedProbe,'nested probe');
+    fs.writeFileSync(nestedFile,'nested');
+    const outer={uri:Uri.file(outerRoot),name:'outer'};
+    const nested={uri:Uri.file(nestedRoot),name:'nested'};
+    const getFolder=uri=>[nested,outer].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    try{
+        vscode.workspace.workspaceFolders=[outer,nested];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        // Unique per-folder traversal inspects 3 outer entries (including the
+        // nested-root boundary) plus 2 nested entries. Reseeding the nested root
+        // during the outer call would consume 7 entries and fail this budget.
+        const budget={remainingEntries:5};
+        const outerFiles=await tracker.findScopeFilesUnderDirectory(outerRoot,budget);
+        const nestedFiles=await tracker.findScopeFilesUnderDirectory(nestedRoot,budget);
+        assert.equal(budget.remainingEntries,0);
+        assert.equal(outerFiles.some(uri=>uri.fsPath===nestedFile),false,
+            'the parent per-folder scan must stop at the nested workspace boundary');
+        assert.equal(nestedFiles.some(uri=>uri.fsPath===nestedFile),true);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('S4-A Whole Workspace restore shares traversal and capacity budgets across roots',async()=>{
     const previousFolders=vscode.workspace.workspaceFolders;
     const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
@@ -4680,6 +4855,29 @@ test('S4-A watcher-excluded include shadowed by explicit exclusion does not requ
     tracker=new DiffTracker(Uri.file(storage));
     assert.equal(await tracker.restorePersistedState(),'restored',
         'restore must preserve exclusion precedence over the shadowed include');
+});
+
+test('S4-A Rules file include requires S4-B when an ancestor directory is watcher-excluded',async()=>{
+    const vendor=file('watcher-ancestor-vendor');
+    const includeFile=path.join(vendor,'file.txt');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(includeFile,'included');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const relativeFile=path.relative(root,includeFile).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeFile}],excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/watcherExclude|supplemental/i);
 });
 
 test('S4-A Rules include prefix still requires coverage when only descendants are excluded',async()=>{
