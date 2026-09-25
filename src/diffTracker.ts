@@ -5481,11 +5481,11 @@ export class DiffTracker {
                 wholeWorkspacePersistenceBudget =
                     this.createCandidatePersistenceBudget(scanFingerprint);
             }
-            vscode.workspace.textDocuments.forEach(doc => {
+            for (const doc of vscode.workspace.textDocuments) {
                 if (!transientPaths.has(doc.uri.fsPath)) {
                     this.ensureSnapshotForDocument(doc, true, wholeWorkspacePersistenceBudget);
                 }
-            });
+            }
             if (wholeWorkspacePersistenceBudget) {
                 // Unsupported/uncertain document handling can add unresolved
                 // evidence without going through the text capture branch.
@@ -5576,6 +5576,12 @@ export class DiffTracker {
             }
         }
 
+        if (wholeWorkspacePersistenceBudget) {
+            // One final event-loop yield follows the last candidate batch. Any
+            // watcher/editor evidence that arrived in that window must join the
+            // same durable budget before the baseline can cross the Ready barrier.
+            this.synchronizeCandidateUnresolvedBudget(wholeWorkspacePersistenceBudget);
+        }
         this.scanCoverage = scanIgnoreVersion === this.ignoreRefreshVersion ? scanFingerprint : undefined;
         await this.completeBaseline(epoch, transaction);
     }
@@ -8815,6 +8821,10 @@ export class DiffTracker {
             if (!this.snapshotInitialized) { this.baselineExistingFiles.add(filePath); }
             else { this.updateTrackedDiff(filePath, content); }
         } catch (error) {
+            // Persistence capacity is a preparation failure, not a file-read
+            // failure. Do not translate a sealed budget into unresolved review
+            // evidence or continue capturing later open documents.
+            if (persistenceBudget?.failedReason) { throw error; }
             if (!this.isFileNotFound(error)) {
                 this.markFileUnavailable(filePath, 'Baseline cannot be read or decoded');
                 return;
