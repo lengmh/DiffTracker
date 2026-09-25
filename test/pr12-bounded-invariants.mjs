@@ -236,9 +236,47 @@ export function registerPR12BoundedInvariants(h) {
         );
         assert.ok(tracker.fileSnapshots.size<2,
             'open documents must stop being retained as soon as the durable byte budget is exhausted');
+        assert.equal(tracker.unresolvedBaselineFiles.has(second),false,
+            'a persistence-budget exception must escape editor capture instead of being converted into unreadable baseline evidence');
+        assert.equal(tracker.getTrackedChanges().some(change=>change.filePath===second),false,
+            'budget failure must not manufacture a review for the rejected editor baseline');
         assert.ok(serialized(tracker)<=tracker.maxPersistedBytes,
             'failed startup document capture must never retain a state beyond the configured durable byte limit');
         assert.equal(tracker.getBaselineState(),'building');
+    }));
+
+    test('PR12 AUDIT Whole Workspace Start reconciles watcher evidence after the final yield',()=>fixture(async({tracker,dir})=>{
+        const candidate=path.join(dir,'final-yield-candidate.txt');
+        const late=path.join(dir,'final-yield-late.txt');
+        fs.writeFileSync(candidate,'candidate baseline');
+        tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        await tracker.refreshIgnoreMatchers();
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=tracker.ignoreFingerprint;
+        const baseBytes=Buffer.byteLength(JSON.stringify(state),'utf8');
+        tracker.maxPersistedBytes=baseBytes+900;
+
+        const originalYield=tracker.yieldToEventLoop.bind(tracker);
+        let injected=false;
+        tracker.yieldToEventLoop=async()=>{
+            if(!injected){
+                injected=true;
+                tracker.recordUnresolvedBaseline(late,'late watcher evidence '.repeat(80));
+                return;
+            }
+            await originalYield();
+        };
+        try {
+            await assert.rejects(
+                ()=>tracker.initializeWorkspaceSnapshots(),
+                /persisted byte capacity.*concurrent evidence|capacity exceeded by concurrent evidence/i
+            );
+            assert.equal(injected,true);
+            assert.equal(tracker.getBaselineState(),'building',
+                'late watcher evidence must be rejected before the Ready persistence barrier');
+        } finally {
+            tracker.yieldToEventLoop=originalYield;
+        }
     }));
 
     test('PR12 AUDIT repository rebuild budgets against history after owned items are removed',()=>fixture(async({tracker,dir})=>{
