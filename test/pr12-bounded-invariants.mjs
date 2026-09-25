@@ -279,6 +279,40 @@ export function registerPR12BoundedInvariants(h) {
         }
     }));
 
+
+    test('PR12 AUDIT Whole Workspace completion resynchronizes evidence added during pending-event processing',()=>fixture(async({tracker,dir})=>{
+        const candidate=path.join(dir,'completion-candidate.txt');
+        const late=path.join(dir,'completion-late.txt');
+        fs.writeFileSync(candidate,'candidate');
+        tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        await tracker.refreshIgnoreMatchers();
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=tracker.ignoreFingerprint;
+        const baseBytes=Buffer.byteLength(JSON.stringify(state),'utf8');
+        tracker.maxPersistedBytes=baseBytes+900;
+
+        const originalProcess=tracker.processPendingExternalChanges.bind(tracker);
+        let injected=false;
+        tracker.processPendingExternalChanges=async()=>{
+            await originalProcess();
+            if(!injected){
+                injected=true;
+                tracker.recordUnresolvedBaseline(late,'completion watcher evidence '.repeat(80));
+            }
+        };
+        try {
+            await assert.rejects(
+                ()=>tracker.initializeWorkspaceSnapshots(),
+                /persisted byte capacity.*concurrent evidence|capacity exceeded by concurrent evidence/i
+            );
+            assert.equal(injected,true);
+            assert.equal(tracker.getBaselineState(),'building',
+                'completion-time evidence must be budgeted before the Ready persistence write');
+        } finally {
+            tracker.processPendingExternalChanges=originalProcess;
+        }
+    }));
+
     test('PR12 AUDIT repository rebuild budgets against history after owned items are removed',()=>fixture(async({tracker,dir})=>{
         const target=path.join(dir,'history-rebuild.txt');
         fs.writeFileSync(target,'branch baseline '.repeat(220));
