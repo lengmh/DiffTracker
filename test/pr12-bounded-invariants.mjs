@@ -361,6 +361,30 @@ export function registerPR12BoundedInvariants(h) {
             'the explicit metadata-file exclusion itself remains effective');
     }));
 
+    test('PR12 AUDIT Whole Workspace never reads Git exclude policy metadata',()=>fixture(async({tracker,dir})=>{
+        const gitInfo=path.join(dir,'.git','info');fs.mkdirSync(gitInfo,{recursive:true});
+        const exclude=path.join(gitInfo,'exclude');fs.writeFileSync(exclude,'ignored-by-git.txt\n');
+        const target=path.join(dir,'ignored-by-git.txt');fs.writeFileSync(target,'whole workspace baseline');
+        const requested=scopeFor(tracker,'wholeWorkspace',[]);
+        const originalOpen=fs.promises.open;let attempts=0;
+        fs.promises.open=async(targetPath,...args)=>{
+            if(path.resolve(String(targetPath))===path.resolve(exclude)){
+                attempts++;
+                throw new Error('Whole Workspace must not read .git/info/exclude');
+            }
+            return originalOpen(targetPath,...args);
+        };
+        try {
+            const preflight=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+            assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+            tracker.effectiveMonitoringScope=requested;
+            await tracker.refreshIgnoreMatchers();
+            assert.equal(attempts,0);
+            assert.equal(tracker.isPathIgnored(Uri.file(target)),false,
+                'Git exclude policy must not define Whole Workspace membership');
+        } finally {fs.promises.open=originalOpen;}
+    }));
+
     test('PR12 AUDIT imported-tree watcher installation is streaming and bounded before candidate scan',()=>fixture(async({tracker,dir})=>{
         const imported=path.join(dir,'imported-watch-budget');fs.mkdirSync(imported);
         for(let i=0;i<4;i++) fs.mkdirSync(path.join(imported,`child-${i}`));
