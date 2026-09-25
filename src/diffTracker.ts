@@ -3397,6 +3397,40 @@ export class DiffTracker {
         };
     }
 
+    private validateCandidatePersistenceProjection(
+        budget: CandidatePersistenceBudget
+    ): string {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+
+        // First absorb live unresolved evidence into the incremental ledger, then
+        // validate the exact Session V4 payload. This final projection catches
+        // concurrently mutable durable evidence outside the baseline maps too,
+        // including coverage gaps and retained-review metadata.
+        this.synchronizeCandidateUnresolvedBudget(budget);
+        const state = this.buildPersistedState();
+        if (!state) { return ''; }
+        state.baselineState = 'ready';
+        if (!this.parsePersistedState(state)) {
+            fail(
+                'Monitoring scope final persistence projection exceeds Session V4 schema/count limits; ' +
+                'narrow the scope before retrying.'
+            );
+        }
+        const payload = JSON.stringify(state);
+        if (Buffer.byteLength(payload, 'utf8') > this.maxPersistedBytes) {
+            fail(
+                'Monitoring scope final persistence projection exceeds ' +
+                this.maxPersistedBytes +
+                ' bytes; narrow the scope before retrying.'
+            );
+        }
+        return payload;
+    }
+
     private planScannedBaseline(
         filePath: string,
         state: CurrentFileState,
@@ -5146,7 +5180,12 @@ export class DiffTracker {
             return matcher;
         }
         const info = path.join(rootPath, '.git', 'info', 'exclude');
-        if (fs.existsSync(info)) {
+        let infoStat: fs.Stats | undefined;
+        try { infoStat = fs.lstatSync(info); }
+        catch (error) {
+            if (!this.isFileNotFound(error)) { throw error; }
+        }
+        if (infoStat) {
             const text = await this.readBudgetedIgnoreFile(vscode.Uri.file(info), rootPath, budget);
             this.addGitignorePatterns(matcher, text, '');
             evidence.push('.git/info/exclude', text);
@@ -5643,24 +5682,17 @@ export class DiffTracker {
         let evidenceChangedDuringFlush: boolean;
         do {
             version = this.baselineCompletionVersion;
-            if (persistenceBudget) {
-                // Pending-event processing can create unresolved evidence after
-                // the scanner's last yield. Reconcile immediately before each
-                // durable write, then verify again after the awaited write. If
-                // evidence arrived during persistence, loop and persist the
-                // newly budgeted state before exposing Ready.
-                this.synchronizeCandidateUnresolvedBudget(persistenceBudget);
-            }
-            const unresolvedRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
-                ? this.unresolvedBaselineFiles.revision : undefined;
+            // Pending-event processing can mutate several persisted evidence
+            // categories. Validate the exact Ready payload immediately before
+            // writing, then compare the whole projection after the awaited write.
+            const projectionBefore = persistenceBudget
+                ? this.validateCandidatePersistenceProjection(persistenceBudget)
+                : undefined;
             if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) { return false; }
-            if (persistenceBudget) {
-                this.synchronizeCandidateUnresolvedBudget(persistenceBudget);
-            }
-            const afterRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
-                ? this.unresolvedBaselineFiles.revision : undefined;
-            evidenceChangedDuringFlush = unresolvedRevision !== undefined &&
-                afterRevision !== undefined && unresolvedRevision !== afterRevision;
+            const projectionAfter = persistenceBudget
+                ? this.validateCandidatePersistenceProjection(persistenceBudget)
+                : undefined;
+            evidenceChangedDuringFlush = projectionBefore !== projectionAfter;
         } while (version !== this.baselineCompletionVersion || evidenceChangedDuringFlush);
         if (transaction?.valid && !transaction.valid()) { return false; }
         this.baselineBuilding = false;
