@@ -74,7 +74,7 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(searches,0,'configured metadata discovery must not materialize global search results');
             await assert.rejects(()=>tracker.refreshIgnoreMatchers(),/preparation.*budget|discovery.*limit/i);
         } finally {vscode.workspace.findFiles=oldFind;}
-    }));
+    },'rules'));
 
     test('PR12 AUDIT policy content has a cumulative byte bound before matcher publication',()=>fixture(async({tracker,scope,dir})=>{
         const target=path.join(dir,'.gitignore');fs.writeFileSync(target,'x'.repeat(512));
@@ -85,7 +85,7 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(result.status,'failed',JSON.stringify(result));assert.match(result.reason??'',/byte/i);
             assert.equal(tracker.ignoreMatchers,before);
         } finally {h.setListedIgnores([]);}
-    }));
+    },'rules'));
 
     test('PR12 AUDIT Start uses bounded configured policy discovery rather than a search fallback',()=>fixture(async({tracker,scope,dir})=>{
         fs.writeFileSync(path.join(dir,'candidate.txt'),'baseline');
