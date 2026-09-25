@@ -5615,10 +5615,14 @@ export class DiffTracker {
             this.synchronizeCandidateUnresolvedBudget(wholeWorkspacePersistenceBudget);
         }
         this.scanCoverage = scanIgnoreVersion === this.ignoreRefreshVersion ? scanFingerprint : undefined;
-        await this.completeBaseline(epoch, transaction);
+        await this.completeBaseline(epoch, transaction, wholeWorkspacePersistenceBudget);
     }
 
-    private async completeBaseline(epoch: number, transaction?: BaselineTransaction): Promise<boolean> {
+    private async completeBaseline(
+        epoch: number,
+        transaction?: BaselineTransaction,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): Promise<boolean> {
         ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
@@ -5629,10 +5633,28 @@ export class DiffTracker {
             this.persistTimer = undefined;
         }
         let version: number;
+        let evidenceChangedDuringFlush: boolean;
         do {
             version = this.baselineCompletionVersion;
+            if (persistenceBudget) {
+                // Pending-event processing can create unresolved evidence after
+                // the scanner's last yield. Reconcile immediately before each
+                // durable write, then verify again after the awaited write. If
+                // evidence arrived during persistence, loop and persist the
+                // newly budgeted state before exposing Ready.
+                this.synchronizeCandidateUnresolvedBudget(persistenceBudget);
+            }
+            const unresolvedRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                ? this.unresolvedBaselineFiles.revision : undefined;
             if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) { return false; }
-        } while (version !== this.baselineCompletionVersion);
+            if (persistenceBudget) {
+                this.synchronizeCandidateUnresolvedBudget(persistenceBudget);
+            }
+            const afterRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                ? this.unresolvedBaselineFiles.revision : undefined;
+            evidenceChangedDuringFlush = unresolvedRevision !== undefined &&
+                afterRevision !== undefined && unresolvedRevision !== afterRevision;
+        } while (version !== this.baselineCompletionVersion || evidenceChangedDuringFlush);
         if (transaction?.valid && !transaction.valid()) { return false; }
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
