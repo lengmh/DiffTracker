@@ -313,13 +313,58 @@ export function registerPR12BoundedInvariants(h) {
         }
     }));
 
+    test('PR12 AUDIT Whole Workspace completion budgets concurrent coverage-gap evidence before Ready write',()=>fixture(async({tracker,dir})=>{
+        const candidate=path.join(dir,'coverage-gap-candidate.txt');
+        const gapPath=path.join(dir,'coverage-gap-directory');
+        fs.writeFileSync(candidate,'candidate baseline');
+        tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        await tracker.refreshIgnoreMatchers();
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=tracker.ignoreFingerprint;
+        const baseBytes=Buffer.byteLength(JSON.stringify(state),'utf8');
+        tracker.maxPersistedBytes=baseBytes+900;
+
+        const originalProcess=tracker.processPendingExternalChanges.bind(tracker);
+        const originalFlush=tracker.flushPersistState.bind(tracker);
+        let injected=false,flushes=0;
+        tracker.processPendingExternalChanges=async()=>{
+            await originalProcess();
+            if(!injected){
+                injected=true;
+                tracker.setSubtreeCoverageGap(
+                    gapPath,
+                    'test-concurrent-gap',
+                    'coverage gap evidence '.repeat(80)
+                );
+            }
+        };
+        tracker.flushPersistState=async(...args)=>{flushes++;return originalFlush(...args);};
+        try {
+            await assert.rejects(
+                ()=>tracker.initializeWorkspaceSnapshots(),
+                /persistence projection|coverage|persisted byte capacity|schema.*limit/i
+            );
+            assert.equal(injected,true);
+            assert.equal(flushes,0,
+                'completion budget must reject oversized concurrent coverage evidence before the Ready persistence write');
+            assert.equal(tracker.getBaselineState(),'building');
+        } finally {
+            tracker.processPendingExternalChanges=originalProcess;
+            tracker.flushPersistState=originalFlush;
+        }
+    }));
+
     test('PR12 AUDIT repository rebuild budgets against history after owned items are removed',()=>fixture(async({tracker,dir})=>{
-        const target=path.join(dir,'history-rebuild.txt');
-        fs.writeFileSync(target,'branch baseline '.repeat(220));
-        tracker.fileSnapshots.set(target,'old');
-        tracker.baselineExistingFiles.add(target);
-        tracker.updateTrackedDiff(target,fs.readFileSync(target,'utf8'));
-        const item=tracker.createFileRevertItem(target);
+        const historyTarget=path.join(dir,'history-source.txt');
+        const replacement=path.join(dir,'history-rebuild.txt');
+        fs.writeFileSync(historyTarget,'history current');
+        fs.writeFileSync(replacement,'branch baseline '.repeat(220));
+        tracker.fileSnapshots.set(historyTarget,'history baseline');
+        tracker.baselineExistingFiles.add(historyTarget);
+        tracker.updateTrackedDiff(historyTarget,'history current');
+        tracker.fileSnapshots.set(replacement,'old replacement baseline');
+        tracker.baselineExistingFiles.add(replacement);
+        const item=tracker.createFileRevertItem(historyTarget);
         assert.ok(item);
         tracker.revertHistory=[{
             id:'repo-history-large',
@@ -341,8 +386,9 @@ export function registerPR12BoundedInvariants(h) {
 
         assert.equal(await tracker.rebuildRepositoryBaseline(dir,current),true,
             'history that is guaranteed to be removed must not consume replacement-baseline budget');
-        assert.equal(tracker.getOriginalContent(target),fs.readFileSync(target,'utf8'));
-        assert.equal(tracker.revertHistory.some(record=>record.items.some(historyItem=>historyItem.filePath===target)),false);
+        assert.equal(tracker.getOriginalContent(replacement),fs.readFileSync(replacement,'utf8'),
+            'replacement baseline must still be captured while obsolete history is projected out');
+        assert.equal(tracker.revertHistory.some(record=>record.items.some(historyItem=>historyItem.filePath===historyTarget)),false);
         assert.ok(serialized(tracker)<=tracker.maxPersistedBytes);
     }));
 
@@ -384,6 +430,28 @@ export function registerPR12BoundedInvariants(h) {
                 'Git exclude policy must not define Whole Workspace membership');
         } finally {fs.promises.open=originalOpen;}
     }));
+
+    test('PR12 AUDIT Rules mode fails closed when Git exclude metadata cannot be inspected',()=>fixture(async({tracker,dir})=>{
+        const gitInfo=path.join(dir,'.git','info');fs.mkdirSync(gitInfo,{recursive:true});
+        const exclude=path.join(gitInfo,'exclude');fs.writeFileSync(exclude,'private.txt\n');
+        const requested=scopeFor(tracker,'rules',[]);
+        const originalLstat=fs.lstatSync;let attempts=0;
+        fs.lstatSync=function(target,...args){
+            if(path.resolve(String(target))===path.resolve(exclude)){
+                attempts++;
+                throw Object.assign(new Error('access denied'),{code:'EACCES'});
+            }
+            return originalLstat(target,...args);
+        };
+        try {
+            const preflight=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+            assert.equal(preflight.status,'failed',JSON.stringify(preflight));
+            assert.match(preflight.reason??'',/access denied|EACCES|ignore policy/i);
+            assert.ok(attempts>0,'Rules mode must inspect repository exclude metadata rather than silently omitting it');
+            tracker.effectiveMonitoringScope=requested;
+            await assert.rejects(()=>tracker.refreshIgnoreMatchers(),/access denied|EACCES|ignore policy/i);
+        } finally {fs.lstatSync=originalLstat;}
+    },'rules'));
 
     test('PR12 AUDIT imported-tree watcher installation is streaming and bounded before candidate scan',()=>fixture(async({tracker,dir})=>{
         const imported=path.join(dir,'imported-watch-budget');fs.mkdirSync(imported);
