@@ -379,4 +379,34 @@ export function registerPR12BoundedInvariants(h) {
         } finally {tracker.findScopeFilesUnderDirectory=originalFind;}
     }));
 
+
+    test('PR12 AUDIT imported-tree watcher descends through unknown Dirent types',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'unknown-dirent-watch');
+        const nested=path.join(imported,'nested');
+        fs.mkdirSync(nested,{recursive:true});
+        const originalOpen=fs.promises.opendir;
+        fs.promises.opendir=async(target,...args)=>{
+            const handle=await originalOpen(target,...args);
+            if(path.resolve(String(target))!==path.resolve(imported)) return handle;
+            const originalRead=handle.readSync.bind(handle);
+            handle.readSync=()=>{
+                const entry=originalRead();
+                if(!entry||entry.name!=='nested') return entry;
+                return {
+                    name:entry.name,
+                    isDirectory:()=>false,
+                    isFile:()=>false,
+                    isSymbolicLink:()=>false
+                };
+            };
+            return handle;
+        };
+        try {
+            await tracker.watchImportedTree(imported,tracker.sessionEpoch);
+            assert.ok(tracker.importedDirectoryWatchers.has(imported));
+            assert.ok(tracker.importedDirectoryWatchers.has(nested),
+                'unknown directory entries must use lstat fallback and receive direct imported-tree watchers');
+        } finally {fs.promises.opendir=originalOpen;}
+    }));
+
 }
