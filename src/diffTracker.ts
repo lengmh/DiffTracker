@@ -5416,6 +5416,7 @@ export class DiffTracker {
             this.effectiveMonitoringScope.mode === 'wholeWorkspace'
                 ? { remainingEntries: this.maxScopePreflightEntries }
                 : undefined;
+        let wholeWorkspacePersistenceBudget: CandidatePersistenceBudget | undefined;
         if (this.initialIgnoreEpoch === epoch) {
             const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
             // Keep each path's first event across I/O rounds. An event arriving
@@ -5473,9 +5474,23 @@ export class DiffTracker {
                 this.pendingExternalChanges.add(filePath);
             }
             // Unchanged editors may be ahead of disk. Changed paths stay unknown.
+            // Whole Workspace must create the durable budget before copying any
+            // editor contents into the baseline so open documents cannot bypass
+            // the same incremental byte/category limits as filesystem candidates.
+            if (wholeWorkspacePreparationBudget) {
+                wholeWorkspacePersistenceBudget =
+                    this.createCandidatePersistenceBudget(scanFingerprint);
+            }
             vscode.workspace.textDocuments.forEach(doc => {
-                if (!transientPaths.has(doc.uri.fsPath)) { this.ensureSnapshotForDocument(doc, true); }
+                if (!transientPaths.has(doc.uri.fsPath)) {
+                    this.ensureSnapshotForDocument(doc, true, wholeWorkspacePersistenceBudget);
+                }
             });
+            if (wholeWorkspacePersistenceBudget) {
+                // Unsupported/uncertain document handling can add unresolved
+                // evidence without going through the text capture branch.
+                this.synchronizeCandidateUnresolvedBudget(wholeWorkspacePersistenceBudget);
+            }
         }
 
         const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
@@ -5491,9 +5506,10 @@ export class DiffTracker {
                     countedCandidates: new Set<string>()
                 }
                 : undefined;
-        const wholeWorkspacePersistenceBudget = wholeWorkspacePreparationBudget
-            ? this.createCandidatePersistenceBudget(scanFingerprint)
-            : undefined;
+        if (wholeWorkspacePreparationBudget && !wholeWorkspacePersistenceBudget) {
+            wholeWorkspacePersistenceBudget =
+                this.createCandidatePersistenceBudget(scanFingerprint);
+        }
 
         for (const folder of folders) {
             if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
@@ -6933,6 +6949,14 @@ export class DiffTracker {
                 this.markLineChangesUpdated(filePath);
             }
 
+            // Repository rebuild permanently drops recovery history owned by the
+            // repository. Remove those items before projecting durable capacity
+            // so obsolete history cannot consume replacement-baseline bytes.
+            this.revertHistory = this.revertHistory.map(record => ({
+                ...record,
+                items: record.items.filter(item => !ownsPath(item.filePath))
+            })).filter(record => record.items.length > 0);
+
             const projectedScanCoverage =
                 previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
             const repositoryPersistenceBudget =
@@ -6966,10 +6990,6 @@ export class DiffTracker {
             });
 
             if (!contextStillCurrent()) { throw new Error('Git context changed during baseline rebuild'); }
-            this.revertHistory = this.revertHistory.map(record => ({
-                ...record,
-                items: record.items.filter(item => !ownsPath(item.filePath))
-            })).filter(record => record.items.length > 0);
             this.baselineGitContexts.set(repoRoot, { ...context });
             this.scanCoverage = projectedScanCoverage;
             this.resetChangeBlocksCaches();
@@ -8724,7 +8744,11 @@ export class DiffTracker {
         }
     }
 
-    private ensureSnapshotForDocument(doc: vscode.TextDocument, useDocumentContent = false): void {
+    private ensureSnapshotForDocument(
+        doc: vscode.TextDocument,
+        useDocumentContent = false,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): void {
         if (!this.isRecording || this.initialIgnoreEpoch === this.sessionEpoch || this.restoringEpoch !== undefined) {
             return;
         }
@@ -8778,14 +8802,29 @@ export class DiffTracker {
                 this.markFileUnavailable(filePath, 'Baseline is unsupported or exceeds the 5 MiB limit');
                 return;
             }
+            const mode = stat.mode & 0o777;
+            if (!this.snapshotInitialized && persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(
+                    filePath,
+                    { kind: 'text', content, mode, baselineExists: true },
+                    persistenceBudget
+                );
+            }
             this.fileSnapshots.set(filePath, this.snapshotInitialized ? '' : content);
-            this.fileModes.set(filePath, stat.mode & 0o777);
+            this.fileModes.set(filePath, mode);
             if (!this.snapshotInitialized) { this.baselineExistingFiles.add(filePath); }
             else { this.updateTrackedDiff(filePath, content); }
         } catch (error) {
             if (!this.isFileNotFound(error)) {
                 this.markFileUnavailable(filePath, 'Baseline cannot be read or decoded');
                 return;
+            }
+            if (!this.snapshotInitialized && persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(
+                    filePath,
+                    { kind: 'text', content: '', baselineExists: false },
+                    persistenceBudget
+                );
             }
             this.fileSnapshots.set(filePath, '');
             this.baselineExistingFiles.delete(filePath);
