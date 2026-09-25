@@ -6521,6 +6521,16 @@ export class DiffTracker {
                             await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
                         }
                     }
+                    if (!scanEvent && creationIsCurrent()) {
+                        // Child publications share one incremental budget. Persist
+                        // once after the bounded parent scan so the first capacity
+                        // failure aborts the whole import instead of being hidden by
+                        // a child-level completeBaseline() return.
+                        this.validateCandidatePersistenceProjection(childPersistenceBudget);
+                        if (!await this.flushPendingPersistence()) {
+                            throw new Error('Created directory baseline changes could not be persisted');
+                        }
+                    }
                     if (watchFailed && creationIsCurrent()) {
                         await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
                     } else if (creationIsCurrent()) {
@@ -6574,8 +6584,9 @@ export class DiffTracker {
                 this.fileSnapshots.set(filePath, '');
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
+                } else if (!await this.completeBaseline(epoch)) {
+                    return;
                 }
-                if (!await this.completeBaseline(epoch)) { return; }
             }
             if (this.reconcileOpaqueBaseline(filePath, state)) {
                 return;
