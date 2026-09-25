@@ -216,4 +216,62 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=oldOpen;fs.readdirSync=oldRead;}
     });
 
+
+    test('PR12 AUDIT Whole Workspace Start budgets open-document baselines before retention',()=>fixture(async({tracker,dir})=>{
+        const first=path.join(dir,'open-first.txt'),second=path.join(dir,'open-second.txt');
+        fs.writeFileSync(first,'a'.repeat(800));fs.writeFileSync(second,'b'.repeat(800));
+        document(first);document(second);
+        tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        tracker.initialIgnoreEpoch=tracker.sessionEpoch;
+        await tracker.refreshIgnoreMatchers();
+        const projected=tracker.ignoreFingerprint;
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=projected;
+        const baseBytes=Buffer.byteLength(JSON.stringify(state),'utf8');
+        tracker.maxPersistedBytes=baseBytes+1500;
+
+        await assert.rejects(
+            ()=>tracker.initializeWorkspaceSnapshots(),
+            /persisted byte capacity|exceed.*bytes/i
+        );
+        assert.ok(tracker.fileSnapshots.size<2,
+            'open documents must stop being retained as soon as the durable byte budget is exhausted');
+        assert.ok(serialized(tracker)<=tracker.maxPersistedBytes,
+            'failed startup document capture must never retain a state beyond the configured durable byte limit');
+        assert.equal(tracker.getBaselineState(),'building');
+    }));
+
+    test('PR12 AUDIT repository rebuild budgets against history after owned items are removed',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'history-rebuild.txt');
+        fs.writeFileSync(target,'branch baseline '.repeat(220));
+        tracker.fileSnapshots.set(target,'old');
+        tracker.baselineExistingFiles.add(target);
+        tracker.updateTrackedDiff(target,fs.readFileSync(target,'utf8'));
+        const item=tracker.createFileRevertItem(target);
+        assert.ok(item);
+        tracker.revertHistory=[{
+            id:'repo-history-large',
+            createdAt:new Date().toISOString(),
+            items:[{
+                ...item,
+                before:{...item.before,content:'history-before '.repeat(900)},
+                after:{...item.after,content:'history-after '.repeat(900)}
+            }]
+        }];
+
+        const base={repoRoot:dir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+        const current={...base,headName:'feature',headCommit:'bbb'};
+        tracker.setBaselineGitContexts([base]);
+        tracker.observeGitContext(current);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const currentBytes=serialized(tracker);
+        tracker.maxPersistedBytes=currentBytes+1200;
+
+        assert.equal(await tracker.rebuildRepositoryBaseline(dir,current),true,
+            'history that is guaranteed to be removed must not consume replacement-baseline budget');
+        assert.equal(tracker.getOriginalContent(target),fs.readFileSync(target,'utf8'));
+        assert.equal(tracker.revertHistory.some(record=>record.items.some(historyItem=>historyItem.filePath===target)),false);
+        assert.ok(serialized(tracker)<=tracker.maxPersistedBytes);
+    }));
+
 }
