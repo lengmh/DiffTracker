@@ -312,4 +312,71 @@ export function registerPR12BoundedInvariants(h) {
         assert.ok(serialized(tracker)<=tracker.maxPersistedBytes);
     }));
 
+
+    test('PR12 AUDIT Whole Workspace may explicitly exclude .gitignore without requiring ordinary policy',()=>fixture(async({tracker,scope,dir})=>{
+        fs.writeFileSync(path.join(dir,'.gitignore'),'ignored.txt\n');
+        fs.writeFileSync(path.join(dir,'ignored.txt'),'still in Whole Workspace');
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'.gitignore'}]);
+        const preflight=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        tracker.effectiveMonitoringScope=requested;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'ignored.txt'))),false,
+            'ordinary .gitignore policy must not define Whole Workspace membership');
+        assert.equal(tracker.isPathIgnored(Uri.file(path.join(dir,'.gitignore'))),true,
+            'the explicit metadata-file exclusion itself remains effective');
+    }));
+
+    test('PR12 AUDIT imported-tree watcher installation is streaming and bounded before candidate scan',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'imported-watch-budget');fs.mkdirSync(imported);
+        for(let i=0;i<4;i++) fs.mkdirSync(path.join(imported,`child-${i}`));
+        tracker.maxScopePreflightEntries=2;
+        const oldReaddir=fs.promises.readdir;let materialized=0;
+        fs.promises.readdir=async(...args)=>{materialized++;return oldReaddir(...args);};
+        try {
+            await assert.rejects(
+                ()=>tracker.watchImportedTree(imported,tracker.sessionEpoch,false,{remainingEntries:tracker.maxScopePreflightEntries}),
+                /preparation work budget|inspected directory entries/i
+            );
+            assert.equal(materialized,0,'imported watch discovery must not allocate readdir result arrays');
+            assert.equal([...tracker.importedDirectoryWatchers.keys()].some(candidate=>tracker.pathBelongsToRoot(candidate,imported)),false,
+                'bounded watch failure must roll back partial imported-tree watcher installation');
+        } finally {fs.promises.readdir=oldReaddir;}
+    }));
+
+    test('PR12 AUDIT populated-directory creation stops child baseline publication at the byte budget',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'populated-byte-budget');fs.mkdirSync(imported);
+        const children=[];
+        for(let i=0;i<20;i++){
+            const child=path.join(imported,`child-${String(i).padStart(2,'0')}.txt`);
+            fs.writeFileSync(child,'current');children.push(child);
+        }
+        tracker.maxPersistedBytes=serialized(tracker)+1500;
+        await tracker.onExternalFileCreated(Uri.file(imported));
+        const captured=children.filter(child=>tracker.fileSnapshots.has(child));
+        assert.ok(captured.length<children.length,
+            'the parent scan must abort instead of retaining every child after durable byte capacity is exhausted');
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===imported),
+            'aborted populated-directory capture must preserve an explicit subtree reconciliation obligation');
+    }));
+
+    test('PR12 AUDIT rollback preserves revisioned unresolved accounting maps',()=>fixture(async({tracker,dir})=>{
+        const unresolved=path.join(dir,'rollback-unresolved.txt');
+        tracker.unresolvedBaselineFiles.set(unresolved,'prior unknown evidence');
+        const base={repoRoot:dir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+        const current={...base,headName:'feature',headCommit:'bbb'};
+        tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        tracker.findScopeFilesUnderDirectory=async()=>{throw new Error('forced rollback');};
+        try {
+            assert.equal(await tracker.rebuildRepositoryBaseline(dir,current),false);
+            assert.equal(typeof tracker.unresolvedBaselineFiles.revision,'number',
+                'repository rollback must restore UnresolvedBaselineMap rather than a plain Map');
+            const before=tracker.unresolvedBaselineFiles.revision;
+            tracker.unresolvedBaselineFiles.set(path.join(dir,'after.txt'),'after rollback');
+            assert.ok(tracker.unresolvedBaselineFiles.revision>before);
+        } finally {tracker.findScopeFilesUnderDirectory=originalFind;}
+    }));
+
 }
