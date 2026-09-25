@@ -3169,19 +3169,24 @@ for(const block of [false,true]) for(const failure of ['write','git']) for(const
 for(const failure of ['limit','quota','read']) test(`ROUND27 watcher ${failure} cleans partial coverage and still discovers files`,async()=>{
     const existing=file('watched-existing');fs.mkdirSync(existing);tracker.watchImportedDirectory(existing,tracker.sessionEpoch);
     const dir=file('watch-limit'),child=path.join(dir,'deep'),p=path.join(child,'file.txt');fs.mkdirSync(child,{recursive:true});fs.writeFileSync(p,'imported');listedFiles=[Uri.file(p)];
-    const originalWatch=fs.watch,originalRead=fs.promises.readdir;
+    const originalWatch=fs.watch,originalOpen=fs.promises.opendir;
+    let failWatchRead=true;
     if(failure==='limit')tracker.maxImportedDirectoryWatchers=2;
     if(failure==='quota')fs.watch=(directory,...args)=>{if(directory===child)throw error('ENOSPC');return originalWatch(directory,...args);};
-    if(failure==='read')fs.promises.readdir=async(directory,...args)=>{if(directory===child)throw error('EACCES');return originalRead(directory,...args);};
+    if(failure==='read')fs.promises.opendir=async(directory,...args)=>{
+        if(directory===child&&failWatchRead){failWatchRead=false;throw error('EACCES');}
+        return originalOpen(directory,...args);
+    };
     try{
         for(let attempt=0;attempt<2;attempt++){
+            failWatchRead=true;
             await tracker.onExternalFileCreated(Uri.file(dir));
             assert.equal(pending(p)?.currentContent,'imported');assert.equal(pending(p)?.unavailableReason,undefined);
             assert.equal(pending(dir),undefined);
             assert.match(subtreeGap(dir)?.reason??'',/watch coverage is incomplete/);
             assert.deepEqual(nativeDirectoryWatchers.filter(w=>w.active).map(w=>w.directory),[existing]);
         }
-    }finally{fs.watch=originalWatch;fs.promises.readdir=originalRead;}
+    }finally{fs.watch=originalWatch;fs.promises.opendir=originalOpen;}
 });
 
 
