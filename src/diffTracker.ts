@@ -1119,7 +1119,7 @@ export class DiffTracker {
             fileSnapshots: new Map(this.fileSnapshots),
             fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             trackedChanges: new Map(this.trackedChanges),
             lineChanges: new Map(this.lineChanges),
@@ -1526,6 +1526,7 @@ export class DiffTracker {
 
     private async performImportedDirectoryResume(epoch: number, version: number): Promise<void> {
         if (!this.isRecording || !this.externalWatcherEnabled) { return; }
+        const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
         for (const [directory, previous] of Array.from(this.importedDirectoryWatchers)) {
             if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             if (this.importedDirectoryWatchers.get(directory)?.epoch === epoch ||
@@ -1534,7 +1535,7 @@ export class DiffTracker {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
                 // Register before exposing active watches to overlapping refreshes.
                 this.pendingImportedDirectoryReconciliation.add(directory);
-                await this.watchImportedTree(directory, epoch, previous.provenAbsent);
+                await this.watchImportedTree(directory, epoch, previous.provenAbsent, preparationBudget);
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
@@ -1583,7 +1584,12 @@ export class DiffTracker {
         return true;
     }
 
-    private async watchImportedTree(root: string, epoch: number, inheritedAbsence = false): Promise<void> {
+    private async watchImportedTree(
+        root: string,
+        epoch: number,
+        inheritedAbsence = false,
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
+    ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: ImportedDirectoryWatch; previous?: ImportedDirectoryWatch }>();
         try {
@@ -1596,12 +1602,28 @@ export class DiffTracker {
                 if (this.watchImportedDirectory(directory, epoch, inheritedAbsence)) {
                     installed.set(directory, { current: this.importedDirectoryWatchers.get(directory)!, previous });
                 }
-                const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-                if (!this.isCurrentEpoch(epoch)) { return; }
-                for (const entry of entries) {
-                    // Never follow symlink directories outside the validated tree.
-                    if (entry.isDirectory() && !entry.isSymbolicLink()) {
-                        pending.push(path.join(directory, entry.name));
+                let handle: fs.Dir | undefined;
+                try {
+                    handle = await fs.promises.opendir(directory);
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    while (true) {
+                        const entry = handle.readSync();
+                        if (!entry) { break; }
+                        if (preparationBudget.remainingEntries <= 0) {
+                            throw new Error(
+                                `Monitoring scope preparation work budget would exceed ${this.maxScopePreflightEntries} inspected directory entries while installing imported-tree watchers`
+                            );
+                        }
+                        preparationBudget.remainingEntries--;
+                        // Never follow symlink directories outside the validated tree.
+                        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                            pending.push(path.join(directory, entry.name));
+                        }
+                    }
+                } finally {
+                    if (handle) {
+                        try { handle.closeSync(); }
+                        catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
                     }
                 }
             }
@@ -3755,7 +3777,7 @@ export class DiffTracker {
             fileSnapshots: new Map(this.fileSnapshots),
             fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             postBaselineUnknownFiles: new Set(this.postBaselineUnknownFiles),
             trackedChanges: new Map(this.trackedChanges),
@@ -5009,6 +5031,12 @@ export class DiffTracker {
         const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
         const fileDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, false);
         if (fileDecision.source !== 'explicitExclude') { return 'read'; }
+        if (scope.mode === 'wholeWorkspace') {
+            // Whole Workspace membership ignores ordinary .gitignore policy.
+            // An explicitly excluded policy file can therefore be skipped
+            // without creating a coverage hole in its monitored parent.
+            return 'skip';
+        }
 
         const relativeDir = path.posix.dirname(relative);
         return configuredScopeExplicitlyExcludesSubtree(
@@ -6339,7 +6367,11 @@ export class DiffTracker {
         return true;
     }
 
-    private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {
+    private async onExternalFileCreated(
+        uri: vscode.Uri,
+        duringScan = false,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
@@ -6391,8 +6423,10 @@ export class DiffTracker {
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!creationIsCurrent()) { return; }
+                    const importedPreparationBudget = { remainingEntries: this.maxScopePreflightEntries };
+                    const childPersistenceBudget = this.createCandidatePersistenceBudget();
                     let watchFailed = false;
-                    try { await this.watchImportedTree(filePath, epoch); }
+                    try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget); }
                     catch { watchFailed = true; }
                     if (!creationIsCurrent()) { return; }
                     const durablePaths = new Set([
@@ -6412,14 +6446,14 @@ export class DiffTracker {
                     };
                     const children = await this.findScopeFilesUnderDirectory(
                         filePath,
-                        undefined,
+                        importedPreparationBudget,
                         childCapacityGuard
                     );
                     if (!creationIsCurrent()) { return; }
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
-                            await this.onExternalFileCreated(child, scanEvent);
+                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
                         }
                     }
                     if (watchFailed && creationIsCurrent()) {
@@ -6439,16 +6473,43 @@ export class DiffTracker {
                 return;
             }
             if (scanEvent) {
-                this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
+                const reason = 'File appeared during baseline scan; before-image is unknown';
+                const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+                const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                    ? this.unresolvedBaselineFiles.revision : undefined;
+                if (persistenceBudget) {
+                    this.consumeCandidatePersistenceBudget(
+                        filePath,
+                        { kind: 'unresolved', reason },
+                        persistenceBudget
+                    );
+                }
+                this.recordUnresolvedBaseline(filePath, reason);
+                if (persistenceBudget) {
+                    this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
+                }
                 return;
             }
             const state = await this.readFileSnapshot(uri);
             if (!creationIsCurrent()) { return; }
             if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
                 (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+                const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+                const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                    ? this.unresolvedBaselineFiles.revision : undefined;
+                if (persistenceBudget) {
+                    this.consumeCandidatePersistenceBudget(
+                        filePath,
+                        { kind: 'text', content: '', baselineExists: false },
+                        persistenceBudget
+                    );
+                }
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
+                if (persistenceBudget) {
+                    this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
+                }
                 if (!await this.completeBaseline(epoch)) { return; }
             }
             if (this.reconcileOpaqueBaseline(filePath, state)) {
@@ -6859,7 +6920,7 @@ export class DiffTracker {
             lineChanges: new Map(this.lineChanges),
             inlineViews: new Map(this.inlineViews),
             revertHistory: [...this.revertHistory],
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             baselineGitContexts: new Map(this.baselineGitContexts),
             pausedGitRepositories: new Map(this.pausedGitRepositories),
