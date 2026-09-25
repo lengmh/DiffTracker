@@ -3272,21 +3272,21 @@ for(const failScan of [false,true]) test(`ROUND27 same-fingerprint watch retry r
 for(const failResume of [false,true]) test(`ROUND27 stale failed ${failResume?'watch resume':'reconciliation'} cannot overwrite a newer success`,async()=>{
     tracker.storageUri=Uri.file(file('storage'));tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('stale-reconcile'),p=path.join(dir,'known.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));await tracker.keepAllChangesInFile(p);
     const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));await waitUntil(()=>!!subtreeGap(dir));assert.equal(pending(dir),undefined);
-    const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,read=fs.promises.readdir;let first=true;
-    if(failResume)fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return read(directory,...args);};
+    const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,open=fs.promises.opendir;let first=true;
+    if(failResume)fs.promises.opendir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return open(directory,...args);};
     else vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*'&&first){first=false;entered.resolve();await release.promise;throw error('old scan');}return find(pattern);};
     const old=tracker.refreshIgnoreMatchers();const oldResult=old.then(()=>null,e=>e);
     try{await entered.promise;if(failResume){nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir).error(error('ENOSPC'));}fs.writeFileSync(p,'latest');const latest=tracker.refreshIgnoreMatchers();if(failResume)release.resolve();await latest;assert.equal(pending(p)?.currentContent,'latest');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);release.resolve();assert.equal(await oldResult,null);assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);}
-    finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.readdir=read;}
+    finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.opendir=open;}
 });
 
 
 for(const stop of [false,true]) test(`ROUND27 overlapping successful watch resume retains reconciliation (stop=${stop})`,async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('overlap-resume'),sub=dir,p=path.join(sub,'known.txt'),deleted=path.join(sub,'deleted.txt');fs.mkdirSync(sub,{recursive:true});for(const f of [p,deleted])fs.writeFileSync(f,'base');listedFiles=[p,deleted].map(Uri.file);await tracker.onExternalFileCreated(Uri.file(dir));for(const f of [p,deleted])await tracker.keepAllChangesInFile(f);
     watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();fs.writeFileSync(p,'gap edit');fs.unlinkSync(deleted);const q=path.join(sub,'gap-new.txt');fs.writeFileSync(q,'gap new');listedFiles=[p,q].map(Uri.file);watchExclude=[];
-    const read=fs.promises.readdir,entered=deferred(),release=deferred();let first=true;fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return read(directory,...args);};
+    const open=fs.promises.opendir,entered=deferred(),release=deferred();let first=true;fs.promises.opendir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return open(directory,...args);};
     const old=tracker.refreshIgnoreMatchers();try{await entered.promise;const newer=tracker.refreshIgnoreMatchers();if(stop)tracker.stopRecording();release.resolve();await Promise.all([old,newer]);if(stop){assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);return;}assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);}
-    finally{release.resolve();await old;fs.promises.readdir=read;}
+    finally{release.resolve();await old;fs.promises.opendir=open;}
 });
 
 registerOpaqueBaselineInvariants({
