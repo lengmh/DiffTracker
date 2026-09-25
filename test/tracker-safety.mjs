@@ -43,6 +43,21 @@ const docs = [];
 const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
 const nativeDirectoryWatchers = [];
+const nativeWriteFileSync = fs.writeFileSync.bind(fs);
+const policyArtifacts = new Set();
+fs.writeFileSync = function(target,...args) {
+    const resolved=path.resolve(String(target));
+    if(path.basename(resolved)==='.gitignore' ||
+        resolved.endsWith(path.join('.git','info','exclude'))) {
+        policyArtifacts.add(resolved);
+    }
+    return nativeWriteFileSync(target,...args);
+};
+const clearPriorPolicyArtifacts=()=>{
+    for(const policy of policyArtifacts) fs.rmSync(policy,{force:true});
+    policyArtifacts.clear();
+};
+
 const nativeWatch = fs.watch;
 fs.watch = (directory, options, listener) => {
     fault(root, 'watcher');
@@ -5229,6 +5244,10 @@ if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.star
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
+    // Configured-scope policy discovery now reads the real filesystem. Keep
+    // top-level regressions isolated so a .gitignore created by one fixture
+    // cannot alter a later fixture merely because they share the harness root.
+    clearPriorPolicyArtifacts();
     docs.length=0; watcherInstances.length=0; nativeDirectoryWatchers.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[];listedIgnores=[];vscodeExcludes={}; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }
