@@ -1616,7 +1616,11 @@ export class DiffTracker {
                         }
                         preparationBudget.remainingEntries--;
                         // Never follow symlink directories outside the validated tree.
-                        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+                        // Some NFS/FUSE providers surface UV_DIRENT_UNKNOWN;
+                        // classifyDirectoryEntry supplies the same lstat fallback
+                        // used by bounded candidate enumeration.
+                        const entryKind = this.classifyDirectoryEntry(directory, entry);
+                        if (entryKind === 'directory') {
                             pending.push(path.join(directory, entry.name));
                         }
                     }
