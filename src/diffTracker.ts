@@ -5138,6 +5138,13 @@ export class DiffTracker {
         const identity = this.workspaceRootIdentityForFolder(folder);
         this.checkIgnoreDiscovery(budget);
         if (configuredScopeExplicitlyExcludesSubtree(scope, identity, '')) { return matcher; }
+        if (scope.mode === 'wholeWorkspace') {
+            // Whole Workspace membership is defined by explicit DiffTracker
+            // exclusions plus hard boundaries, not ordinary Git ignore policy.
+            // Skip both .gitignore and .git/info/exclude discovery entirely so
+            // irrelevant policy metadata cannot narrow or block preparation.
+            return matcher;
+        }
         const info = path.join(rootPath, '.git', 'info', 'exclude');
         if (fs.existsSync(info)) {
             const text = await this.readBudgetedIgnoreFile(vscode.Uri.file(info), rootPath, budget);
