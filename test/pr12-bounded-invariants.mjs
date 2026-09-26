@@ -470,6 +470,20 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.promises.readdir=oldReaddir;}
     }));
 
+    test('PR12 AUDIT restore-directory descendant watcher exclusions need no supplemental coverage',()=>fixture(async({tracker,scope})=>{
+        const original=tracker.getVsCodeWatcherExcludePatterns.bind(tracker);
+        try {
+            tracker.getVsCodeWatcherExcludePatterns=()=>['**/.difftracker-restore-*/**'];
+            assert.equal(tracker.configuredScopeNeedsSupplementalCoverage(scope),undefined,
+                'descendant-only restore-directory watcher exclusions are already covered by the hard boundary');
+            tracker.getVsCodeWatcherExcludePatterns=()=>['**/.difftracker-restore-*'];
+            assert.match(tracker.configuredScopeNeedsSupplementalCoverage(scope)??'',/watcherExclude/,
+                'a watcher pattern that can match an ordinary restore-prefixed file must still require supplemental coverage');
+        } finally {
+            tracker.getVsCodeWatcherExcludePatterns=original;
+        }
+    }));
+
     test('PR12 AUDIT populated-directory creation stops child baseline publication at the byte budget',()=>fixture(async({tracker,dir})=>{
         const imported=path.join(dir,'populated-byte-budget');fs.mkdirSync(imported);
         const children=[];
@@ -482,7 +496,9 @@ export function registerPR12BoundedInvariants(h) {
         const captured=children.filter(child=>tracker.fileSnapshots.has(child));
         assert.ok(captured.length<children.length,
             'the parent scan must abort instead of retaining every child after durable byte capacity is exhausted');
-        assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===imported),
+        const importedIdentity=tracker.canonicalTrackingPath(imported);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>
+            tracker.canonicalTrackingPath(gap.targetPath)===importedIdentity),
             'aborted populated-directory capture must preserve an explicit subtree reconciliation obligation');
     }));
 

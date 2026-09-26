@@ -4530,12 +4530,19 @@ export class DiffTracker {
     }
 
     private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
-        const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').split('/');
+        const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')
+            .split('/').filter(Boolean);
         // An exact .git path segment is unmonitorable regardless of whether the
         // leaf is a file or directory. Restore-prefixed names are different:
         // only restore-prefixed directories are hard boundaries, while an
         // ordinary file such as ".difftracker-restore-notes" is monitorable.
-        return segments.some(segment => segment === '.git');
+        // A restore-prefixed segment followed by another path segment can only
+        // match descendants of a directory, so that watcher blind spot is fully
+        // contained by the existing hard boundary.
+        return segments.some((segment, index) =>
+            segment === '.git' ||
+            (segment.startsWith('.difftracker-restore-') && index < segments.length - 1)
+        );
     }
 
     private watcherGlobSegmentMatches(patternSegment: string, value: string, caseSensitive: boolean): boolean {
