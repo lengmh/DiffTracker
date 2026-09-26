@@ -236,8 +236,7 @@ function sameEntryLookup(left: string, right: string): boolean {
 function streamDirectoryEntryIdentity(
     directory: string,
     requested: string,
-    requestedPath: string,
-    caseSensitive: boolean
+    requestedPath: string
 ): { actual?: string; unavailable: boolean } {
     // Fast/common path: watcher and filesystem enumeration normally provide the
     // actual spelling. Scan names without retaining them; this keeps memory
@@ -253,13 +252,10 @@ function streamDirectoryEntryIdentity(
         }
     } finally { handle.closeSync(); }
 
-    if (caseSensitive) {
-        return { unavailable: true };
-    }
-
-    // On an insensitive boundary a differently-cased lookup can resolve to an
-    // existing entry. Preserve the previous hard-link/alias safety rule while
-    // retaining only one candidate; a second match makes the identity ambiguous.
+    // A child directory can have different lookup semantics from the workspace
+    // root (mount points and per-directory case modes are both possible). Preserve
+    // the previous filesystem-identity proof instead of inheriting the root flag:
+    // retain only one matching resource; a second match is ambiguous.
     let match: string | undefined;
     handle = fs.opendirSync(directory);
     try {
@@ -320,8 +316,7 @@ export function resolveRelativePathIdentity(
                     const streamed = streamDirectoryEntryIdentity(
                         current,
                         requested,
-                        requestedPath,
-                        _caseSensitive
+                        requestedPath
                     );
                     actual = streamed.actual;
                     unavailable ||= streamed.unavailable;
