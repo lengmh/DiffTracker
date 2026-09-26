@@ -584,9 +584,12 @@ export function registerPR11ReviewRegressions(h) {
         const identify=t.detectWorkspaceRootCaseSensitivity?.bind(t);
         assert.ok(identify,'tracker should expose the root identity probe to regression tests');
         t.workspaceRootCaseSensitivityCache?.clear();
+        const beforeProbe=fs.statSync(root);
+        const probeTime=new Date(Math.max(Date.now(),beforeProbe.mtimeMs+5000));
+        fs.utimesSync(root,probeTime,probeTime);
         let probes=0;
-        const original=fs.readdirSync;
-        fs.readdirSync=(value,...args)=>{
+        const original=fs.opendirSync;
+        fs.opendirSync=(value,...args)=>{
             if(typeof value==='string'&&path.resolve(value)===path.resolve(root)) probes++;
             return original(value,...args);
         };
@@ -599,7 +602,7 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(probes,afterFirst,
                 'verified root identity must be reused instead of re-enumerating the workspace on every classification');
         }finally{
-            fs.readdirSync=original;
+            fs.opendirSync=original;
         }
     });
 
@@ -735,7 +738,11 @@ export function registerPR11ReviewRegressions(h) {
             const beforeFlags=[t.getIsRecording(),t.snapshotInitialized,t.baselineBuilding,t.externalWatcherEnabled];
             const candidate=scope([...initial.includes,{scope:'all',path:relative(fresh)}]);
             const gate=pause(phase==='read'?fresh:path.join(storage,'session-state.tmp.json'),phase);
-            const op=t.applyConfiguredMonitoringScope(candidate); await gate.entered;
+            const op=t.applyConfiguredMonitoringScope(candidate);
+            await Promise.race([
+                gate.entered,
+                op.then(result=>{throw new Error('Scope Apply completed before the coverage barrier: '+JSON.stringify(result));})
+            ]);
             const publicRevision=t.getEffectiveMonitoringScope().scopeRevision;
             h.setVsCodeExcludes({'files.watcherExclude':{
                 [`**/${path.basename(committedAffected?old:fresh)}`]:true
@@ -869,7 +876,9 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(pending(child)?.reviewKind,'text');
         assert.equal(pending(child)?.isDeleted,false);
 
-        const policy=file('.gitignore');
+        const policy=path.join(root,'.gitignore');
+        const previousPolicy=fs.existsSync(policy)?fs.readFileSync(policy):undefined;
+        try {
         fs.writeFileSync(policy,`${path.basename(dir)}\n`);
         h.setListedIgnores([Uri.file(policy)]);
         await t.refreshIgnoreMatchers();
@@ -893,6 +902,11 @@ export function registerPR11ReviewRegressions(h) {
         assert.equal(review.currentExists,false);
         assert.equal(review.currentContent,'');
         assert.equal(pending(dir),undefined,'ignored directory must not become a file review');
+        } finally {
+            if(previousPolicy===undefined)fs.rmSync(policy,{force:true});
+            else fs.writeFileSync(policy,previousPolicy);
+            h.setListedIgnores([]);
+        }
     });
 
     for(const source of ['files.exclude','search.exclude','gitignore','git-exclude']) for(const kind of ['text','opaque','unknown']) test(`PR11 ordinary scope contraction ${source} retains ${kind} through reload`,async()=>{
@@ -903,8 +917,11 @@ export function registerPR11ReviewRegressions(h) {
         if(kind==='unknown')t.coverageGaps.set(p,{file:{targetKind:'file',reasonCode:'test-historical-gap',reason:'historical uncertainty'}});
         await t.readFileAndUpdate(p,Uri.file(p));assert.equal(pending(p)?.reviewKind,kind);
         let policy;
+        const rootPolicy=path.join(root,'.gitignore');
+        const previousPolicy=fs.existsSync(rootPolicy)?fs.readFileSync(rootPolicy):undefined;
+        try {
         if(source==='gitignore'){
-            policy=file('.gitignore');fs.writeFileSync(policy,path.basename(p)+'\n');h.setListedIgnores([Uri.file(policy)]);
+            policy=rootPolicy;fs.writeFileSync(policy,path.basename(p)+'\n');h.setListedIgnores([Uri.file(policy)]);
         }else if(source==='git-exclude'){
             policy=path.join(root,'.git','info','exclude');fs.mkdirSync(path.dirname(policy),{recursive:true});fs.writeFileSync(policy,path.basename(p)+'\n');
         }else h.setVsCodeExcludes({[source]:{[`**/${path.basename(p)}`]:true}});
@@ -918,6 +935,13 @@ export function registerPR11ReviewRegressions(h) {
         if(kind==='text'){
             assert.equal((await t.keepAllChangesInFile(p)).status,'success');
             assert.equal(t.getOriginalContent(p),'changed','ordinary baseline must not be released after retained status ends');
+        }
+        } finally {
+            if(source==='gitignore') {
+                if(previousPolicy===undefined)fs.rmSync(rootPolicy,{force:true});
+                else fs.writeFileSync(rootPolicy,previousPolicy);
+            }
+            h.setListedIgnores([]);
         }
     });
 

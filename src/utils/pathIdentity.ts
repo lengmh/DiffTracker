@@ -1,6 +1,45 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+const maxIdentityDirectoryEntries = 10000;
+const maxCaseSensitivityProbeEntries = 128;
+
+interface DirectoryEntryListing {
+    entries: fs.Dirent[];
+    complete: boolean;
+}
+
+function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing {
+    const handle = fs.opendirSync(directory);
+    try {
+        const entries: fs.Dirent[] = [];
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { return { entries, complete: true }; }
+            if (entries.length >= maxIdentityDirectoryEntries) {
+                // The cache is bounded, not the live directory. Runtime identity
+                // resolution can stream a targeted lookup when the requested
+                // entry is outside this retained prefix.
+                return { entries, complete: false };
+            }
+            entries.push(entry);
+        }
+    } finally { handle.closeSync(); }
+}
+
+function readIdentityDirectoryPrefix(directory: string, limit: number): fs.Dirent[] {
+    const handle = fs.opendirSync(directory);
+    try {
+        const entries: fs.Dirent[] = [];
+        while (entries.length < limit) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            entries.push(entry);
+        }
+        return entries;
+    } finally { handle.closeSync(); }
+}
+
 export function asciiCaseFold(value: string): string {
     return value.replace(/[A-Z]/g, character => character.toLowerCase());
 }
@@ -34,20 +73,25 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
     }
 }
 
-function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
+function caseEquivalentEntries(
+    parent: string,
+    requested: string,
+    knownEntries?: readonly fs.Dirent[]
+): string[] | undefined {
     try {
         const folded = asciiCaseFold(requested);
-        return fs.readdirSync(parent).filter(name => asciiCaseFold(name) === folded);
+        const entries = knownEntries ?? directoryEntries(parent);
+        return entries.map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
     }
 }
 
-function probeExistingPath(existingPath: string): boolean | undefined {
+function probeExistingPath(existingPath: string, knownParentEntries?: readonly fs.Dirent[]): boolean | undefined {
     const base = path.basename(existingPath);
     if (!base) { return undefined; }
     const parent = path.dirname(existingPath);
-    const equivalentEntries = caseEquivalentEntries(parent, base);
+    const equivalentEntries = caseEquivalentEntries(parent, base, knownParentEntries);
 
     if (equivalentEntries) {
         // Two separately named directory entries that differ only by case prove
@@ -79,9 +123,23 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     const same = sameExistingResource(existingPath, alternate);
     if (same === false) { return true; }
     if (same === true) {
-        // When the parent listing proves that only the requested spelling exists,
-        // a differently-cased lookup resolving to it is sufficient evidence for
-        // an insensitive boundary. Without listing evidence, remain unverified.
+        // A case-sensitive directory can still contain a differently-cased
+        // hard link or symlink to the same resource. The bounded parent prefix
+        // may not contain that second spelling, so distinguish a real second
+        // directory entry before accepting insensitive lookup semantics.
+        try {
+            const existing = fs.lstatSync(existingPath);
+            const alternateEntry = fs.lstatSync(alternate);
+            if (existing.isSymbolicLink() !== alternateEntry.isSymbolicLink() ||
+                fs.realpathSync.native(existingPath) !== fs.realpathSync.native(alternate)) {
+                return true;
+            }
+        } catch {
+            return undefined;
+        }
+        // When the bounded parent prefix proves the requested spelling exists,
+        // a differently-cased lookup resolving to that same canonical entry is
+        // sufficient evidence for an insensitive boundary.
         return equivalentEntries?.includes(base) ? false : undefined;
     }
     return undefined;
@@ -96,10 +154,14 @@ export function detectLocalPathCaseSensitivity(
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
     try {
-        const entries = fs.readdirSync(rootPath, { withFileTypes: true });
-        for (const entry of entries.slice(0, 128)) {
+        // Root case probing needs only a small witness prefix. Do not require
+        // every direct child to fit the full path-identity listing bound before
+        // inspecting those witnesses; large roots are handled later by their
+        // own bounded preparation/traversal contracts.
+        const entries = readIdentityDirectoryPrefix(rootPath, maxCaseSensitivityProbeEntries);
+        for (const entry of entries) {
             if (entry.isSymbolicLink()) { continue; }
-            const probe = probeExistingPath(path.join(rootPath, entry.name));
+            const probe = probeExistingPath(path.join(rootPath, entry.name), entries);
             if (probe !== undefined) { return probe; }
         }
     } catch {
@@ -122,6 +184,15 @@ export interface RelativePathIdentity {
 // parent identity/metadata; each selected entry is still lstat'ed. In particular,
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
 const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
+let cachedDirectoryEntryCount = 0;
+
+function invalidateDirectoryEntries(directory: string): void {
+    const cached = directoryEntriesCache.get(directory);
+    if (!cached) { return; }
+    directoryEntriesCache.delete(directory);
+    cachedDirectoryEntryCount = Math.max(0, cachedDirectoryEntryCount - cached.entries.length);
+}
+
 function directoryEntries(directory: string): fs.Dirent[] {
     const signature = (): string => {
         const stat = fs.statSync(directory);
@@ -130,10 +201,26 @@ function directoryEntries(directory: string): fs.Dirent[] {
     const before = signature();
     const cached = directoryEntriesCache.get(directory);
     if (cached?.signature === before) { return cached.entries; }
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    const listing = readIdentityDirectoryEntries(directory);
+    const entries = listing.entries;
+    if (!listing.complete) {
+        // Never cache a truncated directory as if it were a complete identity
+        // oracle. The targeted streaming lookup below handles paths outside the
+        // retained prefix without materializing the whole directory.
+        invalidateDirectoryEntries(directory);
+        return entries;
+    }
     if (signature() === before) {
-        if (directoryEntriesCache.size >= 4096) { directoryEntriesCache.clear(); }
+        const previousCount = cached?.entries.length ?? 0;
+        if (directoryEntriesCache.size >= 4096 ||
+            cachedDirectoryEntryCount - previousCount + entries.length > maxIdentityDirectoryEntries) {
+            directoryEntriesCache.clear();
+            cachedDirectoryEntryCount = 0;
+        } else {
+            cachedDirectoryEntryCount -= previousCount;
+        }
         directoryEntriesCache.set(directory, { signature: before, entries });
+        cachedDirectoryEntryCount += entries.length;
     }
     return entries;
 }
@@ -144,6 +231,51 @@ function sameEntryLookup(left: string, right: string): boolean {
     // Do not follow a symlink in order to prove entry identity.
     return !a.isSymbolicLink() && !b.isSymbolicLink() &&
         fs.realpathSync.native(left) === fs.realpathSync.native(right);
+}
+
+function streamDirectoryEntryIdentity(
+    directory: string,
+    requested: string,
+    requestedPath: string
+): { actual?: string; unavailable: boolean } {
+    // Fast/common path: watcher and filesystem enumeration normally provide the
+    // actual spelling. Scan names without retaining them; this keeps memory
+    // bounded even when the directory is much larger than the identity cache.
+    let handle = fs.opendirSync(directory);
+    try {
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            if (entry.name === requested) {
+                return { actual: entry.name, unavailable: false };
+            }
+        }
+    } finally { handle.closeSync(); }
+
+    // A child directory can have different lookup semantics from the workspace
+    // root (mount points and per-directory case modes are both possible). Preserve
+    // the previous filesystem-identity proof instead of inheriting the root flag:
+    // retain only one matching resource; a second match is ambiguous.
+    let match: string | undefined;
+    handle = fs.opendirSync(directory);
+    try {
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            try {
+                if (!sameEntryLookup(requestedPath, path.join(directory, entry.name))) { continue; }
+            } catch {
+                continue;
+            }
+            if (match !== undefined) {
+                return { unavailable: true };
+            }
+            match = entry.name;
+        }
+    } finally { handle.closeSync(); }
+    return match === undefined
+        ? { unavailable: true }
+        : { actual: match, unavailable: false };
 }
 
 export function resolveRelativePathIdentity(
@@ -163,23 +295,31 @@ export function resolveRelativePathIdentity(
         let actual: string | undefined;
         if (physicalPrefixAvailable) {
             try {
-                const entries = directoryEntries(current);
+                let entries = directoryEntries(current);
                 const requestedPath = path.join(current, requested);
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // the current directory can differ from the workspace root.
                 const requestedStat = fs.lstatSync(requestedPath);
-                const exact = entries.find(entry => entry.name === requested);
+                let exact = entries.find(entry => entry.name === requested);
+                if (!exact) {
+                    // Some filesystems (notably Windows runners) can preserve a
+                    // directory mtime/ctime signature across a rapid child create.
+                    // Refresh the bounded cache once, then fall back to a streaming
+                    // target lookup if the directory outgrew cache capacity.
+                    invalidateDirectoryEntries(current);
+                    entries = directoryEntries(current);
+                    exact = entries.find(entry => entry.name === requested);
+                }
                 if (exact) {
                     actual = exact.name;
                 } else {
-                    const matches = entries.filter(entry => {
-                        try { return sameEntryLookup(requestedPath, path.join(current, entry.name)); }
-                        catch { return false; }
-                    });
-                    // Separately named hard links remain distinct entries. An
-                    // ambiguous alias is not permission to merge their scopes.
-                    if (matches.length === 1) { actual = matches[0].name; }
-                    else { unavailable = true; }
+                    const streamed = streamDirectoryEntryIdentity(
+                        current,
+                        requested,
+                        requestedPath
+                    );
+                    actual = streamed.actual;
+                    unavailable ||= streamed.unavailable;
                 }
                 if (actual !== undefined) {
                     verifiedPrefixLength++;
