@@ -140,6 +140,14 @@ export interface RelativePathIdentity {
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
 const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
 let cachedDirectoryEntryCount = 0;
+
+function invalidateDirectoryEntries(directory: string): void {
+    const cached = directoryEntriesCache.get(directory);
+    if (!cached) { return; }
+    directoryEntriesCache.delete(directory);
+    cachedDirectoryEntryCount = Math.max(0, cachedDirectoryEntryCount - cached.entries.length);
+}
+
 function directoryEntries(directory: string): fs.Dirent[] {
     const signature = (): string => {
         const stat = fs.statSync(directory);
@@ -189,12 +197,22 @@ export function resolveRelativePathIdentity(
         let actual: string | undefined;
         if (physicalPrefixAvailable) {
             try {
-                const entries = directoryEntries(current);
+                let entries = directoryEntries(current);
                 const requestedPath = path.join(current, requested);
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // the current directory can differ from the workspace root.
                 const requestedStat = fs.lstatSync(requestedPath);
-                const exact = entries.find(entry => entry.name === requested);
+                let exact = entries.find(entry => entry.name === requested);
+                if (!exact) {
+                    // Some filesystems (notably Windows runners) can preserve a
+                    // directory mtime/ctime signature across a rapid child create.
+                    // If the requested entry already exists but the cached listing
+                    // does not contain its spelling, refresh the bounded listing
+                    // once before treating the identity as unavailable/aliased.
+                    invalidateDirectoryEntries(current);
+                    entries = directoryEntries(current);
+                    exact = entries.find(entry => entry.name === requested);
+                }
                 if (exact) {
                     actual = exact.name;
                 } else {
