@@ -5211,7 +5211,11 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
 registerPR12BoundedInvariants({
     test, vscode, Uri, DiffTracker, file, document,
     getTracker: () => tracker, setTracker: value => { tracker=value; },
-    setListedIgnores: value => { listedIgnores=value; }
+    setListedIgnores: value => { listedIgnores=value; },
+    setVsCodeExcludes: value => { vscodeExcludes=value; },
+    fireConfigurationChanged: key => configurationChanged({
+        affectsConfiguration: name => name === key
+    })
 });
 
 registerStateSchemaCompatibility({

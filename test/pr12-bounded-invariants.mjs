@@ -5,7 +5,10 @@ import { createHash } from 'node:crypto';
 import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR12BoundedInvariants(h) {
-    const { test, vscode, Uri, DiffTracker, file, document, getTracker, setTracker } = h;
+    const {
+        test, vscode, Uri, DiffTracker, file, document, getTracker, setTracker,
+        setVsCodeExcludes, fireConfigurationChanged
+    } = h;
     function scopeFor(tracker, mode='wholeWorkspace', excludes=[]) {
         const scope={kind:'configured',mode,roots:tracker.currentWorkspaceRootIdentities(),includes:[],excludes,scopeRevision:''};
         scope.scopeRevision=createHash('sha256').update(JSON.stringify({model:1,mode,roots:scope.roots,includes:[],excludes})).digest('hex');
@@ -397,6 +400,36 @@ export function registerPR12BoundedInvariants(h) {
         assert.ok(serialized(tracker)<=tracker.maxPersistedBytes);
     }));
 
+
+    test('PR12 AUDIT Whole Workspace preserves coverage across irrelevant ordinary exclude settings',()=>fixture(async({tracker})=>{
+        setVsCodeExcludes({});
+        await tracker.refreshIgnoreMatchers();
+        const fingerprint=tracker.ignoreFingerprint;
+        tracker.scanCoverage=fingerprint;
+
+        setVsCodeExcludes({'files.exclude':{'hidden/**':true}});
+        fireConfigurationChanged('files.exclude');
+        assert.equal(tracker.scanCoverage,fingerprint,
+            'files.exclude must not retire Whole Workspace coverage');
+        await tracker.ignoreRefreshPromise;
+        assert.equal(tracker.ignoreFingerprint,fingerprint,
+            'files.exclude must not change the Whole Workspace coverage fingerprint');
+        assert.equal(tracker.scanCoverage,fingerprint);
+
+        setVsCodeExcludes({'search.exclude':{'search-only/**':true}});
+        fireConfigurationChanged('search.exclude');
+        assert.equal(tracker.scanCoverage,fingerprint,
+            'search.exclude must not retire Whole Workspace coverage');
+        await tracker.ignoreRefreshPromise;
+        assert.equal(tracker.ignoreFingerprint,fingerprint,
+            'search.exclude must not change the Whole Workspace coverage fingerprint');
+        assert.equal(tracker.scanCoverage,fingerprint);
+
+        setVsCodeExcludes({'files.watcherExclude':{'blind/**':true}});
+        fireConfigurationChanged('files.watcherExclude');
+        assert.equal(tracker.scanCoverage,undefined,
+            'watcher exclusions remain a real Whole Workspace coverage invalidation');
+    }));
 
     test('PR12 AUDIT Whole Workspace may explicitly exclude .gitignore without requiring ordinary policy',()=>fixture(async({tracker,scope,dir})=>{
         fs.writeFileSync(path.join(dir,'.gitignore'),'ignored.txt\n');

@@ -707,20 +707,30 @@ export class DiffTracker {
 
         this.disposables.push(
             vscode.workspace.onDidChangeConfiguration(e => {
-                const watcherCoverageChanged = e.affectsConfiguration('files.watcherExclude');
-                if (
+                const automationPolicyChanged =
                     e.affectsConfiguration('diffTracker.onlyTrackAutomatedChanges') ||
-                    e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges') ||
-                    e.affectsConfiguration('diffTracker.watchExclude') ||
-                    watcherCoverageChanged ||
+                    e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges');
+                const legacyWatchPolicyChanged = e.affectsConfiguration('diffTracker.watchExclude');
+                const watcherCoverageChanged = e.affectsConfiguration('files.watcherExclude');
+                const ordinaryExcludeChanged =
                     e.affectsConfiguration('search.exclude') ||
-                    e.affectsConfiguration('files.exclude')
-                ) {
+                    e.affectsConfiguration('files.exclude');
+                if (automationPolicyChanged || legacyWatchPolicyChanged ||
+                    watcherCoverageChanged || ordinaryExcludeChanged) {
                     if (watcherCoverageChanged) {
                         this.invalidateConfiguredScopeForWatcherCoverage();
                     }
-                    this.scanCoverage = undefined;
-                    this.schedulePersistState();
+                    const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
+                        this.effectiveMonitoringScope.mode === 'wholeWorkspace';
+                    const coverageRelevantChange =
+                        automationPolicyChanged ||
+                        legacyWatchPolicyChanged ||
+                        watcherCoverageChanged ||
+                        (!wholeWorkspace && ordinaryExcludeChanged);
+                    if (coverageRelevantChange) {
+                        this.scanCoverage = undefined;
+                        this.schedulePersistState();
+                    }
                     this.refreshIgnoreMatchers().catch(() => undefined);
                 }
             })
@@ -5001,6 +5011,8 @@ export class DiffTracker {
         discoveryBudget?: IgnoreDiscoveryBudget
     ): Promise<Ignore> {
         const ig = ignore();
+        const configured = scopeOverride ?? (this.effectiveMonitoringScope.kind === 'configured'
+            ? this.effectiveMonitoringScope as CanonicalMonitoringScope : undefined);
         const watchExcludes = includeLegacyWatchExclude
             ? this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate)
             : [];
@@ -5010,14 +5022,23 @@ export class DiffTracker {
             ...watchExcludes
         ];
         ig.add(basePatterns);
-        evidence.push(folder.uri.fsPath, JSON.stringify(basePatterns));
-        // Include resource-scoped settings that may influence VS Code discovery.
         const scoped = vscode.workspace.getConfiguration(undefined, folder.uri);
-        evidence.push(JSON.stringify(['files.exclude', 'files.watcherExclude', 'search.exclude']
-            .map(key => scoped.get(key, {}))));
+        if (configured?.mode === 'wholeWorkspace') {
+            // Whole Workspace membership ignores ordinary files.exclude and
+            // search.exclude policy. Keep only watcher coverage policy in the
+            // scan fingerprint so unrelated UI/search settings cannot retire a
+            // still-valid coverage proof.
+            evidence.push(folder.uri.fsPath, JSON.stringify({
+                wholeWorkspace: true,
+                watcherExclude: scoped.get('files.watcherExclude', {})
+            }));
+        } else {
+            evidence.push(folder.uri.fsPath, JSON.stringify(basePatterns));
+            // Include resource-scoped settings that may influence discovery.
+            evidence.push(JSON.stringify(['files.exclude', 'files.watcherExclude', 'search.exclude']
+                .map(key => scoped.get(key, {}))));
+        }
 
-        const configured = scopeOverride ?? (this.effectiveMonitoringScope.kind === 'configured'
-            ? this.effectiveMonitoringScope as CanonicalMonitoringScope : undefined);
         if (configured) {
             const epoch = this.sessionEpoch;
             return this.readConfiguredIgnoreMatcher(folder, ig, evidence, configured,
