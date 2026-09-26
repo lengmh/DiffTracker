@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
 
 export function registerPR12BoundedInvariants(h) {
     const { test, vscode, Uri, DiffTracker, file, document, getTracker, setTracker } = h;
@@ -468,6 +469,37 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal([...tracker.importedDirectoryWatchers.keys()].some(candidate=>tracker.pathBelongsToRoot(candidate,imported)),false,
                 'bounded watch failure must roll back partial imported-tree watcher installation');
         } finally {fs.promises.readdir=oldReaddir;}
+    }));
+
+    test('PR12 AUDIT case-sensitivity probe reads only a bounded prefix of very large roots',()=>fixture(async({dir})=>{
+        const probeName='CaseProbeName';
+        fs.writeFileSync(path.join(dir,probeName),'probe');
+        const originalOpendir=fs.opendirSync;
+        let reads=0;
+        fs.opendirSync=function(target,...args){
+            if(path.resolve(String(target))!==path.resolve(dir)) return originalOpendir(target,...args);
+            return {
+                readSync(){
+                    reads++;
+                    if(reads===1){
+                        return {name:probeName,isSymbolicLink:()=>false};
+                    }
+                    if(reads<=10050){
+                        return {name:`synthetic-${reads}`,isSymbolicLink:()=>false};
+                    }
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            assert.equal(typeof detectLocalPathCaseSensitivity(dir),'boolean',
+                'case probing must establish semantics without requiring the complete large root listing');
+            assert.ok(reads<=128,
+                `case probing must stop at its bounded prefix instead of materializing the root (reads=${reads})`);
+        } finally {
+            fs.opendirSync=originalOpendir;
+        }
     }));
 
     test('PR12 AUDIT restore-directory descendant watcher exclusions need no supplemental coverage',()=>fixture(async({tracker,scope})=>{

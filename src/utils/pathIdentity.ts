@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const maxIdentityDirectoryEntries = 10000;
+const maxCaseSensitivityProbeEntries = 128;
 
 function readIdentityDirectoryEntries(directory: string): fs.Dirent[] {
     const handle = fs.opendirSync(directory);
@@ -15,6 +16,19 @@ function readIdentityDirectoryEntries(directory: string): fs.Dirent[] {
             }
             entries.push(entry);
         }
+    } finally { handle.closeSync(); }
+}
+
+function readIdentityDirectoryPrefix(directory: string, limit: number): fs.Dirent[] {
+    const handle = fs.opendirSync(directory);
+    try {
+        const entries: fs.Dirent[] = [];
+        while (entries.length < limit) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            entries.push(entry);
+        }
+        return entries;
     } finally { handle.closeSync(); }
 }
 
@@ -51,20 +65,25 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
     }
 }
 
-function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
+function caseEquivalentEntries(
+    parent: string,
+    requested: string,
+    knownEntries?: readonly fs.Dirent[]
+): string[] | undefined {
     try {
         const folded = asciiCaseFold(requested);
-        return directoryEntries(parent).map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
+        const entries = knownEntries ?? directoryEntries(parent);
+        return entries.map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
     }
 }
 
-function probeExistingPath(existingPath: string): boolean | undefined {
+function probeExistingPath(existingPath: string, knownParentEntries?: readonly fs.Dirent[]): boolean | undefined {
     const base = path.basename(existingPath);
     if (!base) { return undefined; }
     const parent = path.dirname(existingPath);
-    const equivalentEntries = caseEquivalentEntries(parent, base);
+    const equivalentEntries = caseEquivalentEntries(parent, base, knownParentEntries);
 
     if (equivalentEntries) {
         // Two separately named directory entries that differ only by case prove
@@ -96,9 +115,23 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     const same = sameExistingResource(existingPath, alternate);
     if (same === false) { return true; }
     if (same === true) {
-        // When the parent listing proves that only the requested spelling exists,
-        // a differently-cased lookup resolving to it is sufficient evidence for
-        // an insensitive boundary. Without listing evidence, remain unverified.
+        // A case-sensitive directory can still contain a differently-cased
+        // hard link or symlink to the same resource. The bounded parent prefix
+        // may not contain that second spelling, so distinguish a real second
+        // directory entry before accepting insensitive lookup semantics.
+        try {
+            const existing = fs.lstatSync(existingPath);
+            const alternateEntry = fs.lstatSync(alternate);
+            if (existing.isSymbolicLink() !== alternateEntry.isSymbolicLink() ||
+                fs.realpathSync.native(existingPath) !== fs.realpathSync.native(alternate)) {
+                return true;
+            }
+        } catch {
+            return undefined;
+        }
+        // When the bounded parent prefix proves the requested spelling exists,
+        // a differently-cased lookup resolving to that same canonical entry is
+        // sufficient evidence for an insensitive boundary.
         return equivalentEntries?.includes(base) ? false : undefined;
     }
     return undefined;
@@ -113,10 +146,14 @@ export function detectLocalPathCaseSensitivity(
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
     try {
-        const entries = directoryEntries(rootPath);
-        for (const entry of entries.slice(0, 128)) {
+        // Root case probing needs only a small witness prefix. Do not require
+        // every direct child to fit the full path-identity listing bound before
+        // inspecting those witnesses; large roots are handled later by their
+        // own bounded preparation/traversal contracts.
+        const entries = readIdentityDirectoryPrefix(rootPath, maxCaseSensitivityProbeEntries);
+        for (const entry of entries) {
             if (entry.isSymbolicLink()) { continue; }
-            const probe = probeExistingPath(path.join(rootPath, entry.name));
+            const probe = probeExistingPath(path.join(rootPath, entry.name), entries);
             if (probe !== undefined) { return probe; }
         }
     } catch {
