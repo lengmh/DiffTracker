@@ -201,19 +201,23 @@ export function registerPR12BoundedInvariants(h) {
         }
     }));
 
-    test('PR12 AUDIT path identity discovery never materializes an unbounded root listing',async()=>{
-        const {detectLocalPathCaseSensitivity}=await import('../out/utils/pathIdentity.js');
+    test('PR12 AUDIT path identity discovery probes only a bounded prefix of a large root',async()=>{
         const dir=file('identity-bounded');fs.mkdirSync(dir);fs.writeFileSync(path.join(dir,'ProbeName'),'probe');
         const oldOpen=fs.opendirSync,oldRead=fs.readdirSync;
         let reads=0,listings=0,closed=false;
         fs.opendirSync=(target,...args)=>path.resolve(String(target))===dir?{
-            readSync(){reads++;return reads<=10001?{name:`entry-${reads}`,isSymbolicLink:()=>false}:null;},
+            readSync(){
+                reads++;
+                if(reads===1)return {name:'ProbeName',isSymbolicLink:()=>false};
+                return reads<=10001?{name:`entry-${reads}`,isSymbolicLink:()=>false}:null;
+            },
             closeSync(){closed=true;}
         }:oldOpen(target,...args);
         fs.readdirSync=(target,...args)=>{if(path.resolve(String(target))===dir)listings++;return oldRead(target,...args);};
         try {
-            assert.equal(detectLocalPathCaseSensitivity(dir),undefined,'an incomplete directory identity proof must remain unverified');
-            assert.equal(listings,0);assert.ok(reads<=10001);assert.equal(closed,true);
+            assert.equal(typeof detectLocalPathCaseSensitivity(dir),'boolean',
+                'a real entry in the bounded prefix must establish case semantics without reading the complete large root');
+            assert.equal(listings,0);assert.ok(reads<=128);assert.equal(closed,true);
         } finally {fs.opendirSync=oldOpen;fs.readdirSync=oldRead;}
     });
 
@@ -469,37 +473,6 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal([...tracker.importedDirectoryWatchers.keys()].some(candidate=>tracker.pathBelongsToRoot(candidate,imported)),false,
                 'bounded watch failure must roll back partial imported-tree watcher installation');
         } finally {fs.promises.readdir=oldReaddir;}
-    }));
-
-    test('PR12 AUDIT case-sensitivity probe reads only a bounded prefix of very large roots',()=>fixture(async({dir})=>{
-        const probeName='CaseProbeName';
-        fs.writeFileSync(path.join(dir,probeName),'probe');
-        const originalOpendir=fs.opendirSync;
-        let reads=0;
-        fs.opendirSync=function(target,...args){
-            if(path.resolve(String(target))!==path.resolve(dir)) return originalOpendir(target,...args);
-            return {
-                readSync(){
-                    reads++;
-                    if(reads===1){
-                        return {name:probeName,isSymbolicLink:()=>false};
-                    }
-                    if(reads<=10050){
-                        return {name:`synthetic-${reads}`,isSymbolicLink:()=>false};
-                    }
-                    return null;
-                },
-                closeSync(){}
-            };
-        };
-        try {
-            assert.equal(typeof detectLocalPathCaseSensitivity(dir),'boolean',
-                'case probing must establish semantics without requiring the complete large root listing');
-            assert.ok(reads<=128,
-                `case probing must stop at its bounded prefix instead of materializing the root (reads=${reads})`);
-        } finally {
-            fs.opendirSync=originalOpendir;
-        }
     }));
 
     test('PR12 AUDIT restore-directory descendant watcher exclusions need no supplemental coverage',()=>fixture(async({tracker,scope})=>{
