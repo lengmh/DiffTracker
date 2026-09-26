@@ -4530,13 +4530,51 @@ export class DiffTracker {
             .map(([pattern]) => pattern);
     }
 
-    private expandSimpleBraceGlob(pattern: string): string[] {
-        const match = pattern.match(/\{([^{}]+)\}/);
-        if (!match) { return [pattern]; }
-        const alternatives = match[1].split(',').map(value => value.trim()).filter(Boolean);
-        if (alternatives.length === 0) { return [pattern]; }
-        return alternatives.flatMap(value =>
-            this.expandSimpleBraceGlob(pattern.slice(0, match.index!) + value + pattern.slice(match.index! + match[0].length)));
+    private readonly maxWatcherExcludeVariants = 256;
+
+    private expandSimpleBraceGlob(pattern: string, limit = this.maxWatcherExcludeVariants): string[] | undefined {
+        const completed: string[] = [];
+        const pending = [pattern];
+        while (pending.length > 0) {
+            const current = pending.pop()!;
+            const match = current.match(/\{([^{}]+)\}/);
+            if (!match) {
+                if (completed.length >= limit) { return undefined; }
+                completed.push(current);
+                continue;
+            }
+            const alternatives = match[1].split(',').map(value => value.trim()).filter(Boolean);
+            if (alternatives.length === 0) {
+                if (completed.length >= limit) { return undefined; }
+                completed.push(current);
+                continue;
+            }
+            // Every pending branch produces at least one completed variant.
+            // Refuse the Cartesian product before it can exceed the retained cap.
+            if (completed.length + pending.length + alternatives.length > limit) {
+                return undefined;
+            }
+            for (const value of alternatives) {
+                pending.push(
+                    current.slice(0, match.index!) + value + current.slice(match.index! + match[0].length)
+                );
+            }
+        }
+        return completed;
+    }
+
+    private getExpandedVsCodeWatcherExcludePatterns(resource: vscode.Uri): string[] | undefined {
+        const expanded: string[] = [];
+        for (const pattern of this.getVsCodeWatcherExcludePatterns(resource)) {
+            const variants = this.expandSimpleBraceGlob(
+                pattern,
+                this.maxWatcherExcludeVariants - expanded.length
+            );
+            if (!variants) { return undefined; }
+            expanded.push(...variants);
+            if (expanded.length > this.maxWatcherExcludeVariants) { return undefined; }
+        }
+        return expanded;
     }
 
     private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
@@ -4680,8 +4718,10 @@ export class DiffTracker {
                 }
                 const descendantsExplicitlyExcluded =
                     configuredScopeExplicitlyExcludesSubtree(scope, identity, rel);
-                const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
-                    .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
+                const patterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
+                if (!patterns) {
+                    return `${folder.name}:${rule.path}:files.watcherExclude expansion exceeds safe bound`;
+                }
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
@@ -4788,8 +4828,11 @@ export class DiffTracker {
             if (typeof identity.caseSensitive !== 'boolean') {
                 return `${folder.name}:unverified-path-identity`;
             }
-            const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
-                .flatMap(pattern => this.expandSimpleBraceGlob(pattern))
+            const expandedPatterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
+            if (!expandedPatterns) {
+                return `${folder.name}:files.watcherExclude expansion exceeds safe bound`;
+            }
+            const patterns = expandedPatterns
                 .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern))
                 .filter(pattern => !this.watcherPatternCoveredByExplicitScopeExclusion(scope, identity, pattern));
             if (patterns.length > 0) {

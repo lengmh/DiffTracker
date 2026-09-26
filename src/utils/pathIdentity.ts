@@ -4,15 +4,23 @@ import * as path from 'path';
 const maxIdentityDirectoryEntries = 10000;
 const maxCaseSensitivityProbeEntries = 128;
 
-function readIdentityDirectoryEntries(directory: string): fs.Dirent[] {
+interface DirectoryEntryListing {
+    entries: fs.Dirent[];
+    complete: boolean;
+}
+
+function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing {
     const handle = fs.opendirSync(directory);
     try {
         const entries: fs.Dirent[] = [];
         while (true) {
             const entry = handle.readSync();
-            if (!entry) { return entries; }
+            if (!entry) { return { entries, complete: true }; }
             if (entries.length >= maxIdentityDirectoryEntries) {
-                throw new Error('Directory identity discovery exceeded its bounded entry limit');
+                // The cache is bounded, not the live directory. Runtime identity
+                // resolution can stream a targeted lookup when the requested
+                // entry is outside this retained prefix.
+                return { entries, complete: false };
             }
             entries.push(entry);
         }
@@ -193,7 +201,15 @@ function directoryEntries(directory: string): fs.Dirent[] {
     const before = signature();
     const cached = directoryEntriesCache.get(directory);
     if (cached?.signature === before) { return cached.entries; }
-    const entries = readIdentityDirectoryEntries(directory);
+    const listing = readIdentityDirectoryEntries(directory);
+    const entries = listing.entries;
+    if (!listing.complete) {
+        // Never cache a truncated directory as if it were a complete identity
+        // oracle. The targeted streaming lookup below handles paths outside the
+        // retained prefix without materializing the whole directory.
+        invalidateDirectoryEntries(directory);
+        return entries;
+    }
     if (signature() === before) {
         const previousCount = cached?.entries.length ?? 0;
         if (directoryEntriesCache.size >= 4096 ||
@@ -215,6 +231,55 @@ function sameEntryLookup(left: string, right: string): boolean {
     // Do not follow a symlink in order to prove entry identity.
     return !a.isSymbolicLink() && !b.isSymbolicLink() &&
         fs.realpathSync.native(left) === fs.realpathSync.native(right);
+}
+
+function streamDirectoryEntryIdentity(
+    directory: string,
+    requested: string,
+    requestedPath: string,
+    caseSensitive: boolean
+): { actual?: string; unavailable: boolean } {
+    // Fast/common path: watcher and filesystem enumeration normally provide the
+    // actual spelling. Scan names without retaining them; this keeps memory
+    // bounded even when the directory is much larger than the identity cache.
+    let handle = fs.opendirSync(directory);
+    try {
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            if (entry.name === requested) {
+                return { actual: entry.name, unavailable: false };
+            }
+        }
+    } finally { handle.closeSync(); }
+
+    if (caseSensitive) {
+        return { unavailable: true };
+    }
+
+    // On an insensitive boundary a differently-cased lookup can resolve to an
+    // existing entry. Preserve the previous hard-link/alias safety rule while
+    // retaining only one candidate; a second match makes the identity ambiguous.
+    let match: string | undefined;
+    handle = fs.opendirSync(directory);
+    try {
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            try {
+                if (!sameEntryLookup(requestedPath, path.join(directory, entry.name))) { continue; }
+            } catch {
+                continue;
+            }
+            if (match !== undefined) {
+                return { unavailable: true };
+            }
+            match = entry.name;
+        }
+    } finally { handle.closeSync(); }
+    return match === undefined
+        ? { unavailable: true }
+        : { actual: match, unavailable: false };
 }
 
 export function resolveRelativePathIdentity(
@@ -243,9 +308,8 @@ export function resolveRelativePathIdentity(
                 if (!exact) {
                     // Some filesystems (notably Windows runners) can preserve a
                     // directory mtime/ctime signature across a rapid child create.
-                    // If the requested entry already exists but the cached listing
-                    // does not contain its spelling, refresh the bounded listing
-                    // once before treating the identity as unavailable/aliased.
+                    // Refresh the bounded cache once, then fall back to a streaming
+                    // target lookup if the directory outgrew cache capacity.
                     invalidateDirectoryEntries(current);
                     entries = directoryEntries(current);
                     exact = entries.find(entry => entry.name === requested);
@@ -253,14 +317,14 @@ export function resolveRelativePathIdentity(
                 if (exact) {
                     actual = exact.name;
                 } else {
-                    const matches = entries.filter(entry => {
-                        try { return sameEntryLookup(requestedPath, path.join(current, entry.name)); }
-                        catch { return false; }
-                    });
-                    // Separately named hard links remain distinct entries. An
-                    // ambiguous alias is not permission to merge their scopes.
-                    if (matches.length === 1) { actual = matches[0].name; }
-                    else { unavailable = true; }
+                    const streamed = streamDirectoryEntryIdentity(
+                        current,
+                        requested,
+                        requestedPath,
+                        _caseSensitive
+                    );
+                    actual = streamed.actual;
+                    unavailable ||= streamed.unavailable;
                 }
                 if (actual !== undefined) {
                     verifiedPrefixLength++;

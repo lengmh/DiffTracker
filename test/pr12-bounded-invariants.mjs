@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { detectLocalPathCaseSensitivity } from '../out/utils/pathIdentity.js';
+import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from '../out/utils/pathIdentity.js';
 
 export function registerPR12BoundedInvariants(h) {
     const {
@@ -222,6 +222,36 @@ export function registerPR12BoundedInvariants(h) {
                 'a real entry in the bounded prefix must establish case semantics without reading the complete large root');
             assert.equal(listings,0);assert.ok(reads<=128);assert.equal(closed,true);
         } finally {fs.opendirSync=oldOpen;fs.readdirSync=oldRead;}
+    });
+
+
+    test('PR12 AUDIT runtime path identity streams entries beyond the cache bound',async()=>{
+        const dir=file('identity-runtime-large');fs.mkdirSync(dir);
+        const target=path.join(dir,'late-entry.txt');fs.writeFileSync(target,'tracked');
+        const originalOpen=fs.opendirSync;
+        let opens=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir)) return originalOpen(value,...args);
+            opens++;
+            let index=0;
+            return {
+                readSync(){
+                    index++;
+                    if(index<=10000) return {name:`synthetic-${index}.txt`};
+                    if(index===10001) return {name:'late-entry.txt'};
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            const resolved=resolveRelativePathIdentity(dir,'late-entry.txt',true);
+            assert.equal(resolved.unavailable,false,
+                'an existing path after the cache prefix must not become identityUnknown');
+            assert.equal(resolved.identity,'late-entry.txt');
+            assert.equal(resolved.verifiedPrefixLength,1);
+            assert.ok(opens>=2,'oversized identity lookup must fall back to a streaming target scan');
+        } finally {fs.opendirSync=originalOpen;}
     });
 
 
@@ -506,6 +536,21 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal([...tracker.importedDirectoryWatchers.keys()].some(candidate=>tracker.pathBelongsToRoot(candidate,imported)),false,
                 'bounded watch failure must roll back partial imported-tree watcher installation');
         } finally {fs.promises.readdir=oldReaddir;}
+    }));
+
+    test('PR12 AUDIT watcher brace expansion is capped before Cartesian explosion',()=>fixture(async({tracker,scope})=>{
+        const original=tracker.getVsCodeWatcherExcludePatterns.bind(tracker);
+        try {
+            const explosive=Array.from({length:25},()=>'{a,b}').join('/');
+            tracker.getVsCodeWatcherExcludePatterns=()=>[explosive];
+            const issue=tracker.configuredScopeNeedsSupplementalCoverage(scope);
+            assert.match(issue??'',/watcherExclude expansion exceeds safe bound/i,
+                'brace explosion must conservatively require supplemental coverage');
+            assert.equal(tracker.expandSimpleBraceGlob(explosive),undefined,
+                'brace expansion must stop before materializing the full Cartesian product');
+        } finally {
+            tracker.getVsCodeWatcherExcludePatterns=original;
+        }
     }));
 
     test('PR12 AUDIT restore-directory descendant watcher exclusions need no supplemental coverage',()=>fixture(async({tracker,scope})=>{
