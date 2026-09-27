@@ -6502,7 +6502,14 @@ export class DiffTracker {
         this.ensureSnapshotForDocument(doc);
     }
 
-    private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number, refreshVersion?: number): Promise<void> {
+    private async markCreatedDirectoryUnavailable(
+        filePath: string,
+        reason: string,
+        duringScan: boolean,
+        epoch: number,
+        refreshVersion?: number,
+        schedule = true
+    ): Promise<void> {
         const isCurrent = () => this.isCurrentEpoch(epoch) && (refreshVersion === undefined || refreshVersion === this.ignoreRefreshVersion);
         if (!isCurrent()) { return; }
         const historicalFileEvidence = this.baselineExistingFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath);
@@ -6527,7 +6534,8 @@ export class DiffTracker {
         this.setSubtreeCoverageGap(
             filePath,
             duringScan ? 'directory-scan-coverage-gap' : 'directory-runtime-coverage-gap',
-            reason
+            reason,
+            schedule
         );
     }
 
@@ -6644,13 +6652,16 @@ export class DiffTracker {
                     let watcherFailureProjected = false;
                     if (watchFailed && !scanEvent && creationIsCurrent()) {
                         // Runtime child baselines and their missing-watcher
-                        // obligation are one durable publication. Reserve the gap
-                        // before the final Session V4 projection so capacity
-                        // failure cannot commit children without warning evidence.
-                        this.setSubtreeCoverageGap(
+                        // obligation are one durable publication. Normalize any
+                        // stale file-level uncertainty into subtree evidence now,
+                        // but suppress a separate persistence schedule: the final
+                        // projection/flush below owns the whole publication.
+                        await this.markCreatedDirectoryUnavailable(
                             filePath,
-                            'directory-runtime-coverage-gap',
                             watcherFailureReason,
+                            false,
+                            epoch,
+                            undefined,
                             false
                         );
                         watcherFailureProjected = true;
