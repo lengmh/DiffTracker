@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { evaluateConfiguredScope } from '../out/monitoringScope.js';
+import { withLookups } from './pr11-final-scope-regressions.mjs';
 import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from '../out/utils/pathIdentity.js';
 
 export function registerPR12BoundedInvariants(h) {
@@ -623,6 +625,162 @@ export function registerPR12BoundedInvariants(h) {
         } finally {
             tracker.getVsCodeWatcherExcludePatterns=original;
         }
+    }));
+
+    // These regressions model filesystem lookup only; production scope and
+    // coverage classifiers remain the authorities under test on every platform.
+    function caseIdentity(tracker, sensitive) {
+        const original = tracker.workspaceRootIdentityForFolder.bind(tracker);
+        tracker.workspaceRootIdentityForFolder = folder => ({ ...original(folder), caseSensitive: sensitive });
+        return { ...tracker.currentWorkspaceRootIdentities()[0], caseSensitive: sensitive };
+    }
+
+    test('PR12 CASE Unicode lowercasing is not watcher exclusion coverage proof',()=>fixture(async({tracker,dir})=>{
+        const identity=caseIdentity(tracker,false);
+        const upper='\u0130',lower='i\u0307';
+        fs.mkdirSync(path.join(dir,upper));fs.mkdirSync(path.join(dir,lower));
+        fs.writeFileSync(path.join(dir,upper,'live.txt'),'must remain observed');
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:`**/${lower}/**`}]);
+        assert.equal(upper.toLowerCase(),lower,'fixture demonstrates the unsafe JavaScript equivalence');
+        assert.equal(evaluateConfiguredScope(requested,identity,`${upper}/live.txt`,false).monitored,true);
+        assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,`**/${upper}/**`),false);
+        tracker.getVsCodeWatcherExcludePatterns=()=>[`**/${upper}/**`];
+        assert.match(tracker.configuredScopeNeedsSupplementalCoverage(requested)??'',/watcherExclude/);
+        const result=await tracker.applyConfiguredMonitoringScope(requested);
+        assert.equal(result.status,'requiresS4','public Apply must reject the uncovered Unicode watcher blind spot');
+    }));
+
+    test('PR12 CASE wildcard ASCII aliases cannot inherit root case semantics',()=>fixture(async({tracker,dir})=>{
+        const identity=caseIdentity(tracker,false);
+        const actual=path.join(dir,'mixed','PRIVATE'),missing=path.join(dir,'mixed','private');
+        fs.mkdirSync(actual,{recursive:true});fs.writeFileSync(path.join(actual,'live.txt'),'live');
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'**/private/**'}]);
+        await withLookups([], [missing], async()=>{
+            assert.equal(evaluateConfiguredScope(requested,identity,'mixed/PRIVATE/live.txt',false).monitored,true);
+            assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,'**/PRIVATE/**'),false,
+                'a wildcard has no unique physical parent at which to prove a case alias');
+        });
+    }));
+
+    test('PR12 CASE literal exclusion coverage retains filesystem alias proof',()=>fixture(async({tracker,dir})=>{
+        const identity=caseIdentity(tracker,false);
+        const actual=path.join(dir,'private'),alias=path.join(dir,'PRIVATE');
+        fs.mkdirSync(actual);fs.writeFileSync(path.join(actual,'live.txt'),'excluded');
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'private/**'}]);
+        await withLookups([[alias,actual]],[],async()=>{
+            assert.equal(evaluateConfiguredScope(requested,identity,'PRIVATE/live.txt',false).source,'explicitExclude');
+            assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,'PRIVATE/**'),true);
+        });
+    }));
+
+    test('PR12 CASE exact Unicode patterns and exclusion precedence remain valid',()=>fixture(async({tracker,dir})=>{
+        const identity=caseIdentity(tracker,false);
+        const same='**/\u0130/**';
+        let requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:same}]);
+        assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,same),true);
+        requested=scopeFor(tracker,'wholeWorkspace',[{scope:'folder',folder:'another-root',pattern:same}]);
+        assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,same),false);
+        requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'**/ordinary/'}]);
+        assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,'**/ordinary'),false,
+            'directory-only rules cannot cover a same-named ordinary file');
+        requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'**'}]);
+        assert.equal(tracker.watcherPatternCoveredByExplicitScopeExclusion(requested,identity,same),true);
+    }));
+
+    for(const sensitive of [true,false]) {
+        test(`PR12 CASE reserved watcher pattern case semantics (sensitive=${sensitive})`,()=>fixture(async({tracker,dir})=>{
+            const identity=caseIdentity(tracker,sensitive);
+            const git=path.join(dir,sensitive?'.GIT':'.git');fs.mkdirSync(git);
+            const probe=path.join(dir,'ProbeName'),probeAlias=path.join(dir,'probeName');
+            const aliases=sensitive?[]:[
+                [probeAlias,probe],[path.join(dir,'.GIT'),git],[path.join(dir,'.Git'),git]
+            ];
+            const denied=sensitive?[probeAlias,path.join(dir,'.git'),path.join(dir,'.Git')]:[];
+            await withLookups(aliases,denied,async()=>{
+                for(const pattern of ['**/.git/**','**/.difftracker-restore-*/**']) {
+                    assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(pattern,identity),true);
+                }
+                for(const pattern of ['.GIT/**','.Git','.DIFFTRACKER-RESTORE-*/**']) {
+                    assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(pattern,identity),!sensitive,pattern);
+                }
+                for(const pattern of ['**/.GIT/**','**/.DIFFTRACKER-RESTORE-*/**',
+                    '**/.difftracker-restore-*','**/.DIFFTRACKER-RESTORE-*','**/.G\u0130T/**','**/.git*/**','**/.G?T/**']) {
+                    assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(pattern,identity),false,pattern);
+                }
+                const originalOpen=fs.opendirSync;
+                let probeOpens=0;
+                fs.opendirSync=(target,...args)=>{
+                    if(path.resolve(String(target))===path.resolve(dir))probeOpens++;
+                    return originalOpen(target,...args);
+                };
+                try {
+                    for(let i=0;i<32;i++) {
+                        assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(
+                            '.DIFFTRACKER-RESTORE-*/**',identity),!sensitive);
+                    }
+                    assert.ok(probeOpens<=1,
+                        `same-parent proof must reuse a bounded metadata-validated case probe (opens=${probeOpens})`);
+                } finally {fs.opendirSync=originalOpen;}
+                const requested=scopeFor(tracker);
+                tracker.getVsCodeWatcherExcludePatterns=()=>['{.GIT,.DIFFTRACKER-RESTORE-*}/**'];
+                const issue=tracker.configuredScopeNeedsSupplementalCoverage(requested);
+                if(sensitive)assert.match(issue??'',/watcherExclude/);else assert.equal(issue,undefined);
+            });
+        }));
+    }
+
+    test('PR12 CASE literal hard-boundary proof respects child filesystem semantics',()=>fixture(async({tracker,dir})=>{
+        let identity=caseIdentity(tracker,true);
+        const git=path.join(dir,'insensitive','.git'),alias=path.join(dir,'insensitive','.GIT');
+        fs.mkdirSync(git,{recursive:true});
+        await withLookups([[alias,git]],[],async()=>{
+            assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('insensitive/.GIT/**',identity),true,
+                'verified child alias must work even under a sensitive root');
+        });
+        identity={...identity,caseSensitive:false};
+        const distinct=path.join(dir,'sensitive','.GIT'),missing=path.join(dir,'sensitive','.git');
+        fs.mkdirSync(distinct,{recursive:true});fs.writeFileSync(path.join(distinct,'live.txt'),'live');
+        await withLookups([], [missing], async()=>{
+            assert.equal(evaluateConfiguredScope(scopeFor(tracker),identity,'sensitive/.GIT/live.txt',false).monitored,true);
+            assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('sensitive/.GIT/**',identity),false,
+                'root case mode must not override a proven distinct literal child');
+        });
+    }));
+
+    test('PR12 CASE wildcard hard-boundary aliases cannot trust only the root flag',()=>fixture(async({tracker,dir})=>{
+        const identity=caseIdentity(tracker,false);
+        const actual=path.join(dir,'sensitive','.GIT'),missing=path.join(dir,'sensitive','.git');
+        fs.mkdirSync(actual,{recursive:true});fs.writeFileSync(path.join(actual,'live.txt'),'live');
+        const requested=scopeFor(tracker);
+        await withLookups([], [missing], async()=>{
+            assert.equal(evaluateConfiguredScope(requested,identity,'sensitive/.GIT/live.txt',false).monitored,true);
+            assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('**/.GIT/**',identity),false,
+                'one insensitive root is not proof about every wildcard-selected descendant parent');
+        });
+    }));
+
+    test('PR12 CASE Rules include and Whole Workspace share reserved watcher classification',()=>fixture(async({tracker,dir})=>{
+        caseIdentity(tracker,false);
+        const visible=path.join(dir,'visible'),git=path.join(visible,'.git');
+        fs.mkdirSync(git,{recursive:true});fs.writeFileSync(path.join(visible,'ProbeName'),'visible');
+        const aliases=[[path.join(visible,'.GIT'),git],[path.join(visible,'.Git'),git],[path.join(visible,'probeName'),path.join(visible,'ProbeName')]];
+        await withLookups(aliases,[],async()=>{
+            tracker.getVsCodeWatcherExcludePatterns=()=>['visible/.GIT/**','visible/.DIFFTRACKER-RESTORE-*/**'];
+            const requested=scopeFor(tracker,'rules');
+            requested.includes=[{scope:'all',path:'visible'}];
+            assert.equal(tracker.configuredScopeNeedsSupplementalCoverage(requested),undefined,
+                'explicit-include intersection checks must consume the same hard-boundary-filtered patterns');
+            tracker.getVsCodeWatcherExcludePatterns=()=>['visible/.DIFFTRACKER-RESTORE-*'];
+            assert.ok(tracker.configuredScopeNeedsSupplementalCoverage(requested),
+                'ordinary restore-prefixed files remain a coverage obligation in Rules mode');
+        });
+    },'rules'));
+
+    test('PR12 CASE unknown identity and excessive brace variants remain fail closed',()=>fixture(async({tracker})=>{
+        const identity=caseIdentity(tracker,false);
+        assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('**/.GIT/**',{...identity,caseSensitive:undefined}),false);
+        tracker.getVsCodeWatcherExcludePatterns=()=>[Array.from({length:25},()=>'{.GIT,.DIFFTRACKER-RESTORE-x}').join('/')];
+        assert.match(tracker.configuredScopeNeedsSupplementalCoverage(scopeFor(tracker))??'',/expansion exceeds safe bound/);
     }));
 
     test('PR12 AUDIT watcher-failure gap participates in the same populated-directory projection',()=>fixture(async({tracker,dir})=>{

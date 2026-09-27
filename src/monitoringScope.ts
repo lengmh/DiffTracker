@@ -569,7 +569,7 @@ function exclusionDirectorySignature(directory: string): string | undefined {
     }
 }
 
-function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
+export function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
     const key = path.resolve(directory);
     const before = exclusionDirectorySignature(directory);
     if (before !== undefined) {
