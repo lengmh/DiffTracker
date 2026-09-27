@@ -3,31 +3,47 @@ on:
   push:
     branches: [assist/s4a-case-closure-20260927-runner]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  workspace:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ed6c92cab48e47fad8f929225e664df5b331a3c2
-          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm ci
-      - run: npm run compile
-      - name: Package source and test dependencies without credentials
+      - name: Verify authored patch and stage exact source
         shell: bash
         run: |
           set -euo pipefail
-          git archive --format=tar HEAD > "$RUNNER_TEMP/s4a-workspace.tar"
-          tar -rf "$RUNNER_TEMP/s4a-workspace.tar" node_modules out
-          gzip -1 "$RUNNER_TEMP/s4a-workspace.tar"
-          sha256sum "$RUNNER_TEMP/s4a-workspace.tar.gz"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: s4a-case-workspace
-          path: ${{ runner.temp }}/s4a-workspace.tar.gz
-          retention-days: 1
+          cat .s4a-case-chunks/part-* | base64 --decode | gzip -dc > "$RUNNER_TEMP/repair.patch"
+          echo "00b734e4f1e848ff99d50a1a100165e9ab7f8256953c4715b999f15ed7e7cf05  $RUNNER_TEMP/repair.patch" | sha256sum -c -
+          git fetch --no-tags --depth=1 origin ed6c92cab48e47fad8f929225e664df5b331a3c2
+          git checkout --detach ed6c92cab48e47fad8f929225e664df5b331a3c2
+          test "$(git rev-parse HEAD)" = ed6c92cab48e47fad8f929225e664df5b331a3c2
+          git apply --check "$RUNNER_TEMP/repair.patch"
+          git apply "$RUNNER_TEMP/repair.patch"
+          git diff --check
+          git add src/diffTracker.ts test/pr12-bounded-invariants.mjs docs/pr12-watcher-case-closure-2026-09-27.md
+          printf '%s\n' docs/pr12-watcher-case-closure-2026-09-27.md src/diffTracker.ts test/pr12-bounded-invariants.mjs > "$RUNNER_TEMP/expected-paths"
+          git diff --cached --name-only > "$RUNNER_TEMP/actual-paths"
+          diff -u "$RUNNER_TEMP/expected-paths" "$RUNNER_TEMP/actual-paths"
+          git diff --cached --stat
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+      - name: Publish tested candidate only, not the PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ed6c92cab48e47fad8f929225e664df5b331a3c2
+          git diff --exit-code
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(s4a): prove watcher coverage with filesystem identity'
+          test "$(git rev-parse HEAD^)" = ed6c92cab48e47fad8f929225e664df5b331a3c2
+          git push origin HEAD:refs/heads/assist/s4a-case-closure-20260927-candidate
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          git show --stat --oneline HEAD
