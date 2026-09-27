@@ -13,20 +13,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Verify authored patch and stage exact source
+      - name: Verify authored patches and stage exact source
         shell: bash
         run: |
           set -euo pipefail
           cat .s4a-case-chunks/part-* | base64 --decode | gzip -dc > "$RUNNER_TEMP/repair.patch"
+          cp .s4a-case-chunks/cost.patch "$RUNNER_TEMP/cost.patch"
           echo "00b734e4f1e848ff99d50a1a100165e9ab7f8256953c4715b999f15ed7e7cf05  $RUNNER_TEMP/repair.patch" | sha256sum -c -
+          echo "31fda92e9c0a7e7d12f0c1e7335ae8f74972e567d4dc551366872daea69587fb  $RUNNER_TEMP/cost.patch" | sha256sum -c -
           git fetch --no-tags --depth=1 origin ed6c92cab48e47fad8f929225e664df5b331a3c2
           git checkout --detach ed6c92cab48e47fad8f929225e664df5b331a3c2
           test "$(git rev-parse HEAD)" = ed6c92cab48e47fad8f929225e664df5b331a3c2
           git apply --check "$RUNNER_TEMP/repair.patch"
           git apply "$RUNNER_TEMP/repair.patch"
+          git apply --check "$RUNNER_TEMP/cost.patch"
+          git apply "$RUNNER_TEMP/cost.patch"
           git diff --check
-          git add src/diffTracker.ts test/pr12-bounded-invariants.mjs docs/pr12-watcher-case-closure-2026-09-27.md
-          printf '%s\n' docs/pr12-watcher-case-closure-2026-09-27.md src/diffTracker.ts test/pr12-bounded-invariants.mjs > "$RUNNER_TEMP/expected-paths"
+          git add src/diffTracker.ts src/monitoringScope.ts test/pr12-bounded-invariants.mjs docs/pr12-watcher-case-closure-2026-09-27.md
+          printf '%s\n' docs/pr12-watcher-case-closure-2026-09-27.md src/diffTracker.ts src/monitoringScope.ts test/pr12-bounded-invariants.mjs > "$RUNNER_TEMP/expected-paths"
           git diff --cached --name-only > "$RUNNER_TEMP/actual-paths"
           diff -u "$RUNNER_TEMP/expected-paths" "$RUNNER_TEMP/actual-paths"
           git diff --cached --stat
@@ -42,8 +46,8 @@ jobs:
           git diff --exit-code
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(s4a): prove watcher coverage with filesystem identity'
+          git commit -m 'fix(s4a): unify filesystem-aware watcher coverage proofs'
           test "$(git rev-parse HEAD^)" = ed6c92cab48e47fad8f929225e664df5b331a3c2
-          git push origin HEAD:refs/heads/assist/s4a-case-closure-20260927-candidate
+          git push origin HEAD:refs/heads/assist/s4a-case-closure-20260927-candidate-v2
           echo "CANDIDATE_SHA=$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
           git show --stat --oneline HEAD

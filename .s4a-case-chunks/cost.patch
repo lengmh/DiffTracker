@@ -1,0 +1,69 @@
+--- a/src/diffTracker.ts
++++ b/src/diffTracker.ts
+@@ -8,7 +8,7 @@
+ import ignore, { Ignore } from 'ignore';
+ import { compareGitContexts, GitContextSnapshot } from './gitContext';
+ import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
+-import { CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
++import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
+ 
+ export type ReviewKind = 'text' | 'opaque' | 'unknown';
+ 
+@@ -4663,7 +4663,7 @@
+                 // behavior at this exact existing parent. Never infer it from
+                 // the root flag or Unicode string folding.
+                 const parent = path.join(rootPath, ...parentIdentity.resolvedRelativePath.split('/').filter(Boolean));
+-                return detectLocalPathCaseSensitivity(parent) === false;
++                return cachedExclusionDirectoryCaseSensitivity(parent) === false;
+             } catch {
+                 return false;
+             }
+--- a/src/monitoringScope.ts
++++ b/src/monitoringScope.ts
+@@ -569,7 +569,7 @@
+     }
+ }
+ 
+-function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
++export function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
+     const key = path.resolve(directory);
+     const before = exclusionDirectorySignature(directory);
+     if (before !== undefined) {
+--- a/test/pr12-bounded-invariants.mjs
++++ b/test/pr12-bounded-invariants.mjs
+@@ -707,6 +707,20 @@
+                     '**/.difftracker-restore-*','**/.DIFFTRACKER-RESTORE-*','**/.G\u0130T/**','**/.git*/**','**/.G?T/**']) {
+                     assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(pattern,identity),false,pattern);
+                 }
++                const originalOpen=fs.opendirSync;
++                let probeOpens=0;
++                fs.opendirSync=(target,...args)=>{
++                    if(path.resolve(String(target))===path.resolve(dir))probeOpens++;
++                    return originalOpen(target,...args);
++                };
++                try {
++                    for(let i=0;i<32;i++) {
++                        assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(
++                            '.DIFFTRACKER-RESTORE-*/**',identity),!sensitive);
++                    }
++                    assert.ok(probeOpens<=1,
++                        `same-parent proof must reuse a bounded metadata-validated case probe (opens=${probeOpens})`);
++                } finally {fs.opendirSync=originalOpen;}
+                 const requested=scopeFor(tracker);
+                 tracker.getVsCodeWatcherExcludePatterns=()=>['{.GIT,.DIFFTRACKER-RESTORE-*}/**'];
+                 const issue=tracker.configuredScopeNeedsSupplementalCoverage(requested);
+--- a/docs/pr12-watcher-case-closure-2026-09-27.md
++++ b/docs/pr12-watcher-case-closure-2026-09-27.md
+@@ -30,7 +30,11 @@
+ without descendants can still be an ordinary file.
+ 
+ Rules-mode explicit includes and Whole Workspace use the same hard-boundary
+-filter before direct-path, ancestor and descendant intersection checks.
++filter before direct-path, ancestor and descendant intersection checks. Concrete
++parent case probes reuse the existing bounded, metadata-validated exclusion-case
++cache rather than reopening the same parent for every coverage check. A counting
++regression reproduced 32 opens for 32 identical checks before this cost repair;
++the repaired path performs at most one probe and still validates parent metadata.
+ 
+ ## Necessary qualification of P2
+ 
