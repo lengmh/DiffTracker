@@ -625,6 +625,48 @@ export function registerPR12BoundedInvariants(h) {
         }
     }));
 
+    test('PR12 AUDIT watcher-failure gap participates in the same populated-directory projection',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'populated-watch-failure-projection');
+        fs.mkdirSync(imported);
+        fs.writeFileSync(path.join(imported,'child.txt'),'current');
+
+        const originalWatch=tracker.watchImportedTree.bind(tracker);
+        const originalValidate=tracker.validateCandidatePersistenceProjection.bind(tracker);
+        const originalFlush=tracker.flushPendingPersistence.bind(tracker);
+        let projected=false;
+        let flushed=false;
+        tracker.watchImportedTree=async()=>{throw new Error('forced watcher installation failure');};
+        tracker.validateCandidatePersistenceProjection=budget=>{
+            const gap=tracker.coverageGaps.get(path.resolve(imported))?.subtree;
+            assert.equal(gap?.reasonCode,'directory-runtime-coverage-gap',
+                'watcher-failure gap must exist before the final persistence projection');
+            projected=true;
+            return originalValidate(budget);
+        };
+        tracker.flushPendingPersistence=async(...args)=>{
+            if(projected){
+                const gap=tracker.coverageGaps.get(path.resolve(imported))?.subtree;
+                assert.equal(gap?.reasonCode,'directory-runtime-coverage-gap',
+                    'watcher-failure gap must share the child-baseline durable flush');
+                flushed=true;
+            }
+            return originalFlush(...args);
+        };
+        try {
+            await tracker.onExternalFileCreated(Uri.file(imported));
+            assert.equal(projected,true,'runtime populated-directory import must validate a final projection');
+            assert.equal(flushed,true,'runtime populated-directory import must flush the combined projection');
+            assert.equal(
+                tracker.coverageGaps.get(path.resolve(imported))?.subtree?.reasonCode,
+                'directory-runtime-coverage-gap'
+            );
+        } finally {
+            tracker.watchImportedTree=originalWatch;
+            tracker.validateCandidatePersistenceProjection=originalValidate;
+            tracker.flushPendingPersistence=originalFlush;
+        }
+    }));
+
     test('PR12 AUDIT populated-directory creation stops child baseline publication at the byte budget',()=>fixture(async({tracker,dir})=>{
         const imported=path.join(dir,'populated-byte-budget');fs.mkdirSync(imported);
         const children=[];

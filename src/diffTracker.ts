@@ -2639,10 +2639,15 @@ export class DiffTracker {
         this.setCoverageGap(filePath, { targetKind: 'file', reasonCode, reason });
     }
 
-    private setSubtreeCoverageGap(directory: string, reasonCode: string, reason: string): void {
+    private setSubtreeCoverageGap(
+        directory: string,
+        reasonCode: string,
+        reason: string,
+        schedule = true
+    ): void {
         const key = path.resolve(directory);
         const previous = this.coverageGaps.get(key)?.subtree;
-        this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason });
+        this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason }, schedule);
         if (!previous || previous.reasonCode !== reasonCode || previous.reason !== reason) {
             this.emitTrackChangesEvent({ fullRefresh: true });
         }
@@ -6634,18 +6639,41 @@ export class DiffTracker {
                             await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
                         }
                     }
+                    const watcherFailureReason =
+                        'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
+                    let watcherFailureProjected = false;
+                    if (watchFailed && !scanEvent && creationIsCurrent()) {
+                        // Runtime child baselines and their missing-watcher
+                        // obligation are one durable publication. Reserve the gap
+                        // before the final Session V4 projection so capacity
+                        // failure cannot commit children without warning evidence.
+                        this.setSubtreeCoverageGap(
+                            filePath,
+                            'directory-runtime-coverage-gap',
+                            watcherFailureReason,
+                            false
+                        );
+                        watcherFailureProjected = true;
+                    }
                     if (!scanEvent && creationIsCurrent()) {
                         // Child publications share one incremental budget. Persist
-                        // once after the bounded parent scan so the first capacity
-                        // failure aborts the whole import instead of being hidden by
-                        // a child-level completeBaseline() return.
+                        // once after the bounded parent scan so both child baselines
+                        // and any required watcher-failure gap cross the same
+                        // projection and durable write barrier.
                         this.validateCandidatePersistenceProjection(childPersistenceBudget);
                         if (!await this.flushPendingPersistence()) {
                             throw new Error('Created directory baseline changes could not be persisted');
                         }
                     }
                     if (watchFailed && creationIsCurrent()) {
-                        await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
+                        if (!watcherFailureProjected) {
+                            await this.markCreatedDirectoryUnavailable(
+                                filePath,
+                                watcherFailureReason,
+                                scanEvent,
+                                epoch
+                            );
+                        }
                     } else if (creationIsCurrent()) {
                         // A successful watch plus the completed bounded scan above
                         // satisfies an existing diagnostic; watcher installation
