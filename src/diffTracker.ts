@@ -3788,6 +3788,7 @@ export class DiffTracker {
         const needsBroadPreparation = scope.mode === 'wholeWorkspace' ||
             !!expansion?.reasons.some(reason =>
                 reason.startsWith('New workspace root:') ||
+                reason.startsWith('New or broader explicit include:') ||
                 reason.startsWith('Explicit exclude removed or changed:') ||
                 reason.startsWith('Whole Workspace mode'));
         if (needsBroadPreparation) {

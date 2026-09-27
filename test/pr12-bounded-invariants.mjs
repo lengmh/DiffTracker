@@ -255,6 +255,34 @@ export function registerPR12BoundedInvariants(h) {
     });
 
 
+    test('PR12 AUDIT broader Rules include is routed through bounded expansion preparation',()=>fixture(async({tracker,scope,dir})=>{
+        const included=path.join(dir,'broad-include');
+        fs.mkdirSync(included);
+        fs.writeFileSync(path.join(included,'child.txt'),'baseline');
+
+        const requested=scopeFor(tracker,'rules',[]);
+        requested.includes=[{scope:'all',path:'broad-include'}];
+        requested.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,
+            mode:requested.mode,
+            roots:requested.roots,
+            includes:requested.includes,
+            excludes:requested.excludes
+        })).digest('hex');
+
+        assert.equal(scope.includes.length,0,'fixture starts from a narrower Rules scope');
+        tracker.maxScopePreflightEntries=0;
+
+        const result=await tracker.applyConfiguredMonitoringScope(requested);
+        assert.equal(result.status,'failed',
+            'broader include must fail under the zero bounded-preparation budget instead of using legacy unbounded capture');
+        assert.match(result.reason??'',/preparation|budget|capacity|entries/i);
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision,
+            'failed bounded preparation must preserve the previously committed scope');
+        assert.equal(tracker.fileSnapshots.has(path.join(included,'child.txt')),false,
+            'rejected broad include must not retain candidate baselines');
+    },'rules'));
+
     test('PR12 AUDIT Whole Workspace Start budgets open-document baselines before retention',()=>fixture(async({tracker,dir})=>{
         const first=path.join(dir,'open-first.txt'),second=path.join(dir,'open-second.txt');
         fs.writeFileSync(first,'a'.repeat(800));fs.writeFileSync(second,'b'.repeat(800));
