@@ -2884,6 +2884,28 @@ export class DiffTracker {
             return conflict('Requested scope roots do not match the current local workspace identity.');
         }
 
+        // Configuration/controller updates can leave a committed-scope matcher
+        // refresh in flight immediately before Apply starts. Drain only work that
+        // already existed before taking the preflight version snapshot; a refresh
+        // that begins after this barrier still invalidates candidate preparation.
+        let pendingRefresh = this.ignoreRefreshPromise;
+        while (true) {
+            try { await pendingRefresh; } catch { /* Candidate preflight rebuilds its own matcher below. */ }
+            if (!requestStillCurrent()) {
+                return conflict('Monitoring scope request changed while waiting for ignore-policy refresh.');
+            }
+            if (pendingRefresh === this.ignoreRefreshPromise) { break; }
+            pendingRefresh = this.ignoreRefreshPromise;
+        }
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
+            return conflict('Monitoring scope preflight was invalidated while waiting for ignore-policy refresh.');
+        }
+        const refreshedIdentityIssue = this.getPathIdentityIssue();
+        if (refreshedIdentityIssue) { return conflict(refreshedIdentityIssue); }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
+            return conflict('Requested scope roots changed while waiting for ignore-policy refresh.');
+        }
+
         const epoch = this.sessionEpoch;
         const ignoreVersion = this.ignoreRefreshVersion;
         const contextStillCurrent = (): boolean =>
