@@ -4,6 +4,7 @@ import * as Diff from 'diff';
 import * as path from 'path';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
+import { fileURLToPath } from 'url';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
 import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
@@ -4624,20 +4625,49 @@ export class DiffTracker {
         return expanded;
     }
 
-    private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
+    private watcherPatternOnlyTargetsHardBoundary(
+        pattern: string,
+        identity: WorkspaceRootIdentity
+    ): boolean {
         const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')
             .split('/').filter(Boolean);
-        // An exact .git path segment is unmonitorable regardless of whether the
-        // leaf is a file or directory. Restore-prefixed names are different:
-        // only restore-prefixed directories are hard boundaries, while an
-        // ordinary file such as ".difftracker-restore-notes" is monitorable.
-        // A restore-prefixed segment followed by another path segment can only
-        // match descendants of a directory, so that watcher blind spot is fully
-        // contained by the existing hard boundary.
-        return segments.some((segment, index) =>
-            segment === '.git' ||
-            (segment.startsWith('.difftracker-restore-') && index < segments.length - 1)
-        );
+        return segments.some((segment, index) => {
+            // Only ancestor segments are known directories. A leaf with the
+            // restore prefix can still be an ordinary, monitorable file.
+            const directory = index < segments.length - 1;
+            if (isHardUnmonitorableRelativePath(segment, true, directory)) { return true; }
+            if (!isHardUnmonitorableRelativePath(segment, false, directory)) { return false; }
+            if (typeof identity.caseSensitive !== 'boolean') { return false; }
+
+            const parents = segments.slice(0, index);
+            // A root's case flag cannot prove lookup semantics under every
+            // wildcard-selected parent (a child may be a sensitive directory or
+            // mount). Keep that unproved blind spot for supplemental coverage.
+            if (parents.some(part => /[*?\[\]{}]/.test(part))) { return false; }
+            try {
+                const root = new URL(identity.uri);
+                if (root.protocol !== 'file:') { return false; }
+                const rootPath = fileURLToPath(root);
+                const parentIdentity = resolveRelativePathIdentity(rootPath, parents.join('/'), true);
+                if (parentIdentity.unavailable || parentIdentity.verifiedPrefixLength !== parents.length) {
+                    return false;
+                }
+                if (!/[*?\[\]{}]/.test(segment)) {
+                    const prefix = [...parents, segment].join('/');
+                    const target = resolveRelativePathIdentity(rootPath, prefix, true);
+                    if (!target.unavailable && target.verifiedPrefixLength === parents.length + 1) {
+                        return isHardUnmonitorableRelativePath(prefix, identity, directory);
+                    }
+                }
+                // For a missing name or restore-prefix glob, prove ASCII case
+                // behavior at this exact existing parent. Never infer it from
+                // the root flag or Unicode string folding.
+                const parent = path.join(rootPath, ...parentIdentity.resolvedRelativePath.split('/').filter(Boolean));
+                return detectLocalPathCaseSensitivity(parent) === false;
+            } catch {
+                return false;
+            }
+        });
     }
 
     private watcherGlobSegmentMatches(patternSegment: string, value: string, caseSensitive: boolean): boolean {
@@ -4714,7 +4744,6 @@ export class DiffTracker {
         includePath: string,
         caseSensitive: boolean
     ): boolean {
-        if (this.watcherPatternOnlyTargetsHardBoundary(pattern)) { return false; }
         const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const include = includePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const patternSegments = normalized.split('/').filter(Boolean);
@@ -4765,10 +4794,14 @@ export class DiffTracker {
                 }
                 const descendantsExplicitlyExcluded =
                     configuredScopeExplicitlyExcludesSubtree(scope, identity, rel);
-                const patterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
-                if (!patterns) {
+                const expandedPatterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
+                if (!expandedPatterns) {
                     return `${folder.name}:${rule.path}:files.watcherExclude expansion exceeds safe bound`;
                 }
+                // Direct target, ancestor and descendant checks must share
+                // the same root-aware hard-boundary classification.
+                const patterns = expandedPatterns.filter(pattern =>
+                    !this.watcherPatternOnlyTargetsHardBoundary(pattern, identity));
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
@@ -4834,12 +4867,16 @@ export class DiffTracker {
         // watcher patterns, whose coverage helper strips that marker.
         const comparable = (value: string): string =>
             value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
-        const watcherKey = identity.caseSensitive ? normalized : normalized.toLowerCase();
+        // Only identical glob syntax is a global coverage proof. Neither
+        // Unicode nor ASCII folding proves that every literal component resolves
+        // equivalently beneath wildcard-selected parents. Non-identical patterns
+        // fall through to the concrete filesystem-aware subtree proof below.
+        const watcherKey = normalized;
         const identicalExplicitExclusion = scope.excludes.some(rule => {
             if (rule.scope === 'folder' && rule.folder !== identity.name) { return false; }
             if (rule.pattern.endsWith('/')) { return false; }
             const ruleKey = comparable(rule.pattern);
-            return (identity.caseSensitive ? ruleKey : ruleKey.toLowerCase()) === watcherKey;
+            return ruleKey === watcherKey;
         });
         if (identicalExplicitExclusion) {
             return true;
@@ -4880,7 +4917,7 @@ export class DiffTracker {
                 return `${folder.name}:files.watcherExclude expansion exceeds safe bound`;
             }
             const patterns = expandedPatterns
-                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern))
+                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern, identity))
                 .filter(pattern => !this.watcherPatternCoveredByExplicitScopeExclusion(scope, identity, pattern));
             if (patterns.length > 0) {
                 return `${folder.name}:Whole Workspace intersects files.watcherExclude (${patterns[0]})`;
