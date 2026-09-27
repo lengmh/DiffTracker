@@ -1,0 +1,33 @@
+name: S4-A isolated case closure
+on:
+  push:
+    branches: [assist/s4a-case-closure-20260927-runner]
+permissions:
+  contents: read
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ed6c92cab48e47fad8f929225e664df5b331a3c2
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm run compile
+      - name: Package source and test dependencies without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar HEAD > "$RUNNER_TEMP/s4a-workspace.tar"
+          tar -rf "$RUNNER_TEMP/s4a-workspace.tar" node_modules out
+          gzip -1 "$RUNNER_TEMP/s4a-workspace.tar"
+          sha256sum "$RUNNER_TEMP/s4a-workspace.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s4a-case-workspace
+          path: ${{ runner.temp }}/s4a-workspace.tar.gz
+          retention-days: 1
