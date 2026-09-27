@@ -6,6 +6,7 @@ const maxCaseSensitivityProbeEntries = 128;
 
 interface DirectoryEntryListing {
     entries: fs.Dirent[];
+    byName: Map<string, fs.Dirent>;
     complete: boolean;
 }
 
@@ -13,16 +14,18 @@ function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing 
     const handle = fs.opendirSync(directory);
     try {
         const entries: fs.Dirent[] = [];
+        const byName = new Map<string, fs.Dirent>();
         while (true) {
             const entry = handle.readSync();
-            if (!entry) { return { entries, complete: true }; }
+            if (!entry) { return { entries, byName, complete: true }; }
             if (entries.length >= maxIdentityDirectoryEntries) {
-                // The cache is bounded, not the live directory. Runtime identity
-                // resolution can stream a targeted lookup when the requested
-                // entry is outside this retained prefix.
-                return { entries, complete: false };
+                // The cache is bounded, not the live directory. Retain this
+                // prefix with an incomplete marker so later lookups can reuse it
+                // instead of synchronously rereading the same 10k entries.
+                return { entries, byName, complete: false };
             }
             entries.push(entry);
+            byName.set(entry.name, entry);
         }
     } finally { handle.closeSync(); }
 }
@@ -80,7 +83,7 @@ function caseEquivalentEntries(
 ): string[] | undefined {
     try {
         const folded = asciiCaseFold(requested);
-        const entries = knownEntries ?? directoryEntries(parent);
+        const entries = knownEntries ?? directoryEntries(parent).entries;
         return entries.map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
@@ -183,7 +186,12 @@ export interface RelativePathIdentity {
 // Cache listings, not case semantics or lookup results. Every reuse verifies the
 // parent identity/metadata; each selected entry is still lstat'ed. In particular,
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
-const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
+const directoryEntriesCache = new Map<string, {
+    signature: string;
+    entries: fs.Dirent[];
+    byName: Map<string, fs.Dirent>;
+    complete: boolean;
+}>();
 let cachedDirectoryEntryCount = 0;
 
 function invalidateDirectoryEntries(directory: string): void {
@@ -193,36 +201,39 @@ function invalidateDirectoryEntries(directory: string): void {
     cachedDirectoryEntryCount = Math.max(0, cachedDirectoryEntryCount - cached.entries.length);
 }
 
-function directoryEntries(directory: string): fs.Dirent[] {
+function directoryEntries(directory: string): DirectoryEntryListing {
     const signature = (): string => {
         const stat = fs.statSync(directory);
         return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
     };
     const before = signature();
     const cached = directoryEntriesCache.get(directory);
-    if (cached?.signature === before) { return cached.entries; }
-    const listing = readIdentityDirectoryEntries(directory);
-    const entries = listing.entries;
-    if (!listing.complete) {
-        // Never cache a truncated directory as if it were a complete identity
-        // oracle. The targeted streaming lookup below handles paths outside the
-        // retained prefix without materializing the whole directory.
-        invalidateDirectoryEntries(directory);
-        return entries;
+    if (cached?.signature === before) {
+        return {
+            entries: cached.entries,
+            byName: cached.byName,
+            complete: cached.complete
+        };
     }
+    const listing = readIdentityDirectoryEntries(directory);
     if (signature() === before) {
         const previousCount = cached?.entries.length ?? 0;
         if (directoryEntriesCache.size >= 4096 ||
-            cachedDirectoryEntryCount - previousCount + entries.length > maxIdentityDirectoryEntries) {
+            cachedDirectoryEntryCount - previousCount + listing.entries.length > maxIdentityDirectoryEntries) {
             directoryEntriesCache.clear();
             cachedDirectoryEntryCount = 0;
         } else {
             cachedDirectoryEntryCount -= previousCount;
         }
-        directoryEntriesCache.set(directory, { signature: before, entries });
-        cachedDirectoryEntryCount += entries.length;
+        directoryEntriesCache.set(directory, {
+            signature: before,
+            entries: listing.entries,
+            byName: listing.byName,
+            complete: listing.complete
+        });
+        cachedDirectoryEntryCount += listing.entries.length;
     }
-    return entries;
+    return listing;
 }
 
 function sameEntryLookup(left: string, right: string): boolean {
@@ -295,20 +306,21 @@ export function resolveRelativePathIdentity(
         let actual: string | undefined;
         if (physicalPrefixAvailable) {
             try {
-                let entries = directoryEntries(current);
+                let listing = directoryEntries(current);
                 const requestedPath = path.join(current, requested);
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // the current directory can differ from the workspace root.
                 const requestedStat = fs.lstatSync(requestedPath);
-                let exact = entries.find(entry => entry.name === requested);
-                if (!exact) {
+                let exact = listing.byName.get(requested);
+                if (!exact && listing.complete) {
                     // Some filesystems (notably Windows runners) can preserve a
                     // directory mtime/ctime signature across a rapid child create.
-                    // Refresh the bounded cache once, then fall back to a streaming
-                    // target lookup if the directory outgrew cache capacity.
+                    // Refresh a complete cache once. An incomplete cached prefix
+                    // is already reusable evidence and falls through directly to
+                    // the streaming target lookup below.
                     invalidateDirectoryEntries(current);
-                    entries = directoryEntries(current);
-                    exact = entries.find(entry => entry.name === requested);
+                    listing = directoryEntries(current);
+                    exact = listing.byName.get(requested);
                 }
                 if (exact) {
                     actual = exact.name;

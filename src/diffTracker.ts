@@ -602,6 +602,7 @@ export class DiffTracker {
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
     private ignoreFingerprint?: string;
+    private ignorePolicyRevision = 0;
     private scanCoverage?: string;
     private effectiveMonitoringScope: EffectiveMonitoringScope;
     // Scope preparation temporarily stages matcher/baseline state. Public
@@ -2907,10 +2908,10 @@ export class DiffTracker {
         }
 
         const epoch = this.sessionEpoch;
-        const ignoreVersion = this.ignoreRefreshVersion;
+        const ignorePolicyRevision = this.ignorePolicyRevision;
         const contextStillCurrent = (): boolean =>
             this.isCurrentEpoch(epoch) && requestStillCurrent() &&
-            ignoreVersion === this.ignoreRefreshVersion && !this.baselineTransaction &&
+            ignorePolicyRevision === this.ignorePolicyRevision && !this.baselineTransaction &&
             this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
         // Preflight must evaluate ordinary ignore policy against the
         // requested scope, not the committed matcher snapshot. Existing-root
@@ -3086,6 +3087,23 @@ export class DiffTracker {
             .sort((left, right) => right.entries - left.entries ||
                 left.root.localeCompare(right.root) || left.path.localeCompare(right.path))
             .slice(0, this.maxScopePreflightDirectorySummaries);
+
+        // A watcher-triggered matcher refresh can overlap preflight. Wait for the
+        // current refresh chain to settle before publication and reject only if
+        // the effective matcher fingerprint actually changed. A no-op refresh
+        // (for example a directory create with no new ignore policy) is harmless.
+        let finalRefresh = this.ignoreRefreshPromise;
+        while (true) {
+            try { await finalRefresh; } catch { /* Candidate matcher already reports its own read failures. */ }
+            if (!requestStillCurrent()) {
+                return conflict('Monitoring scope request changed while finalizing ignore-policy preparation.');
+            }
+            if (finalRefresh === this.ignoreRefreshPromise) { break; }
+            finalRefresh = this.ignoreRefreshPromise;
+        }
+        if (!contextStillCurrent()) {
+            return conflict('Monitoring scope ignore policy changed during preparation.');
+        }
         return result;
     }
 
@@ -4377,6 +4395,7 @@ export class DiffTracker {
         if (legacyPolicyChanged) { this.schedulePersistState(); }
         const fingerprint = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
         const changed = fingerprint !== this.ignoreFingerprint;
+        if (changed) { this.ignorePolicyRevision++; }
         this.ignoreFingerprint = fingerprint;
         if (this.scanCoverage && this.scanCoverage !== fingerprint) {
             this.scanCoverage = undefined;

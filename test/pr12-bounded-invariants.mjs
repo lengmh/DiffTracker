@@ -229,14 +229,14 @@ export function registerPR12BoundedInvariants(h) {
         const dir=file('identity-runtime-large');fs.mkdirSync(dir);
         const target=path.join(dir,'late-entry.txt');fs.writeFileSync(target,'tracked');
         const originalOpen=fs.opendirSync;
-        let opens=0;
+        let opens=0,totalReads=0;
         fs.opendirSync=(value,...args)=>{
             if(path.resolve(String(value))!==path.resolve(dir)) return originalOpen(value,...args);
             opens++;
             let index=0;
             return {
                 readSync(){
-                    index++;
+                    index++;totalReads++;
                     if(index<=10000) return {name:`synthetic-${index}.txt`};
                     if(index===10001) return {name:'late-entry.txt'};
                     return null;
@@ -245,15 +245,45 @@ export function registerPR12BoundedInvariants(h) {
             };
         };
         try {
-            const resolved=resolveRelativePathIdentity(dir,'late-entry.txt',true);
-            assert.equal(resolved.unavailable,false,
+            const first=resolveRelativePathIdentity(dir,'late-entry.txt',true);
+            assert.equal(first.unavailable,false,
                 'an existing path after the cache prefix must not become identityUnknown');
-            assert.equal(resolved.identity,'late-entry.txt');
-            assert.equal(resolved.verifiedPrefixLength,1);
-            assert.ok(opens>=2,'oversized identity lookup must fall back to a streaming target scan');
+            assert.equal(first.identity,'late-entry.txt');
+            assert.equal(first.verifiedPrefixLength,1);
+            const readsAfterFirst=totalReads;
+            const second=resolveRelativePathIdentity(dir,'late-entry.txt',true);
+            assert.equal(second.unavailable,false);
+            assert.equal(second.identity,'late-entry.txt');
+            assert.equal(opens,3,
+                'second oversized lookup must reuse the cached 10k prefix and open only the streaming fallback');
+            assert.ok(totalReads-readsAfterFirst<=10002,
+                'cached incomplete prefix must prevent rereading the first 10k entries on every lookup');
         } finally {fs.opendirSync=originalOpen;}
     });
 
+
+    test('PR12 AUDIT no-op matcher refresh does not invalidate bounded preflight',()=>fixture(async({tracker,scope})=>{
+        await tracker.refreshIgnoreMatchers();
+        const beforeFingerprint=tracker.ignoreFingerprint;
+        const originalBuild=tracker.buildIgnoreMatcher.bind(tracker);
+        let injected=false;
+        tracker.buildIgnoreMatcher=async(...args)=>{
+            const matcher=await originalBuild(...args);
+            if(!injected){
+                injected=true;
+                await tracker.refreshIgnoreMatchers();
+            }
+            return matcher;
+        };
+        try {
+            const result=await tracker.preflightConfiguredMonitoringScope(scope);
+            assert.equal(result.status,'ready',JSON.stringify(result));
+            assert.equal(tracker.ignoreFingerprint,beforeFingerprint,
+                'injected refresh is intentionally policy-equivalent');
+        } finally {
+            tracker.buildIgnoreMatcher=originalBuild;
+        }
+    },'rules'));
 
     test('PR12 AUDIT broader Rules include is routed through bounded expansion preparation',()=>fixture(async({tracker,scope,dir})=>{
         const included=path.join(dir,'broad-include');
