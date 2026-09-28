@@ -1,0 +1,77 @@
+name: S4-A isolated migration closure
+on:
+  push:
+    branches: [assist/s4a-migration-closure-20260928-runner]
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify authored patch and stage pinned source
+        run: python .s4a-migration-chunks/stage.py
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run compile
+      - name: Verify original-source counterexamples on Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if DT_SOURCE="$RUNNER_TEMP/migration-original.ts" DT_TEST_FILTER='PR12 MIGRATION' node test/tracker-safety.mjs > "$RUNNER_TEMP/migration-red.log" 2>&1; then
+            cat "$RUNNER_TEMP/migration-red.log"
+            echo 'Expected original source to fail the migration regression matrix'
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/migration-red.log"
+          grep -F '5/14 production tracker regressions passed' "$RUNNER_TEMP/migration-red.log"
+      - name: Full Linux regression
+        if: runner.os == 'Linux'
+        run: npm test
+      - name: Real Windows PR12 matrix
+        if: runner.os == 'Windows'
+        env:
+          DT_TEST_FILTER: PR12
+        run: node test/tracker-safety.mjs
+      - name: Windows unchanged coverage-callback regressions
+        if: runner.os == 'Windows'
+        env:
+          DT_TEST_FILTER: PR11 candidate coverage callback
+        run: node test/tracker-safety.mjs
+      - run: npm run test:performance
+      - name: Confirm no test changed the verified source
+        run: git diff --exit-code
+  publish-candidate:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reproduce verified source tree
+        run: python .s4a-migration-chunks/stage.py
+      - name: Publish tested candidate only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 83b9c862e4c22c440647b25dd54b903d78dad23d
+          git diff --exit-code
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(s4a): bound every scope-apply acquisition route'
+          test "$(git rev-parse HEAD^)" = 83b9c862e4c22c440647b25dd54b903d78dad23d
+          git push origin HEAD:refs/heads/assist/s4a-migration-closure-20260928-candidate
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          git show --stat --oneline HEAD
