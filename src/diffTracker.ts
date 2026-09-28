@@ -3113,70 +3113,49 @@ export class DiffTracker {
         return result;
     }
 
-    private async enumerateExplicitIncludeFiles(
-        rootPath: string,
+    private async captureConfiguredIncludeBaselines(
         scope: CanonicalMonitoringScope,
-        epoch: number
-    ): Promise<string[]> {
-        const files: string[] = [];
-        const pending = [rootPath];
-        while (pending.length > 0) {
-            if (!this.isCurrentEpoch(epoch)) { return files; }
-            const current = pending.pop()!;
-            const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
-            if (!folder || folder.uri.scheme !== 'file') { continue; }
-            const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
-            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
-            if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                isHardUnmonitorableRelativePath(relative, rootIdentity, true)) { continue; }
-            const currentDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, true);
-            if (currentDecision.source === 'explicitExclude') { continue; }
-
-            let entries: fs.Dirent[];
-            try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
-            catch (error) {
-                if (this.isFileNotFound(error)) { continue; }
-                throw error;
-            }
-            if (!this.isCurrentEpoch(epoch)) { return files; }
-
-            for (const entry of entries) {
-                if (!this.isCurrentEpoch(epoch)) { return files; }
-                const child = path.join(current, entry.name);
-                const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                    isHardUnmonitorableRelativePath(childRelative, rootIdentity, entry.isDirectory()) ||
-                    entry.isSymbolicLink()) { continue; }
-                const childDecision = evaluateConfiguredScope(
-                    scope, rootIdentity, childRelative, false, entry.isDirectory()
-                );
-                if (childDecision.source === 'explicitExclude') { continue; }
-                if (entry.isDirectory()) {
-                    pending.push(child);
-                } else if (entry.isFile()) {
-                    files.push(child);
-                }
-            }
+        epoch: number,
+        preparationStillCurrent: () => boolean,
+        shared?: {
+            persistence: CandidatePersistenceBudget;
+            traversal: { remainingEntries: number };
+            missingOnly: boolean;
         }
-        return files;
-    }
-
-    private async captureConfiguredIncludeBaselines(scope: CanonicalMonitoringScope, epoch: number): Promise<number> {
+    ): Promise<number> {
         let captured = 0;
+        const assertCurrent = (): void => {
+            if (!this.isCurrentEpoch(epoch) || !preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
+        };
+        assertCurrent();
+        const projectedScanCoverage = !this.isRecording || this.baselineBuilding ||
+            !this.snapshotInitialized || this.workspaceContextChanged ? undefined : this.ignoreFingerprint;
+        const persistenceBudget = shared?.persistence ?? this.createCandidatePersistenceBudget(projectedScanCoverage);
+        const preparationBudget = shared?.traversal ?? { remainingEntries: this.maxScopePreflightEntries };
+        const capacityGuard: CandidateCapacityGuard = {
+            remaining: this.remainingCandidatePersistenceSlots(),
+            exemptPaths: new Set([
+                ...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys(), ...this.trackedChanges.keys()
+            ]),
+            countedCandidates: new Set<string>()
+        };
+        const visitedDirectories = new Set<string>();
+        const visitedTargets = new Set<string>();
         const rootsByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
+        const eligible = (filePath: string): boolean => !this.hasCapturedBaseline(filePath) &&
+            !this.unresolvedBaselineFiles.has(filePath) && !this.trackedChanges.has(filePath) &&
+            !this.isPathIgnored(vscode.Uri.file(filePath), false, false, false);
         const captureFile = async (filePath: string): Promise<void> => {
+            assertCurrent();
             filePath = this.canonicalTrackingPath(filePath);
-            if (!this.isCurrentEpoch(epoch) || this.hasCapturedBaseline(filePath) ||
-                this.unresolvedBaselineFiles.has(filePath) || this.trackedChanges.has(filePath) ||
-                this.isPathIgnored(vscode.Uri.file(filePath), false, false)) { return; }
-            const targetError = this.isRecording
-                ? this.validateSnapshotTarget(filePath)
-                : this.validateResourceTarget(filePath);
-            if (targetError) { return; }
+            if (!eligible(filePath) || this.validateSnapshotTarget(filePath)) { return; }
             const state = await this.readCurrentFileState(filePath);
-            if (!this.isCurrentEpoch(epoch)) { return; }
-            this.recordScannedBaseline(filePath, state, 'workspace');
-            captured++;
+            assertCurrent();
+            if (!eligible(filePath)) { return; }
+            if (this.recordScannedBaseline(filePath, state, 'workspace', persistenceBudget)) { captured++; }
         };
 
         for (const rule of scope.includes) {
@@ -3184,39 +3163,56 @@ export class DiffTracker {
                 ? [rootsByName.get(rule.folder ?? '')].filter((value): value is vscode.WorkspaceFolder => !!value)
                 : this.getSupportedWorkspaceFolders();
             for (const folder of folders) {
-                if (!this.isCurrentEpoch(epoch)) { return captured; }
+                assertCurrent();
+                // Literal/absent targets must consume work as well; a large list
+                // of missing includes cannot bypass the directory-entry bound.
+                if (preparationBudget.remainingEntries <= 0) {
+                    throw new Error('Monitoring scope include preparation work budget exceeded; narrow the scope before retrying.');
+                }
+                preparationBudget.remainingEntries--;
                 const target = this.canonicalTrackingPath(path.join(folder.uri.fsPath, ...rule.path.split('/')));
+                if (visitedTargets.has(target)) { continue; }
+                visitedTargets.add(target);
+                const uri = vscode.Uri.file(target);
+                if (this.isPathIgnored(uri, false, false, false)) { continue; }
                 const targetError = this.validateResourceTarget(target);
                 if (targetError) { throw new Error(targetError); }
                 let stat: fs.Stats | undefined;
                 try { stat = fs.lstatSync(target); }
-                catch (error) {
-                    if (!this.isFileNotFound(error)) { throw error; }
-                }
+                catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
                 if (!stat) {
-                    if (!this.hasCapturedBaseline(target) && !this.unresolvedBaselineFiles.has(target)) {
-                        this.fileSnapshots.set(target, '');
-                        this.fileModes.delete(target);
-                        this.baselineExistingFiles.delete(target);
-                        this.opaqueBaselineFiles.delete(target);
-                        captured++;
+                    if (!eligible(target)) { continue; }
+                    if (this.hasDirtyDocument(target)) {
+                        await captureFile(target);
+                        continue;
                     }
+                    // Preserve S3's explicit missing-target absence provenance,
+                    // but reserve its exact text/count/byte cost before retention.
+                    this.consumeCandidatePersistenceBudget(target,
+                        { kind: 'text', content: '', baselineExists: false }, persistenceBudget);
+                    this.fileSnapshots.set(target, '');
+                    this.fileModes.delete(target);
+                    this.baselineExistingFiles.delete(target);
+                    this.opaqueBaselineFiles.delete(target);
+                    captured++;
                     continue;
                 }
                 if (stat.isSymbolicLink()) { throw new Error('Explicit include resolves through a symbolic link'); }
-                if (stat.isFile()) {
-                    await captureFile(target);
-                    continue;
-                }
+                if (shared?.missingOnly) { continue; }
+                if (stat.isFile()) { await captureFile(target); continue; }
                 if (!stat.isDirectory()) { continue; }
-                const files = await this.enumerateExplicitIncludeFiles(target, scope, epoch);
-                if (!this.isCurrentEpoch(epoch)) { return captured; }
-                for (const filePath of files) {
-                    if (!this.pathBelongsToRoot(filePath, target)) { continue; }
-                    await captureFile(filePath);
-                }
+                // There is no legacy/unbudgeted acquisition path. Even repeated
+                // or contracting Rules Apply uses the shared streaming enumerator.
+                const files = await this.enumerateConfiguredCandidateFiles(
+                    scope, epoch, target, capacityGuard, preparationBudget, preparationStillCurrent,
+                    { seedOverlappingWorkspaceRoots: true, visitedDirectories }
+                );
+                assertCurrent();
+                for (const filePath of files) { await captureFile(filePath); }
             }
         }
+        assertCurrent();
+        this.validateCandidatePersistenceProjection(persistenceBudget);
         return captured;
     }
 
@@ -3283,6 +3279,7 @@ export class DiffTracker {
         traversalOptions: {
             seedOverlappingWorkspaceRoots?: boolean;
             skipTraversalPath?: (targetPath: string) => boolean;
+            visitedDirectories?: Set<string>;
         } = {}
     ): Promise<string[]> {
         const files: string[] = [];
@@ -3340,6 +3337,9 @@ export class DiffTracker {
                 isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true) ||
                 this.isPathIgnored(vscode.Uri.file(directory), true, false, false)
             )) { continue; }
+            const visitKey = folder.uri.toString() + '\0' + path.resolve(directory);
+            if (traversalOptions.visitedDirectories?.has(visitKey)) { continue; }
+            traversalOptions.visitedDirectories?.add(visitKey);
 
             let handle: fs.Dir | undefined;
             try {
@@ -3732,7 +3732,7 @@ export class DiffTracker {
     private async captureConfiguredExpansionBaselines(
         scope: CanonicalMonitoringScope,
         epoch: number,
-        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch)
+        preparationStillCurrent: () => boolean
     ): Promise<number> {
         let captured = 0;
         const durableResourcePaths = new Set([
@@ -3749,6 +3749,7 @@ export class DiffTracker {
                 ? undefined
                 : this.ignoreFingerprint;
         const persistenceBudget = this.createCandidatePersistenceBudget(projectedScanCoverage);
+        const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
         const files = await this.enumerateConfiguredCandidateFiles(
             scope,
             epoch,
@@ -3758,7 +3759,7 @@ export class DiffTracker {
                 exemptPaths: capacityExemptPaths,
                 countedCandidates: new Set<string>()
             },
-            { remainingEntries: this.maxScopePreflightEntries },
+            preparationBudget,
             preparationStillCurrent
         );
         if (!this.isCurrentEpoch(epoch)) { return captured; }
@@ -3794,6 +3795,12 @@ export class DiffTracker {
                 this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)) { continue; }
             if (this.recordScannedBaseline(filePath, state, 'workspace', persistenceBudget)) { captured++; }
         }
+        if (scope.mode === 'rules') {
+            captured += await this.captureConfiguredIncludeBaselines(scope, epoch, preparationStillCurrent, {
+                persistence: persistenceBudget, traversal: preparationBudget, missingOnly: true
+            });
+        }
+        this.validateCandidatePersistenceProjection(persistenceBudget);
         return captured;
     }
 
@@ -3831,12 +3838,12 @@ export class DiffTracker {
         const expansion = this.effectiveMonitoringScope.kind === 'configured'
             ? detectScopeExpansion(this.effectiveMonitoringScope, scope)
             : undefined;
-        const needsBroadPreparation = scope.mode === 'wholeWorkspace' ||
-            !!expansion?.reasons.some(reason =>
-                reason.startsWith('New workspace root:') ||
-                reason.startsWith('New or broader explicit include:') ||
-                reason.startsWith('Explicit exclude removed or changed:') ||
-                reason.startsWith('Whole Workspace mode'));
+        // Migration is a scope transition too. Use semantic expansion, never
+        // diagnostic reason strings, to select advisory broad preflight. This
+        // choice cannot exempt any acquisition path from its own work/byte caps.
+        const legacyMigration = this.effectiveMonitoringScope.kind === 'legacyV3';
+        const needsBroadCapture = scope.mode === 'wholeWorkspace' || expansion?.expands === true;
+        const needsBroadPreparation = legacyMigration || needsBroadCapture;
         if (needsBroadPreparation) {
             const preflight = await this.preflightConfiguredMonitoringScope(scope, requestStillCurrent);
             if (preflight.status !== 'ready') {
@@ -3995,10 +4002,13 @@ export class DiffTracker {
 
             // Apply is not Start: stopped sessions must not acquire new
             // before-images or enumerate newly included resource contents.
+            // A first Rules migration establishes only its explicit targets.
+            // Treating every untracked ordinary file as a new baseline here
+            // would silently accept unrelated post-scan creations.
             result.capturedBaselines = this.isRecording
-                ? needsBroadPreparation
+                ? needsBroadCapture
                     ? await this.captureConfiguredExpansionBaselines(scope, epoch, scopeContextStillCurrent)
-                    : await this.captureConfiguredIncludeBaselines(scope, epoch)
+                    : await this.captureConfiguredIncludeBaselines(scope, epoch, scopeContextStillCurrent)
                 : 0;
             const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
             if (lateSupplementalCoverageIssue) {
@@ -4009,7 +4019,8 @@ export class DiffTracker {
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }
-            this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+            this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged ||
+                (legacyMigration && scope.mode === 'rules')
                 ? undefined
                 : this.ignoreFingerprint;
             if (!await this.flushPersistState(false, transaction, true)) {

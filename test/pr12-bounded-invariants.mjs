@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { evaluateConfiguredScope } from '../out/monitoringScope.js';
+import { evaluateConfiguredScope, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 import { withLookups } from './pr11-final-scope-regressions.mjs';
 import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from '../out/utils/pathIdentity.js';
 
@@ -313,6 +313,204 @@ export function registerPR12BoundedInvariants(h) {
             'failed bounded preparation must preserve the previously committed scope');
         assert.equal(tracker.fileSnapshots.has(path.join(included,'child.txt')),false,
             'rejected broad include must not retain candidate baselines');
+    },'rules'));
+
+    // Exercise public Apply across source-scope transitions. Helper-only tests
+    // cannot establish that every acquisition route actually consumes a budget.
+    function includeScope(tracker, mode, includes, excludes=[]) {
+        const checked=validateAndCanonicalizeScope({mode,
+            includes:includes.map(value=>typeof value==='string'?{scope:'all',path:value}:value),excludes
+        },tracker.currentWorkspaceRootIdentities());
+        assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+        return {kind:'configured',...checked.scope};
+    }
+    async function sourceScope(tracker, scope, legacy) {
+        if(legacy) {
+            tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        } else { tracker.effectiveMonitoringScope=scope; }
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        return JSON.parse(JSON.stringify(tracker.getEffectiveMonitoringScope()));
+    }
+
+    for(const source of ['legacy','configured-repeat','configured-expansion']) {
+        test(`PR12 MIGRATION ${source} cannot bypass the include traversal budget`,()=>fixture(async({tracker,dir})=>{
+            const target=path.join(dir,'included');fs.mkdirSync(target);
+            fs.writeFileSync(path.join(target,'child.txt'),'baseline');
+            const requested=includeScope(tracker,'rules',['included']);
+            const before=await sourceScope(tracker,source==='configured-repeat'?requested:scopeFor(tracker,'rules'),source==='legacy');
+            tracker.maxScopePreflightEntries=0;
+            const originalPreflight=tracker.preflightConfiguredMonitoringScope.bind(tracker);
+            let preflights=0;
+            tracker.preflightConfiguredMonitoringScope=async(...args)=>{preflights++;return originalPreflight(...args);};
+            const originalRead=tracker.readCurrentFileState.bind(tracker);
+            let reads=0;
+            tracker.readCurrentFileState=async target=>{reads++;return originalRead(target);};
+            try {
+                const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+                assert.equal(preflights,source==='configured-repeat'?0:1,'migration and expansion must reach bounded preflight');
+                assert.notEqual(outcome.status,'applied','every include acquisition must be bounded, regardless of source kind');
+                assert.match(outcome.reason??'',/budget|preparation|capacity/i);
+                assert.equal(reads,0,'work rejection must happen before content acquisition');
+                assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+                assert.equal(tracker.fileSnapshots.has(path.join(target,'child.txt')),false);
+            } finally {tracker.readCurrentFileState=originalRead;tracker.preflightConfiguredMonitoringScope=originalPreflight;}
+        },'rules'));
+    }
+
+    test('PR12 MIGRATION initial Rules cannot accept unrelated files or certify a full scan',()=>fixture(async({tracker,dir})=>{
+        fs.writeFileSync(path.join(dir,'ordinary.txt'),'current');
+        await sourceScope(tracker,undefined,true);
+        const outcome=await tracker.applyConfiguredMonitoringScope(scopeFor(tracker,'rules'));
+        assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+        assert.equal(tracker.getOriginalContent(path.join(dir,'ordinary.txt')),undefined,
+            'Rules migration must not silently accept unrelated post-scan creations');
+        assert.equal(tracker.scanCoverage,undefined,
+            'include-only migration cannot certify full workspace absence provenance');
+    },'rules'));
+
+    for(const legacy of [true,false]) {
+        test(`PR12 MIGRATION include byte failure aborts later reads and rolls back (legacy=${legacy})`,()=>fixture(async({tracker,dir})=>{
+            const imported=path.join(dir,'bytes');fs.mkdirSync(imported);
+            const children=['a.txt','b.txt','c.txt'].map(name=>path.join(imported,name));
+            for(const child of children)fs.writeFileSync(child,'x'.repeat(4096));
+            const requested=includeScope(tracker,'rules',['bytes']);
+            const before=await sourceScope(tracker,requested,legacy);
+            tracker.maxPersistedBytes=serialized(tracker)+2048;
+            const original=tracker.readCurrentFileState.bind(tracker);let candidateReads=0;
+            tracker.readCurrentFileState=async target=>{
+                if(children.includes(target))candidateReads++;
+                return original(target);
+            };
+            try {
+                const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+                assert.notEqual(outcome.status,'applied');
+                assert.equal(candidateReads,1,'sealed byte budget must stop before the next include read');
+                assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+                assert.ok(children.every(child=>!tracker.fileSnapshots.has(child)));
+                const saved=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'),'utf8'));
+                assert.deepEqual(saved.effectiveMonitoringScope,before,'durable scope must roll back too');
+            } finally {tracker.readCurrentFileState=original;}
+        },'rules'));
+    }
+
+    for(const mode of ['rules']) {
+        test(`PR12 MIGRATION missing explicit targets preserve known absence (${mode})`,()=>fixture(async({tracker,dir})=>{
+            await sourceScope(tracker,undefined,true);
+            const target=path.join(dir,'missing.txt');
+            const outcome=await tracker.applyConfiguredMonitoringScope(includeScope(tracker,mode,['missing.txt']));
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(tracker.getOriginalContent(target),'','missing explicit target must retain its absence sentinel');
+            assert.equal(tracker.baselineExistingFiles.has(tracker.canonicalTrackingPath(target)),false);
+            assert.equal(tracker.unresolvedBaselineFiles.has(tracker.canonicalTrackingPath(target)),false);
+        },'rules'));
+    }
+
+    test('PR12 MIGRATION missing targets obey text capacity even with spare opaque capacity',()=>fixture(async({tracker,dir})=>{
+        await sourceScope(tracker,undefined,true);
+        tracker.maxPersistedSnapshots=1;
+        const before=tracker.getEffectiveMonitoringScope();
+        const requested=includeScope(tracker,'rules',['one.txt','two.txt'],[{scope:'all',pattern:'ProbeName'}]);
+        const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+        assert.notEqual(outcome.status,'applied');
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.fileSnapshots.size,0,'partial absent-sentinel capture must roll back');
+    },'rules'));
+
+    test('PR12 MIGRATION excluded missing includes are not captured or charged',()=>fixture(async({tracker,dir})=>{
+        const requested=includeScope(tracker,'rules',['missing.txt'],[{scope:'all',pattern:'missing.txt'}]);
+        await sourceScope(tracker,requested,false);
+        tracker.maxPersistedSnapshots=0;
+        const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+        assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+        assert.equal(tracker.getOriginalContent(path.join(dir,'missing.txt')),undefined);
+    },'rules'));
+
+    test('PR12 MIGRATION include cancellation stops later reads while preserving prior review',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'race');fs.mkdirSync(target);
+        const children=['a.txt','b.txt'].map(name=>path.join(target,name));
+        for(const child of children)fs.writeFileSync(child,'candidate');
+        const before=await sourceScope(tracker,undefined,true);
+        const original=tracker.readCurrentFileState.bind(tracker);let candidateReads=0;
+        tracker.readCurrentFileState=async target=>{
+            const state=await original(target);
+            if(children.includes(target)){
+                candidateReads++;
+                tracker.recordBaselineTransactionEvent(Uri.file(target),'change');
+            }
+            return state;
+        };
+        try {
+            const outcome=await tracker.applyConfiguredMonitoringScope(includeScope(tracker,'rules',['race']));
+            assert.notEqual(outcome.status,'applied');
+            assert.equal(candidateReads,1,'invalidated migration must not read the next candidate');
+            assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+            assert.ok(children.every(child=>!tracker.fileSnapshots.has(child)));
+        } finally {tracker.readCurrentFileState=original;}
+    },'rules'));
+
+    test('PR12 MIGRATION stopped Apply performs no candidate content acquisition',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'stopped');fs.mkdirSync(target);fs.writeFileSync(path.join(target,'a.txt'),'current');
+        await sourceScope(tracker,undefined,true);
+        tracker.isRecording=false;tracker.externalWatcherEnabled=false;
+        const original=tracker.readCurrentFileState.bind(tracker);let reads=0;
+        tracker.readCurrentFileState=async()=>{reads++;throw Error('stopped content capture');};
+        try {
+            const outcome=await tracker.applyConfiguredMonitoringScope(includeScope(tracker,'rules',['stopped','missing.txt']));
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(reads,0);assert.equal(tracker.fileSnapshots.size,0);
+        } finally {tracker.readCurrentFileState=original;}
+    },'rules'));
+
+    test('PR12 MIGRATION overlapping repeat includes share one directory traversal',()=>fixture(async({tracker,dir})=>{
+        const parent=path.join(dir,'overlap'),nested=path.join(parent,'nested');fs.mkdirSync(nested,{recursive:true});
+        const files=[path.join(parent,'a.txt'),path.join(nested,'b.txt')];for(const file of files)fs.writeFileSync(file,'baseline');
+        const requested=includeScope(tracker,'rules',['overlap','overlap/nested']);await sourceScope(tracker,requested,false);
+        const originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker),originalOpen=fs.promises.opendir;
+        let enumerating=false;const opens=[];
+        tracker.enumerateConfiguredCandidateFiles=async(...args)=>{enumerating=true;try{return await originalEnumerate(...args);}finally{enumerating=false;}};
+        fs.promises.opendir=async(target,...args)=>{if(enumerating)opens.push(path.resolve(String(target)));return originalOpen(target,...args);};
+        try {
+            const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(opens.filter(value=>value===nested).length,1,'overlapping includes must not charge or rescan descendants twice');
+            for(const file of files)assert.equal(tracker.getOriginalContent(file),'baseline');
+        } finally {tracker.enumerateConfiguredCandidateFiles=originalEnumerate;fs.promises.opendir=originalOpen;}
+    },'rules'));
+
+    test('PR12 MIGRATION absent includes reserve bytes before any baseline retention',()=>fixture(async({tracker,dir})=>{
+        const requested=includeScope(tracker,'rules',['missing.txt']);await sourceScope(tracker,requested,false);
+        const original=tracker.createCandidatePersistenceBudget.bind(tracker);let budgets=0;
+        tracker.createCandidatePersistenceBudget=(...args)=>{budgets++;return {...original(...args),remainingBytes:0};};
+        try {
+            const result=await tracker.applyConfiguredMonitoringScope(requested);
+            assert.notEqual(result.status,'applied','absence is durable text metadata, not free capacity');
+            assert.equal(budgets,1,'even no-expansion Rules Apply must create the acquisition budget');
+            assert.equal(tracker.getOriginalContent(path.join(dir,'missing.txt')),undefined);
+        } finally {tracker.createCandidatePersistenceBudget=original;}
+    },'rules'));
+
+    test('PR12 MIGRATION repeated Rules include classifies unknown Dirents through bounded discovery',()=>fixture(async({tracker,dir})=>{
+        const included=path.join(dir,'unknown'),nested=path.join(included,'nested');fs.mkdirSync(nested,{recursive:true});
+        const child=path.join(nested,'child.txt');fs.writeFileSync(child,'included');
+        const requested=includeScope(tracker,'rules',['unknown']);await sourceScope(tracker,requested,false);
+        const originalOpen=fs.promises.opendir,originalRead=fs.promises.readdir;
+        fs.promises.readdir=async()=>{throw Error('unbounded include readdir');};
+        fs.promises.opendir=async(...args)=>{
+            const handle=await originalOpen(...args);
+            const read=handle.readSync.bind(handle);
+            handle.readSync=()=>{
+                const entry=read();
+                if(!entry)return null;
+                return {name:entry.name,isFile:()=>false,isDirectory:()=>false,isSymbolicLink:()=>false};
+            };
+            return handle;
+        };
+        try {
+            const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(tracker.getOriginalContent(child),'included');
+        } finally {fs.promises.opendir=originalOpen;fs.promises.readdir=originalRead;}
     },'rules'));
 
     test('PR12 AUDIT Whole Workspace Start budgets open-document baselines before retention',()=>fixture(async({tracker,dir})=>{
@@ -693,10 +891,16 @@ export function registerPR12BoundedInvariants(h) {
             const git=path.join(dir,sensitive?'.GIT':'.git');fs.mkdirSync(git);
             const probe=path.join(dir,'ProbeName'),probeAlias=path.join(dir,'probeName');
             const aliases=sensitive?[]:[
-                [probeAlias,probe],[path.join(dir,'.GIT'),git],[path.join(dir,'.Git'),git]
+                [probeAlias,probe],[path.join(dir,'.GIT'),git],[path.join(dir,'.Git'),git],
+                [path.join(dir,'.gIT'),git]
             ];
-            const denied=sensitive?[probeAlias,path.join(dir,'.git'),path.join(dir,'.Git')]:[];
+            // toggleAsciiCase('.GIT') probes '.gIT', not '.git'. Model that
+            // spelling too: the native Windows lookup must not leak into this
+            // simulated sensitive directory merely because opendir lists Git first.
+            const denied=sensitive?[probeAlias,path.join(dir,'.git'),path.join(dir,'.Git'),path.join(dir,'.gIT')]:[];
             await withLookups(aliases,denied,async()=>{
+                assert.equal(detectLocalPathCaseSensitivity(dir),sensitive,
+                    'fixture must establish the requested case semantics before coverage assertions');
                 for(const pattern of ['**/.git/**','**/.difftracker-restore-*/**']) {
                     assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary(pattern,identity),true);
                 }
@@ -725,6 +929,32 @@ export function registerPR12BoundedInvariants(h) {
                 tracker.getVsCodeWatcherExcludePatterns=()=>['{.GIT,.DIFFTRACKER-RESTORE-*}/**'];
                 const issue=tracker.configuredScopeNeedsSupplementalCoverage(requested);
                 if(sensitive)assert.match(issue??'',/watcherExclude/);else assert.equal(issue,undefined);
+            });
+        }));
+    }
+
+    for(const gitFirst of [true,false]) {
+        test(`PR12 CASE sensitive lookup fixture is independent of directory order (gitFirst=${gitFirst})`,()=>fixture(async({tracker,dir})=>{
+            const identity=caseIdentity(tracker,true);
+            const git=path.join(dir,'.GIT'),probe=path.join(dir,'ProbeName');fs.mkdirSync(git);
+            // Simulate an insensitive backing lookup even on Linux, then overlay
+            // a sensitive directory. This reproduces the Windows fixture leak
+            // independently of the runner's real filesystem and entry order.
+            await withLookups([[path.join(dir,'.gIT'),git],[path.join(dir,'probeName'),probe]],[],async()=>{
+                const originalOpen=fs.opendirSync;
+                fs.opendirSync=(target,...args)=>{
+                    if(path.resolve(String(target))!==path.resolve(dir))return originalOpen(target,...args);
+                    let index=0;
+                    const names=gitFirst?['.GIT','ProbeName']:['ProbeName','.GIT'];
+                    return {readSync(){return index<names.length?{name:names[index++],isSymbolicLink:()=>false}:null;},closeSync(){}};
+                };
+                try {
+                    await withLookups([],['.git','.Git','.gIT','probeName'].map(name=>path.join(dir,name)),async()=>{
+                        assert.equal(detectLocalPathCaseSensitivity(dir),true);
+                        assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('.Git',identity),false);
+                        assert.equal(tracker.watcherPatternOnlyTargetsHardBoundary('.DIFFTRACKER-RESTORE-*/**',identity),false);
+                    });
+                } finally {fs.opendirSync=originalOpen;}
             });
         }));
     }
