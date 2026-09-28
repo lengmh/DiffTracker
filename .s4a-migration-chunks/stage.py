@@ -23,7 +23,10 @@ patch_file = Path(os.environ['RUNNER_TEMP']) / 'migration-repair.patch'
 patch_file.write_bytes(patch)
 git('config', 'core.autocrlf', 'false')
 git('fetch', '--no-tags', '--depth=1', 'origin', BASE)
-git('checkout', '--detach', BASE)
+# This is an ephemeral Actions checkout, never a developer working tree.
+# Re-materialize tracked source after switching off native CRLF conversion.
+git('checkout', '--detach', '--force', BASE)
+git('checkout-index', '--all', '--force')
 assert git('rev-parse', 'HEAD') == BASE
 Path(os.environ['RUNNER_TEMP'], 'migration-original.ts').write_bytes(Path('src/diffTracker.ts').read_bytes())
 git('apply', '--check', str(patch_file))
