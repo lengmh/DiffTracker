@@ -1131,12 +1131,54 @@ export function registerPR12BoundedInvariants(h) {
         tracker.maxPersistedBytes=serialized(tracker)+1500;
         await tracker.onExternalFileCreated(Uri.file(imported));
         const captured=children.filter(child=>tracker.fileSnapshots.has(child));
-        assert.ok(captured.length<children.length,
-            'the parent scan must abort instead of retaining every child after durable byte capacity is exhausted');
+        assert.equal(captured.length,0,
+            'capacity failure must roll back every child baseline from this populated-directory import');
         const importedIdentity=tracker.canonicalTrackingPath(imported);
         assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>
             tracker.canonicalTrackingPath(gap.targetPath)===importedIdentity),
             'aborted populated-directory capture must preserve an explicit subtree reconciliation obligation');
+    }));
+
+    test('PR12 AUDIT populated-directory durable flush failure rolls back children and persists the gap',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'populated-durable-rollback');fs.mkdirSync(imported);
+        const child=path.join(imported,'child.txt');fs.writeFileSync(child,'current');
+        assert.equal(await tracker.flushPendingPersistence(),true);
+
+        const originalWatch=tracker.watchImportedTree.bind(tracker);
+        const originalFlush=tracker.flushPendingPersistence.bind(tracker);
+        let flushes=0,forcedFailure=false;
+        tracker.watchImportedTree=async()=>{};
+        tracker.flushPendingPersistence=async(...args)=>{
+            flushes++;
+            if(!forcedFailure&&tracker.fileSnapshots.has(child)){
+                forcedFailure=true;
+                return false;
+            }
+            return originalFlush(...args);
+        };
+        try {
+            await tracker.onExternalFileCreated(Uri.file(imported));
+            assert.equal(forcedFailure,true,'test must reject the durable child publication');
+            assert.ok(flushes>=2,
+                'failed child publication must be followed by an immediate rollback persistence attempt');
+            assert.equal(tracker.fileSnapshots.has(child),false,
+                'failed durable publication must not retain the child absence baseline in memory');
+            assert.equal(tracker.trackedChanges.has(child),false,
+                'failed durable publication must not retain child review state');
+            assert.equal(
+                tracker.coverageGaps.get(path.resolve(imported))?.subtree?.reasonCode,
+                'directory-runtime-coverage-gap'
+            );
+            const saved=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'),'utf8'));
+            assert.equal(saved.fileSnapshots.some(([target])=>path.resolve(target)===path.resolve(child)),false,
+                'rolled-back child must not survive in the durable session');
+            const savedGap=saved.coverageGaps.find(([target])=>path.resolve(target)===path.resolve(imported));
+            assert.equal(savedGap?.[1]?.subtree?.reasonCode,'directory-runtime-coverage-gap',
+                'durable rollback must retain the subtree reconciliation obligation');
+        } finally {
+            tracker.watchImportedTree=originalWatch;
+            tracker.flushPendingPersistence=originalFlush;
+        }
     }));
 
     test('PR12 AUDIT rollback preserves revisioned unresolved accounting maps',()=>fixture(async({tracker,dir})=>{

@@ -177,6 +177,22 @@ interface CandidatePersistenceBudget {
     observedUnresolvedRevision?: number;
 }
 
+interface ImportedDirectoryRollbackState {
+    fileSnapshots: Map<string, string>;
+    fileModes: Map<string, number>;
+    baselineExistingFiles: Set<string>;
+    unresolvedBaselineFiles: Map<string, string>;
+    opaqueBaselineFiles: Map<string, OpaqueBaselineState>;
+    trackedChanges: Map<string, FileDiff>;
+    lineChanges: Map<string, LineChange[]>;
+    inlineViews: Map<string, InlineDiffView>;
+    postBaselineUnknownFiles: Set<string>;
+    retainedReviewPaths: Set<string>;
+    coverageGaps: Map<string, CoverageGapRecord>;
+    pendingReconciliation: Set<string>;
+    revertHistory: PersistedRevertRecord[];
+}
+
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
@@ -6636,6 +6652,120 @@ export class DiffTracker {
         );
     }
 
+    private captureImportedDirectoryRollbackState(root: string): ImportedDirectoryRollbackState {
+        const resolvedRoot = path.resolve(root);
+        const ownsPath = (targetPath: string): boolean =>
+            path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot);
+        const scopedMap = <T>(source: Map<string, T>, clone: (value: T) => T = value => value): Map<string, T> =>
+            new Map([...source].filter(([targetPath]) => ownsPath(targetPath))
+                .map(([targetPath, value]) => [targetPath, clone(value)]));
+        const scopedSet = (source: Set<string>): Set<string> =>
+            new Set([...source].filter(targetPath => ownsPath(targetPath)));
+
+        return {
+            fileSnapshots: scopedMap(this.fileSnapshots),
+            fileModes: scopedMap(this.fileModes),
+            baselineExistingFiles: scopedSet(this.baselineExistingFiles),
+            unresolvedBaselineFiles: scopedMap(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: scopedMap(this.opaqueBaselineFiles, value => ({ ...value })),
+            trackedChanges: scopedMap(this.trackedChanges, value => ({
+                ...value,
+                changes: value.changes.map(change => ({ ...change })),
+                timestamp: new Date(value.timestamp)
+            })),
+            lineChanges: scopedMap(this.lineChanges, value => value.map(change => ({ ...change }))),
+            inlineViews: scopedMap(this.inlineViews, value => ({
+                ...value,
+                lineTypes: [...value.lineTypes]
+            })),
+            postBaselineUnknownFiles: scopedSet(this.postBaselineUnknownFiles),
+            retainedReviewPaths: scopedSet(this.retainedReviewPaths),
+            coverageGaps: scopedMap(this.coverageGaps, value => ({
+                file: value.file ? { ...value.file } : undefined,
+                subtree: value.subtree ? { ...value.subtree } : undefined
+            })),
+            pendingReconciliation: scopedSet(this.pendingImportedDirectoryReconciliation),
+            // releaseScopeBaselineData() can remove an absence sentinel's Undo
+            // item. Preserve only records that touch this subtree so unrelated
+            // concurrent history remains outside this local rollback.
+            revertHistory: this.revertHistory
+                .map(record => ({
+                    ...record,
+                    items: record.items.filter(item => ownsPath(item.filePath)).map(item => ({
+                        ...item,
+                        before: { ...item.before },
+                        after: { ...item.after }
+                    }))
+                }))
+                .filter(record => record.items.length > 0)
+        };
+    }
+
+    private restoreImportedDirectoryRollbackState(
+        root: string,
+        previous: ImportedDirectoryRollbackState
+    ): void {
+        const resolvedRoot = path.resolve(root);
+        const ownsPath = (targetPath: string): boolean =>
+            path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot);
+        const restoreMap = <T>(target: Map<string, T>, snapshot: Map<string, T>): void => {
+            for (const targetPath of [...target.keys()]) {
+                if (ownsPath(targetPath)) { target.delete(targetPath); }
+            }
+            for (const [targetPath, value] of snapshot) { target.set(targetPath, value); }
+        };
+        const restoreSet = (target: Set<string>, snapshot: Set<string>): void => {
+            for (const targetPath of [...target]) {
+                if (ownsPath(targetPath)) { target.delete(targetPath); }
+            }
+            for (const targetPath of snapshot) { target.add(targetPath); }
+        };
+
+        restoreMap(this.fileSnapshots, previous.fileSnapshots);
+        restoreMap(this.fileModes, previous.fileModes);
+        restoreSet(this.baselineExistingFiles, previous.baselineExistingFiles);
+        restoreMap(this.unresolvedBaselineFiles, previous.unresolvedBaselineFiles);
+        restoreMap(this.opaqueBaselineFiles, previous.opaqueBaselineFiles);
+        restoreMap(this.trackedChanges, previous.trackedChanges);
+        restoreMap(this.lineChanges, previous.lineChanges);
+        restoreMap(this.inlineViews, previous.inlineViews);
+        restoreSet(this.postBaselineUnknownFiles, previous.postBaselineUnknownFiles);
+        restoreSet(this.retainedReviewPaths, previous.retainedReviewPaths);
+        restoreMap(this.coverageGaps, previous.coverageGaps);
+        restoreSet(this.pendingImportedDirectoryReconciliation, previous.pendingReconciliation);
+
+        const retainedHistory = this.revertHistory
+            .map(record => ({ ...record, items: record.items.filter(item => !ownsPath(item.filePath)) }))
+            .filter(record => record.items.length > 0);
+        const byId = new Map(retainedHistory.map(record => [record.id, record]));
+        for (const record of previous.revertHistory) {
+            const current = byId.get(record.id);
+            if (current) {
+                current.items.push(...record.items.map(item => ({
+                    ...item,
+                    before: { ...item.before },
+                    after: { ...item.after }
+                })));
+            } else {
+                const restored = {
+                    ...record,
+                    items: record.items.map(item => ({
+                        ...item,
+                        before: { ...item.before },
+                        after: { ...item.after }
+                    }))
+                };
+                retainedHistory.push(restored);
+                byId.set(restored.id, restored);
+            }
+        }
+        this.revertHistory = retainedHistory;
+        this.resetChangeBlocksCaches();
+        this.trackedChangesVersion++;
+        this.trackedChangesCacheVersion = -1;
+        this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+    }
+
     private clearAbsentDirectorySentinel(filePath: string): boolean {
         if (!this.fileSnapshots.has(filePath) || this.baselineExistingFiles.has(filePath)) {
             return false;
@@ -6698,8 +6828,9 @@ export class DiffTracker {
                     'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
                 const scanFailureReason =
                     'Created directory could not be scanned; rebuild the baseline after resolving the read failure';
-                const childPersistenceBudget = this.createCandidatePersistenceBudget();
+                let childPersistenceBudget!: CandidatePersistenceBudget;
                 try {
+                    childPersistenceBudget = this.createCandidatePersistenceBudget();
                     // A failed populated-directory import must always leave a
                     // durable subtree obligation. Reserve the worst-case watcher
                     // failure evidence before mutating any child baseline so a
@@ -6726,6 +6857,13 @@ export class DiffTracker {
                     );
                     return;
                 }
+                // Initial baseline construction already has its enclosing
+                // baseline transaction. Runtime populated-directory imports need
+                // their own subtree-scoped rollback so durable failure cannot
+                // strand newly accepted child baselines in memory.
+                const importRollback = scanEvent
+                    ? undefined
+                    : this.captureImportedDirectoryRollbackState(filePath);
 
                 // A missing explicit include is represented by an absent-file
                 // sentinel. Once that path is known to be a directory the
@@ -6741,13 +6879,17 @@ export class DiffTracker {
                 }
                 // Native watchers may report only the parent when a populated
                 // directory appears; its nested .gitignore events are not guaranteed.
+                let failureReason = scanFailureReason;
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!creationIsCurrent()) { return; }
                     const importedPreparationBudget = { remainingEntries: this.maxScopePreflightEntries };
                     let watchFailed = false;
                     try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget); }
-                    catch { watchFailed = true; }
+                    catch {
+                        watchFailed = true;
+                        failureReason = watcherFailureReason;
+                    }
                     if (!creationIsCurrent()) { return; }
                     const durablePaths = new Set([
                         ...this.fileSnapshots.keys(),
@@ -6821,7 +6963,19 @@ export class DiffTracker {
                     }
                 } catch {
                     if (creationIsCurrent()) {
-                        await this.markCreatedDirectoryUnavailable(filePath, scanFailureReason, scanEvent, epoch);
+                        if (importRollback) {
+                            this.restoreImportedDirectoryRollbackState(filePath, importRollback);
+                        }
+                        await this.markCreatedDirectoryUnavailable(filePath, failureReason, scanEvent, epoch);
+                        if (importRollback) {
+                            // A failed flush can occur after the target file was
+                            // replaced but before the backup/commit barrier. Push
+                            // the rolled-back state plus its coverage obligation
+                            // through the durable writer immediately. If storage
+                            // is still unavailable, the existing failure marker /
+                            // backup recovery path remains authoritative.
+                            await this.flushPendingPersistence();
+                        }
                     }
                 }
                 return;
