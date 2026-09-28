@@ -1055,6 +1055,72 @@ export function registerPR12BoundedInvariants(h) {
         }
     }));
 
+    test('PR12 AUDIT populated-directory failure gap is reserved before child baseline bytes',()=>fixture(async({tracker,dir})=>{
+        const imported=path.join(dir,'populated-gap-reservation');fs.mkdirSync(imported);
+        const child=path.join(imported,'child.txt');fs.writeFileSync(child,'current');
+        const watcherFailureReason=
+            'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
+
+        tracker.maxPersistedBytes=serialized(tracker)+100000;
+        const probe=tracker.createCandidatePersistenceBudget();
+        const beforeGap=probe.remainingBytes;
+        tracker.reserveCandidateCoverageGap(imported,{
+            targetKind:'subtree',
+            reasonCode:'directory-runtime-coverage-gap',
+            reason:watcherFailureReason
+        },probe);
+        const gapBytes=beforeGap-probe.remainingBytes;
+        const beforeChild=probe.remainingBytes;
+        tracker.consumeCandidatePersistenceBudget(
+            child,
+            {kind:'text',content:'',baselineExists:false},
+            probe
+        );
+        const childBytes=beforeChild-probe.remainingBytes;
+        assert.ok(gapBytes>0&&childBytes>0);
+
+        tracker.maxPersistedBytes=serialized(tracker)+gapBytes+childBytes-1;
+        const originalWatch=tracker.watchImportedTree.bind(tracker);
+        tracker.watchImportedTree=async()=>{};
+        try {
+            await tracker.onExternalFileCreated(Uri.file(imported));
+            assert.equal(tracker.fileSnapshots.has(child),false,
+                'child baseline must not consume bytes reserved for mandatory failure evidence');
+            assert.equal(
+                tracker.coverageGaps.get(path.resolve(imported))?.subtree?.reasonCode,
+                'directory-runtime-coverage-gap'
+            );
+            assert.equal(await tracker.flushPendingPersistence(),true,
+                'the reserved failure gap must remain durably persistable after child-budget rejection');
+        } finally {
+            tracker.watchImportedTree=originalWatch;
+        }
+    }));
+
+    test('PR12 AUDIT full coverage-gap ledger rejects populated imports before child mutation',()=>fixture(async({tracker,dir})=>{
+        const existing=path.join(dir,'existing-gap');
+        tracker.maxPersistedSnapshots=1;
+        tracker.setSubtreeCoverageGap(existing,'existing-gap','existing durable gap',false);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+
+        const imported=path.join(dir,'gap-count-full');fs.mkdirSync(imported);
+        const child=path.join(imported,'child.txt');fs.writeFileSync(child,'current');
+        const originalWatch=tracker.watchImportedTree.bind(tracker);
+        let watchAttempted=false;
+        tracker.watchImportedTree=async()=>{watchAttempted=true;};
+        try {
+            await tracker.onExternalFileCreated(Uri.file(imported));
+            assert.equal(watchAttempted,false,
+                'mandatory gap capacity must be checked before watcher traversal or child capture');
+            assert.equal(tracker.fileSnapshots.has(child),false);
+            assert.equal(tracker.coverageGaps.has(path.resolve(imported)),false,
+                'a rejected reservation must not create an over-limit non-durable gap');
+            assert.equal(tracker.coverageGaps.size,1);
+        } finally {
+            tracker.watchImportedTree=originalWatch;
+        }
+    }));
+
     test('PR12 AUDIT populated-directory creation stops child baseline publication at the byte budget',()=>fixture(async({tracker,dir})=>{
         const imported=path.join(dir,'populated-byte-budget');fs.mkdirSync(imported);
         const children=[];

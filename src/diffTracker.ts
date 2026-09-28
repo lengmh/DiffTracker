@@ -169,6 +169,7 @@ interface CandidatePersistenceBudget {
     baselineExistingFiles: number;
     unresolvedBaselineFiles: number;
     opaqueBaselineFiles: number;
+    coverageGaps: number;
     failedReason?: string;
     accountedUnresolvedBaselineFiles: Map<string, string>;
     observedUnresolvedBaselineFiles: Map<string, string>;
@@ -3445,12 +3446,60 @@ export class DiffTracker {
             baselineExistingFiles,
             unresolvedBaselineFiles: this.unresolvedBaselineFiles.size,
             opaqueBaselineFiles: this.opaqueBaselineFiles.size,
+            coverageGaps: this.coverageGaps.size,
             accountedUnresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
             observedUnresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
             observedUnresolvedMap: this.unresolvedBaselineFiles,
             observedUnresolvedRevision: this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
                 ? this.unresolvedBaselineFiles.revision : undefined
         };
+    }
+
+    private reserveCandidateCoverageGap(
+        targetPath: string,
+        evidence: CoverageGapEvidence,
+        budget: CandidatePersistenceBudget
+    ): void {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+
+        const key = evidence.targetKind === 'file'
+            ? this.canonicalTrackingPath(targetPath)
+            : path.resolve(targetPath);
+        const previous = this.coverageGaps.get(key);
+        const next: CoverageGapRecord = evidence.targetKind === 'file'
+            ? { ...previous, file: evidence }
+            : { ...previous, subtree: evidence };
+        let addedBytes: number;
+        if (previous) {
+            addedBytes =
+                Buffer.byteLength(JSON.stringify([key, next]), 'utf8') -
+                Buffer.byteLength(JSON.stringify([key, previous]), 'utf8');
+        } else {
+            if (budget.coverageGaps >= this.maxPersistedSnapshots) {
+                fail(
+                    'Monitoring scope coverage-gap capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; reconcile existing coverage gaps before retrying.'
+                );
+            }
+            addedBytes = this.serializedArrayAppendBytes(
+                budget.coverageGaps,
+                [key, next]
+            );
+        }
+        if (addedBytes > budget.remainingBytes) {
+            fail(
+                'Monitoring scope persisted byte capacity would exceed ' +
+                this.maxPersistedBytes +
+                ' bytes after reserving required coverage evidence.'
+            );
+        }
+        budget.remainingBytes -= addedBytes;
+        if (!previous) { budget.coverageGaps++; }
     }
 
     private validateCandidatePersistenceProjection(
@@ -6645,6 +6694,39 @@ export class DiffTracker {
             const directory = await this.isUntrackedDirectory(uri);
             if (!creationIsCurrent()) { return; }
             if (directory) {
+                const watcherFailureReason =
+                    'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
+                const scanFailureReason =
+                    'Created directory could not be scanned; rebuild the baseline after resolving the read failure';
+                const childPersistenceBudget = this.createCandidatePersistenceBudget();
+                try {
+                    // A failed populated-directory import must always leave a
+                    // durable subtree obligation. Reserve the worst-case watcher
+                    // failure evidence before mutating any child baseline so a
+                    // later capacity rejection cannot strand partial children
+                    // without a persistable warning.
+                    this.reserveCandidateCoverageGap(
+                        filePath,
+                        {
+                            targetKind: 'subtree',
+                            reasonCode: scanEvent
+                                ? 'directory-scan-coverage-gap'
+                                : 'directory-runtime-coverage-gap',
+                            reason: watcherFailureReason
+                        },
+                        childPersistenceBudget
+                    );
+                } catch (error) {
+                    // No child/sentinel state has changed yet. Failing here is
+                    // safer than publishing a partial imported-tree baseline
+                    // when the mandatory reconciliation evidence cannot fit.
+                    this.reportPersistenceIssue(
+                        'Created directory was not baselined because its required coverage evidence exceeds persistence capacity.',
+                        error
+                    );
+                    return;
+                }
+
                 // A missing explicit include is represented by an absent-file
                 // sentinel. Once that path is known to be a directory the
                 // sentinel must not survive persistence: directories are not
@@ -6663,7 +6745,6 @@ export class DiffTracker {
                     await this.refreshIgnoreMatchers();
                     if (!creationIsCurrent()) { return; }
                     const importedPreparationBudget = { remainingEntries: this.maxScopePreflightEntries };
-                    const childPersistenceBudget = this.createCandidatePersistenceBudget();
                     let watchFailed = false;
                     try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget); }
                     catch { watchFailed = true; }
@@ -6695,8 +6776,6 @@ export class DiffTracker {
                             await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
                         }
                     }
-                    const watcherFailureReason =
-                        'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
                     let watcherFailureProjected = false;
                     if (watchFailed && !scanEvent && creationIsCurrent()) {
                         // Runtime child baselines and their missing-watcher
@@ -6742,7 +6821,7 @@ export class DiffTracker {
                     }
                 } catch {
                     if (creationIsCurrent()) {
-                        await this.markCreatedDirectoryUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure', scanEvent, epoch);
+                        await this.markCreatedDirectoryUnavailable(filePath, scanFailureReason, scanEvent, epoch);
                     }
                 }
                 return;
@@ -9998,120 +10077,3 @@ export class DiffTracker {
                 continue;
             }
 
-            const last = result[result.length - 1];
-            if (last &&
-                last.added === change.added &&
-                last.removed === change.removed) {
-                last.value.push(...change.value);
-            } else {
-                result.push({ ...change, value: [...change.value] });
-            }
-        }
-
-        return result;
-    }
-
-    private normalizeLineForMatch(input: string | undefined): string {
-        let value = (input ?? '').trim();
-
-        value = value.replace(/^\/\/\s?/, '');
-        value = value.replace(/^#\s?/, '');
-        value = value.replace(/^--\s?/, '');
-        value = value.replace(/^\/\*\s?/, '');
-        value = value.replace(/\*\/\s?$/, '');
-        value = value.replace(/\s+/g, ' ');
-
-        return value.trim();
-    }
-
-    private setTrackedChange(filePath: string, diff: FileDiff): void {
-        this.trackedChanges.set(filePath, diff);
-        this.markTrackedChangesDirty();
-    }
-
-    private deleteTrackedChange(filePath: string): void {
-        if (this.trackedChanges.delete(filePath)) {
-            this.markTrackedChangesDirty();
-        }
-    }
-
-    private clearTrackedChanges(): void {
-        if (this.trackedChanges.size === 0) {
-            return;
-        }
-        this.trackedChanges.clear();
-        this.markTrackedChangesDirty();
-    }
-
-    private markTrackedChangesDirty(): void {
-        this.trackedChangesVersion++;
-    }
-
-    private bumpLineChangesVersion(filePath: string): number {
-        const current = this.lineChangesVersionByFile.get(filePath) ?? 0;
-        const next = current + 1;
-        this.lineChangesVersionByFile.set(filePath, next);
-        return next;
-    }
-
-    private invalidateChangeBlocksCache(filePath: string): void {
-        this.changeBlocksCache.delete(filePath);
-    }
-
-    private resetChangeBlocksCaches(): void {
-        this.changeBlocksCache.clear();
-        this.lineChangesVersionByFile.clear();
-    }
-
-    private markLineChangesUpdated(filePath: string): void {
-        this.bumpLineChangesVersion(filePath);
-        this.invalidateChangeBlocksCache(filePath);
-    }
-
-    private emitTrackChangesEvent(event: Partial<TrackChangesEvent>): void {
-        const normalizeFiles = (files: string[] | undefined): string[] => {
-            if (!files || files.length === 0) {
-                return [];
-            }
-            return [...new Set(files)];
-        };
-
-        this._onDidTrackChanges.fire({
-            changedFiles: normalizeFiles(event.changedFiles),
-            removedFiles: normalizeFiles(event.removedFiles),
-            fullRefresh: event.fullRefresh === true,
-            baselineChanged: event.baselineChanged === true
-        });
-    }
-
-    private setIgnoreResultCache(cacheKey: string, ignored: boolean): void {
-        this.ignoreResultCache.set(cacheKey, ignored);
-        if (this.ignoreResultCache.size <= this.ignoreResultCacheMaxEntries) {
-            return;
-        }
-
-        const oldestKey = this.ignoreResultCache.keys().next().value as string | undefined;
-        if (oldestKey !== undefined) {
-            this.ignoreResultCache.delete(oldestKey);
-        }
-    }
-
-    public async dispose(): Promise<void> {
-        this.advanceEpoch();
-        this.disposed = true;
-        this.creationTempExpiryTimers.forEach(timer => clearTimeout(timer));
-        this.creationTempExpiryTimers.clear();
-        this.creationTempRoots.clear();
-        await this.flushPendingPersistence();
-        this.clearExternalChangeTimers();
-        this.clearDocumentChangeTimers();
-        this.clearWatcherSuppressionTimers();
-        this.clearAutomationSessions();
-        this.disposeFileWatchers();
-        this.importedDirectoryWatchers.clear();
-        this.disposables.forEach(d => d.dispose());
-        this._onDidChangeRecordingState.dispose();
-        this._onDidTrackChanges.dispose();
-        this._onDidChangeBaselineState.dispose();
-    }
-}
