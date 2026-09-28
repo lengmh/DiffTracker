@@ -10077,3 +10077,120 @@ export class DiffTracker {
                 continue;
             }
 
+            const last = result[result.length - 1];
+            if (last &&
+                last.added === change.added &&
+                last.removed === change.removed) {
+                last.value.push(...change.value);
+            } else {
+                result.push({ ...change, value: [...change.value] });
+            }
+        }
+
+        return result;
+    }
+
+    private normalizeLineForMatch(input: string | undefined): string {
+        let value = (input ?? '').trim();
+
+        value = value.replace(/^\/\/\s?/, '');
+        value = value.replace(/^#\s?/, '');
+        value = value.replace(/^--\s?/, '');
+        value = value.replace(/^\/\*\s?/, '');
+        value = value.replace(/\*\/\s?$/, '');
+        value = value.replace(/\s+/g, ' ');
+
+        return value.trim();
+    }
+
+    private setTrackedChange(filePath: string, diff: FileDiff): void {
+        this.trackedChanges.set(filePath, diff);
+        this.markTrackedChangesDirty();
+    }
+
+    private deleteTrackedChange(filePath: string): void {
+        if (this.trackedChanges.delete(filePath)) {
+            this.markTrackedChangesDirty();
+        }
+    }
+
+    private clearTrackedChanges(): void {
+        if (this.trackedChanges.size === 0) {
+            return;
+        }
+        this.trackedChanges.clear();
+        this.markTrackedChangesDirty();
+    }
+
+    private markTrackedChangesDirty(): void {
+        this.trackedChangesVersion++;
+    }
+
+    private bumpLineChangesVersion(filePath: string): number {
+        const current = this.lineChangesVersionByFile.get(filePath) ?? 0;
+        const next = current + 1;
+        this.lineChangesVersionByFile.set(filePath, next);
+        return next;
+    }
+
+    private invalidateChangeBlocksCache(filePath: string): void {
+        this.changeBlocksCache.delete(filePath);
+    }
+
+    private resetChangeBlocksCaches(): void {
+        this.changeBlocksCache.clear();
+        this.lineChangesVersionByFile.clear();
+    }
+
+    private markLineChangesUpdated(filePath: string): void {
+        this.bumpLineChangesVersion(filePath);
+        this.invalidateChangeBlocksCache(filePath);
+    }
+
+    private emitTrackChangesEvent(event: Partial<TrackChangesEvent>): void {
+        const normalizeFiles = (files: string[] | undefined): string[] => {
+            if (!files || files.length === 0) {
+                return [];
+            }
+            return [...new Set(files)];
+        };
+
+        this._onDidTrackChanges.fire({
+            changedFiles: normalizeFiles(event.changedFiles),
+            removedFiles: normalizeFiles(event.removedFiles),
+            fullRefresh: event.fullRefresh === true,
+            baselineChanged: event.baselineChanged === true
+        });
+    }
+
+    private setIgnoreResultCache(cacheKey: string, ignored: boolean): void {
+        this.ignoreResultCache.set(cacheKey, ignored);
+        if (this.ignoreResultCache.size <= this.ignoreResultCacheMaxEntries) {
+            return;
+        }
+
+        const oldestKey = this.ignoreResultCache.keys().next().value as string | undefined;
+        if (oldestKey !== undefined) {
+            this.ignoreResultCache.delete(oldestKey);
+        }
+    }
+
+    public async dispose(): Promise<void> {
+        this.advanceEpoch();
+        this.disposed = true;
+        this.creationTempExpiryTimers.forEach(timer => clearTimeout(timer));
+        this.creationTempExpiryTimers.clear();
+        this.creationTempRoots.clear();
+        await this.flushPendingPersistence();
+        this.clearExternalChangeTimers();
+        this.clearDocumentChangeTimers();
+        this.clearWatcherSuppressionTimers();
+        this.clearAutomationSessions();
+        this.disposeFileWatchers();
+        this.importedDirectoryWatchers.clear();
+        this.disposables.forEach(d => d.dispose());
+        this._onDidChangeRecordingState.dispose();
+        this._onDidTrackChanges.dispose();
+        this._onDidChangeBaselineState.dispose();
+    }
+}
