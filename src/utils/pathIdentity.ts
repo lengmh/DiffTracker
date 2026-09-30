@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const maxIdentityDirectoryEntries = 10000;
-const maxCaseSensitivityProbeEntries = 128;
+const maxCaseSensitivityProbeWorkEntries = maxIdentityDirectoryEntries;
 
 interface DirectoryEntryListing {
     entries: fs.Dirent[];
@@ -27,19 +27,6 @@ function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing 
             entries.push(entry);
             byName.set(entry.name, entry);
         }
-    } finally { handle.closeSync(); }
-}
-
-function readIdentityDirectoryPrefix(directory: string, limit: number): fs.Dirent[] {
-    const handle = fs.opendirSync(directory);
-    try {
-        const entries: fs.Dirent[] = [];
-        while (entries.length < limit) {
-            const entry = handle.readSync();
-            if (!entry) { break; }
-            entries.push(entry);
-        }
-        return entries;
     } finally { handle.closeSync(); }
 }
 
@@ -156,19 +143,22 @@ export function detectLocalPathCaseSensitivity(
     // of lookup semantics *inside* that workspace. Per-directory case behavior,
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
+    let handle: fs.Dir | undefined;
     try {
-        // Root case probing needs only a small witness prefix. Do not require
-        // every direct child to fit the full path-identity listing bound before
-        // inspecting those witnesses; large roots are handled later by their
-        // own bounded preparation/traversal contracts.
-        const entries = readIdentityDirectoryPrefix(rootPath, maxCaseSensitivityProbeEntries);
-        for (const entry of entries) {
-            if (entry.isSymbolicLink()) { continue; }
-            const probe = probeExistingPath(path.join(rootPath, entry.name), entries);
+        handle = fs.opendirSync(rootPath);
+        for (let inspected = 0; inspected < maxCaseSensitivityProbeWorkEntries; inspected++) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            if (entry.isSymbolicLink() || !toggleAsciiCase(entry.name)) { continue; }
+            const probe = probeExistingPath(path.join(rootPath, entry.name), [entry]);
             if (probe !== undefined) { return probe; }
         }
     } catch {
         // Fall through to the fail-closed result below.
+    } finally {
+        if (handle) {
+            try { handle.closeSync(); } catch { /* Preserve the probe result/failure. */ }
+        }
     }
 
     // Empty roots, unreadable roots, or roots without an internally probeable

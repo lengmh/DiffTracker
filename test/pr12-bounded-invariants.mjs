@@ -959,6 +959,35 @@ export function registerPR12BoundedInvariants(h) {
         }));
     }
 
+    test('PR12 CASE root case probe searches past non-probeable raw entries',()=>fixture(async({dir})=>{
+        const originalOpen=fs.opendirSync;
+        let index=0,reads=0,closed=false;
+        fs.opendirSync=(target,...args)=>{
+            if(path.resolve(String(target))!==path.resolve(dir))return originalOpen(target,...args);
+            return {
+                readSync(){
+                    reads++;
+                    if(index<128){
+                        index++;
+                        return {name:String(index).padStart(4,'0'),isSymbolicLink:()=>false};
+                    }
+                    if(index===128){
+                        index++;
+                        return {name:'ProbeName',isSymbolicLink:()=>false};
+                    }
+                    return null;
+                },
+                closeSync(){closed=true;}
+            };
+        };
+        try {
+            const detected=detectLocalPathCaseSensitivity(dir);
+            assert.equal(typeof detected,'boolean');
+            assert.equal(reads,129);
+            assert.equal(closed,true);
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 CASE literal hard-boundary proof respects child filesystem semantics',()=>fixture(async({tracker,dir})=>{
         let identity=caseIdentity(tracker,true);
         const git=path.join(dir,'insensitive','.git'),alias=path.join(dir,'insensitive','.GIT');
@@ -1116,6 +1145,13 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(tracker.coverageGaps.has(path.resolve(imported)),false,
                 'a rejected reservation must not create an over-limit non-durable gap');
             assert.equal(tracker.coverageGaps.size,1);
+            assert.equal(tracker.isRecording,false,
+                'recording must pause when mandatory coverage evidence cannot be reserved');
+            assert.equal(tracker.baselineBuilding,true);
+            assert.equal(tracker.snapshotInitialized,false);
+            assert.equal(tracker.externalWatcherEnabled,false);
+            assert.equal(fs.existsSync(path.join(tracker.storageUri.fsPath,'session-state.unsaved')),true,
+                'fail-closed pause must retain a durable unsaved marker');
         } finally {
             tracker.watchImportedTree=originalWatch;
         }
@@ -1137,6 +1173,42 @@ export function registerPR12BoundedInvariants(h) {
         assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>
             tracker.canonicalTrackingPath(gap.targetPath)===importedIdentity),
             'aborted populated-directory capture must preserve an explicit subtree reconciliation obligation');
+    }));
+
+    test('PR12 AUDIT restore additions validate late coverage evidence before publication',()=>fixture(async({tracker,dir})=>{
+        const candidate=path.join(dir,'restore-projection-candidate.txt');
+        fs.writeFileSync(candidate,'current');
+        tracker.scanCoverage=tracker.ignoreFingerprint;
+        const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        const originalValidate=tracker.validateRestoreAdditionsProjection.bind(tracker);
+        let injected=false,validated=false;
+        tracker.findScopeFilesUnderDirectory=async()=>[Uri.file(candidate)];
+        tracker.validateRestoreAdditionsProjection=additions=>{
+            if(!injected){
+                injected=true;
+                tracker.setSubtreeCoverageGap(
+                    path.join(dir,'late-restore-gap'),
+                    'late-restore-gap',
+                    'late restore evidence '.repeat(80),
+                    false
+                );
+                tracker.maxPersistedBytes=serialized(tracker)+64;
+            }
+            validated=true;
+            return originalValidate(additions);
+        };
+        try {
+            await assert.rejects(
+                ()=>tracker.discoverRestoredFiles(tracker.sessionEpoch),
+                /Restored additions would exceed persisted byte capacity|schema\/count limits/i
+            );
+            assert.equal(validated,true);
+            assert.equal(tracker.fileSnapshots.has(candidate),false);
+            assert.equal(tracker.unresolvedBaselineFiles.has(candidate),false);
+        } finally {
+            tracker.findScopeFilesUnderDirectory=originalFind;
+            tracker.validateRestoreAdditionsProjection=originalValidate;
+        }
     }));
 
     test('PR12 AUDIT populated-directory durable flush failure rolls back children and persists the gap',()=>fixture(async({tracker,dir})=>{

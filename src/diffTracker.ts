@@ -2062,6 +2062,61 @@ export class DiffTracker {
         console.error(message, error);
     }
 
+    private async retainPersistenceFailureMarker(message: string): Promise<boolean> {
+        const epoch = this.sessionEpoch;
+        const storageUri = this.storageUri;
+        const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+        if (!storageUri || !failureUri) { return false; }
+
+        const task = async (): Promise<boolean> => {
+            if (epoch !== this.sessionEpoch) { return false; }
+            try {
+                await vscode.workspace.fs.createDirectory(storageUri);
+                if (epoch !== this.sessionEpoch) { return false; }
+                await vscode.workspace.fs.writeFile(
+                    failureUri,
+                    new TextEncoder().encode(message.slice(0, 1000))
+                );
+                return epoch === this.sessionEpoch;
+            } catch (error) {
+                if (epoch === this.sessionEpoch) {
+                    this.reportPersistenceIssue(
+                        'Failed to retain the mandatory coverage failure marker.',
+                        error
+                    );
+                }
+                return false;
+            }
+        };
+        this.persistStateWriteQueue = this.persistStateWriteQueue.then(task, task);
+        return this.persistStateWriteQueue;
+    }
+
+    private async pauseRecordingForUnpersistableCoverage(
+        message: string,
+        error?: unknown
+    ): Promise<void> {
+        this.isRecording = false;
+        this.externalWatcherEnabled = false;
+        this.baselineBuilding = true;
+        this.snapshotInitialized = false;
+        this.scanCoverage = undefined;
+        this.clearAutomationSessions();
+        this.clearExternalChangeTimers();
+        this.clearDocumentChangeTimers();
+        this.clearWatcherSuppressionTimers();
+        this.disposeFileWatchers();
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+        }
+        this._onDidChangeRecordingState.fire(false);
+        this._onDidChangeBaselineState.fire('building');
+        await this.retainPersistenceFailureMarker(message);
+        this.reportPersistenceIssue(message, error);
+        this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+    }
+
     private async flushPersistState(
         completedBaseline = false,
         transaction?: BaselineTransaction,
@@ -3550,6 +3605,66 @@ export class DiffTracker {
             );
         }
         return payload;
+    }
+
+    private validateRestoreAdditionsProjection(
+        additions: readonly { filePath: string; plan: CandidateBaselinePlan }[]
+    ): void {
+        if (additions.length === 0) { return; }
+        const state = this.buildPersistedState();
+        if (!state) { return; }
+
+        const snapshots = new Map(state.fileSnapshots);
+        const modes = new Map(state.fileModes);
+        const existingFiles = new Set(state.baselineExistingFiles);
+        const unresolved = new Map(state.unresolvedBaselineFiles);
+        const opaque = new Map(state.opaqueBaselineFiles);
+
+        for (const { filePath, plan } of additions) {
+            if (plan.kind === 'text') {
+                snapshots.set(filePath, plan.content);
+                unresolved.delete(filePath);
+                opaque.delete(filePath);
+                if (plan.mode === undefined) { modes.delete(filePath); }
+                else { modes.set(filePath, plan.mode); }
+                if (plan.baselineExists) { existingFiles.add(filePath); }
+                else { existingFiles.delete(filePath); }
+            } else if (plan.kind === 'unresolved') {
+                snapshots.delete(filePath);
+                modes.delete(filePath);
+                existingFiles.delete(filePath);
+                opaque.delete(filePath);
+                unresolved.set(filePath, plan.reason);
+            } else {
+                opaque.set(filePath, {
+                    reason: plan.state.reason,
+                    size: plan.state.size,
+                    mtime: plan.state.mtime,
+                    fingerprint: plan.state.fingerprint
+                });
+                snapshots.delete(filePath);
+                modes.delete(filePath);
+                existingFiles.delete(filePath);
+                unresolved.delete(filePath);
+            }
+        }
+
+        state.fileSnapshots = [...snapshots].sort(([left], [right]) => left.localeCompare(right));
+        state.fileModes = [...modes].filter(([filePath]) => snapshots.has(filePath));
+        state.baselineExistingFiles = [...existingFiles].sort((left, right) => left.localeCompare(right));
+        state.unresolvedBaselineFiles = [...unresolved].sort(([left], [right]) => left.localeCompare(right));
+        state.opaqueBaselineFiles = [...opaque].sort(([left], [right]) => left.localeCompare(right));
+
+        if (!this.parsePersistedState(state)) {
+            throw new Error(
+                'Restored additions would exceed Session V4 schema/count limits; rebuild or narrow the monitoring scope before retrying.'
+            );
+        }
+        if (Buffer.byteLength(JSON.stringify(state), 'utf8') > this.maxPersistedBytes) {
+            throw new Error(
+                'Restored additions would exceed persisted byte capacity; rebuild or narrow the monitoring scope before retrying.'
+            );
+        }
     }
 
     private planScannedBaseline(
@@ -6312,21 +6427,52 @@ export class DiffTracker {
             plannedAdditions.push({ filePath, plan });
         }
 
-        for (const { filePath, plan } of plannedAdditions) {
+        const publishableAdditions = plannedAdditions.filter(({ filePath }) => {
+            const uri = vscode.Uri.file(filePath);
+            return !this.isPathIgnored(uri) &&
+                !this.fileSnapshots.has(filePath) &&
+                !this.unresolvedBaselineFiles.has(filePath) &&
+                !this.opaqueBaselineFiles.has(filePath);
+        });
+        if (persistenceBudget) {
+            this.validateCandidatePersistenceProjection(persistenceBudget);
+        }
+        this.validateRestoreAdditionsProjection(publishableAdditions);
+
+        const unresolvedReviews: Array<{ filePath: string; reason: string }> = [];
+        for (const { filePath, plan } of publishableAdditions) {
+            const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+            const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                ? this.unresolvedBaselineFiles.revision : undefined;
             if (plan.kind === 'text') {
                 this.fileSnapshots.set(filePath, plan.content);
                 this.fileModes.delete(filePath);
                 this.baselineExistingFiles.delete(filePath);
             } else if (plan.kind === 'unresolved') {
-                this.recordUnresolvedBaseline(filePath, plan.reason);
+                this.opaqueBaselineFiles.delete(filePath);
+                this.postBaselineUnknownFiles.delete(filePath);
+                this.unresolvedBaselineFiles.set(filePath, plan.reason);
+                unresolvedReviews.push({ filePath, reason: plan.reason });
             } else {
-                // Restore discovery never creates opaque before-images because no
-                // file content is read here; keep this exhaustive for type safety.
                 throw new Error('Unexpected opaque restore candidate');
             }
+            if (persistenceBudget) {
+                this.noteCandidateBudgetPublication(
+                    filePath,
+                    persistenceBudget,
+                    beforeReason,
+                    beforeRevision
+                );
+            }
         }
-        if (plannedAdditions.length > 0 && !await this.flushPendingPersistence()) {
+        if (persistenceBudget) {
+            this.validateCandidatePersistenceProjection(persistenceBudget);
+        }
+        if (publishableAdditions.length > 0 && !await this.flushPendingPersistence()) {
             throw new Error('Restored additions could not be persisted');
+        }
+        for (const { filePath, reason } of unresolvedReviews) {
+            this.markFileUnavailable(filePath, reason);
         }
     }
 
@@ -6848,11 +6994,8 @@ export class DiffTracker {
                         childPersistenceBudget
                     );
                 } catch (error) {
-                    // No child/sentinel state has changed yet. Failing here is
-                    // safer than publishing a partial imported-tree baseline
-                    // when the mandatory reconciliation evidence cannot fit.
-                    this.reportPersistenceIssue(
-                        'Created directory was not baselined because its required coverage evidence exceeds persistence capacity.',
+                    await this.pauseRecordingForUnpersistableCoverage(
+                        'Created directory could not reserve durable coverage evidence; recording is paused until the baseline is rebuilt.',
                         error
                     );
                     return;
