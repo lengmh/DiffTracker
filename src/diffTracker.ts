@@ -2096,6 +2096,12 @@ export class DiffTracker {
         message: string,
         error?: unknown
     ): Promise<void> {
+        // Invalidate every operation that began under the now-untrustworthy
+        // coverage generation before publishing the paused state. This also
+        // rolls back any enclosing baseline transaction and prevents an older
+        // async handler from scheduling a later write that could clear the
+        // durable failure marker.
+        this.advanceEpoch();
         this.isRecording = false;
         this.externalWatcherEnabled = false;
         this.baselineBuilding = true;

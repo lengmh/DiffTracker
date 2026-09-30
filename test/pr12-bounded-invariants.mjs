@@ -1136,6 +1136,7 @@ export function registerPR12BoundedInvariants(h) {
         const child=path.join(imported,'child.txt');fs.writeFileSync(child,'current');
         const originalWatch=tracker.watchImportedTree.bind(tracker);
         let watchAttempted=false;
+        const beforePauseEpoch=tracker.sessionEpoch;
         tracker.watchImportedTree=async()=>{watchAttempted=true;};
         try {
             await tracker.onExternalFileCreated(Uri.file(imported));
@@ -1150,6 +1151,8 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(tracker.baselineBuilding,true);
             assert.equal(tracker.snapshotInitialized,false);
             assert.equal(tracker.externalWatcherEnabled,false);
+            assert.ok(tracker.sessionEpoch>beforePauseEpoch,
+                'fail-closed pause must invalidate operations from the old coverage epoch');
             assert.equal(fs.existsSync(path.join(tracker.storageUri.fsPath,'session-state.unsaved')),true,
                 'fail-closed pause must retain a durable unsaved marker');
         } finally {
