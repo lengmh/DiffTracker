@@ -1101,6 +1101,48 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT runtime scan cap preserves a proven case-insensitive explicit include',()=>fixture(async({tracker,dir})=>{
+        const actual=path.join(dir,'MixedIncluded');
+        const alias=path.join(dir,'mixedincluded');
+        fs.writeFileSync(actual,'tracked');
+        const originalOpen=fs.opendirSync;
+        try {
+            await withLookups([[alias,actual]],[],async()=>{
+                const wrappedOpen=fs.opendirSync;
+                fs.opendirSync=(value,...args)=>{
+                    if(path.resolve(String(value))!==path.resolve(dir))return wrappedOpen(value,...args);
+                    let index=0;
+                    return {
+                        readSync(){
+                            index++;
+                            if(index<=25000)return {
+                                name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                                isSymbolicLink:()=>false
+                            };
+                            return null;
+                        },
+                        closeSync(){}
+                    };
+                };
+                try {
+                    const identity={...tracker.currentWorkspaceRootIdentities()[0],caseSensitive:false};
+                    const requested=includeScope(tracker,'rules',['mixedincluded']);
+                    requested.roots=[identity];
+                    const decision=evaluateConfiguredScope(
+                        requested,identity,'MixedIncluded',true,false
+                    );
+                    assert.equal(decision.source,'explicitInclude',
+                        'a previously valid ASCII-case alias must remain included when runtime spelling recovery hits its bounded cap');
+                    assert.equal(decision.monitored,true);
+                } finally {
+                    fs.opendirSync=wrappedOpen;
+                }
+            });
+        } finally {
+            fs.opendirSync=originalOpen;
+        }
+    },'rules'));
+
     test('PR12 AUDIT runtime scan cap does not drop an existing Whole Workspace path',()=>fixture(async({tracker,dir})=>{
         const target=path.join(dir,'runtime-late-entry.txt');
         fs.writeFileSync(target,'tracked');
@@ -1230,33 +1272,56 @@ export function registerPR12BoundedInvariants(h) {
         fs.writeFileSync(target,'target');
 
         const originalOpen=fs.opendirSync;
-        let reads=0;
-        fs.opendirSync=(value,...args)=>{
-            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
-            let index=0;
+        const originalAsyncOpen=fs.promises.opendir;
+        let syncReads=0,asyncReads=0;
+        const entries=()=>Array.from({length:20},(_,entryIndex)=>({
+            name:`f-${String(entryIndex+1).padStart(3,'0')}`,
+            isFile:()=>true,isDirectory:()=>false,isSymbolicLink:()=>false
+        })).concat([{
+            name:'TargetName',isFile:()=>true,isDirectory:()=>false,isSymbolicLink:()=>false
+        }]);
+        const syncHandle=()=>{
+            const pending=entries();
             return {
                 readSync(){
-                    reads++;
-                    if(index<20){
-                        index++;
-                        return {name:`f-${String(index).padStart(3,'0')}`,isSymbolicLink:()=>false};
-                    }
-                    if(index++===20)return {name:'TargetName',isSymbolicLink:()=>false};
-                    return null;
+                    syncReads++;
+                    return pending.shift()??null;
                 },
                 closeSync(){}
+            };
+        };
+        fs.opendirSync=(value,...args)=>
+            path.resolve(String(value))===path.resolve(dir)?syncHandle():originalOpen(value,...args);
+        fs.promises.opendir=async(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalAsyncOpen(value,...args);
+            const pending=entries();
+            return {
+                readSync(){
+                    asyncReads++;
+                    return pending.shift()??null;
+                },
+                closeSync(){},
+                async *[Symbol.asyncIterator](){
+                    while(pending.length>0){
+                        asyncReads++;
+                        yield pending.shift();
+                    }
+                }
             };
         };
         tracker.maxScopePreflightEntries=5;
         try {
             const outcome=await tracker.applyConfiguredMonitoringScope(requested);
             assert.notEqual(outcome.status,'applied');
-            assert.match(outcome.reason??'',/path-identity|preparation|budget/i);
-            assert.ok(reads<=5,
+            assert.match(outcome.reason??'',/path-identity|preparation|budget|entries/i);
+            assert.ok(asyncReads<=5,
+                'bounded preflight must not discover the late real target outside its entry allowance');
+            assert.ok(syncReads<=5,
                 'Rules Apply must not perform identity fallback work outside the shared preparation allowance');
             assert.equal(tracker.fileSnapshots.has(target),false);
         } finally {
             fs.opendirSync=originalOpen;
+            fs.promises.opendir=originalAsyncOpen;
             tracker.detectWorkspaceRootCaseSensitivity=originalDetect;
             tracker.workspaceRootCaseSensitivityCache.clear();
         }

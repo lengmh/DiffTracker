@@ -486,15 +486,59 @@ function localRootPath(root: WorkspaceRootIdentity): string | undefined {
     }
 }
 
-function relativeIdentity(
+function normalizeRelativeParts(value: string): string[] {
+    return value.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '')
+        .split('/').filter(Boolean);
+}
+
+/**
+ * Compare two same-depth literal relative paths without treating root case
+ * semantics as proof for descendant directories. Normal physical identity wins.
+ * If runtime spelling recovery hit its bounded cap, only an existing lookup plus
+ * a filesystem-proven insensitive parent may bridge an ASCII-case difference.
+ */
+function sameRelativeFilesystemIdentity(
     root: WorkspaceRootIdentity,
-    value: string,
+    leftValue: string,
+    rightValue: string,
     workBudget?: PathIdentityWorkBudget
-): string {
+): boolean {
+    const leftRequested = normalizeRelativeParts(leftValue);
+    const rightRequested = normalizeRelativeParts(rightValue);
+    if (leftRequested.length !== rightRequested.length) { return false; }
+    if (leftRequested.every((part, index) => part === rightRequested[index])) { return true; }
+
     const rootPath = localRootPath(root);
-    return rootPath
-        ? resolveRelativePathIdentity(rootPath, value, false, workBudget).identity
-        : value;
+    if (!rootPath || typeof root.caseSensitive !== 'boolean') { return false; }
+    const leftRelative = leftRequested.join('/');
+    const rightRelative = rightRequested.join('/');
+    const left = resolveRelativePathIdentity(rootPath, leftRelative, root.caseSensitive, workBudget);
+    const right = resolveRelativePathIdentity(rootPath, rightRelative, root.caseSensitive, workBudget);
+    const leftResolved = normalizeRelativeParts(left.resolvedRelativePath);
+    const rightResolved = normalizeRelativeParts(right.resolvedRelativePath);
+
+    for (let index = 0; index < leftRequested.length; index++) {
+        if (leftResolved[index] === rightResolved[index]) { continue; }
+
+        // Physical spelling is still unresolved. Never use generic Unicode
+        // folding, missing lookup, symlink uncertainty, or preparation-budget
+        // exhaustion as alias proof.
+        if (asciiCaseFold(leftRequested[index]) !== asciiCaseFold(rightRequested[index]) ||
+            left.lookupVerifiedPrefixLength <= index ||
+            right.lookupVerifiedPrefixLength <= index ||
+            (left.runtimeFallbackExhausted !== true && right.runtimeFallbackExhausted !== true)) {
+            return false;
+        }
+
+        const parentSensitive = index === 0
+            ? root.caseSensitive
+            : cachedExclusionDirectoryCaseSensitivity(
+                path.join(rootPath, ...rightRequested.slice(0, index)),
+                workBudget
+            );
+        if (parentSensitive !== false) { return false; }
+    }
+    return true;
 }
 
 function includeCoversRelativePath(
@@ -504,14 +548,22 @@ function includeCoversRelativePath(
     root: WorkspaceRootIdentity,
     workBudget?: PathIdentityWorkBudget
 ): boolean {
-    const includeParts = relativeIdentity(root, includePath, workBudget).split('/').filter(Boolean);
-    const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, ''), workBudget).split('/').filter(Boolean);
-    if (targetParts.length >= includeParts.length &&
-        includeParts.every((part, index) => targetParts[index] === part)) {
-        return true;
+    const includeParts = normalizeRelativeParts(includePath);
+    const targetParts = normalizeRelativeParts(relativePath);
+    if (targetParts.length >= includeParts.length) {
+        return sameRelativeFilesystemIdentity(
+            root,
+            includeParts.join('/'),
+            targetParts.slice(0, includeParts.length).join('/'),
+            workBudget
+        );
     }
-    return directory && targetParts.length < includeParts.length &&
-        targetParts.every((part, index) => includeParts[index] === part);
+    return directory && sameRelativeFilesystemIdentity(
+        root,
+        targetParts.join('/'),
+        includeParts.slice(0, targetParts.length).join('/'),
+        workBudget
+    );
 }
 
 function explicitPatternForIgnore(pattern: string): string {
