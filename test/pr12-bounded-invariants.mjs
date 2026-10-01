@@ -1019,6 +1019,35 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT preparation reuses unique filesystem alias identity proof',()=>fixture(async({dir})=>{
+        const actual=path.join(dir,'PhysicalTarget');
+        const alias=path.join(dir,'physicaltarget');
+        fs.writeFileSync(actual,'target');
+        const originalOpen=fs.opendirSync;
+        let opens=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))===path.resolve(dir))opens++;
+            return originalOpen(value,...args);
+        };
+        try {
+            await withLookups([[alias,actual]],[],async()=>{
+                const budget={remainingEntries:64};
+                const first=resolveRelativePathIdentity(dir,'physicaltarget',false,budget);
+                assert.equal(first.unavailable,false);
+                assert.equal(first.resolvedRelativePath,'PhysicalTarget');
+                const afterFirst=budget.remainingEntries;
+                const opensAfterFirst=opens;
+                const second=resolveRelativePathIdentity(dir,'physicaltarget',false,budget);
+                assert.equal(second.unavailable,false);
+                assert.equal(second.resolvedRelativePath,'PhysicalTarget');
+                assert.equal(budget.remainingEntries,afterFirst,
+                    'repeated alias resolution must reuse operation-local identity evidence');
+                assert.equal(opens,opensAfterFirst,
+                    'repeated alias resolution must not reopen and rescan the parent directory');
+            });
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT path identity fallback consumes the caller work budget',()=>fixture(async({dir})=>{
         const target=path.join(dir,'TargetName');
         fs.writeFileSync(target,'target');
@@ -1053,6 +1082,26 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(opens,1,
                 'budget exhaustion must stop before an additional fallback scan');
         } finally {fs.opendirSync=originalOpen;}
+    }));
+
+    test('PR12 AUDIT preflight reports identity-budget exhaustion as truncated',()=>fixture(async({tracker,dir})=>{
+        const originalDetect=tracker.detectWorkspaceRootCaseSensitivity.bind(tracker);
+        tracker.detectWorkspaceRootCaseSensitivity=()=>false;
+        tracker.workspaceRootCaseSensitivityCache.clear();
+        for(let i=0;i<8;i++)fs.writeFileSync(path.join(dir,`identity-${i}.txt`),'x');
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'missing-alias/**'}]);
+        tracker.maxScopePreflightEntries=2;
+        try {
+            const result=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+            assert.equal(result.status,'ready',JSON.stringify(result));
+            assert.equal(result.truncated,true,JSON.stringify(result));
+            assert.equal(result.unreadableDirectoryCount,0,
+                'identity work exhaustion is a bounded-preparation condition, not a filesystem read failure');
+            assert.match(result.reason??'',/identity|preparation|budget|entries/i);
+        } finally {
+            tracker.detectWorkspaceRootCaseSensitivity=originalDetect;
+            tracker.workspaceRootCaseSensitivityCache.clear();
+        }
     }));
 
     test('PR12 AUDIT Rules include identity work shares the traversal preparation budget',()=>fixture(async({tracker,dir})=>{

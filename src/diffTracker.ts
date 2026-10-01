@@ -3202,7 +3202,20 @@ export class DiffTracker {
                     }
                 }
             } catch (error) {
-                if (!this.isFileNotFound(error)) { rememberUnreadable(folder, directory, error); }
+                if (error instanceof IgnoreDiscoveryError) {
+                    if (error.limit === 'invalidated') {
+                        return conflict(error.message);
+                    }
+                    if (error.limit === 'entries') {
+                        result.inspectedEntries = this.maxScopePreflightEntries - ignoreBudget.remainingEntries;
+                        result.truncated = true;
+                        result.reason = error.message;
+                    } else {
+                        return failed(error.message);
+                    }
+                } else if (!this.isFileNotFound(error)) {
+                    rememberUnreadable(folder, directory, error);
+                }
             }
 
             directorySummaries.push({

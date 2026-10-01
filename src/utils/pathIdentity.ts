@@ -309,9 +309,19 @@ function streamDirectoryEntryIdentity(
         while (identityWorkAvailable(budget)) {
             const entry = handle.readSync();
             if (!entry) {
-                return match === undefined
-                    ? { unavailable: true }
-                    : { actual: match, unavailable: false };
+                if (match === undefined) { return { unavailable: true }; }
+                if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+                    // Cache the unique filesystem-alias proof as well as exact
+                    // spelling hits. Scope matching repeatedly asks the same
+                    // literal question for many children; reopening and rescanning
+                    // the parent for each child would turn bounded traversal into
+                    // quadratic identity work.
+                    (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                        signature: beforeSignature,
+                        actual: match
+                    });
+                }
+                return { actual: match, unavailable: false };
             }
             consumeIdentityEntry(budget);
             try {
@@ -381,19 +391,12 @@ export function resolveRelativePathIdentity(
                 // explicit targets therefore do not burn the identity allowance.
                 const requestedStat = fs.lstatSync(requestedPath);
 
-                // The root's lookup semantics were independently probed before
-                // this resolver is called. On a proven case-sensitive root, a
-                // successful exact first-component lstat is itself proof of the
-                // physical spelling, so scanning a huge root directory would add
-                // no information. Descendant directories are not covered by the
-                // root flag and continue through filesystem-aware lookup below.
-                if (partIndex === 0 && _caseSensitive === true) {
-                    actual = requested;
-                }
-
-                let listing = actual === undefined
-                    ? directoryEntries(current, workBudget)
-                    : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
+                // The case-sensitivity argument describes matching policy, not
+                // physical entry spelling. Callers intentionally force this
+                // resolver through filesystem identity checks in several safety
+                // paths, so only directory evidence may establish the actual
+                // spelling.
+                let listing = directoryEntries(current, workBudget);
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // descendant directories can differ from the workspace root.
                 let exact = actual === undefined ? listing.byName.get(requested) : undefined;
