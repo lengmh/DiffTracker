@@ -3293,7 +3293,7 @@ export class DiffTracker {
         const preparationBudget = shared?.traversal ?? identityEvidence ?? {
             remainingEntries: this.maxScopePreflightEntries
         };
-        if (!shared?.traversal) {
+        if (!shared?.traversal && !identityEvidence) {
             preparationBudget.remainingEntries = this.maxScopePreflightEntries;
             preparationBudget.exhausted = false;
         }
@@ -4055,8 +4055,10 @@ export class DiffTracker {
         const preparationBudget = identityEvidence ?? {
             remainingEntries: this.maxScopePreflightEntries
         };
-        preparationBudget.remainingEntries = this.maxScopePreflightEntries;
-        preparationBudget.exhausted = false;
+        if (!identityEvidence) {
+            preparationBudget.remainingEntries = this.maxScopePreflightEntries;
+            preparationBudget.exhausted = false;
+        }
         const files = await this.enumerateConfiguredCandidateFiles(
             scope,
             epoch,
@@ -5620,12 +5622,14 @@ export class DiffTracker {
         const budget = (identityEvidence ?? {
             remainingEntries: this.maxScopePreflightEntries
         }) as IgnoreDiscoveryBudget;
-        // Each preparation phase owns a fresh hard allowance; only proven
-        // identity evidence is carried forward. This prevents advisory preflight
-        // from consuming the formal capture quota while still avoiding duplicate
-        // filesystem proof.
-        budget.remainingEntries = this.maxScopePreflightEntries;
-        budget.exhausted = false;
+        // A supplied evidence carrier belongs to one complete Apply operation:
+        // preflight and capture share both its proven identity facts and its
+        // remaining work allowance. Standalone matcher refreshes still get a
+        // fresh bound because they pass no carrier.
+        if (!identityEvidence) {
+            budget.remainingEntries = this.maxScopePreflightEntries;
+            budget.exhausted = false;
+        }
         budget.remainingBytes = this.maxPersistedBytes;
         budget.seenEntries = new Set<string>();
         budget.policyBytes = new Map<string, number>();

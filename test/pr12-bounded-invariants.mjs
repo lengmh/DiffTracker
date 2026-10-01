@@ -247,17 +247,17 @@ export function registerPR12BoundedInvariants(h) {
             };
         };
         try {
-            const first=resolveRelativePathIdentity(dir,'late-entry.txt',true);
+            const first=resolveRelativePathIdentity(dir,'late-entry.txt',false);
             assert.equal(first.unavailable,false,
-                'an existing path after the cache prefix must not become identityUnknown');
+                'an existing path after the cache prefix must not become identityUnknown on a fallback-requiring root');
             assert.equal(first.identity,'late-entry.txt');
             assert.equal(first.verifiedPrefixLength,1);
             const readsAfterFirst=totalReads;
-            const second=resolveRelativePathIdentity(dir,'late-entry.txt',true);
+            const second=resolveRelativePathIdentity(dir,'late-entry.txt',false);
             assert.equal(second.unavailable,false);
             assert.equal(second.identity,'late-entry.txt');
             assert.equal(opens,3,
-                'second oversized lookup must reuse the cached 10k prefix and open only the streaming fallback');
+                'first lookup may build the bounded prefix plus fallback; second must reuse the prefix and open only one fallback scan');
             assert.ok(totalReads-readsAfterFirst<=10002,
                 'cached incomplete prefix must prevent rereading the first 10k entries on every lookup');
         } finally {fs.opendirSync=originalOpen;}
