@@ -3411,9 +3411,11 @@ export class DiffTracker {
             seedOverlappingWorkspaceRoots?: boolean;
             skipTraversalPath?: (targetPath: string) => boolean;
             visitedDirectories?: Set<string>;
+            identityBudget?: PathIdentityWorkBudget;
         } = {}
     ): Promise<string[]> {
         const files: string[] = [];
+        const identityBudget = traversalOptions.identityBudget ?? preparationBudget;
         const countedCandidates = capacityGuard?.countedCandidates ?? new Set<string>();
         const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
         const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
@@ -3465,12 +3467,12 @@ export class DiffTracker {
                 scope,
                 rootIdentity,
                 relativeDirectory,
-                preparationBudget
+                identityBudget
             )) {
-                this.assertPathIdentityBudget(preparationBudget);
+                this.assertPathIdentityBudget(identityBudget);
                 continue;
             }
-            this.assertPathIdentityBudget(preparationBudget);
+            this.assertPathIdentityBudget(identityBudget);
             if (relativeDirectory) {
                 const hardBoundary = isHardUnmonitorableRelativePath(
                     relativeDirectory,
@@ -3478,9 +3480,9 @@ export class DiffTracker {
                     true,
                     preparationBudget
                 );
-                this.assertPathIdentityBudget(preparationBudget);
+                this.assertPathIdentityBudget(identityBudget);
                 if (hardBoundary ||
-                    this.isPathIgnored(vscode.Uri.file(directory), true, false, false, preparationBudget)) {
+                    this.isPathIgnored(vscode.Uri.file(directory), true, false, false, identityBudget)) {
                     continue;
                 }
             }
@@ -3519,16 +3521,16 @@ export class DiffTracker {
                     const isDirectory = entryKind === 'directory';
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, preparationBudget)) {
-                        this.assertPathIdentityBudget(preparationBudget);
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, identityBudget)) {
+                        this.assertPathIdentityBudget(identityBudget);
                         continue;
                     }
-                    this.assertPathIdentityBudget(preparationBudget);
-                    if (this.isPathIgnored(vscode.Uri.file(child), isDirectory, false, false, preparationBudget)) { continue; }
+                    this.assertPathIdentityBudget(identityBudget);
+                    if (this.isPathIgnored(vscode.Uri.file(child), isDirectory, false, false, identityBudget)) { continue; }
                     if (isDirectory) {
                         pending.push({ folder, directory: child });
                     } else {
-                        const canonical = this.canonicalTrackingPath(child, false, preparationBudget);
+                        const canonical = this.canonicalTrackingPath(child, false, identityBudget);
                         if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
                             !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
                             if (capacityGuard.remaining <= 0) {
@@ -4750,6 +4752,7 @@ export class DiffTracker {
         traversalOptions: {
             seedOverlappingWorkspaceRoots?: boolean;
             skipTraversalPath?: (targetPath: string) => boolean;
+            identityBudget?: PathIdentityWorkBudget;
         } = {}
     ): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
@@ -7846,6 +7849,7 @@ export class DiffTracker {
                 undefined,
                 {
                     seedOverlappingWorkspaceRoots: true,
+                    identityBudget: { remainingEntries: this.maxScopePreflightEntries },
                     skipTraversalPath: targetPath => {
                         for (let current = path.resolve(targetPath); ; current = path.dirname(current)) {
                             if (nestedRepositoryRootSet.has(current)) { return true; }
