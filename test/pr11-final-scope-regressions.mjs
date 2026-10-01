@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { evaluateConfiguredScope, validateAndCanonicalizeScope, detectScopeExpansion } from '../out/monitoringScope.js';
 
@@ -145,8 +146,7 @@ export function registerFinalScopeRegressions(h) {
         // >10k workspace-capacity test.
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetWorkspaceFolder = vscode.workspace.getWorkspaceFolder;
-        const isolatedRoot = file('final-gap-workspace');
-        fs.mkdirSync(isolatedRoot, { recursive: true });
+        const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-final-gap-'));
         fs.writeFileSync(path.join(isolatedRoot, 'ProbeName'), 'case identity witness');
         const folder = { uri: Uri.file(isolatedRoot), name: 'final-gap-workspace' };
         const belongs = uri => {
