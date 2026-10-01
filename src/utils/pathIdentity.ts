@@ -14,7 +14,6 @@ interface DirectoryEntryListing {
     entries: fs.Dirent[];
     byName: Map<string, fs.Dirent>;
     complete: boolean;
-    budgetExhausted?: boolean;
 }
 
 function identityWorkAvailable(budget?: PathIdentityWorkBudget): boolean {
@@ -28,26 +27,17 @@ function consumeIdentityEntry(budget?: PathIdentityWorkBudget): void {
     if (budget) { budget.remainingEntries--; }
 }
 
-function readIdentityDirectoryEntries(
-    directory: string,
-    workBudget?: PathIdentityWorkBudget
-): DirectoryEntryListing {
+function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing {
     const handle = fs.opendirSync(directory);
     try {
         const entries: fs.Dirent[] = [];
         const byName = new Map<string, fs.Dirent>();
         while (true) {
-            if (entries.length >= maxIdentityDirectoryEntries) {
-                // The cache is bounded, not the live directory. Retain this
-                // prefix with an incomplete marker so later lookups can reuse it.
-                return { entries, byName, complete: false };
-            }
-            if (!identityWorkAvailable(workBudget)) {
-                return { entries, byName, complete: false, budgetExhausted: true };
-            }
             const entry = handle.readSync();
             if (!entry) { return { entries, byName, complete: true }; }
-            consumeIdentityEntry(workBudget);
+            if (entries.length >= maxIdentityDirectoryEntries) {
+                return { entries, byName, complete: false };
+            }
             entries.push(entry);
             byName.set(entry.name, entry);
         }
@@ -236,10 +226,14 @@ function directoryEntries(
         };
     }
     if (cached) { invalidateDirectoryEntries(directory); }
-    const listing = readIdentityDirectoryEntries(directory, workBudget);
-    // A caller-limited prefix must not poison the reusable global cache: a
-    // later runtime lookup may have a larger independent allowance.
-    if (!listing.budgetExhausted && signature() === before) {
+    if (workBudget) {
+        // Preparation must pay only for identity work it actually needs. Do not
+        // spend the shared allowance materializing a reusable 10k prefix cache;
+        // the caller will stream the requested entry below.
+        return { entries: [], byName: new Map(), complete: false };
+    }
+    const listing = readIdentityDirectoryEntries(directory);
+    if (signature() === before) {
         if (directoryEntriesCache.size >= 4096 ||
             cachedDirectoryEntryCount + listing.entries.length > maxIdentityDirectoryEntries) {
             directoryEntriesCache.clear();
@@ -332,11 +326,13 @@ export function resolveRelativePathIdentity(
         let actual: string | undefined;
         if (physicalPrefixAvailable) {
             try {
-                let listing = directoryEntries(current, workBudget);
                 const requestedPath = path.join(current, requested);
+                // Existence is checked before any directory enumeration. Missing
+                // explicit targets therefore do not burn the identity allowance.
+                const requestedStat = fs.lstatSync(requestedPath);
+                let listing = directoryEntries(current, workBudget);
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // the current directory can differ from the workspace root.
-                const requestedStat = fs.lstatSync(requestedPath);
                 let exact = listing.byName.get(requested);
                 if (!exact && listing.complete) {
                     // Some filesystems (notably Windows runners) can preserve a

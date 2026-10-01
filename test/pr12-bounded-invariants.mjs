@@ -959,6 +959,36 @@ export function registerPR12BoundedInvariants(h) {
         }));
     }
 
+    test('PR12 AUDIT preparation identity lookup stops at an early exact witness',()=>fixture(async({dir})=>{
+        const target=path.join(dir,'EarlyTarget');
+        fs.writeFileSync(target,'target');
+        const originalOpen=fs.opendirSync;
+        let reads=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            let index=0;
+            return {
+                readSync(){
+                    reads++;
+                    if(index++===0)return {name:'EarlyTarget',isSymbolicLink:()=>false};
+                    return {name:`later-${index}`,isSymbolicLink:()=>false};
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            const budget={remainingEntries:5};
+            const resolved=resolveRelativePathIdentity(dir,'EarlyTarget',true,budget);
+            assert.equal(resolved.unavailable,false);
+            assert.equal(resolved.resolvedRelativePath,'EarlyTarget');
+            assert.equal(reads,1,
+                'preparation identity lookup must stream only until the requested exact entry is found');
+            assert.equal(budget.remainingEntries,4,
+                'unused identity work must remain available to the enclosing preparation traversal');
+            assert.equal(budget.exhausted,undefined);
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT path identity fallback consumes the caller work budget',()=>fixture(async({dir})=>{
         const target=path.join(dir,'TargetName');
         fs.writeFileSync(target,'target');
