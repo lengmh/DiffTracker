@@ -1358,7 +1358,13 @@ export function registerPR11ReviewRegressions(h) {
         await t.flushPendingPersistence();
         const requested=scope([], [{scope:'all',pattern:relative(p)}]);
         const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
-        const applying=t.applyConfiguredMonitoringScope(requested);await gate.entered;
+        const applying=t.applyConfiguredMonitoringScope(requested);
+        const first=await Promise.race([
+            gate.entered.then(()=>({kind:'gate'})),
+            applying.then(result=>({kind:'result',result}))
+        ]);
+        assert.equal(first.kind,'gate',
+            `scope Apply returned before the prepared persistence barrier: ${JSON.stringify(first.result)}`);
         fs.writeFileSync(p,'changed during apply');await t.onExternalFileChanged(Uri.file(p));
         gate.release();const result=await applying;
         assert.notEqual(result.status,'applied',JSON.stringify(result));
