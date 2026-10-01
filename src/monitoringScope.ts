@@ -531,7 +531,12 @@ export function isHardUnmonitorableRelativePath(
     workBudget?: PathIdentityWorkBudget
 ): boolean {
     const rootPath = typeof identity === 'boolean' ? undefined : localRootPath(identity);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true, workBudget) : undefined;
+    const rootCaseSensitive = typeof identity === 'boolean'
+        ? identity
+        : identity.caseSensitive ?? false;
+    const resolved = rootPath
+        ? resolveRelativePathIdentity(rootPath, relativePath, rootCaseSensitive, workBudget)
+        : undefined;
     const parts = (resolved?.resolvedRelativePath ?? relativePath)
         .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
     return parts.some((part, index) => {
@@ -547,7 +552,12 @@ export function isHardUnmonitorableRelativePath(
         if (index >= resolved.verifiedPrefixLength) { return true; }
         const prefix = parts.slice(0, index);
         const reservedSpelling = folded === '.git' ? '.git' : '.difftracker-restore-' + part.slice('.difftracker-restore-'.length);
-        const canonical = resolveRelativePathIdentity(rootPath, [...prefix, reservedSpelling].join('/'), true, workBudget);
+        const canonical = resolveRelativePathIdentity(
+            rootPath,
+            [...prefix, reservedSpelling].join('/'),
+            rootCaseSensitive,
+            workBudget
+        );
         return canonical.unavailable || (canonical.verifiedPrefixLength === index + 1 &&
             canonical.identity === [...prefix, part].join('/'));
     });
@@ -607,7 +617,9 @@ function explicitExcludeMatches(
     const body = pattern.replace(/^\//, '').replace(/\/$/, '');
     const components = body.split('/');
     const rootPath = localRootPath(root);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true, workBudget) : undefined;
+    const resolved = rootPath
+        ? resolveRelativePathIdentity(rootPath, relativePath, root.caseSensitive ?? false, workBudget)
+        : undefined;
     const target = (resolved?.resolvedRelativePath ?? relativePath).replace(/\/$/, '').split('/').filter(Boolean);
     const directoryOnly = pattern.endsWith('/');
     const anchored = pattern.startsWith('/') || body.includes('/');
@@ -619,7 +631,12 @@ function explicitExcludeMatches(
         const literal = literalPatternComponent(component);
         if (literal !== undefined && exact.ignores(literal)) {
             if (!rootPath) { return false; }
-            const requested = resolveRelativePathIdentity(rootPath, [...target.slice(0, index), literal].join('/'), true, workBudget);
+            const requested = resolveRelativePathIdentity(
+                rootPath,
+                [...target.slice(0, index), literal].join('/'),
+                root.caseSensitive ?? false,
+                workBudget
+            );
             // Unreadable/ambiguous identity must not turn an exclusion into
             // permission to read. Missing paths, by contrast, remain distinct.
             return requested.unavailable || !!resolved?.unavailable ||

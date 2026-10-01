@@ -381,12 +381,19 @@ export function resolveRelativePathIdentity(
                 // explicit targets therefore do not burn the identity allowance.
                 const requestedStat = fs.lstatSync(requestedPath);
 
-                // The case-sensitivity argument describes matching policy, not
-                // physical entry spelling. Callers intentionally force this
-                // resolver through filesystem identity checks in several safety
-                // paths, so only directory evidence may establish the actual
-                // spelling.
-                let listing = directoryEntries(current, workBudget);
+                // A verified case-sensitive workspace root makes successful
+                // lookup of an exact first component sufficient physical
+                // evidence. This optimization is safe only because forced alias
+                // checks now pass the root's real lookup policy rather than a
+                // synthetic `true`. Descendant components still require
+                // filesystem-aware identity proof.
+                if (partIndex === 0 && _caseSensitive === true) {
+                    actual = requested;
+                }
+
+                let listing = actual === undefined
+                    ? directoryEntries(current, workBudget)
+                    : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
                 // Successful lookup is mandatory even for an ASCII candidate:
                 // descendant directories can differ from the workspace root.
                 let exact = actual === undefined ? listing.byName.get(requested) : undefined;

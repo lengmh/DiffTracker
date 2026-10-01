@@ -2962,7 +2962,8 @@ export class DiffTracker {
 
     public async preflightConfiguredMonitoringScope(
         scope: CanonicalMonitoringScope,
-        requestStillCurrent: () => boolean = () => true
+        requestStillCurrent: () => boolean = () => true,
+        identityEvidence?: PathIdentityWorkBudget
     ): Promise<MonitoringScopePreflightResult> {
         const result: MonitoringScopePreflightResult = {
             status: 'ready',
@@ -3029,7 +3030,7 @@ export class DiffTracker {
         // requested scope, not the committed matcher snapshot. Existing-root
         // matchers may have skipped nested .gitignore files inside a subtree
         // that the requested scope is now expanding back into.
-        const ignoreBudget = this.createIgnoreDiscoveryBudget(contextStillCurrent);
+        const ignoreBudget = this.createIgnoreDiscoveryBudget(contextStillCurrent, identityEvidence);
         const unreadablePolicyDirectories = new Set<string>();
         ignoreBudget.onUnreadableDirectory = (directory, error) => {
             const key = path.resolve(directory);
@@ -3154,6 +3155,8 @@ export class DiffTracker {
                     const child = path.join(directory, entry.name);
                     if (!ignoreBudget.seenEntries.has(path.resolve(child)) && ignoreBudget.remainingEntries <= 0) {
                         result.truncated = true;
+                        result.reason ??=
+                            'Monitoring scope preparation work budget exhausted while enumerating directory entries';
                         break;
                     }
                     this.consumeIgnoreDiscoveryEntry(ignoreBudget, child);
@@ -3272,9 +3275,10 @@ export class DiffTracker {
         preparationStillCurrent: () => boolean,
         shared?: {
             persistence: CandidatePersistenceBudget;
-            traversal: { remainingEntries: number };
+            traversal: PathIdentityWorkBudget;
             missingOnly: boolean;
-        }
+        },
+        identityEvidence?: PathIdentityWorkBudget
     ): Promise<number> {
         let captured = 0;
         const assertCurrent = (): void => {
@@ -3286,7 +3290,13 @@ export class DiffTracker {
         const projectedScanCoverage = !this.isRecording || this.baselineBuilding ||
             !this.snapshotInitialized || this.workspaceContextChanged ? undefined : this.ignoreFingerprint;
         const persistenceBudget = shared?.persistence ?? this.createCandidatePersistenceBudget(projectedScanCoverage);
-        const preparationBudget = shared?.traversal ?? { remainingEntries: this.maxScopePreflightEntries };
+        const preparationBudget = shared?.traversal ?? identityEvidence ?? {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        if (!shared?.traversal) {
+            preparationBudget.remainingEntries = this.maxScopePreflightEntries;
+            preparationBudget.exhausted = false;
+        }
         const capacityGuard: CandidateCapacityGuard = {
             remaining: this.remainingCandidatePersistenceSlots(),
             exemptPaths: new Set([
@@ -3362,7 +3372,11 @@ export class DiffTracker {
                 // or contracting Rules Apply uses the shared streaming enumerator.
                 const files = await this.enumerateConfiguredCandidateFiles(
                     scope, epoch, target, capacityGuard, preparationBudget, preparationStillCurrent,
-                    { seedOverlappingWorkspaceRoots: true, visitedDirectories }
+                    {
+                        seedOverlappingWorkspaceRoots: true,
+                        visitedDirectories,
+                        identityBudget: preparationBudget
+                    }
                 );
                 assertCurrent();
                 for (const filePath of files) { await captureFile(filePath); }
@@ -4020,7 +4034,8 @@ export class DiffTracker {
     private async captureConfiguredExpansionBaselines(
         scope: CanonicalMonitoringScope,
         epoch: number,
-        preparationStillCurrent: () => boolean
+        preparationStillCurrent: () => boolean,
+        identityEvidence?: PathIdentityWorkBudget
     ): Promise<number> {
         let captured = 0;
         const durableResourcePaths = new Set([
@@ -4037,7 +4052,11 @@ export class DiffTracker {
                 ? undefined
                 : this.ignoreFingerprint;
         const persistenceBudget = this.createCandidatePersistenceBudget(projectedScanCoverage);
-        const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
+        const preparationBudget = identityEvidence ?? {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        preparationBudget.remainingEntries = this.maxScopePreflightEntries;
+        preparationBudget.exhausted = false;
         const files = await this.enumerateConfiguredCandidateFiles(
             scope,
             epoch,
@@ -4048,7 +4067,8 @@ export class DiffTracker {
                 countedCandidates: new Set<string>()
             },
             preparationBudget,
-            preparationStillCurrent
+            preparationStillCurrent,
+            { identityBudget: preparationBudget }
         );
         if (!this.isCurrentEpoch(epoch)) { return captured; }
         if (!preparationStillCurrent()) {
@@ -4086,9 +4106,16 @@ export class DiffTracker {
             if (this.recordScannedBaseline(filePath, state, 'workspace', persistenceBudget)) { captured++; }
         }
         if (scope.mode === 'rules') {
-            captured += await this.captureConfiguredIncludeBaselines(scope, epoch, preparationStillCurrent, {
-                persistence: persistenceBudget, traversal: preparationBudget, missingOnly: true
-            });
+            captured += await this.captureConfiguredIncludeBaselines(
+                scope,
+                epoch,
+                preparationStillCurrent,
+                {
+                    persistence: persistenceBudget,
+                    traversal: preparationBudget,
+                    missingOnly: true
+                }
+            );
         }
         this.validateCandidatePersistenceProjection(persistenceBudget);
         return captured;
@@ -4134,8 +4161,14 @@ export class DiffTracker {
         const legacyMigration = this.effectiveMonitoringScope.kind === 'legacyV3';
         const needsBroadCapture = scope.mode === 'wholeWorkspace' || expansion?.expands === true;
         const needsBroadPreparation = legacyMigration || needsBroadCapture;
+        const preparationIdentityEvidence: PathIdentityWorkBudget | undefined =
+            needsBroadPreparation ? { remainingEntries: this.maxScopePreflightEntries } : undefined;
         if (needsBroadPreparation) {
-            const preflight = await this.preflightConfiguredMonitoringScope(scope, requestStillCurrent);
+            const preflight = await this.preflightConfiguredMonitoringScope(
+                scope,
+                requestStillCurrent,
+                preparationIdentityEvidence
+            );
             if (preflight.status !== 'ready') {
                 return empty(preflight.status === 'conflict' ? 'conflict' : 'failed',
                     preflight.reason ?? 'Monitoring scope bounded preflight failed.');
@@ -4297,8 +4330,19 @@ export class DiffTracker {
             // would silently accept unrelated post-scan creations.
             result.capturedBaselines = this.isRecording
                 ? needsBroadCapture
-                    ? await this.captureConfiguredExpansionBaselines(scope, epoch, scopeContextStillCurrent)
-                    : await this.captureConfiguredIncludeBaselines(scope, epoch, scopeContextStillCurrent)
+                    ? await this.captureConfiguredExpansionBaselines(
+                        scope,
+                        epoch,
+                        scopeContextStillCurrent,
+                        preparationIdentityEvidence
+                    )
+                    : await this.captureConfiguredIncludeBaselines(
+                        scope,
+                        epoch,
+                        scopeContextStillCurrent,
+                        undefined,
+                        preparationIdentityEvidence
+                    )
                 : 0;
             const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
             if (lateSupplementalCoverageIssue) {
@@ -5569,14 +5613,24 @@ export class DiffTracker {
         ) ? 'skip' : 'block';
     }
 
-    private createIgnoreDiscoveryBudget(stillCurrent: () => boolean): IgnoreDiscoveryBudget {
-        return {
-            remainingEntries: this.maxScopePreflightEntries,
-            remainingBytes: this.maxPersistedBytes,
-            seenEntries: new Set<string>(),
-            policyBytes: new Map<string, number>(),
-            stillCurrent
-        };
+    private createIgnoreDiscoveryBudget(
+        stillCurrent: () => boolean,
+        identityEvidence?: PathIdentityWorkBudget
+    ): IgnoreDiscoveryBudget {
+        const budget = (identityEvidence ?? {
+            remainingEntries: this.maxScopePreflightEntries
+        }) as IgnoreDiscoveryBudget;
+        // Each preparation phase owns a fresh hard allowance; only proven
+        // identity evidence is carried forward. This prevents advisory preflight
+        // from consuming the formal capture quota while still avoiding duplicate
+        // filesystem proof.
+        budget.remainingEntries = this.maxScopePreflightEntries;
+        budget.exhausted = false;
+        budget.remainingBytes = this.maxPersistedBytes;
+        budget.seenEntries = new Set<string>();
+        budget.policyBytes = new Map<string, number>();
+        budget.stillCurrent = stillCurrent;
+        return budget;
     }
 
     private checkIgnoreDiscovery(budget: IgnoreDiscoveryBudget): void {
