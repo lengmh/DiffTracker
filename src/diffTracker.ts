@@ -5118,10 +5118,30 @@ export class DiffTracker {
         }
     }
 
+    private watcherTargetParentCaseSensitivity(
+        identity: WorkspaceRootIdentity,
+        targetSegments: readonly string[],
+        targetIndex: number,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean | undefined {
+        if (targetIndex === 0) { return identity.caseSensitive; }
+        try {
+            const root = new URL(identity.uri);
+            if (root.protocol !== 'file:') { return undefined; }
+            return cachedExclusionDirectoryCaseSensitivity(
+                path.join(fileURLToPath(root), ...targetSegments.slice(0, targetIndex)),
+                identityBudget
+            );
+        } catch {
+            return undefined;
+        }
+    }
+
     private watcherPatternMatchesPath(
         pattern: string,
         relativePath: string,
-        caseSensitive: boolean
+        identity: WorkspaceRootIdentity,
+        identityBudget?: PathIdentityWorkBudget
     ): boolean {
         const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const target = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
@@ -5146,10 +5166,15 @@ export class DiffTracker {
             } else if (targetIndex === targetSegments.length) {
                 result = false;
             } else {
+                const parentSensitive = this.watcherTargetParentCaseSensitivity(
+                    identity, targetSegments, targetIndex, identityBudget
+                );
+                // Unknown parent semantics cannot prove disjointness. Case-
+                // insensitive matching is the conservative superset.
                 result = this.watcherGlobSegmentMatches(
                     patternSegments[patternIndex],
                     targetSegments[targetIndex],
-                    caseSensitive
+                    parentSensitive === true
                 ) && visit(patternIndex + 1, targetIndex + 1);
             }
             memo.set(key, result);
@@ -5161,7 +5186,8 @@ export class DiffTracker {
     private watcherPatternMayMatchWithinInclude(
         pattern: string,
         includePath: string,
-        caseSensitive: boolean
+        identity: WorkspaceRootIdentity,
+        identityBudget?: PathIdentityWorkBudget
     ): boolean {
         const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const include = includePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
@@ -5185,10 +5211,13 @@ export class DiffTracker {
             } else if (patternSegments[patternIndex] === '**') {
                 result = visit(patternIndex + 1, includeIndex) || visit(patternIndex, includeIndex + 1);
             } else {
+                const parentSensitive = this.watcherTargetParentCaseSensitivity(
+                    identity, includeSegments, includeIndex, identityBudget
+                );
                 result = this.watcherGlobSegmentMatches(
                     patternSegments[patternIndex],
                     includeSegments[includeIndex],
-                    caseSensitive
+                    parentSensitive === true
                 ) && visit(patternIndex + 1, includeIndex + 1);
             }
             memo.set(key, result);
@@ -5237,14 +5266,14 @@ export class DiffTracker {
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
                 if (patterns.some(pattern =>
-                    this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
+                    this.watcherPatternMatchesPath(pattern, rel, identity, identityBudget))) {
                     return `${folder.name}:${rule.path}`;
                 }
                 const includeSegments = rel.split('/').filter(Boolean);
                 const includeAncestors = includeSegments.slice(0, -1)
                     .map((_segment, index) => includeSegments.slice(0, index + 1).join('/'));
                 if (patterns.some(pattern => includeAncestors.some(ancestor =>
-                    this.watcherPatternMatchesPath(pattern, ancestor, identity.caseSensitive!)))) {
+                    this.watcherPatternMatchesPath(pattern, ancestor, identity, identityBudget)))) {
                     return `${folder.name}:${rule.path}`;
                 }
                 if (descendantsExplicitlyExcluded) {
@@ -5268,7 +5297,7 @@ export class DiffTracker {
                 ];
                 if (directProbes.some(probe => matcher.ignores(probe)) ||
                     patterns.some(pattern =>
-                        this.watcherPatternMayMatchWithinInclude(pattern, rel, identity.caseSensitive!))) {
+                        this.watcherPatternMayMatchWithinInclude(pattern, rel, identity, identityBudget))) {
                     return `${folder.name}:${rule.path}`;
                 }
             }

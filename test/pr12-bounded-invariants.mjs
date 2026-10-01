@@ -796,6 +796,53 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.promises.readdir=oldReaddir;}
     }));
 
+    test('PR12 CASE watcher glob uses child-directory case semantics under a sensitive root',()=>fixture(async({tracker,dir})=>{
+        const child=path.join(dir,'child-case-insensitive');
+        const actual=path.join(child,'Foo.txt');
+        fs.mkdirSync(child);fs.writeFileSync(actual,'tracked');
+        const lower=path.join(child,'foo.txt'),upper=path.join(child,'FOO.txt');
+        const originalDetect=tracker.detectWorkspaceRootCaseSensitivity.bind(tracker);
+        tracker.detectWorkspaceRootCaseSensitivity=()=>true;
+        tracker.workspaceRootCaseSensitivityCache.clear();
+        setVsCodeExcludes({'files.watcherExclude':{'child-case-insensitive/FOO.txt':true}});
+        try {
+            await withLookups([[lower,actual],[upper,actual]],[],async()=>{
+                const requested=includeScope(tracker,'rules',['child-case-insensitive/foo.txt']);
+                const issue=tracker.configuredScopeNeedsSupplementalCoverage(requested);
+                assert.match(issue??'',/child-case-insensitive\/foo\.txt/i,
+                    'a case-insensitive child must make the watcher exclusion intersect the explicit file include even when the workspace root is case-sensitive');
+            });
+        } finally {
+            tracker.detectWorkspaceRootCaseSensitivity=originalDetect;
+            tracker.workspaceRootCaseSensitivityCache.clear();
+        }
+    },'rules'));
+
+    test('PR12 CASE watcher glob does not inherit insensitive root semantics into a sensitive child',()=>fixture(async({tracker,dir})=>{
+        const child=path.join(dir,'child-case-sensitive');
+        fs.mkdirSync(child);
+        const lower=path.join(child,'foo.txt'),upper=path.join(child,'FOO.txt');
+        fs.writeFileSync(lower,'lower');fs.writeFileSync(upper,'upper');
+        const actualChildSensitivity=detectLocalPathCaseSensitivity(child);
+        if(actualChildSensitivity!==true){
+            console.log('SKIP PR12 sensitive-child watcher case fixture requires a case-sensitive child directory');
+            return;
+        }
+        const originalDetect=tracker.detectWorkspaceRootCaseSensitivity.bind(tracker);
+        tracker.detectWorkspaceRootCaseSensitivity=()=>false;
+        tracker.workspaceRootCaseSensitivityCache.clear();
+        setVsCodeExcludes({'files.watcherExclude':{'child-case-sensitive/FOO.txt':true}});
+        try {
+            const requested=includeScope(tracker,'rules',['child-case-sensitive/foo.txt']);
+            const issue=tracker.configuredScopeNeedsSupplementalCoverage(requested);
+            assert.equal(issue,undefined,
+                'a sensitive child keeps case-distinct watcher and include file names disjoint even when the root is insensitive');
+        } finally {
+            tracker.detectWorkspaceRootCaseSensitivity=originalDetect;
+            tracker.workspaceRootCaseSensitivityCache.clear();
+        }
+    },'rules'));
+
     test('PR12 AUDIT watcher brace expansion is capped before Cartesian explosion',()=>fixture(async({tracker,scope})=>{
         const original=tracker.getVsCodeWatcherExcludePatterns.bind(tracker);
         try {
