@@ -1019,6 +1019,31 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT preparation directory evidence is reused across different literals',()=>fixture(async({dir})=>{
+        const first=path.join(dir,'AlphaTarget'),second=path.join(dir,'BetaTarget');
+        fs.writeFileSync(first,'a');fs.writeFileSync(second,'b');
+        const firstAlias=path.join(dir,'alphatarget'),secondAlias=path.join(dir,'betatarget');
+        const originalOpen=fs.opendirSync;
+        let opens=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))===path.resolve(dir))opens++;
+            return originalOpen(value,...args);
+        };
+        try {
+            await withLookups([[firstAlias,first],[secondAlias,second]],[],async()=>{
+                const budget={remainingEntries:64};
+                assert.equal(resolveRelativePathIdentity(dir,'alphatarget',false,budget).resolvedRelativePath,'AlphaTarget');
+                const afterFirst=budget.remainingEntries;
+                const opensAfterFirst=opens;
+                assert.equal(resolveRelativePathIdentity(dir,'betatarget',false,budget).resolvedRelativePath,'BetaTarget');
+                assert.equal(opens,opensAfterFirst,
+                    'different literals in the same parent must reuse one bounded directory enumeration');
+                assert.equal(budget.remainingEntries,afterFirst,
+                    'reusing parent directory evidence must not consume additional entry work');
+            });
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT alias identity proof enumerates a parent only once',()=>fixture(async({dir})=>{
         const actual=path.join(dir,'LatePhysicalTarget');
         const alias=path.join(dir,'latephysicaltarget');

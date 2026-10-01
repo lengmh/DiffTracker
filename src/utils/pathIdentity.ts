@@ -8,11 +8,18 @@ const maxRuntimeIdentityFallbackWorkEntries = maxIdentityDirectoryEntries * 2;
 export interface PathIdentityWorkBudget {
     remainingEntries: number;
     exhausted?: boolean;
-    // Sparse operation-local cache for exact physical spellings. Unlike the
-    // global prefix cache, this stores only entries the current preparation
-    // actually proved and therefore does not consume extra discovery work.
+    // Sparse operation-local cache for exact/alias physical spellings.
     exactEntries?: Map<string, { signature: string; actual: string }>;
     physicalPaths?: Set<string>;
+    // Bounded directory evidence acquired by this preparation. Entries stored
+    // here have already consumed the operation work allowance, so later identity
+    // queries for the same parent must reuse them instead of reopening/scanning.
+    directoryEvidence?: Map<string, {
+        signature: string;
+        entries: fs.Dirent[];
+        byName: Map<string, fs.Dirent>;
+        complete: boolean;
+    }>;
 }
 
 interface DirectoryEntryListing {
@@ -270,60 +277,86 @@ function streamDirectoryEntryIdentity(
     requestedPath: string,
     workBudget?: PathIdentityWorkBudget
 ): { actual?: string; unavailable: boolean } {
-    // Runtime lookup has its own hard allowance. Preparation passes the shared
-    // S4-A work budget instead, so identity proof cannot escape that contract.
     const budget = workBudget ?? { remainingEntries: maxRuntimeIdentityFallbackWorkEntries };
-    const exactKey = path.resolve(directory) + '\0' + requested;
+    const directoryKey = path.resolve(directory);
+    const exactKey = directoryKey + '\0' + requested;
     const beforeSignature = directoryIdentitySignature(directory);
     const cachedExact = workBudget?.exactEntries?.get(exactKey);
     if (cachedExact?.signature === beforeSignature) {
         return { actual: cachedExact.actual, unavailable: false };
     }
 
-    const scannedEntries: fs.Dirent[] = [];
-    const handle = fs.opendirSync(directory);
-    let exactScanCompleted = false;
-    try {
-        while (identityWorkAvailable(budget)) {
-            const entry = handle.readSync();
-            if (!entry) { exactScanCompleted = true; break; }
-            consumeIdentityEntry(budget);
-            scannedEntries.push(entry);
-            if (entry.name === requested) {
-                if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
-                    (workBudget.exactEntries ??= new Map()).set(exactKey, {
-                        signature: beforeSignature,
-                        actual: entry.name
-                    });
-                }
-                return { actual: entry.name, unavailable: false };
-            }
-        }
-    } finally { handle.closeSync(); }
-    if (!exactScanCompleted) { return { unavailable: true }; }
-
-    // Exact spelling was absent. Reuse the bounded evidence already read above
-    // rather than reopening the directory for an identity pass. This keeps
-    // directory enumeration at O(n) per new literal proof; the lstat checks are
-    // bounded by the same n entries that already consumed the work allowance.
-    let match: string | undefined;
-    for (const entry of scannedEntries) {
-        try {
-            if (!sameEntryLookup(requestedPath, path.join(directory, entry.name))) { continue; }
-        } catch {
-            continue;
-        }
-        if (match !== undefined) { return { unavailable: true }; }
-        match = entry.name;
+    let evidence = workBudget?.directoryEvidence?.get(directoryKey);
+    if (evidence?.signature !== beforeSignature) {
+        workBudget?.directoryEvidence?.delete(directoryKey);
+        evidence = undefined;
     }
-    if (match === undefined) { return { unavailable: true }; }
-    if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+
+    if (!evidence) {
+        const entries: fs.Dirent[] = [];
+        const byName = new Map<string, fs.Dirent>();
+        let complete = false;
+        const handle = fs.opendirSync(directory);
+        try {
+            while (identityWorkAvailable(budget)) {
+                const entry = handle.readSync();
+                if (!entry) { complete = true; break; }
+                consumeIdentityEntry(budget);
+                entries.push(entry);
+                byName.set(entry.name, entry);
+                if (entry.name === requested) {
+                    if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+                        (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                            signature: beforeSignature,
+                            actual: entry.name
+                        });
+                    }
+                    return { actual: entry.name, unavailable: false };
+                }
+            }
+        } finally { handle.closeSync(); }
+
+        evidence = { signature: beforeSignature, entries, byName, complete };
+        if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+            (workBudget.directoryEvidence ??= new Map()).set(directoryKey, evidence);
+        }
+        if (!complete) { return { unavailable: true }; }
+    }
+
+    const exact = evidence.byName.get(requested);
+    if (exact) {
+        if (workBudget) {
+            (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                signature: evidence.signature,
+                actual: exact.name
+            });
+        }
+        return { actual: exact.name, unavailable: false };
+    }
+    if (!evidence.complete) { return { unavailable: true }; }
+
+    // An exact spelling is absent. A successful lookup can only be accepted as
+    // an alias when the bounded directory evidence contains a unique ASCII-case
+    // equivalent physical spelling that resolves to the same entry. Do not scan
+    // every unrelated entry with lstat/realpath and do not use Unicode JS folding.
+    const folded = asciiCaseFold(requested);
+    const candidates = evidence.entries.filter(entry => asciiCaseFold(entry.name) === folded);
+    if (candidates.length !== 1) { return { unavailable: true }; }
+    const candidate = candidates[0];
+    try {
+        if (!sameEntryLookup(requestedPath, path.join(directory, candidate.name))) {
+            return { unavailable: true };
+        }
+    } catch {
+        return { unavailable: true };
+    }
+    if (workBudget) {
         (workBudget.exactEntries ??= new Map()).set(exactKey, {
-            signature: beforeSignature,
-            actual: match
+            signature: evidence.signature,
+            actual: candidate.name
         });
     }
-    return { actual: match, unavailable: false };
+    return { actual: candidate.name, unavailable: false };
 }
 
 export function resolveRelativePathIdentity(

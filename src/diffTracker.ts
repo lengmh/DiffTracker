@@ -4173,24 +4173,13 @@ export class DiffTracker {
         const preparationIdentityEvidence: PathIdentityWorkBudget = {
             remainingEntries: this.maxScopePreflightEntries
         };
-        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
-            scope,
-            preparationIdentityEvidence
-        );
-        if (preparationIdentityEvidence.exhausted) {
-            return empty('failed',
-                'Monitoring scope preparation path-identity work budget exceeded before scope qualification completed.');
-        }
-        if (supplementalCoverageIssue) {
-            return empty('requiresS4',
-                `Monitoring scope requires S4-B supplemental observation coverage at ${supplementalCoverageIssue}.`);
-        }
         const expansion = this.effectiveMonitoringScope.kind === 'configured'
             ? detectScopeExpansion(this.effectiveMonitoringScope, scope)
             : undefined;
-        // Migration is a scope transition too. Use semantic expansion, never
-        // diagnostic reason strings, to select advisory broad preflight. This
-        // choice cannot exempt any acquisition path from its own work/byte caps.
+        // Migration is a scope transition too. Broad migration/expansion must
+        // cross bounded preflight before any later qualification shortcut can
+        // reject the request. The preflight's physical identity evidence is then
+        // reused by supplemental watcher qualification and candidate capture.
         const legacyMigration = this.effectiveMonitoringScope.kind === 'legacyV3';
         const needsBroadCapture = scope.mode === 'wholeWorkspace' || expansion?.expands === true;
         const needsBroadPreparation = legacyMigration || needsBroadCapture;
@@ -4208,6 +4197,18 @@ export class DiffTracker {
                 return empty('failed',
                     `Monitoring scope preflight could not enumerate ${preflight.unreadableDirectoryCount} director${preflight.unreadableDirectoryCount === 1 ? 'y' : 'ies'}; the previous effective scope remains active.`);
             }
+        }
+        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
+            scope,
+            preparationIdentityEvidence
+        );
+        if (preparationIdentityEvidence.exhausted) {
+            return empty('failed',
+                'Monitoring scope preparation path-identity work budget exceeded before scope qualification completed.');
+        }
+        if (supplementalCoverageIssue) {
+            return empty('requiresS4',
+                `Monitoring scope requires S4-B supplemental observation coverage at ${supplementalCoverageIssue}.`);
         }
         const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
         const preflightEpoch = this.sessionEpoch;
