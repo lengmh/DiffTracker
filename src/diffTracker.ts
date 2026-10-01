@@ -667,6 +667,10 @@ export class DiffTracker {
     // Hitting this bound returns a truncated lower-fidelity estimate rather than
     // publishing a partial scope or silently dropping resources.
     private readonly maxScopePreflightEntries = 10000;
+    // Identity proof has its own operation-wide hard bound when it is not
+    // deliberately sharing a scope traversal allowance (for example repository
+    // rebuild and watcher-coverage qualification).
+    private readonly maxPathIdentityPreparationEntries = 10000;
     private readonly maxScopePreflightDiagnostics = 20;
     private readonly maxScopePreflightDirectorySummaries = 10;
     private readonly maxRevertHistory = 10;
@@ -5195,7 +5199,7 @@ export class DiffTracker {
 
     private configuredScopeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
         const identityBudget: PathIdentityWorkBudget = {
-            remainingEntries: this.maxScopePreflightEntries
+            remainingEntries: this.maxPathIdentityPreparationEntries
         };
         const includeIssue = this.explicitIncludeNeedsSupplementalCoverage(scope, identityBudget);
         if (includeIssue) { return includeIssue; }
@@ -7849,7 +7853,7 @@ export class DiffTracker {
                 undefined,
                 {
                     seedOverlappingWorkspaceRoots: true,
-                    identityBudget: { remainingEntries: this.maxScopePreflightEntries },
+                    identityBudget: { remainingEntries: this.maxPathIdentityPreparationEntries },
                     skipTraversalPath: targetPath => {
                         for (let current = path.resolve(targetPath); ; current = path.dirname(current)) {
                             if (nestedRepositoryRootSet.has(current)) { return true; }
