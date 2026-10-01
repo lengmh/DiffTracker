@@ -187,6 +187,7 @@ export function registerFinalScopeRegressions(h) {
             await h.getTracker().dispose();
             vscode.workspace.workspaceFolders = previousFolders;
             vscode.workspace.getWorkspaceFolder = previousGetWorkspaceFolder;
+            fs.rmSync(isolatedRoot, { recursive: true, force: true });
         }
     });
 
