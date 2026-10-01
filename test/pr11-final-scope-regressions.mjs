@@ -147,6 +147,7 @@ export function registerFinalScopeRegressions(h) {
         const previousGetWorkspaceFolder = vscode.workspace.getWorkspaceFolder;
         const isolatedRoot = file('final-gap-workspace');
         fs.mkdirSync(isolatedRoot, { recursive: true });
+        fs.writeFileSync(path.join(isolatedRoot, 'ProbeName'), 'case identity witness');
         const folder = { uri: Uri.file(isolatedRoot), name: 'final-gap-workspace' };
         const belongs = uri => {
             const relative = path.relative(isolatedRoot, uri.fsPath);
