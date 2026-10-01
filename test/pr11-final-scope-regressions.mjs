@@ -138,27 +138,55 @@ export function registerFinalScopeRegressions(h) {
     }
 
     test('PR11 FINAL P2 effective exclusion deactivates subtree gaps across restart without losing uncertainty', async () => {
-        let t = h.getTracker();
-        const storage = file('final-gap-storage'), dir = file('final-deferred-gap');
-        t.storageUri = Uri.file(storage);
-        const requested = scope(t, [], [{ scope: 'all', pattern: rel(dir) + '/' }]);
-        t.setPendingMonitoringScope(requested); fs.mkdirSync(dir);
-        await t.onExternalFileCreated(Uri.file(dir));
-        assert.ok(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), 'a pending-only exclusion has not retired active coverage yet');
-        assert.equal((await t.applyConfiguredMonitoringScope(requested)).status, 'applied');
-        t.setPendingMonitoringScope(undefined);
-        assert.equal(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), false,
-            'intentionally excluded subtree must not keep the active Coverage Limited warning');
-        assert.equal(t.getCoverageGaps().some(([target]) => target === dir), false);
-        assert.ok(t.coverageGaps.get(dir)?.subtree, 'uncertainty remains durable for future re-inclusion');
-        assert.equal(await t.flushPendingPersistence(), true);
-        await t.dispose(); t = new DiffTracker(Uri.file(storage)); h.setTracker(t);
-        assert.equal(await t.restorePersistedState(), 'restored');
-        assert.equal(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), false, 'restart must not resurrect retired warnings');
-        // Simulate a future prepared scope; S4 preparation itself remains out of S3.
-        t.effectiveMonitoringScope = { kind: 'configured', ...scope(t) };
-        t.setPendingMonitoringScope(undefined);
-        assert.ok(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), 're-inclusion must reactivate preserved uncertainty');
+        // Keep this legacy semantic regression independent from unrelated files
+        // created by hundreds of earlier tracker-safety cases. S4-A now
+        // deliberately bounds workspace preparation, so shared-root test debris
+        // must not turn this small exclusion/restart fixture into an accidental
+        // >10k workspace-capacity test.
+        const previousFolders = vscode.workspace.workspaceFolders;
+        const previousGetWorkspaceFolder = vscode.workspace.getWorkspaceFolder;
+        const isolatedRoot = file('final-gap-workspace');
+        fs.mkdirSync(isolatedRoot, { recursive: true });
+        const folder = { uri: Uri.file(isolatedRoot), name: 'final-gap-workspace' };
+        const belongs = uri => {
+            const relative = path.relative(isolatedRoot, uri.fsPath);
+            return relative === '' ||
+                (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative));
+        };
+        try {
+            await h.getTracker().dispose();
+            vscode.workspace.workspaceFolders = [folder];
+            vscode.workspace.getWorkspaceFolder = uri => belongs(uri) ? folder : undefined;
+
+            const storage = path.join(isolatedRoot, 'storage');
+            const dir = path.join(isolatedRoot, 'deferred-gap');
+            let t = new DiffTracker(Uri.file(storage)); h.setTracker(t);
+            t.isRecording = true; t.externalWatcherEnabled = true; t.snapshotInitialized = true;
+            const localRel = value => path.relative(isolatedRoot, value).split(path.sep).join('/');
+            const requested = scope(t, [], [{ scope: 'all', pattern: localRel(dir) + '/' }]);
+            t.setPendingMonitoringScope(requested); fs.mkdirSync(dir);
+            await t.onExternalFileCreated(Uri.file(dir));
+            assert.ok(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), 'a pending-only exclusion has not retired active coverage yet');
+            const applied = await t.applyConfiguredMonitoringScope(requested);
+            assert.equal(applied.status, 'applied', JSON.stringify(applied));
+            t.setPendingMonitoringScope(undefined);
+            assert.equal(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), false,
+                'intentionally excluded subtree must not keep the active Coverage Limited warning');
+            assert.equal(t.getCoverageGaps().some(([target]) => target === dir), false);
+            assert.ok(t.coverageGaps.get(dir)?.subtree, 'uncertainty remains durable for future re-inclusion');
+            assert.equal(await t.flushPendingPersistence(), true);
+            await t.dispose(); t = new DiffTracker(Uri.file(storage)); h.setTracker(t);
+            assert.equal(await t.restorePersistedState(), 'restored');
+            assert.equal(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), false, 'restart must not resurrect retired warnings');
+            // Simulate a future prepared scope; S4 preparation itself remains out of S3.
+            t.effectiveMonitoringScope = { kind: 'configured', ...scope(t) };
+            t.setPendingMonitoringScope(undefined);
+            assert.ok(t.getSubtreeCoverageGaps().some(gap => gap.targetPath === dir), 're-inclusion must reactivate preserved uncertainty');
+        } finally {
+            await h.getTracker().dispose();
+            vscode.workspace.workspaceFolders = previousFolders;
+            vscode.workspace.getWorkspaceFolder = previousGetWorkspaceFolder;
+        }
     });
 
     test('PR11 FINAL P2 uncommitted exclusion cannot hide active subtree gaps', async () => {
