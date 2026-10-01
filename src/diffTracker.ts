@@ -2934,21 +2934,34 @@ export class DiffTracker {
         }
     }
 
-    public getExplicitlyExcludedPendingReviewPaths(scope: CanonicalMonitoringScope): string[] {
+    public getExplicitlyExcludedPendingReviewPaths(
+        scope: CanonicalMonitoringScope,
+        identityBudget?: PathIdentityWorkBudget
+    ): string[] {
         const results: string[] = [];
         for (const filePath of this.trackedChanges.keys()) {
             const uri = vscode.Uri.file(filePath);
             const folder = vscode.workspace.getWorkspaceFolder(uri);
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
-            const decision = evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, false);
+            const decision = evaluateConfiguredScope(
+                scope,
+                this.workspaceRootIdentityForFolder(folder),
+                relPath,
+                false,
+                false,
+                identityBudget
+            );
             if (decision.source === 'explicitExclude') { results.push(filePath); }
         }
         return results.sort((left, right) => left.localeCompare(right));
     }
 
-    public getExplicitlyExcludedReviewRevision(scope: CanonicalMonitoringScope): string {
-        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope).map(filePath => [
+    public getExplicitlyExcludedReviewRevision(
+        scope: CanonicalMonitoringScope,
+        identityBudget?: PathIdentityWorkBudget
+    ): string {
+        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope, identityBudget).map(filePath => [
             filePath,
             { ...this.trackedChanges.get(filePath), timestamp: undefined },
             this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
@@ -4149,7 +4162,17 @@ export class DiffTracker {
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
             return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
         }
-        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
+        const preparationIdentityEvidence: PathIdentityWorkBudget = {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
+            scope,
+            preparationIdentityEvidence
+        );
+        if (preparationIdentityEvidence.exhausted) {
+            return empty('failed',
+                'Monitoring scope preparation path-identity work budget exceeded before scope qualification completed.');
+        }
         if (supplementalCoverageIssue) {
             return empty('requiresS4',
                 `Monitoring scope requires S4-B supplemental observation coverage at ${supplementalCoverageIssue}.`);
@@ -4163,8 +4186,6 @@ export class DiffTracker {
         const legacyMigration = this.effectiveMonitoringScope.kind === 'legacyV3';
         const needsBroadCapture = scope.mode === 'wholeWorkspace' || expansion?.expands === true;
         const needsBroadPreparation = legacyMigration || needsBroadCapture;
-        const preparationIdentityEvidence: PathIdentityWorkBudget | undefined =
-            needsBroadPreparation ? { remainingEntries: this.maxScopePreflightEntries } : undefined;
         if (needsBroadPreparation) {
             const preflight = await this.preflightConfiguredMonitoringScope(
                 scope,
@@ -4186,12 +4207,20 @@ export class DiffTracker {
             return empty('conflict', 'Monitoring scope preparation could not drain file events observed under the current effective scope; retry after file activity settles.');
         }
         const approvedDiscardRevision = discardExplicitlyExcludedReviews
-            ? expectedAffectedReviewRevision ?? this.getExplicitlyExcludedReviewRevision(scope) : undefined;
+            ? expectedAffectedReviewRevision ??
+                this.getExplicitlyExcludedReviewRevision(scope, preparationIdentityEvidence)
+            : undefined;
         let approvedReviewsDiscarded = false;
         const discardApprovalStillCurrent = (): boolean => !discardExplicitlyExcludedReviews ||
             (approvedReviewsDiscarded
-                ? this.getExplicitlyExcludedPendingReviewPaths(scope).length === 0
-                : this.getExplicitlyExcludedReviewRevision(scope) === approvedDiscardRevision);
+                ? this.getExplicitlyExcludedPendingReviewPaths(
+                    scope,
+                    preparationIdentityEvidence
+                ).length === 0
+                : this.getExplicitlyExcludedReviewRevision(
+                    scope,
+                    preparationIdentityEvidence
+                ) === approvedDiscardRevision);
         if (!discardApprovalStillCurrent()) {
             return empty('conflict', 'Affected review changed after discard approval; confirm the current review set again.');
         }
@@ -4264,7 +4293,11 @@ export class DiffTracker {
             requestStillCurrent() &&
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
-            !this.configuredScopeNeedsSupplementalCoverage(scope) &&
+            !this.configuredScopeNeedsSupplementalCoverage(
+                scope,
+                preparationIdentityEvidence
+            ) &&
+            !preparationIdentityEvidence.exhausted &&
             discardApprovalStillCurrent() &&
             (transaction.observedEvents?.size ?? 0) === 0 &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
@@ -4284,14 +4317,22 @@ export class DiffTracker {
             for (const filePath of this.trackedChanges.keys()) { this.retainedReviewPaths.add(filePath); }
             this.scanCoverage = undefined;
             this.ignoreResultCache.clear();
-            await this.refreshIgnoreMatchers();
+            await this.refreshIgnoreMatchers(preparationIdentityEvidence);
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }
 
-            const explicitlyExcludedReviews = new Set(this.getExplicitlyExcludedPendingReviewPaths(scope));
+            const explicitlyExcludedReviews = new Set(
+                this.getExplicitlyExcludedPendingReviewPaths(scope, preparationIdentityEvidence)
+            );
             for (const filePath of [...this.trackedChanges.keys()]) {
-                const ignored = this.isPathIgnored(vscode.Uri.file(filePath), false, false);
+                const ignored = this.isPathIgnored(
+                    vscode.Uri.file(filePath),
+                    false,
+                    false,
+                    false,
+                    preparationIdentityEvidence
+                );
                 if (!ignored) {
                     this.retainedReviewPaths.delete(filePath);
                     continue;
@@ -4346,7 +4387,10 @@ export class DiffTracker {
                         preparationIdentityEvidence
                     )
                 : 0;
-            const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(scope);
+            const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
+                scope,
+                preparationIdentityEvidence
+            );
             if (lateSupplementalCoverageIssue) {
                 requiresS4Reason =
                     `Monitoring scope now requires S4-B supplemental observation coverage at ${lateSupplementalCoverageIssue}.`;
@@ -4698,8 +4742,8 @@ export class DiffTracker {
         });
     }
 
-    private async refreshIgnoreMatchers(): Promise<void> {
-        let latest = this.loadIgnoreMatchers(++this.ignoreRefreshVersion);
+    private async refreshIgnoreMatchers(identityEvidence?: PathIdentityWorkBudget): Promise<void> {
+        let latest = this.loadIgnoreMatchers(++this.ignoreRefreshVersion, identityEvidence);
         this.ignoreRefreshPromise = latest;
         while (true) {
             await latest;
@@ -4708,14 +4752,17 @@ export class DiffTracker {
         }
     }
 
-    private async loadIgnoreMatchers(version: number): Promise<void> {
+    private async loadIgnoreMatchers(
+        version: number,
+        identityEvidence?: PathIdentityWorkBudget
+    ): Promise<void> {
         const epoch = this.sessionEpoch;
         const matchers = new Map<string, Ignore>();
         const transaction = this.baselineTransaction;
         const discoveryBudget = this.effectiveMonitoringScope.kind === 'configured'
             ? this.createIgnoreDiscoveryBudget(() => this.isCurrentEpoch(epoch) &&
                 version === this.ignoreRefreshVersion && this.baselineTransaction === transaction &&
-                (!transaction?.valid || transaction.valid()))
+                (!transaction?.valid || transaction.valid()), identityEvidence)
             : undefined;
         // Matching semantics are part of scan provenance: older implementations
         // may have excluded a different set even with identical rule text.
@@ -4997,13 +5044,23 @@ export class DiffTracker {
                 const root = new URL(identity.uri);
                 if (root.protocol !== 'file:') { return false; }
                 const rootPath = fileURLToPath(root);
-                const parentIdentity = resolveRelativePathIdentity(rootPath, parents.join('/'), true, identityBudget);
+                const parentIdentity = resolveRelativePathIdentity(
+                    rootPath,
+                    parents.join('/'),
+                    identity.caseSensitive,
+                    identityBudget
+                );
                 if (parentIdentity.unavailable || parentIdentity.verifiedPrefixLength !== parents.length) {
                     return false;
                 }
                 if (!/[*?\[\]{}]/.test(segment)) {
                     const prefix = [...parents, segment].join('/');
-                    const target = resolveRelativePathIdentity(rootPath, prefix, true, identityBudget);
+                    const target = resolveRelativePathIdentity(
+                        rootPath,
+                        prefix,
+                        identity.caseSensitive,
+                        identityBudget
+                    );
                     if (!target.unavailable && target.verifiedPrefixLength === parents.length + 1) {
                         return isHardUnmonitorableRelativePath(prefix, identity, directory, identityBudget);
                     }
@@ -5266,8 +5323,11 @@ export class DiffTracker {
         return true;
     }
 
-    private configuredScopeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
-        const identityBudget: PathIdentityWorkBudget = {
+    private configuredScopeNeedsSupplementalCoverage(
+        scope: CanonicalMonitoringScope,
+        providedIdentityBudget?: PathIdentityWorkBudget
+    ): string | undefined {
+        const identityBudget: PathIdentityWorkBudget = providedIdentityBudget ?? {
             remainingEntries: this.maxPathIdentityPreparationEntries
         };
         const includeIssue = this.explicitIncludeNeedsSupplementalCoverage(scope, identityBudget);
