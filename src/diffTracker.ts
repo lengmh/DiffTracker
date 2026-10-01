@@ -3165,6 +3165,7 @@ export class DiffTracker {
                         result.skippedSymlinks++;
                         continue;
                     }
+                    this.notePhysicalIdentityPath(ignoreBudget, child);
                     const isDirectory = entryKind === 'directory';
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) {
@@ -3242,6 +3243,14 @@ export class DiffTracker {
             'Monitoring scope preparation path-identity work budget exceeded; ' +
             'narrow the scope or reduce oversized directory fan-out before retrying.'
         );
+    }
+
+    private notePhysicalIdentityPath(
+        budget: PathIdentityWorkBudget | undefined,
+        targetPath: string
+    ): void {
+        if (!budget) { return; }
+        (budget.physicalPaths ??= new Set()).add(path.resolve(targetPath));
     }
 
     private async captureConfiguredIncludeBaselines(
@@ -3522,6 +3531,7 @@ export class DiffTracker {
 
                     const entryKind = this.classifyDirectoryEntry(directory, entry);
                     if (entryKind === 'missing' || entryKind === 'other' || entryKind === 'symlink') { continue; }
+                    this.notePhysicalIdentityPath(identityBudget, child);
                     const isDirectory = entryKind === 'directory';
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
@@ -5711,6 +5721,7 @@ export class DiffTracker {
                     this.consumeIgnoreDiscoveryEntry(budget, child);
                     const kind = this.classifyDirectoryEntry(directory, entry);
                     if (kind !== 'directory' || !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
+                    this.notePhysicalIdentityPath(budget, child);
                     const childRelative = this.toPosixPath(path.relative(rootPath, child));
                     if (isHardUnmonitorableRelativePath(childRelative, identity, true, budget) ||
                         configuredScopeExplicitlyExcludesSubtree(scope, identity, childRelative, budget)) {

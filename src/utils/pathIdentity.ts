@@ -12,6 +12,7 @@ export interface PathIdentityWorkBudget {
     // global prefix cache, this stores only entries the current preparation
     // actually proved and therefore does not consume extra discovery work.
     exactEntries?: Map<string, { signature: string; actual: string }>;
+    physicalPaths?: Set<string>;
 }
 
 interface DirectoryEntryListing {
@@ -333,6 +334,37 @@ export function resolveRelativePathIdentity(
 ): RelativePathIdentity {
     const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '')
         .split('/').filter(Boolean);
+
+    if (parts.length > 0 && workBudget?.physicalPaths) {
+        let observed = path.resolve(rootPath);
+        let allObserved = true;
+        for (const part of parts) {
+            observed = path.join(observed, part);
+            if (!workBudget.physicalPaths.has(path.resolve(observed))) {
+                allObserved = false;
+                break;
+            }
+            try {
+                if (fs.lstatSync(observed).isSymbolicLink()) {
+                    allObserved = false;
+                    break;
+                }
+            } catch {
+                allObserved = false;
+                break;
+            }
+        }
+        if (allObserved) {
+            const value = parts.join('/');
+            return {
+                identity: value,
+                resolvedRelativePath: value,
+                verifiedPrefixLength: parts.length,
+                unavailable: false
+            };
+        }
+    }
+
     const resolved: string[] = [];
     let current = path.resolve(rootPath);
     let physicalPrefixAvailable = true;

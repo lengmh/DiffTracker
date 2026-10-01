@@ -959,6 +959,36 @@ export function registerPR12BoundedInvariants(h) {
         }));
     }
 
+    test('PR12 AUDIT traversal-proven physical identity is not charged twice',()=>fixture(async({dir})=>{
+        const nested=path.join(dir,'physical-parent');
+        fs.mkdirSync(nested);
+        const target=path.join(nested,'PhysicalTarget');
+        fs.writeFileSync(target,'target');
+        const budget={
+            remainingEntries:1,
+            physicalPaths:new Set([path.resolve(nested),path.resolve(target)])
+        };
+        const originalOpen=fs.opendirSync;
+        let opens=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))===path.resolve(dir) ||
+                path.resolve(String(value))===path.resolve(nested)) {
+                opens++;
+                throw new Error('physical provenance must avoid a second directory scan');
+            }
+            return originalOpen(value,...args);
+        };
+        try {
+            const relative=path.relative(dir,target).split(path.sep).join('/');
+            const resolved=resolveRelativePathIdentity(dir,relative,false,budget);
+            assert.equal(resolved.unavailable,false);
+            assert.equal(resolved.resolvedRelativePath,relative);
+            assert.equal(resolved.verifiedPrefixLength,2);
+            assert.equal(budget.remainingEntries,1);
+            assert.equal(opens,0);
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT preparation identity lookup stops at an early exact witness',()=>fixture(async({dir})=>{
         const target=path.join(dir,'EarlyTarget');
         fs.writeFileSync(target,'target');
