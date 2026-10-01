@@ -3,7 +3,7 @@ import { fileURLToPath } from 'url';
 import * as path from 'path';
 import * as fs from 'fs';
 import ignore from 'ignore';
-import { asciiCaseFold, detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
+import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity } from './utils/pathIdentity';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -486,10 +486,14 @@ function localRootPath(root: WorkspaceRootIdentity): string | undefined {
     }
 }
 
-function relativeIdentity(root: WorkspaceRootIdentity, value: string): string {
+function relativeIdentity(
+    root: WorkspaceRootIdentity,
+    value: string,
+    workBudget?: PathIdentityWorkBudget
+): string {
     const rootPath = localRootPath(root);
     return rootPath
-        ? resolveRelativePathIdentity(rootPath, value, false).identity
+        ? resolveRelativePathIdentity(rootPath, value, false, workBudget).identity
         : value;
 }
 
@@ -497,10 +501,11 @@ function includeCoversRelativePath(
     includePath: string,
     relativePath: string,
     directory: boolean,
-    root: WorkspaceRootIdentity
+    root: WorkspaceRootIdentity,
+    workBudget?: PathIdentityWorkBudget
 ): boolean {
-    const includeParts = relativeIdentity(root, includePath).split('/').filter(Boolean);
-    const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, '')).split('/').filter(Boolean);
+    const includeParts = relativeIdentity(root, includePath, workBudget).split('/').filter(Boolean);
+    const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, ''), workBudget).split('/').filter(Boolean);
     if (targetParts.length >= includeParts.length &&
         includeParts.every((part, index) => targetParts[index] === part)) {
         return true;
@@ -522,10 +527,11 @@ function explicitPatternForIgnore(pattern: string): string {
 export function isHardUnmonitorableRelativePath(
     relativePath: string,
     identity: boolean | WorkspaceRootIdentity = true,
-    leafIsDirectory = false
+    leafIsDirectory = false,
+    workBudget?: PathIdentityWorkBudget
 ): boolean {
     const rootPath = typeof identity === 'boolean' ? undefined : localRootPath(identity);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true, workBudget) : undefined;
     const parts = (resolved?.resolvedRelativePath ?? relativePath)
         .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
     return parts.some((part, index) => {
@@ -541,7 +547,7 @@ export function isHardUnmonitorableRelativePath(
         if (index >= resolved.verifiedPrefixLength) { return true; }
         const prefix = parts.slice(0, index);
         const reservedSpelling = folded === '.git' ? '.git' : '.difftracker-restore-' + part.slice('.difftracker-restore-'.length);
-        const canonical = resolveRelativePathIdentity(rootPath, [...prefix, reservedSpelling].join('/'), true);
+        const canonical = resolveRelativePathIdentity(rootPath, [...prefix, reservedSpelling].join('/'), true, workBudget);
         return canonical.unavailable || (canonical.verifiedPrefixLength === index + 1 &&
             canonical.identity === [...prefix, part].join('/'));
     });
@@ -569,7 +575,10 @@ function exclusionDirectorySignature(directory: string): string | undefined {
     }
 }
 
-export function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
+export function cachedExclusionDirectoryCaseSensitivity(
+    directory: string,
+    workBudget?: PathIdentityWorkBudget
+): boolean | undefined {
     const key = path.resolve(directory);
     const before = exclusionDirectorySignature(directory);
     if (before !== undefined) {
@@ -578,7 +587,7 @@ export function cachedExclusionDirectoryCaseSensitivity(directory: string): bool
         if (cached) { exclusionDirectoryCaseCache.delete(key); }
     }
 
-    const value = detectLocalPathCaseSensitivity(directory);
+    const value = detectLocalPathCaseSensitivity(directory, process.platform, workBudget);
     if (value === undefined || before === undefined) { return value; }
     const after = exclusionDirectorySignature(directory);
     if (after === before) {
@@ -589,12 +598,16 @@ export function cachedExclusionDirectoryCaseSensitivity(directory: string): bool
 }
 
 function explicitExcludeMatches(
-    pattern: string, relativePath: string, directory: boolean, root: WorkspaceRootIdentity
+    pattern: string,
+    relativePath: string,
+    directory: boolean,
+    root: WorkspaceRootIdentity,
+    workBudget?: PathIdentityWorkBudget
 ): boolean {
     const body = pattern.replace(/^\//, '').replace(/\/$/, '');
     const components = body.split('/');
     const rootPath = localRootPath(root);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true, workBudget) : undefined;
     const target = (resolved?.resolvedRelativePath ?? relativePath).replace(/\/$/, '').split('/').filter(Boolean);
     const directoryOnly = pattern.endsWith('/');
     const anchored = pattern.startsWith('/') || body.includes('/');
@@ -606,14 +619,14 @@ function explicitExcludeMatches(
         const literal = literalPatternComponent(component);
         if (literal !== undefined && exact.ignores(literal)) {
             if (!rootPath) { return false; }
-            const requested = resolveRelativePathIdentity(rootPath, [...target.slice(0, index), literal].join('/'), true);
+            const requested = resolveRelativePathIdentity(rootPath, [...target.slice(0, index), literal].join('/'), true, workBudget);
             // Unreadable/ambiguous identity must not turn an exclusion into
             // permission to read. Missing paths, by contrast, remain distinct.
             return requested.unavailable || !!resolved?.unavailable ||
                 requested.identity === target.slice(0, index + 1).join('/');
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
-        const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent) : root.caseSensitive;
+        const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent, workBudget) : root.caseSensitive;
         return sensitive !== true && ignore({ ignorecase: true })
             .add('/' + explicitPatternForIgnore(component)).ignores(target[index]);
     };
@@ -647,7 +660,8 @@ function explicitExcludeMatches(
 export function configuredScopeExplicitlyExcludesSubtree(
     scope: CanonicalMonitoringScope,
     rootIdentity: string | WorkspaceRootIdentity,
-    relativeDirectory: string
+    relativeDirectory: string,
+    workBudget?: PathIdentityWorkBudget
 ): boolean {
     const rel = relativeDirectory.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
     const root = typeof rootIdentity === 'string'
@@ -662,7 +676,7 @@ export function configuredScopeExplicitlyExcludesSubtree(
 
         // A rule that excludes the directory node itself necessarily makes its
         // descendants unreachable to configured-scope discovery.
-        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root)) {
+        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root, workBudget)) {
             return true;
         }
 
@@ -685,7 +699,7 @@ export function configuredScopeExplicitlyExcludesSubtree(
             continue;
         }
         if (!prefix) { continue; }
-        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root)) {
+        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root, workBudget)) {
             return true;
         }
     }
@@ -697,7 +711,8 @@ export function evaluateConfiguredScope(
     rootIdentity: string | WorkspaceRootIdentity,
     relativePath: string,
     ordinaryIgnored: boolean,
-    directory = false
+    directory = false,
+    workBudget?: PathIdentityWorkBudget
 ): ConfiguredScopeDecision {
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
     const root = typeof rootIdentity === 'string'
@@ -708,22 +723,22 @@ export function evaluateConfiguredScope(
         return { monitored: false, source: 'identityUnknown' };
     }
     const caseSensitive = root.caseSensitive;
-    if (isHardUnmonitorableRelativePath(rel, root, directory)) {
+    if (isHardUnmonitorableRelativePath(rel, root, directory, workBudget)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (explicitExcludeMatches(rule.pattern, rel, directory, root)) {
+        if (explicitExcludeMatches(rule.pattern, rel, directory, root, workBudget)) {
             return { monitored: false, source: 'explicitExclude' };
         }
     }
     const rootPath = localRootPath(root);
-    if (rootPath && resolveRelativePathIdentity(rootPath, rel, caseSensitive).unavailable) {
+    if (rootPath && resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget).unavailable) {
         return { monitored: false, source: 'identityUnknown' };
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (includeCoversRelativePath(rule.path, rel, directory, root)) {
+        if (includeCoversRelativePath(rule.path, rel, directory, root, workBudget)) {
             return { monitored: true, source: 'explicitInclude' };
         }
     }

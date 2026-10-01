@@ -959,6 +959,77 @@ export function registerPR12BoundedInvariants(h) {
         }));
     }
 
+    test('PR12 AUDIT path identity fallback consumes the caller work budget',()=>fixture(async({dir})=>{
+        const target=path.join(dir,'TargetName');
+        fs.writeFileSync(target,'target');
+        const originalOpen=fs.opendirSync;
+        let opens=0,reads=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            opens++;
+            let index=0;
+            return {
+                readSync(){
+                    reads++;
+                    if(index<20){
+                        index++;
+                        return {name:`f-${String(index).padStart(3,'0')}`,isSymbolicLink:()=>false};
+                    }
+                    if(index++===20)return {name:'TargetName',isSymbolicLink:()=>false};
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            const budget={remainingEntries:5};
+            const resolved=resolveRelativePathIdentity(dir,'TargetName',true,budget);
+            assert.equal(budget.remainingEntries,0);
+            assert.equal(budget.exhausted,true,
+                'identity lookup must expose shared-budget exhaustion instead of scanning past it');
+            assert.equal(resolved.unavailable,true);
+            assert.ok(reads<=5,
+                'shared identity lookup must not inspect entries beyond the caller allowance');
+            assert.equal(opens,1,
+                'budget exhaustion must stop before an additional fallback scan');
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
+    test('PR12 AUDIT Rules include identity work shares the traversal preparation budget',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'TargetName');
+        fs.writeFileSync(target,'target');
+        const requested=includeScope(tracker,'rules',['TargetName']);
+        await sourceScope(tracker,scopeFor(tracker,'rules'),false);
+
+        const originalOpen=fs.opendirSync;
+        let reads=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            let index=0;
+            return {
+                readSync(){
+                    reads++;
+                    if(index<20){
+                        index++;
+                        return {name:`f-${String(index).padStart(3,'0')}`,isSymbolicLink:()=>false};
+                    }
+                    if(index++===20)return {name:'TargetName',isSymbolicLink:()=>false};
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        tracker.maxScopePreflightEntries=5;
+        try {
+            const outcome=await tracker.applyConfiguredMonitoringScope(requested);
+            assert.notEqual(outcome.status,'applied');
+            assert.match(outcome.reason??'',/path-identity|preparation|budget/i);
+            assert.ok(reads<=5,
+                'Rules Apply must not perform identity fallback work outside the shared preparation allowance');
+            assert.equal(tracker.fileSnapshots.has(target),false);
+        } finally {fs.opendirSync=originalOpen;}
+    },'rules'));
+
     test('PR12 CASE root case probe searches past non-probeable raw entries',()=>fixture(async({dir})=>{
         const originalOpen=fs.opendirSync;
         let index=0,reads=0,closed=false;
