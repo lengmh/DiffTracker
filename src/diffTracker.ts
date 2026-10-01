@@ -3108,13 +3108,17 @@ export class DiffTracker {
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
             if (configuredScopeExplicitlyExcludesSubtree(scope, rootIdentity, relativeDirectory, ignoreBudget)) {
+                this.checkIgnoreDiscovery(ignoreBudget);
                 result.skippedExplicitExclusions++;
                 continue;
             }
+            this.checkIgnoreDiscovery(ignoreBudget);
             if (relativeDirectory && isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true, ignoreBudget)) {
+                this.checkIgnoreDiscovery(ignoreBudget);
                 result.skippedHardBoundaries++;
                 continue;
             }
+            this.checkIgnoreDiscovery(ignoreBudget);
             if (relativeDirectory) {
                 const directoryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                 const ordinaryDirectoryIgnored = directoryMatcher?.ignores(relativeDirectory + '/') ?? false;
@@ -3162,9 +3166,11 @@ export class DiffTracker {
                         continue;
                     }
                     if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, ignoreBudget)) {
+                        this.checkIgnoreDiscovery(ignoreBudget);
                         result.skippedHardBoundaries++;
                         continue;
                     }
+                    this.checkIgnoreDiscovery(ignoreBudget);
                     const ordinaryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                     const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (isDirectory ? '/' : '')) ?? false;
                     const decision = evaluateConfiguredScope(
@@ -3464,10 +3470,19 @@ export class DiffTracker {
                 continue;
             }
             this.assertPathIdentityBudget(preparationBudget);
-            if (relativeDirectory && (
-                isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true, preparationBudget) ||
-                this.isPathIgnored(vscode.Uri.file(directory), true, false, false, preparationBudget)
-            )) { continue; }
+            if (relativeDirectory) {
+                const hardBoundary = isHardUnmonitorableRelativePath(
+                    relativeDirectory,
+                    rootIdentity,
+                    true,
+                    preparationBudget
+                );
+                this.assertPathIdentityBudget(preparationBudget);
+                if (hardBoundary ||
+                    this.isPathIgnored(vscode.Uri.file(directory), true, false, false, preparationBudget)) {
+                    continue;
+                }
+            }
             const visitKey = folder.uri.toString() + '\0' + path.resolve(directory);
             if (traversalOptions.visitedDirectories?.has(visitKey)) { continue; }
             traversalOptions.visitedDirectories?.add(visitKey);
@@ -5057,6 +5072,9 @@ export class DiffTracker {
                 }
                 const descendantsExplicitlyExcluded =
                     configuredScopeExplicitlyExcludesSubtree(scope, identity, rel, identityBudget);
+                if (identityBudget.exhausted) {
+                    return `${folder.name}:path-identity preparation budget exceeded`;
+                }
                 const expandedPatterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
                 if (!expandedPatterns) {
                     return `${folder.name}:${rule.path}:files.watcherExclude expansion exceeds safe bound`;
@@ -5065,6 +5083,9 @@ export class DiffTracker {
                 // the same root-aware hard-boundary classification.
                 const patterns = expandedPatterns.filter(pattern =>
                     !this.watcherPatternOnlyTargetsHardBoundary(pattern, identity, identityBudget));
+                if (identityBudget.exhausted) {
+                    return `${folder.name}:path-identity preparation budget exceeded`;
+                }
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);

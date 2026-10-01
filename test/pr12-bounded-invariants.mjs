@@ -997,9 +997,9 @@ export function registerPR12BoundedInvariants(h) {
 
     test('PR12 AUDIT Rules include identity work shares the traversal preparation budget',()=>fixture(async({tracker,dir})=>{
         const target=path.join(dir,'TargetName');
-        fs.writeFileSync(target,'target');
         const requested=includeScope(tracker,'rules',['TargetName']);
         await sourceScope(tracker,scopeFor(tracker,'rules'),false);
+        fs.writeFileSync(target,'target');
 
         const originalOpen=fs.opendirSync;
         let reads=0;
