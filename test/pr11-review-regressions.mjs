@@ -1352,25 +1352,55 @@ export function registerPR11ReviewRegressions(h) {
     });
 
     test('PR11 event arriving during scope transaction aborts publication and replays under committed scope',async()=>{
-        const t=h.getTracker(),p=file('transaction-event.txt'),storage=file('transaction-event-storage');
-        t.storageUri=Uri.file(storage);fs.writeFileSync(p,'baseline');
-        t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
-        await t.flushPendingPersistence();
-        const requested=scope([], [{scope:'all',pattern:relative(p)}]);
-        const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
-        const applying=t.applyConfiguredMonitoringScope(requested);
-        const first=await Promise.race([
-            gate.entered.then(()=>({kind:'gate'})),
-            applying.then(result=>({kind:'result',result}))
-        ]);
-        assert.equal(first.kind,'gate',
-            `scope Apply returned before the prepared persistence barrier: ${JSON.stringify(first.result)}`);
-        fs.writeFileSync(p,'changed during apply');await t.onExternalFileChanged(Uri.file(p));
-        gate.release();const result=await applying;
-        assert.notEqual(result.status,'applied',JSON.stringify(result));
-        await waitUntil(()=>!!pending(p));
-        assert.notEqual(t.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
-        assert.equal(t.getOriginalContent(p),'baseline');
+        const previousFolders=vscode.workspace.workspaceFolders;
+        const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+        const workspaceRoot=file('transaction-event-workspace');
+        const storage=file('transaction-event-storage');
+        fs.mkdirSync(workspaceRoot,{recursive:true});
+        fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+        const folder={uri:Uri.file(workspaceRoot),name:'transaction-event'};
+        const getFolder=uri=>{
+            const rel=path.relative(workspaceRoot,uri.fsPath);
+            return rel===''||(rel!=='..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel))?folder:undefined;
+        };
+        try{
+            await h.getTracker().dispose();
+            vscode.workspace.workspaceFolders=[folder];
+            vscode.workspace.getWorkspaceFolder=getFolder;
+            const t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+            t.isRecording=true;t.externalWatcherEnabled=true;t.snapshotInitialized=true;
+
+            const p=path.join(workspaceRoot,'transaction-event.txt');
+            fs.writeFileSync(p,'baseline');
+            t.fileSnapshots.set(p,'baseline');t.baselineExistingFiles.add(p);
+            await t.flushPendingPersistence();
+
+            const checked=validateAndCanonicalizeScope({
+                mode:'rules',includes:[],
+                excludes:[{scope:'all',pattern:path.relative(workspaceRoot,p).split(path.sep).join('/')}]
+            },t.currentWorkspaceRootIdentities());
+            assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+            const requested=checked.scope;
+
+            const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+            const applying=t.applyConfiguredMonitoringScope(requested);
+            const first=await Promise.race([
+                gate.entered.then(()=>({kind:'gate'})),
+                applying.then(result=>({kind:'result',result}))
+            ]);
+            assert.equal(first.kind,'gate',
+                `scope Apply returned before the prepared persistence barrier: ${JSON.stringify(first.result)}`);
+            fs.writeFileSync(p,'changed during apply');await t.onExternalFileChanged(Uri.file(p));
+            gate.release();const result=await applying;
+            assert.notEqual(result.status,'applied',JSON.stringify(result));
+            await waitUntil(()=>!!t.getTrackedChanges().find(change=>change.filePath===p));
+            assert.notEqual(t.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+            assert.equal(t.getOriginalContent(p),'baseline');
+        }finally{
+            await h.getTracker().dispose();
+            vscode.workspace.workspaceFolders=previousFolders;
+            vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+        }
     });
 
 
