@@ -981,10 +981,10 @@ export function registerPR12BoundedInvariants(h) {
             const resolved=resolveRelativePathIdentity(dir,'EarlyTarget',true,budget);
             assert.equal(resolved.unavailable,false);
             assert.equal(resolved.resolvedRelativePath,'EarlyTarget');
-            assert.equal(reads,1,
-                'preparation identity lookup must stream only until the requested exact entry is found');
-            assert.equal(budget.remainingEntries,4,
-                'unused identity work must remain available to the enclosing preparation traversal');
+            assert.equal(reads,0,
+                'a proven case-sensitive root must not be enumerated to confirm an exact first component');
+            assert.equal(budget.remainingEntries,5,
+                'identity proof must preserve the full preparation allowance when no scan is needed');
             assert.equal(budget.exhausted,undefined);
         } finally {fs.opendirSync=originalOpen;}
     }));
@@ -1013,7 +1013,7 @@ export function registerPR12BoundedInvariants(h) {
         };
         try {
             const budget={remainingEntries:5};
-            const resolved=resolveRelativePathIdentity(dir,'TargetName',true,budget);
+            const resolved=resolveRelativePathIdentity(dir,'TargetName',false,budget);
             assert.equal(budget.remainingEntries,0);
             assert.equal(budget.exhausted,true,
                 'identity lookup must expose shared-budget exhaustion instead of scanning past it');
@@ -1027,6 +1027,9 @@ export function registerPR12BoundedInvariants(h) {
 
     test('PR12 AUDIT Rules include identity work shares the traversal preparation budget',()=>fixture(async({tracker,dir})=>{
         const target=path.join(dir,'TargetName');
+        const originalDetect=tracker.detectWorkspaceRootCaseSensitivity.bind(tracker);
+        tracker.detectWorkspaceRootCaseSensitivity=()=>false;
+        tracker.workspaceRootCaseSensitivityCache.clear();
         const requested=includeScope(tracker,'rules',['TargetName']);
         await sourceScope(tracker,scopeFor(tracker,'rules'),false);
         fs.writeFileSync(target,'target');
@@ -1057,7 +1060,11 @@ export function registerPR12BoundedInvariants(h) {
             assert.ok(reads<=5,
                 'Rules Apply must not perform identity fallback work outside the shared preparation allowance');
             assert.equal(tracker.fileSnapshots.has(target),false);
-        } finally {fs.opendirSync=originalOpen;}
+        } finally {
+            fs.opendirSync=originalOpen;
+            tracker.detectWorkspaceRootCaseSensitivity=originalDetect;
+            tracker.workspaceRootCaseSensitivityCache.clear();
+        }
     },'rules'));
 
     test('PR12 CASE root case probe searches past non-probeable raw entries',()=>fixture(async({dir})=>{

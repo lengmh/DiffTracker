@@ -8,6 +8,10 @@ const maxRuntimeIdentityFallbackWorkEntries = maxIdentityDirectoryEntries * 2;
 export interface PathIdentityWorkBudget {
     remainingEntries: number;
     exhausted?: boolean;
+    // Sparse operation-local cache for exact physical spellings. Unlike the
+    // global prefix cache, this stores only entries the current preparation
+    // actually proved and therefore does not consume extra discovery work.
+    exactEntries?: Map<string, { signature: string; actual: string }>;
 }
 
 interface DirectoryEntryListing {
@@ -25,6 +29,11 @@ function identityWorkAvailable(budget?: PathIdentityWorkBudget): boolean {
 
 function consumeIdentityEntry(budget?: PathIdentityWorkBudget): void {
     if (budget) { budget.remainingEntries--; }
+}
+
+function directoryIdentitySignature(directory: string): string {
+    const stat = fs.statSync(directory);
+    return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
 function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing {
@@ -212,11 +221,7 @@ function directoryEntries(
     directory: string,
     workBudget?: PathIdentityWorkBudget
 ): DirectoryEntryListing {
-    const signature = (): string => {
-        const stat = fs.statSync(directory);
-        return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
-    };
-    const before = signature();
+    const before = directoryIdentitySignature(directory);
     const cached = directoryEntriesCache.get(directory);
     if (cached?.signature === before) {
         return {
@@ -233,7 +238,7 @@ function directoryEntries(
         return { entries: [], byName: new Map(), complete: false };
     }
     const listing = readIdentityDirectoryEntries(directory);
-    if (signature() === before) {
+    if (directoryIdentitySignature(directory) === before) {
         if (directoryEntriesCache.size >= 4096 ||
             cachedDirectoryEntryCount + listing.entries.length > maxIdentityDirectoryEntries) {
             directoryEntriesCache.clear();
@@ -267,6 +272,12 @@ function streamDirectoryEntryIdentity(
     // Runtime lookup has its own hard allowance. Preparation passes the shared
     // S4-A work budget instead, so identity proof cannot escape that contract.
     const budget = workBudget ?? { remainingEntries: maxRuntimeIdentityFallbackWorkEntries };
+    const exactKey = path.resolve(directory) + '\0' + requested;
+    const beforeSignature = directoryIdentitySignature(directory);
+    const cachedExact = workBudget?.exactEntries?.get(exactKey);
+    if (cachedExact?.signature === beforeSignature) {
+        return { actual: cachedExact.actual, unavailable: false };
+    }
 
     let handle = fs.opendirSync(directory);
     let exactScanCompleted = false;
@@ -276,6 +287,12 @@ function streamDirectoryEntryIdentity(
             if (!entry) { exactScanCompleted = true; break; }
             consumeIdentityEntry(budget);
             if (entry.name === requested) {
+                if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+                    (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                        signature: beforeSignature,
+                        actual: entry.name
+                    });
+                }
                 return { actual: entry.name, unavailable: false };
             }
         }
@@ -322,7 +339,8 @@ export function resolveRelativePathIdentity(
     let verifiedPrefixLength = 0;
     let unavailable = false;
 
-    for (const requested of parts) {
+    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+        const requested = parts[partIndex];
         let actual: string | undefined;
         if (physicalPrefixAvailable) {
             try {
@@ -330,10 +348,23 @@ export function resolveRelativePathIdentity(
                 // Existence is checked before any directory enumeration. Missing
                 // explicit targets therefore do not burn the identity allowance.
                 const requestedStat = fs.lstatSync(requestedPath);
-                let listing = directoryEntries(current, workBudget);
+
+                // The root's lookup semantics were independently probed before
+                // this resolver is called. On a proven case-sensitive root, a
+                // successful exact first-component lstat is itself proof of the
+                // physical spelling, so scanning a huge root directory would add
+                // no information. Descendant directories are not covered by the
+                // root flag and continue through filesystem-aware lookup below.
+                if (partIndex === 0 && _caseSensitive === true) {
+                    actual = requested;
+                }
+
+                let listing = actual === undefined
+                    ? directoryEntries(current, workBudget)
+                    : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
                 // Successful lookup is mandatory even for an ASCII candidate:
-                // the current directory can differ from the workspace root.
-                let exact = listing.byName.get(requested);
+                // descendant directories can differ from the workspace root.
+                let exact = actual === undefined ? listing.byName.get(requested) : undefined;
                 if (!exact && listing.complete) {
                     // Some filesystems (notably Windows runners) can preserve a
                     // directory mtime/ctime signature across a rapid child create.
@@ -344,17 +375,19 @@ export function resolveRelativePathIdentity(
                     listing = directoryEntries(current, workBudget);
                     exact = listing.byName.get(requested);
                 }
-                if (exact) {
-                    actual = exact.name;
-                } else {
-                    const streamed = streamDirectoryEntryIdentity(
-                        current,
-                        requested,
-                        requestedPath,
-                        workBudget
-                    );
-                    actual = streamed.actual;
-                    unavailable ||= streamed.unavailable;
+                if (actual === undefined) {
+                    if (exact) {
+                        actual = exact.name;
+                    } else {
+                        const streamed = streamDirectoryEntryIdentity(
+                            current,
+                            requested,
+                            requestedPath,
+                            workBudget
+                        );
+                        actual = streamed.actual;
+                        unavailable ||= streamed.unavailable;
+                    }
                 }
                 if (actual !== undefined) {
                     verifiedPrefixLength++;
