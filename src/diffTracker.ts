@@ -155,6 +155,7 @@ class IgnoreDiscoveryError extends Error {
 
 interface IgnoreDiscoveryBudget {
     remainingEntries: number;
+    exhausted?: boolean;
     remainingBytes: number;
     seenEntries: Set<string>;
     policyBytes: Map<string, number>;
