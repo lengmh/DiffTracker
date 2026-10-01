@@ -1019,6 +1019,34 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT alias identity proof enumerates a parent only once',()=>fixture(async({dir})=>{
+        const actual=path.join(dir,'LatePhysicalTarget');
+        const alias=path.join(dir,'latephysicaltarget');
+        fs.writeFileSync(actual,'target');
+        const originalOpen=fs.opendirSync;
+        let opens=0,reads=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            opens++;
+            const real=originalOpen(value,...args);
+            const originalRead=real.readSync.bind(real);
+            real.readSync=()=>{reads++;return originalRead();};
+            return real;
+        };
+        try {
+            await withLookups([[alias,actual]],[],async()=>{
+                const budget={remainingEntries:64};
+                const resolved=resolveRelativePathIdentity(dir,'latephysicaltarget',false,budget);
+                assert.equal(resolved.unavailable,false);
+                assert.equal(resolved.resolvedRelativePath,'LatePhysicalTarget');
+                assert.equal(opens,1,
+                    'alias proof must reuse the exact-scan evidence instead of reopening the parent');
+                assert.ok(reads<=64,
+                    'one alias proof must remain inside the single shared directory-entry allowance');
+            });
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT preparation reuses unique filesystem alias identity proof',()=>fixture(async({dir})=>{
         const actual=path.join(dir,'PhysicalTarget');
         const alias=path.join(dir,'physicaltarget');

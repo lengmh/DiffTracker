@@ -280,13 +280,15 @@ function streamDirectoryEntryIdentity(
         return { actual: cachedExact.actual, unavailable: false };
     }
 
-    let handle = fs.opendirSync(directory);
+    const scannedEntries: fs.Dirent[] = [];
+    const handle = fs.opendirSync(directory);
     let exactScanCompleted = false;
     try {
         while (identityWorkAvailable(budget)) {
             const entry = handle.readSync();
             if (!entry) { exactScanCompleted = true; break; }
             consumeIdentityEntry(budget);
+            scannedEntries.push(entry);
             if (entry.name === requested) {
                 if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
                     (workBudget.exactEntries ??= new Map()).set(exactKey, {
@@ -300,40 +302,28 @@ function streamDirectoryEntryIdentity(
     } finally { handle.closeSync(); }
     if (!exactScanCompleted) { return { unavailable: true }; }
 
-    // A child directory can have different lookup semantics from the workspace
-    // root. The second proof pass shares the same allowance as the exact-name
-    // pass; exhausting it fails closed rather than synchronously scanning forever.
+    // Exact spelling was absent. Reuse the bounded evidence already read above
+    // rather than reopening the directory for an identity pass. This keeps
+    // directory enumeration at O(n) per new literal proof; the lstat checks are
+    // bounded by the same n entries that already consumed the work allowance.
     let match: string | undefined;
-    handle = fs.opendirSync(directory);
-    try {
-        while (identityWorkAvailable(budget)) {
-            const entry = handle.readSync();
-            if (!entry) {
-                if (match === undefined) { return { unavailable: true }; }
-                if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
-                    // Cache the unique filesystem-alias proof as well as exact
-                    // spelling hits. Scope matching repeatedly asks the same
-                    // literal question for many children; reopening and rescanning
-                    // the parent for each child would turn bounded traversal into
-                    // quadratic identity work.
-                    (workBudget.exactEntries ??= new Map()).set(exactKey, {
-                        signature: beforeSignature,
-                        actual: match
-                    });
-                }
-                return { actual: match, unavailable: false };
-            }
-            consumeIdentityEntry(budget);
-            try {
-                if (!sameEntryLookup(requestedPath, path.join(directory, entry.name))) { continue; }
-            } catch {
-                continue;
-            }
-            if (match !== undefined) { return { unavailable: true }; }
-            match = entry.name;
+    for (const entry of scannedEntries) {
+        try {
+            if (!sameEntryLookup(requestedPath, path.join(directory, entry.name))) { continue; }
+        } catch {
+            continue;
         }
-    } finally { handle.closeSync(); }
-    return { unavailable: true };
+        if (match !== undefined) { return { unavailable: true }; }
+        match = entry.name;
+    }
+    if (match === undefined) { return { unavailable: true }; }
+    if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+        (workBudget.exactEntries ??= new Map()).set(exactKey, {
+            signature: beforeSignature,
+            actual: match
+        });
+    }
+    return { actual: match, unavailable: false };
 }
 
 export function resolveRelativePathIdentity(
