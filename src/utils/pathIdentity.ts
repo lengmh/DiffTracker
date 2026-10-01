@@ -205,6 +205,12 @@ export interface RelativePathIdentity {
     resolvedRelativePath: string;
     verifiedPrefixLength: number;
     unavailable: boolean;
+    // Components for which the requested lookup itself was proven to exist,
+    // even when bounded runtime enumeration could not recover physical spelling.
+    lookupVerifiedPrefixLength: number;
+    // True only when the remaining uncertainty is caused solely by the runtime
+    // fallback cap. Preparation budgets never set this escape hatch.
+    runtimeFallbackExhausted?: boolean;
 }
 
 // Cache listings, not case semantics or lookup results. Every reuse verifies the
@@ -276,7 +282,7 @@ function streamDirectoryEntryIdentity(
     requested: string,
     requestedPath: string,
     workBudget?: PathIdentityWorkBudget
-): { actual?: string; unavailable: boolean } {
+): { actual?: string; unavailable: boolean; runtimeFallbackExhausted?: boolean } {
     const budget = workBudget ?? { remainingEntries: maxRuntimeIdentityFallbackWorkEntries };
     const directoryKey = path.resolve(directory);
     const exactKey = directoryKey + '\0' + requested;
@@ -320,7 +326,12 @@ function streamDirectoryEntryIdentity(
         if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
             (workBudget.directoryEvidence ??= new Map()).set(directoryKey, evidence);
         }
-        if (!complete) { return { unavailable: true }; }
+        if (!complete) {
+            return {
+                unavailable: true,
+                runtimeFallbackExhausted: !workBudget && budget.exhausted === true
+            };
+        }
     }
 
     const exact = evidence.byName.get(requested);
@@ -333,7 +344,12 @@ function streamDirectoryEntryIdentity(
         }
         return { actual: exact.name, unavailable: false };
     }
-    if (!evidence.complete) { return { unavailable: true }; }
+    if (!evidence.complete) {
+        return {
+            unavailable: true,
+            runtimeFallbackExhausted: !workBudget && budget.exhausted === true
+        };
+    }
 
     // An exact spelling is absent. A successful lookup can only be accepted as
     // an alias when the bounded directory evidence contains a unique ASCII-case
@@ -393,7 +409,8 @@ export function resolveRelativePathIdentity(
                 identity: value,
                 resolvedRelativePath: value,
                 verifiedPrefixLength: parts.length,
-                unavailable: false
+                unavailable: false,
+                lookupVerifiedPrefixLength: parts.length
             };
         }
     }
@@ -401,79 +418,100 @@ export function resolveRelativePathIdentity(
     const resolved: string[] = [];
     let current = path.resolve(rootPath);
     let physicalPrefixAvailable = true;
+    let lookupPrefixAvailable = true;
     let verifiedPrefixLength = 0;
+    let lookupVerifiedPrefixLength = 0;
     let unavailable = false;
+    let runtimeFallbackExhausted = false;
+    let nonRuntimeUnavailable = false;
 
     for (let partIndex = 0; partIndex < parts.length; partIndex++) {
         const requested = parts[partIndex];
         let actual: string | undefined;
-        if (physicalPrefixAvailable) {
+        if (lookupPrefixAvailable) {
             try {
                 const requestedPath = path.join(current, requested);
-                // Existence is checked before any directory enumeration. Missing
-                // explicit targets therefore do not burn the identity allowance.
+                // Existence is checked before any directory enumeration. A
+                // successful lookup remains useful coverage evidence even when
+                // the bounded runtime spelling scan later exhausts its cap.
                 const requestedStat = fs.lstatSync(requestedPath);
+                lookupVerifiedPrefixLength++;
 
-                // A verified case-sensitive workspace root makes successful
-                // lookup of an exact first component sufficient physical
-                // evidence. This optimization is safe only because forced alias
-                // checks now pass the root's real lookup policy rather than a
-                // synthetic `true`. Descendant components still require
-                // filesystem-aware identity proof.
-                if (partIndex === 0 && _caseSensitive === true) {
-                    actual = requested;
-                }
-
-                let listing = actual === undefined
-                    ? directoryEntries(current, workBudget)
-                    : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
-                // Successful lookup is mandatory even for an ASCII candidate:
-                // descendant directories can differ from the workspace root.
-                let exact = actual === undefined ? listing.byName.get(requested) : undefined;
-                if (!exact && listing.complete) {
-                    // Some filesystems (notably Windows runners) can preserve a
-                    // directory mtime/ctime signature across a rapid child create.
-                    // Refresh a complete cache once. An incomplete cached prefix
-                    // is already reusable evidence and falls through directly to
-                    // the streaming target lookup below.
-                    invalidateDirectoryEntries(current);
-                    listing = directoryEntries(current, workBudget);
-                    exact = listing.byName.get(requested);
-                }
-                if (actual === undefined) {
-                    if (exact) {
-                        actual = exact.name;
-                    } else {
-                        const streamed = streamDirectoryEntryIdentity(
-                            current,
-                            requested,
-                            requestedPath,
-                            workBudget
-                        );
-                        actual = streamed.actual;
-                        unavailable ||= streamed.unavailable;
+                if (requestedStat.isSymbolicLink()) {
+                    unavailable = true;
+                    nonRuntimeUnavailable = true;
+                    physicalPrefixAvailable = false;
+                } else if (physicalPrefixAvailable) {
+                    // A verified case-sensitive workspace root makes successful
+                    // lookup of an exact first component sufficient physical
+                    // evidence. Descendant components still require filesystem
+                    // spelling proof because per-directory semantics may differ.
+                    if (partIndex === 0 && _caseSensitive === true) {
+                        actual = requested;
                     }
-                }
-                if (actual !== undefined) {
-                    verifiedPrefixLength++;
-                    if (requestedStat.isSymbolicLink()) {
-                        physicalPrefixAvailable = false;
-                        unavailable = true;
+
+                    let listing = actual === undefined
+                        ? directoryEntries(current, workBudget)
+                        : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
+                    let exact = actual === undefined ? listing.byName.get(requested) : undefined;
+                    if (!exact && listing.complete) {
+                        invalidateDirectoryEntries(current);
+                        listing = directoryEntries(current, workBudget);
+                        exact = listing.byName.get(requested);
+                    }
+                    if (actual === undefined) {
+                        if (exact) {
+                            actual = exact.name;
+                        } else {
+                            const streamed = streamDirectoryEntryIdentity(
+                                current,
+                                requested,
+                                requestedPath,
+                                workBudget
+                            );
+                            actual = streamed.actual;
+                            if (streamed.unavailable) {
+                                unavailable = true;
+                                if (streamed.runtimeFallbackExhausted) {
+                                    runtimeFallbackExhausted = true;
+                                } else {
+                                    nonRuntimeUnavailable = true;
+                                }
+                            }
+                        }
+                    }
+                    if (actual !== undefined) {
+                        verifiedPrefixLength++;
                     }
                 }
             } catch (error) {
+                lookupPrefixAvailable = false;
+                physicalPrefixAvailable = false;
                 const code = (error as NodeJS.ErrnoException).code;
-                if (code !== 'ENOENT' && code !== 'ENOTDIR') { unavailable = true; }
+                if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+                    unavailable = true;
+                    nonRuntimeUnavailable = true;
+                }
             }
         }
         if (actual === undefined) { physicalPrefixAvailable = false; }
-        // Missing descendants have no proven case mode. Never inherit a root
-        // boolean or apply Unicode/ASCII folding to these unproved components.
+        // Once physical spelling is unresolved, continue existence checks through
+        // the requested alias path. This preserves coverage for a deep existing
+        // path without pretending that its canonical spelling was established.
         resolved.push(actual ?? requested);
         current = path.join(current, actual ?? requested);
     }
     const value = resolved.join('/');
-    return { identity: value, resolvedRelativePath: value, verifiedPrefixLength, unavailable };
+    const runtimeOnly = runtimeFallbackExhausted && !nonRuntimeUnavailable &&
+        lookupVerifiedPrefixLength === parts.length;
+    return {
+        identity: value,
+        resolvedRelativePath: value,
+        verifiedPrefixLength,
+        unavailable,
+        lookupVerifiedPrefixLength,
+        runtimeFallbackExhausted: runtimeOnly || undefined
+    };
 }
 
 export function pathIdentityText(value: string, caseSensitive: boolean): string {

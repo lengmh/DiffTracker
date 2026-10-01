@@ -750,8 +750,14 @@ export function evaluateConfiguredScope(
         }
     }
     const rootPath = localRootPath(root);
-    if (rootPath && resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget).unavailable) {
-        return { monitored: false, source: 'identityUnknown' };
+    if (rootPath) {
+        const resolvedIdentity = resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget);
+        const componentCount = rel.replace(/\/$/, '').split('/').filter(Boolean).length;
+        const runtimeBoundedExisting = resolvedIdentity.runtimeFallbackExhausted === true &&
+            resolvedIdentity.lookupVerifiedPrefixLength === componentCount;
+        if (resolvedIdentity.unavailable && !runtimeBoundedExisting) {
+            return { monitored: false, source: 'identityUnknown' };
+        }
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }

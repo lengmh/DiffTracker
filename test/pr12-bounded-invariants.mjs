@@ -1101,6 +1101,49 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT runtime scan cap does not drop an existing Whole Workspace path',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'runtime-late-entry.txt');
+        fs.writeFileSync(target,'tracked');
+        const originalOpen=fs.opendirSync;
+        let reads=0;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            let index=0;
+            return {
+                readSync(){
+                    reads++;
+                    index++;
+                    if(index<=25000)return {
+                        name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                        isSymbolicLink:()=>false
+                    };
+                    if(index===25001)return {name:'runtime-late-entry.txt',isSymbolicLink:()=>false};
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            const resolved=resolveRelativePathIdentity(dir,'runtime-late-entry.txt',false);
+            assert.equal(resolved.unavailable,true,
+                'runtime cap must not pretend physical spelling was established');
+            assert.equal(resolved.runtimeFallbackExhausted,true);
+            assert.equal(resolved.lookupVerifiedPrefixLength,1,
+                'successful lstat must survive bounded spelling-scan exhaustion');
+
+            const identity={...tracker.currentWorkspaceRootIdentities()[0],caseSensitive:false};
+            const requested={...scopeFor(tracker,'wholeWorkspace'),roots:[identity]};
+            const decision=evaluateConfiguredScope(
+                requested,identity,'runtime-late-entry.txt',false,false
+            );
+            assert.equal(decision.monitored,true,
+                'an existing ordinary path must not be silently dropped as identityUnknown solely because the runtime scan cap was reached');
+            assert.equal(decision.source,'wholeWorkspace');
+            assert.ok(reads<=50000,
+                'runtime lookup remains bounded even when the physical entry is beyond the scan cap');
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT path identity fallback consumes the caller work budget',()=>fixture(async({dir})=>{
         const target=path.join(dir,'TargetName');
         fs.writeFileSync(target,'target');
