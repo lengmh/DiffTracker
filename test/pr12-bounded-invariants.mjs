@@ -1105,10 +1105,11 @@ export function registerPR12BoundedInvariants(h) {
         const target=path.join(dir,'runtime-late-entry.txt');
         fs.writeFileSync(target,'tracked');
         const originalOpen=fs.opendirSync;
-        let reads=0;
+        const readsPerOpen=[];
         fs.opendirSync=(value,...args)=>{
             if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
-            let index=0;
+            let index=0,reads=0;
+            readsPerOpen.push(()=>reads);
             return {
                 readSync(){
                     reads++;
@@ -1139,8 +1140,9 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(decision.monitored,true,
                 'an existing ordinary path must not be silently dropped as identityUnknown solely because the runtime scan cap was reached');
             assert.equal(decision.source,'wholeWorkspace');
-            assert.ok(reads<=50000,
-                'runtime lookup remains bounded even when the physical entry is beyond the scan cap');
+            assert.ok(readsPerOpen.length>0);
+            assert.ok(Math.max(...readsPerOpen.map(reads=>reads()))<=20001,
+                'every runtime directory enumeration remains individually bounded even when the physical entry is beyond the scan cap');
         } finally {fs.opendirSync=originalOpen;}
     }));
 
