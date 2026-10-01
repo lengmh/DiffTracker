@@ -154,8 +154,10 @@ class IgnoreDiscoveryError extends Error {
 }
 
 interface IgnoreDiscoveryBudget {
+    // Directory/policy traversal allowance for this discovery phase.
     remainingEntries: number;
-    exhausted?: boolean;
+    // Identity fallback allowance may be shared across the whole Apply.
+    identityBudget: PathIdentityWorkBudget;
     remainingBytes: number;
     seenEntries: Set<string>;
     policyBytes: Map<string, number>;
@@ -3126,13 +3128,17 @@ export class DiffTracker {
                 return conflict('Workspace path case-sensitivity could not be verified during preflight.');
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
-            if (configuredScopeExplicitlyExcludesSubtree(scope, rootIdentity, relativeDirectory, ignoreBudget)) {
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope, rootIdentity, relativeDirectory, ignoreBudget.identityBudget
+            )) {
                 this.checkIgnoreDiscovery(ignoreBudget);
                 result.skippedExplicitExclusions++;
                 continue;
             }
             this.checkIgnoreDiscovery(ignoreBudget);
-            if (relativeDirectory && isHardUnmonitorableRelativePath(relativeDirectory, rootIdentity, true, ignoreBudget)) {
+            if (relativeDirectory && isHardUnmonitorableRelativePath(
+                relativeDirectory, rootIdentity, true, ignoreBudget.identityBudget
+            )) {
                 this.checkIgnoreDiscovery(ignoreBudget);
                 result.skippedHardBoundaries++;
                 continue;
@@ -3142,7 +3148,7 @@ export class DiffTracker {
                 const directoryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                 const ordinaryDirectoryIgnored = directoryMatcher?.ignores(relativeDirectory + '/') ?? false;
                 const directoryDecision = evaluateConfiguredScope(
-                    scope, rootIdentity, relativeDirectory, ordinaryDirectoryIgnored, true, ignoreBudget
+                    scope, rootIdentity, relativeDirectory, ordinaryDirectoryIgnored, true, ignoreBudget.identityBudget
                 );
                 this.checkIgnoreDiscovery(ignoreBudget);
                 if (directoryDecision.source === 'explicitExclude') {
@@ -3181,13 +3187,15 @@ export class DiffTracker {
                         result.skippedSymlinks++;
                         continue;
                     }
-                    this.notePhysicalIdentityPath(ignoreBudget, child);
+                    this.notePhysicalIdentityPath(ignoreBudget.identityBudget, child);
                     const isDirectory = entryKind === 'directory';
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) {
                         continue;
                     }
-                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, ignoreBudget)) {
+                    if (isHardUnmonitorableRelativePath(
+                        relative, rootIdentity, isDirectory, ignoreBudget.identityBudget
+                    )) {
                         this.checkIgnoreDiscovery(ignoreBudget);
                         result.skippedHardBoundaries++;
                         continue;
@@ -3196,7 +3204,7 @@ export class DiffTracker {
                     const ordinaryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
                     const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (isDirectory ? '/' : '')) ?? false;
                     const decision = evaluateConfiguredScope(
-                        scope, rootIdentity, relative, ordinaryIgnored, isDirectory, ignoreBudget
+                        scope, rootIdentity, relative, ordinaryIgnored, isDirectory, ignoreBudget.identityBudget
                     );
                     this.checkIgnoreDiscovery(ignoreBudget);
                     if (decision.source === 'explicitExclude') {
@@ -5679,26 +5687,20 @@ export class DiffTracker {
         stillCurrent: () => boolean,
         identityEvidence?: PathIdentityWorkBudget
     ): IgnoreDiscoveryBudget {
-        const budget = (identityEvidence ?? {
-            remainingEntries: this.maxScopePreflightEntries
-        }) as IgnoreDiscoveryBudget;
-        // A supplied evidence carrier belongs to one complete Apply operation:
-        // preflight and capture share both its proven identity facts and its
-        // remaining work allowance. Standalone matcher refreshes still get a
-        // fresh bound because they pass no carrier.
-        if (!identityEvidence) {
-            budget.remainingEntries = this.maxScopePreflightEntries;
-            budget.exhausted = false;
-        }
-        budget.remainingBytes = this.maxPersistedBytes;
-        budget.seenEntries = new Set<string>();
-        budget.policyBytes = new Map<string, number>();
-        budget.stillCurrent = stillCurrent;
-        return budget;
+        return {
+            remainingEntries: this.maxScopePreflightEntries,
+            identityBudget: identityEvidence ?? {
+                remainingEntries: this.maxScopePreflightEntries
+            },
+            remainingBytes: this.maxPersistedBytes,
+            seenEntries: new Set<string>(),
+            policyBytes: new Map<string, number>(),
+            stillCurrent
+        };
     }
 
     private checkIgnoreDiscovery(budget: IgnoreDiscoveryBudget): void {
-        if (budget.exhausted) {
+        if (budget.identityBudget.exhausted) {
             throw new IgnoreDiscoveryError(
                 'entries',
                 'Monitoring scope preparation path-identity work budget exceeded'
@@ -5780,7 +5782,9 @@ export class DiffTracker {
         const rootPath = path.resolve(folder.uri.fsPath);
         const identity = this.workspaceRootIdentityForFolder(folder);
         this.checkIgnoreDiscovery(budget);
-        if (configuredScopeExplicitlyExcludesSubtree(scope, identity, '', budget)) {
+        if (configuredScopeExplicitlyExcludesSubtree(
+            scope, identity, '', budget.identityBudget
+        )) {
             this.checkIgnoreDiscovery(budget);
             return matcher;
         }
@@ -5810,14 +5814,23 @@ export class DiffTracker {
             const directory = pending.pop()!;
             if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
             const relative = this.toPosixPath(path.relative(rootPath, directory));
-            if (configuredScopeExplicitlyExcludesSubtree(scope, identity, relative, budget) ||
-                relative && isHardUnmonitorableRelativePath(relative, identity, true, budget)) {
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope, identity, relative, budget.identityBudget
+            ) || relative && isHardUnmonitorableRelativePath(
+                relative, identity, true, budget.identityBudget
+            )) {
                 this.checkIgnoreDiscovery(budget);
                 continue;
             }
             this.checkIgnoreDiscovery(budget);
-            if (relative && !evaluateConfiguredScope(scope, identity, relative,
-                matcher.ignores(relative + '/'), true, budget).monitored) {
+            if (relative && !evaluateConfiguredScope(
+                scope,
+                identity,
+                relative,
+                matcher.ignores(relative + '/'),
+                true,
+                budget.identityBudget
+            ).monitored) {
                 this.checkIgnoreDiscovery(budget);
                 continue;
             }
@@ -5829,7 +5842,9 @@ export class DiffTracker {
             catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
             if (policyStat?.isFile() || policyStat?.isSymbolicLink()) {
                 const uri = vscode.Uri.file(policyPath);
-                const disposition = this.excludedIgnoreFileDisposition(uri, scope, budget);
+                const disposition = this.excludedIgnoreFileDisposition(
+                    uri, scope, budget.identityBudget
+                );
                 this.checkIgnoreDiscovery(budget);
                 if (disposition === 'block') {
                     throw new Error('Explicitly excluded .gitignore cannot be ignored while its parent subtree remains monitored; nested ignore policy is unavailable');
@@ -5852,16 +5867,25 @@ export class DiffTracker {
                     this.consumeIgnoreDiscoveryEntry(budget, child);
                     const kind = this.classifyDirectoryEntry(directory, entry);
                     if (kind !== 'directory' || !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
-                    this.notePhysicalIdentityPath(budget, child);
+                    this.notePhysicalIdentityPath(budget.identityBudget, child);
                     const childRelative = this.toPosixPath(path.relative(rootPath, child));
-                    if (isHardUnmonitorableRelativePath(childRelative, identity, true, budget) ||
-                        configuredScopeExplicitlyExcludesSubtree(scope, identity, childRelative, budget)) {
+                    if (isHardUnmonitorableRelativePath(
+                        childRelative, identity, true, budget.identityBudget
+                    ) || configuredScopeExplicitlyExcludesSubtree(
+                        scope, identity, childRelative, budget.identityBudget
+                    )) {
                         this.checkIgnoreDiscovery(budget);
                         continue;
                     }
                     this.checkIgnoreDiscovery(budget);
-                    if (evaluateConfiguredScope(scope, identity, childRelative,
-                        matcher.ignores(childRelative + '/'), true, budget).monitored) {
+                    if (evaluateConfiguredScope(
+                        scope,
+                        identity,
+                        childRelative,
+                        matcher.ignores(childRelative + '/'),
+                        true,
+                        budget.identityBudget
+                    ).monitored) {
                         this.checkIgnoreDiscovery(budget);
                         pending.push(child);
                     } else {
