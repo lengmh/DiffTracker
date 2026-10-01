@@ -3478,7 +3478,7 @@ export class DiffTracker {
                     relativeDirectory,
                     rootIdentity,
                     true,
-                    preparationBudget
+                    identityBudget
                 );
                 this.assertPathIdentityBudget(identityBudget);
                 if (hardBoundary ||
