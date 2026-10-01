@@ -642,6 +642,11 @@ export class DiffTracker {
     // scope until configured publication succeeds atomically.
     private committedLegacyWatchExcludeByRoot = new Map<string, string[]>();
     private coverageGeneration = 0;
+    // Lightweight invalidation token for files.watcherExclude. Scope Apply
+    // performs the expensive filesystem-aware coverage qualification once;
+    // later transaction checks compare this token instead of re-running
+    // identity discovery and consuming the operation budget repeatedly.
+    private watcherCoverageRevision = 0;
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
     private externalWatcherEnabled = false;
@@ -744,6 +749,7 @@ export class DiffTracker {
                 if (automationPolicyChanged || legacyWatchPolicyChanged ||
                     watcherCoverageChanged || ordinaryExcludeChanged) {
                     if (watcherCoverageChanged) {
+                        this.watcherCoverageRevision++;
                         this.invalidateConfiguredScopeForWatcherCoverage();
                     }
                     const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
@@ -4173,6 +4179,7 @@ export class DiffTracker {
         const preparationIdentityEvidence: PathIdentityWorkBudget = {
             remainingEntries: this.maxScopePreflightEntries
         };
+        const watcherCoverageRevision = this.watcherCoverageRevision;
         const expansion = this.effectiveMonitoringScope.kind === 'configured'
             ? detectScopeExpansion(this.effectiveMonitoringScope, scope)
             : undefined;
@@ -4197,6 +4204,10 @@ export class DiffTracker {
                 return empty('failed',
                     `Monitoring scope preflight could not enumerate ${preflight.unreadableDirectoryCount} director${preflight.unreadableDirectoryCount === 1 ? 'y' : 'ies'}; the previous effective scope remains active.`);
             }
+        }
+        if (this.watcherCoverageRevision !== watcherCoverageRevision) {
+            return empty('conflict',
+                'Watcher coverage policy changed during monitoring-scope preparation; retry the current request.');
         }
         const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
             scope,
@@ -4302,10 +4313,7 @@ export class DiffTracker {
             requestStillCurrent() &&
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
-            !this.configuredScopeNeedsSupplementalCoverage(
-                scope,
-                preparationIdentityEvidence
-            ) &&
+            this.watcherCoverageRevision === watcherCoverageRevision &&
             !preparationIdentityEvidence.exhausted &&
             discardApprovalStillCurrent() &&
             (transaction.observedEvents?.size ?? 0) === 0 &&
@@ -4396,14 +4404,10 @@ export class DiffTracker {
                         preparationIdentityEvidence
                     )
                 : 0;
-            const lateSupplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
-                scope,
-                preparationIdentityEvidence
-            );
-            if (lateSupplementalCoverageIssue) {
-                requiresS4Reason =
-                    `Monitoring scope now requires S4-B supplemental observation coverage at ${lateSupplementalCoverageIssue}.`;
-                throw new Error(requiresS4Reason);
+            if (this.watcherCoverageRevision !== watcherCoverageRevision) {
+                throw new Error(
+                    'Watcher coverage policy changed during monitoring-scope preparation; retry the current request.'
+                );
             }
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');

@@ -1137,6 +1137,24 @@ export function registerPR12BoundedInvariants(h) {
         } finally {fs.opendirSync=originalOpen;}
     }));
 
+    test('PR12 AUDIT Apply does not repeat supplemental identity qualification at every transaction barrier',()=>fixture(async({tracker,scope})=>{
+        const requested=JSON.parse(JSON.stringify(scope));
+        const original=tracker.configuredScopeNeedsSupplementalCoverage.bind(tracker);
+        let calls=0;
+        tracker.configuredScopeNeedsSupplementalCoverage=(...args)=>{
+            calls++;
+            return original(...args);
+        };
+        try {
+            const result=await tracker.applyConfiguredMonitoringScope(requested);
+            assert.equal(result.status,'applied',JSON.stringify(result));
+            assert.equal(calls,1,
+                'filesystem-aware supplemental qualification must run once; later barriers use the watcher coverage revision');
+        } finally {
+            tracker.configuredScopeNeedsSupplementalCoverage=original;
+        }
+    }));
+
     test('PR12 AUDIT preflight reports identity-budget exhaustion as truncated',()=>fixture(async({tracker,dir})=>{
         const originalDetect=tracker.detectWorkspaceRootCaseSensitivity.bind(tracker);
         tracker.detectWorkspaceRootCaseSensitivity=()=>false;
