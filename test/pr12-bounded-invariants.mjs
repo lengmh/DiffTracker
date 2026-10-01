@@ -1273,7 +1273,7 @@ export function registerPR12BoundedInvariants(h) {
 
         const originalOpen=fs.opendirSync;
         const originalAsyncOpen=fs.promises.opendir;
-        let syncReads=0,asyncReads=0;
+        let syncReads=0,asyncReads=0,asyncSawTarget=false;
         const entries=()=>Array.from({length:20},(_,entryIndex)=>({
             name:`f-${String(entryIndex+1).padStart(3,'0')}`,
             isFile:()=>true,isDirectory:()=>false,isSymbolicLink:()=>false
@@ -1304,7 +1304,9 @@ export function registerPR12BoundedInvariants(h) {
                 async *[Symbol.asyncIterator](){
                     while(pending.length>0){
                         asyncReads++;
-                        yield pending.shift();
+                        const entry=pending.shift();
+                        if(entry?.name==='TargetName')asyncSawTarget=true;
+                        yield entry;
                     }
                 }
             };
@@ -1314,7 +1316,9 @@ export function registerPR12BoundedInvariants(h) {
             const outcome=await tracker.applyConfiguredMonitoringScope(requested);
             assert.notEqual(outcome.status,'applied');
             assert.match(outcome.reason??'',/path-identity|preparation|budget|entries/i);
-            assert.ok(asyncReads<=5,
+            assert.ok(asyncReads<=6,
+                'async iteration may fetch one lookahead entry before the loop body observes the exhausted budget');
+            assert.equal(asyncSawTarget,false,
                 'bounded preflight must not discover the late real target outside its entry allowance');
             assert.ok(syncReads<=5,
                 'Rules Apply must not perform identity fallback work outside the shared preparation allowance');
