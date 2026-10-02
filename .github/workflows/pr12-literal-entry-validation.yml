@@ -1,0 +1,68 @@
+name: PR12 isolated literal-entry validation
+on:
+  push:
+    branches: [validation/pr12-literal-entry-20261002]
+permissions:
+  contents: read
+jobs:
+  quality:
+    name: Prepublish quality (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: python .pr12-repair.py
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+      - uses: actions/upload-artifact@v4
+        with:
+          name: literal-manifest-${{ matrix.os }}
+          path: literal-manifest.json
+          if-no-files-found: error
+  candidate:
+    name: Prepare source-only candidate
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: literal-manifest-*
+          path: manifests
+      - run: python .pr12-repair.py
+      - name: Check identical validated sources and publish isolated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp literal-manifest.json manifests/literal-manifest-ubuntu-latest/literal-manifest.json
+          cmp literal-manifest.json manifests/literal-manifest-windows-latest/literal-manifest.json
+          base=1249c63ee77278edea5b5f48bd440a2dcedf82b9
+          test "$(git rev-parse HEAD^1)" = "$base"
+          git config user.name 'ShakaQAQ'
+          git config user.email '47114200+lengmh@users.noreply.github.com'
+          export GIT_INDEX_FILE="$RUNNER_TEMP/pr12-candidate.index"
+          git read-tree "$base"
+          git add src/diffTracker.ts src/monitoringScope.ts src/utils/pathIdentity.ts test/pr12-bounded-invariants.mjs test/pr12-literal-entry-regressions.mjs
+          tree=$(git write-tree)
+          candidate=$(printf '%s\n' 'fix(s4a): preserve glob literals and directory-entry identity' | git commit-tree "$tree" -p "$base")
+          git diff-tree --stat "$base" "$candidate"
+          git push origin "$candidate:refs/heads/validation/pr12-literal-entry-candidate-20261002"
+          echo "CANDIDATE_SHA=$candidate"
+          echo "Source-only candidate: $candidate" >> "$GITHUB_STEP_SUMMARY"
