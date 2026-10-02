@@ -7,7 +7,7 @@ import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity } from './utils/pathIdentity';
+import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity, sameExistingDirectoryEntry } from './utils/pathIdentity';
 import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
@@ -2634,17 +2634,9 @@ export class DiffTracker {
     }
 
     private sameExistingFilesystemEntry(left: string, right: string): boolean {
-        try {
-            const a = fs.lstatSync(left);
-            const b = fs.lstatSync(right);
-            if (a.isSymbolicLink() || b.isSymbolicLink()) { return false; }
-            if (a.ino !== 0 && b.ino !== 0) {
-                return a.dev === b.dev && a.ino === b.ino;
-            }
-            return fs.realpathSync.native(left) === fs.realpathSync.native(right);
-        } catch {
-            return false;
-        }
+        // An equal inode proves shared content, not the same directory entry.
+        // Unknown identity must not merge a new name into an established key.
+        return sameExistingDirectoryEntry(left, right) === true;
     }
 
     private establishedCanonicalRuntimeAlias(
@@ -5091,7 +5083,9 @@ export class DiffTracker {
                 completed.push(current);
                 continue;
             }
-            const alternatives = match[1].split(',').map(value => value.trim()).filter(Boolean);
+            // Glob alternatives are literal text: whitespace and empty branches
+            // affect the watched resource set and must not be normalized away.
+            const alternatives = match[1].split(',');
             if (alternatives.length === 0) {
                 if (completed.length >= limit) { return undefined; }
                 completed.push(current);

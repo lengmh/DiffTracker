@@ -1,3 +1,4 @@
+import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -39,6 +40,7 @@ export function registerPR12BoundedInvariants(h) {
             vscode.workspace.getWorkspaceFolder=previousGet;
         }
     }
+    registerPR12LiteralEntryRegressions(h, fixture, scopeFor);
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 
@@ -1372,11 +1374,15 @@ export function registerPR12BoundedInvariants(h) {
                         'runtime spelling exhaustion must not make an unrelated literal exclusion match');
                     assert.equal(allowed.source,'ordinaryPolicy');
 
-                    // Case-equivalent positive matches are covered by the
-                    // filesystem-alias exclusion regressions. This case is
-                    // intentionally about the reviewer counterexample: bounded
-                    // spelling uncertainty must not make an unrelated literal
-                    // exclusion match.
+                    const aliasExclude={...scopeFor(tracker,'rules',[
+                        {scope:'all',pattern:'/big/**'}
+                    ]),roots:[identity]};
+                    const excluded=evaluateConfiguredScope(
+                        aliasExclude,identity,'Big/late.txt',false,false
+                    );
+                    assert.equal(excluded.monitored,false,
+                        'a filesystem-proven case-insensitive alias exclusion must still match at the runtime cap');
+                    assert.equal(excluded.source,'explicitExclude');
                 } finally {fs.opendirSync=wrapped;}
             });
         } finally {fs.opendirSync=originalOpen;}

@@ -8,6 +8,7 @@ import {
     detectLocalPathCaseSensitivity,
     PathIdentityWorkBudget,
     RelativePathIdentity,
+    sameExistingDirectoryEntry,
     resolveRelativePathIdentity
 } from './utils/pathIdentity';
 
@@ -732,9 +733,23 @@ function explicitExcludeMatches(
             // through physical/case semantics below. Missing paths remain distinct.
             const requestedComponentCount = index + 1;
             const targetComponentCount = target.length;
-            return identityUnavailableForSafety(requested, requestedComponentCount) ||
-                identityUnavailableForSafety(resolved, targetComponentCount) ||
-                requested.identity === target.slice(0, index + 1).join('/');
+            if (identityUnavailableForSafety(requested, requestedComponentCount) ||
+                identityUnavailableForSafety(resolved, targetComponentCount)) { return true; }
+            if (requested.identity === target.slice(0, index + 1).join('/')) { return true; }
+            // Runtime spelling recovery may be bounded while both lookups still
+            // exist. Preserve genuine aliases, but never equate hard-link names
+            // by inode or grant permission after an inaccessible proof.
+            if (!workBudget &&
+                (runtimeBoundedExistingIdentity(requested, requestedComponentCount) ||
+                    runtimeBoundedExistingIdentity(resolved, targetComponentCount)) &&
+                requested.lookupVerifiedPrefixLength >= requestedComponentCount &&
+                (resolved?.lookupVerifiedPrefixLength ?? 0) >= requestedComponentCount) {
+                return sameExistingDirectoryEntry(
+                    path.join(rootPath, ...target.slice(0, index), literal),
+                    path.join(rootPath, ...target.slice(0, index + 1))
+                ) !== false;
+            }
+            return false;
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
         const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent, workBudget) : root.caseSensitive;

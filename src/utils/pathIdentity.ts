@@ -518,6 +518,25 @@ export function resolveRelativePathIdentity(
     };
 }
 
+/** Prove one directory entry, not merely a shared hard-link inode.
+ * Missing entries are distinct; inaccessible identity remains unknown.
+ * Native canonical paths preserve distinct hard-link names without enumeration.
+ */
+export function sameExistingDirectoryEntry(left: string, right: string): boolean | undefined {
+    try {
+        const a = fs.lstatSync(left);
+        const b = fs.lstatSync(right);
+        if (a.isSymbolicLink() || b.isSymbolicLink()) { return false; }
+        if (a.ino !== 0 && b.ino !== 0 && (a.dev !== b.dev || a.ino !== b.ino)) {
+            return false;
+        }
+        return fs.realpathSync.native(left) === fs.realpathSync.native(right);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === 'ENOENT' || code === 'ENOTDIR' ? false : undefined;
+    }
+}
+
 export function pathIdentityText(value: string, caseSensitive: boolean): string {
     const normalized = path.resolve(value);
     return caseSensitive ? normalized : asciiCaseFold(normalized);
