@@ -3,7 +3,13 @@ import { fileURLToPath } from 'url';
 import * as path from 'path';
 import * as fs from 'fs';
 import ignore from 'ignore';
-import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity } from './utils/pathIdentity';
+import {
+    asciiCaseFold,
+    detectLocalPathCaseSensitivity,
+    PathIdentityWorkBudget,
+    RelativePathIdentity,
+    resolveRelativePathIdentity
+} from './utils/pathIdentity';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -491,6 +497,21 @@ function normalizeRelativeParts(value: string): string[] {
         .split('/').filter(Boolean);
 }
 
+function runtimeBoundedExistingIdentity(
+    value: RelativePathIdentity | undefined,
+    componentCount: number
+): boolean {
+    return value?.runtimeFallbackExhausted === true &&
+        value.lookupVerifiedPrefixLength >= componentCount;
+}
+
+function identityUnavailableForSafety(
+    value: RelativePathIdentity | undefined,
+    componentCount: number
+): boolean {
+    return !!value?.unavailable && !runtimeBoundedExistingIdentity(value, componentCount);
+}
+
 /**
  * Compare two same-depth literal relative paths without treating root case
  * semantics as proof for descendant directories. Normal physical identity wins.
@@ -601,17 +622,33 @@ export function isHardUnmonitorableRelativePath(
             return typeof identity === 'boolean' ? !identity : true;
         }
         // Missing/unreadable reserved spellings are conservative boundaries.
-        if (index >= resolved.verifiedPrefixLength) { return true; }
+        // Runtime spelling-scan exhaustion is different: when lookup already
+        // proved the target prefix exists, continue to the canonical spelling
+        // check instead of treating bounded recovery as identity failure.
+        const targetPrefixLookupVerified =
+            runtimeBoundedExistingIdentity(resolved, parts.length) &&
+            resolved.lookupVerifiedPrefixLength > index;
+        if (index >= resolved.verifiedPrefixLength && !targetPrefixLookupVerified) { return true; }
         const prefix = parts.slice(0, index);
+        const targetPrefix = [...prefix, part].join('/');
         const reservedSpelling = folded === '.git' ? '.git' : '.difftracker-restore-' + part.slice('.difftracker-restore-'.length);
+        const canonicalPrefix = [...prefix, reservedSpelling].join('/');
         const canonical = resolveRelativePathIdentity(
             rootPath,
-            [...prefix, reservedSpelling].join('/'),
+            canonicalPrefix,
             rootCaseSensitive,
             workBudget
         );
-        return canonical.unavailable || (canonical.verifiedPrefixLength === index + 1 &&
-            canonical.identity === [...prefix, part].join('/'));
+        if (identityUnavailableForSafety(canonical, index + 1)) { return true; }
+        if (canonical.verifiedPrefixLength === index + 1 &&
+            canonical.identity === targetPrefix) { return true; }
+        return runtimeBoundedExistingIdentity(canonical, index + 1) &&
+            sameRelativeFilesystemIdentity(
+                identity as WorkspaceRootIdentity,
+                targetPrefix,
+                canonicalPrefix,
+                workBudget
+            );
     });
 }
 
@@ -690,8 +727,13 @@ function explicitExcludeMatches(
                 workBudget
             );
             // Unreadable/ambiguous identity must not turn an exclusion into
-            // permission to read. Missing paths, by contrast, remain distinct.
-            return requested.unavailable || !!resolved?.unavailable ||
+            // permission to read. A runtime spelling cap with successful lookup
+            // is not that condition: it still has to prove this literal matches
+            // through physical/case semantics below. Missing paths remain distinct.
+            const requestedComponentCount = index + 1;
+            const targetComponentCount = target.length;
+            return identityUnavailableForSafety(requested, requestedComponentCount) ||
+                identityUnavailableForSafety(resolved, targetComponentCount) ||
                 requested.identity === target.slice(0, index + 1).join('/');
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
@@ -805,9 +847,7 @@ export function evaluateConfiguredScope(
     if (rootPath) {
         const resolvedIdentity = resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget);
         const componentCount = rel.replace(/\/$/, '').split('/').filter(Boolean).length;
-        const runtimeBoundedExisting = resolvedIdentity.runtimeFallbackExhausted === true &&
-            resolvedIdentity.lookupVerifiedPrefixLength === componentCount;
-        if (resolvedIdentity.unavailable && !runtimeBoundedExisting) {
+        if (identityUnavailableForSafety(resolvedIdentity, componentCount)) {
             return { monitored: false, source: 'identityUnknown' };
         }
     }

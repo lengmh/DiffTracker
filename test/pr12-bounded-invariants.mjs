@@ -1318,6 +1318,104 @@ export function registerPR12BoundedInvariants(h) {
         }
     },'rules'));
 
+    test('PR12 AUDIT runtime scan cap does not turn unrelated exclusions into matches',()=>fixture(async({tracker,dir})=>{
+        const actualParent=path.join(dir,'Big');
+        fs.mkdirSync(actualParent);
+        const target=path.join(actualParent,'late.txt');
+        fs.writeFileSync(target,'tracked');
+        const aliasParent=path.join(dir,'big');
+
+        const originalOpen=fs.opendirSync;
+        try {
+            await withLookups([[aliasParent,actualParent]],[],async()=>{
+                const wrapped=fs.opendirSync;
+                fs.opendirSync=(value,...args)=>{
+                    if(path.resolve(String(value))!==path.resolve(dir))return wrapped(value,...args);
+                    let index=0;
+                    return {
+                        readSync(){
+                            index++;
+                            if(index<=25000)return {
+                                name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                                isSymbolicLink:()=>false
+                            };
+                            return null;
+                        },
+                        closeSync(){}
+                    };
+                };
+                try {
+                    const identity={...tracker.currentWorkspaceRootIdentities()[0],caseSensitive:false};
+
+                    const unrelated={...scopeFor(tracker,'rules',[
+                        {scope:'all',pattern:'/different/**'}
+                    ]),roots:[identity]};
+                    const allowed=evaluateConfiguredScope(
+                        unrelated,identity,'Big/late.txt',false,false
+                    );
+                    assert.equal(allowed.monitored,true,
+                        'runtime spelling exhaustion must not make an unrelated literal exclusion match');
+                    assert.equal(allowed.source,'ordinaryPolicy');
+
+                    const aliasExclude={...scopeFor(tracker,'rules',[
+                        {scope:'all',pattern:'/big/**'}
+                    ]),roots:[identity]};
+                    const excluded=evaluateConfiguredScope(
+                        aliasExclude,identity,'Big/late.txt',false,false
+                    );
+                    assert.equal(excluded.monitored,false,
+                        'a filesystem-proven case-insensitive alias exclusion must still match at the runtime cap');
+                    assert.equal(excluded.source,'explicitExclude');
+                } finally {fs.opendirSync=wrapped;}
+            });
+        } finally {fs.opendirSync=originalOpen;}
+    },'rules'));
+
+    test('PR12 AUDIT runtime scan cap does not manufacture a case-sensitive hard boundary',()=>fixture(async({tracker,dir})=>{
+        const parent=path.join(dir,'sensitive-child');
+        const ordinaryGitCase=path.join(parent,'.GIT');
+        fs.mkdirSync(ordinaryGitCase,{recursive:true});
+        fs.writeFileSync(path.join(ordinaryGitCase,'live.txt'),'ordinary on a sensitive parent');
+
+        if(detectLocalPathCaseSensitivity(parent)!==true){
+            console.log('SKIP PR12 runtime hard-boundary fixture requires a case-sensitive child directory');
+            return;
+        }
+
+        const missingCanonical=path.join(parent,'.git');
+        const originalOpen=fs.opendirSync;
+        try {
+            await withLookups([], [missingCanonical], async()=>{
+                const wrapped=fs.opendirSync;
+                fs.opendirSync=(value,...args)=>{
+                    if(path.resolve(String(value))!==path.resolve(parent))return wrapped(value,...args);
+                    let index=0;
+                    return {
+                        readSync(){
+                            index++;
+                            if(index<=25000)return {
+                                name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                                isSymbolicLink:()=>false
+                            };
+                            return null;
+                        },
+                        closeSync(){}
+                    };
+                };
+                try {
+                    const identity={...tracker.currentWorkspaceRootIdentities()[0],caseSensitive:true};
+                    const requested={...scopeFor(tracker,'wholeWorkspace'),roots:[identity]};
+                    const decision=evaluateConfiguredScope(
+                        requested,identity,'sensitive-child/.GIT/live.txt',false,false
+                    );
+                    assert.equal(decision.monitored,true,
+                        'bounded spelling recovery must not turn a distinct .GIT directory into .git on a sensitive parent');
+                    assert.equal(decision.source,'wholeWorkspace');
+                } finally {fs.opendirSync=wrapped;}
+            });
+        } finally {fs.opendirSync=originalOpen;}
+    }));
+
     test('PR12 AUDIT runtime scan cap does not drop an existing Whole Workspace path',()=>fixture(async({tracker,dir})=>{
         const target=path.join(dir,'runtime-late-entry.txt');
         fs.writeFileSync(target,'tracked');
