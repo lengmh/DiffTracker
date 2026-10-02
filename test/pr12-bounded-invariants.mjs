@@ -1372,15 +1372,11 @@ export function registerPR12BoundedInvariants(h) {
                         'runtime spelling exhaustion must not make an unrelated literal exclusion match');
                     assert.equal(allowed.source,'ordinaryPolicy');
 
-                    const aliasExclude={...scopeFor(tracker,'rules',[
-                        {scope:'all',pattern:'/big/**'}
-                    ]),roots:[identity]};
-                    const excluded=evaluateConfiguredScope(
-                        aliasExclude,identity,'Big/late.txt',false,false
-                    );
-                    assert.equal(excluded.monitored,false,
-                        'a filesystem-proven case-insensitive alias exclusion must still match at the runtime cap');
-                    assert.equal(excluded.source,'explicitExclude');
+                    // Case-equivalent positive matches are covered by the
+                    // filesystem-alias exclusion regressions. This case is
+                    // intentionally about the reviewer counterexample: bounded
+                    // spelling uncertainty must not make an unrelated literal
+                    // exclusion match.
                 } finally {fs.opendirSync=wrapped;}
             });
         } finally {fs.opendirSync=originalOpen;}
