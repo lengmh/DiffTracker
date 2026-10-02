@@ -4804,6 +4804,13 @@ export class DiffTracker {
     private refreshIgnoreMatchersAfterLivePolicyChange(): void {
         const epoch = this.sessionEpoch;
         void this.refreshIgnoreMatchers().catch(error => {
+            // Invalidation means this refresh no longer owns policy publication
+            // (for example, an enclosing scope transaction was superseded).
+            // That path must roll back through its own transaction, not pause an
+            // otherwise-valid committed recording session.
+            if (error instanceof IgnoreDiscoveryError && error.limit === 'invalidated') {
+                return;
+            }
             // A stopped session will revalidate policy before the next Start.
             // Whole Workspace does not use ordinary ignore policy for membership.
             if (!this.isCurrentEpoch(epoch) || !this.isRecording ||

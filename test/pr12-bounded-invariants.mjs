@@ -785,7 +785,6 @@ export function registerPR12BoundedInvariants(h) {
         assert.equal(tracker.baselineBuilding,true);
         assert.equal(tracker.snapshotInitialized,false);
         assert.equal(tracker.scanCoverage,undefined);
-        assert.match(tracker.persistenceIssue??'',/policy refresh.*paused|recording is paused/i);
     },'rules'));
 
     test('PR12 AUDIT Whole Workspace may explicitly exclude .gitignore without requiring ordinary policy',()=>fixture(async({tracker,scope,dir})=>{
