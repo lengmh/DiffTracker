@@ -4354,12 +4354,20 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        // The candidate matcher refresh below is allowed to establish one new
+        // policy generation for the requested scope. Once that refresh
+        // completes, every acquisition and durable barrier must stay on that
+        // exact ignore-policy generation. A live Rules-policy refresh that
+        // publishes during broad capture therefore invalidates the transaction.
+        let preparedIgnorePolicyRevision: number | undefined;
         const scopeContextStillCurrent = (): boolean =>
             this.isCurrentEpoch(epoch) &&
             requestStillCurrent() &&
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
             this.watcherCoverageRevision === watcherCoverageRevision &&
+            (preparedIgnorePolicyRevision === undefined ||
+                this.ignorePolicyRevision === preparedIgnorePolicyRevision) &&
             !preparationIdentityEvidence.exhausted &&
             discardApprovalStillCurrent() &&
             (transaction.observedEvents?.size ?? 0) === 0 &&
@@ -4381,6 +4389,11 @@ export class DiffTracker {
             this.scanCoverage = undefined;
             this.ignoreResultCache.clear();
             await this.refreshIgnoreMatchers(preparationIdentityEvidence);
+            // A superseding refresh that happened before candidate acquisition
+            // is safe because capture has not started yet and refreshIgnoreMatchers
+            // follows the newest queued refresh. From this point forward, freeze
+            // the generation used by the scan.
+            preparedIgnorePolicyRevision = this.ignorePolicyRevision;
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }

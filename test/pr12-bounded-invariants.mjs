@@ -287,6 +287,66 @@ export function registerPR12BoundedInvariants(h) {
         }
     },'rules'));
 
+    test('PR12 AUDIT broad Rules Apply rolls back when ordinary policy changes mid-capture',()=>fixture(async({tracker,dir})=>{
+        const oldExcluded=path.join(dir,'old-explicitly-excluded');
+        const ordinaryHidden=path.join(dir,'ordinary-hidden');
+        fs.mkdirSync(oldExcluded);fs.mkdirSync(ordinaryHidden);
+        const newlyVisible=path.join(oldExcluded,'newly-visible.txt');
+        const previouslyOrdinaryHidden=path.join(ordinaryHidden,'late.txt');
+        fs.writeFileSync(newlyVisible,'candidate');
+        fs.writeFileSync(previouslyOrdinaryHidden,'must not be certified by the stale scan');
+
+        setVsCodeExcludes({'files.exclude':{'ordinary-hidden/**':true}});
+        const source=scopeFor(tracker,'rules',[{scope:'all',pattern:'old-explicitly-excluded/**'}]);
+        const requested=scopeFor(tracker,'rules',[]);
+        const before=await sourceScope(tracker,source,false);
+        tracker.scanCoverage=tracker.ignoreFingerprint;
+
+        const originalRead=tracker.readCurrentFileState.bind(tracker);
+        let enteredResolve,releaseResolve;
+        const entered=new Promise(resolve=>{enteredResolve=resolve;});
+        const release=new Promise(resolve=>{releaseResolve=resolve;});
+        let blocked=false;
+        tracker.readCurrentFileState=async target=>{
+            if(!blocked&&path.resolve(target)===path.resolve(newlyVisible)){
+                blocked=true;
+                enteredResolve();
+                await release;
+            }
+            return originalRead(target);
+        };
+
+        try {
+            const applyPromise=tracker.applyConfiguredMonitoringScope(requested);
+            await entered;
+
+            // The broad scan is already using the old matcher. Remove an
+            // ordinary exclusion and let the live refresh publish the new
+            // generation before allowing capture to continue.
+            setVsCodeExcludes({});
+            fireConfigurationChanged('files.exclude');
+            const revisionBeforeRefresh=tracker.ignorePolicyRevision;
+            await tracker.ignoreRefreshPromise;
+            assert.ok(tracker.ignorePolicyRevision>revisionBeforeRefresh,
+                'the live Rules-policy refresh must publish a new policy generation');
+
+            releaseResolve();
+            const outcome=await applyPromise;
+            assert.notEqual(outcome.status,'applied',
+                'a broad Apply must not commit scanCoverage from an older ignore-policy generation');
+            assert.deepEqual(tracker.getEffectiveMonitoringScope(),before,
+                'policy-race rollback must preserve the previously committed monitoring scope');
+            assert.equal(tracker.fileSnapshots.has(newlyVisible),false,
+                'candidate baselines acquired by the invalidated transaction must roll back');
+            assert.equal(tracker.fileSnapshots.has(previouslyOrdinaryHidden),false,
+                'a file admitted only by the new policy must not gain false post-scan absence provenance');
+        } finally {
+            releaseResolve?.();
+            tracker.readCurrentFileState=originalRead;
+            setVsCodeExcludes({});
+        }
+    },'rules'));
+
     test('PR12 AUDIT broader Rules include is routed through bounded expansion preparation',()=>fixture(async({tracker,scope,dir})=>{
         const included=path.join(dir,'broad-include');
         fs.mkdirSync(included);
