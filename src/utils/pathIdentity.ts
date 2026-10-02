@@ -304,9 +304,13 @@ function streamDirectoryEntryIdentity(
         let complete = false;
         const handle = fs.opendirSync(directory);
         try {
-            while (identityWorkAvailable(budget)) {
+            while (true) {
+                // Reading EOF is not identity work. Probe first so a directory
+                // with exactly N entries can prove completeness with an N-entry
+                // allowance; a non-null N+1 lookahead still exhausts the bound.
                 const entry = handle.readSync();
                 if (!entry) { complete = true; break; }
+                if (!identityWorkAvailable(budget)) { break; }
                 consumeIdentityEntry(budget);
                 entries.push(entry);
                 byName.set(entry.name, entry);

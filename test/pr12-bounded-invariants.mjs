@@ -689,7 +689,7 @@ export function registerPR12BoundedInvariants(h) {
     }));
 
 
-    test('PR12 AUDIT Whole Workspace preserves coverage across irrelevant ordinary exclude settings',()=>fixture(async({tracker})=>{
+    test('PR12 AUDIT Whole Workspace preserves coverage across irrelevant ordinary exclude settings',()=>fixture(async({tracker,dir})=>{
         setVsCodeExcludes({});
         await tracker.refreshIgnoreMatchers();
         const fingerprint=tracker.ignoreFingerprint;
@@ -713,11 +713,49 @@ export function registerPR12BoundedInvariants(h) {
             'search.exclude must not change the Whole Workspace coverage fingerprint');
         assert.equal(tracker.scanCoverage,fingerprint);
 
+        const policy=path.join(dir,'.gitignore');
+        fs.writeFileSync(policy,'ordinary/**\n');
+        tracker.restoringEpoch=tracker.sessionEpoch;
+        try {
+            tracker.dispatchExternalEvent(Uri.file(policy),'change',tracker.sessionEpoch);
+            assert.equal(tracker.scanCoverage,fingerprint,
+                '.gitignore events must not retire Whole Workspace coverage');
+            await tracker.ignoreRefreshPromise;
+            assert.equal(tracker.ignoreFingerprint,fingerprint,
+                '.gitignore contents are not part of the Whole Workspace coverage fingerprint');
+            assert.equal(tracker.scanCoverage,fingerprint);
+        } finally {
+            tracker.restoringEpoch=undefined;
+            tracker.restoreEvents.clear();
+        }
+
         setVsCodeExcludes({'files.watcherExclude':{'blind/**':true}});
         fireConfigurationChanged('files.watcherExclude');
         assert.equal(tracker.scanCoverage,undefined,
             'watcher exclusions remain a real Whole Workspace coverage invalidation');
     }));
+
+    test('PR12 AUDIT Rules .gitignore events still invalidate ordinary-policy coverage',()=>fixture(async({tracker,dir})=>{
+        const policy=path.join(dir,'.gitignore');
+        fs.writeFileSync(policy,'first/**\n');
+        await tracker.refreshIgnoreMatchers();
+        const fingerprint=tracker.ignoreFingerprint;
+        tracker.scanCoverage=fingerprint;
+
+        fs.writeFileSync(policy,'second/**\n');
+        tracker.restoringEpoch=tracker.sessionEpoch;
+        try {
+            tracker.dispatchExternalEvent(Uri.file(policy),'change',tracker.sessionEpoch);
+            assert.equal(tracker.scanCoverage,undefined,
+                'Rules coverage must retire immediately when .gitignore policy changes');
+            await tracker.ignoreRefreshPromise;
+            assert.notEqual(tracker.ignoreFingerprint,fingerprint,
+                'Rules policy fingerprint must reflect the changed .gitignore contents');
+        } finally {
+            tracker.restoringEpoch=undefined;
+            tracker.restoreEvents.clear();
+        }
+    },'rules'));
 
     test('PR12 AUDIT Whole Workspace may explicitly exclude .gitignore without requiring ordinary policy',()=>fixture(async({tracker,scope,dir})=>{
         fs.writeFileSync(path.join(dir,'.gitignore'),'ignored.txt\n');
@@ -1377,6 +1415,42 @@ export function registerPR12BoundedInvariants(h) {
             tracker.workspaceRootCaseSensitivityCache.clear();
         }
     },'rules'));
+
+    test('PR12 AUDIT identity alias scan distinguishes N-1 N and N+1 at EOF',()=>fixture(async({dir})=>{
+        const resolveAtBound=async(entryCount,budgetCount)=>{
+            const parent=path.join(dir,`identity-eof-${entryCount}-${budgetCount}`);
+            fs.mkdirSync(parent,{recursive:true});
+            const actual=path.join(parent,'TargetName');
+            fs.writeFileSync(actual,'target');
+            for(let i=1;i<entryCount;i++)fs.writeFileSync(path.join(parent,`f-${String(i).padStart(3,'0')}`),'x');
+            const alias=path.join(parent,'targetname');
+            const budget={remainingEntries:budgetCount};
+            let result;
+            await withLookups([[alias,actual]],[],async()=>{
+                result=resolveRelativePathIdentity(parent,'targetname',false,budget);
+            });
+            return {result,budget};
+        };
+
+        const below=await resolveAtBound(4,5);
+        assert.equal(below.result.unavailable,false,'N-1 entries must leave complete alias evidence');
+        assert.equal(below.result.resolvedRelativePath,'TargetName');
+        assert.equal(below.budget.remainingEntries,1);
+        assert.notEqual(below.budget.exhausted,true);
+
+        const exact=await resolveAtBound(5,5);
+        assert.equal(exact.result.unavailable,false,'exactly N entries must probe EOF and remain complete');
+        assert.equal(exact.result.resolvedRelativePath,'TargetName');
+        assert.equal(exact.budget.remainingEntries,0);
+        assert.notEqual(exact.budget.exhausted,true,
+            'reaching EOF exactly at the allowance is completion, not exhaustion');
+
+        const above=await resolveAtBound(6,5);
+        assert.equal(above.result.unavailable,true,'N+1 entries must remain fail-closed');
+        assert.equal(above.budget.remainingEntries,0);
+        assert.equal(above.budget.exhausted,true,
+            'a non-null lookahead after N charged entries must mark the preparation budget exhausted');
+    }));
 
     test('PR12 CASE root case probe searches past non-probeable raw entries',()=>fixture(async({dir})=>{
         const originalOpen=fs.opendirSync;

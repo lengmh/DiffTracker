@@ -752,13 +752,11 @@ export class DiffTracker {
                         this.watcherCoverageRevision++;
                         this.invalidateConfiguredScopeForWatcherCoverage();
                     }
-                    const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
-                        this.effectiveMonitoringScope.mode === 'wholeWorkspace';
                     const coverageRelevantChange =
                         automationPolicyChanged ||
                         legacyWatchPolicyChanged ||
                         watcherCoverageChanged ||
-                        (!wholeWorkspace && ordinaryExcludeChanged);
+                        (this.ordinaryIgnorePolicyAffectsCoverage() && ordinaryExcludeChanged);
                     if (coverageRelevantChange) {
                         this.scanCoverage = undefined;
                         this.schedulePersistState();
@@ -1454,12 +1452,19 @@ export class DiffTracker {
         return watcher;
     }
 
+    private ordinaryIgnorePolicyAffectsCoverage(): boolean {
+        return this.effectiveMonitoringScope.kind !== 'configured' ||
+            this.effectiveMonitoringScope.mode !== 'wholeWorkspace';
+    }
+
     private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         if (path.basename(uri.fsPath) === '.gitignore') {
-            this.scanCoverage = undefined;
-            this.schedulePersistState();
+            if (this.ordinaryIgnorePolicyAffectsCoverage()) {
+                this.scanCoverage = undefined;
+                this.schedulePersistState();
+            }
             void this.refreshIgnoreMatchers().catch(() => undefined);
         }
         if (this.restoringEpoch === epoch) {
