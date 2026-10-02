@@ -7,7 +7,7 @@ import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity } from './utils/pathIdentity';
+import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity } from './utils/pathIdentity';
 import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
@@ -761,7 +761,7 @@ export class DiffTracker {
                         this.scanCoverage = undefined;
                         this.schedulePersistState();
                     }
-                    this.refreshIgnoreMatchers().catch(() => undefined);
+                    this.refreshIgnoreMatchersAfterLivePolicyChange();
                 }
             })
         );
@@ -1465,7 +1465,7 @@ export class DiffTracker {
                 this.scanCoverage = undefined;
                 this.schedulePersistState();
             }
-            void this.refreshIgnoreMatchers().catch(() => undefined);
+            this.refreshIgnoreMatchersAfterLivePolicyChange();
         }
         if (this.restoringEpoch === epoch) {
             // A change does not invalidate the evidence that a path
@@ -2633,6 +2633,43 @@ export class DiffTracker {
         return records;
     }
 
+    private sameExistingFilesystemEntry(left: string, right: string): boolean {
+        try {
+            const a = fs.lstatSync(left);
+            const b = fs.lstatSync(right);
+            if (a.isSymbolicLink() || b.isSymbolicLink()) { return false; }
+            if (a.ino !== 0 && b.ino !== 0) {
+                return a.dev === b.dev && a.ino === b.ino;
+            }
+            return fs.realpathSync.native(left) === fs.realpathSync.native(right);
+        } catch {
+            return false;
+        }
+    }
+
+    private establishedCanonicalRuntimeAlias(
+        folder: vscode.WorkspaceFolder,
+        relativePosix: string,
+        filePath: string
+    ): string | undefined {
+        const rootPrefix = `${folder.uri.toString()}\0`;
+        const foldedRequested = asciiCaseFold(relativePosix);
+        let matched: string | undefined;
+        for (const [existingKey, existingPath] of this.canonicalTrackingPaths) {
+            if (!existingKey.startsWith(rootPrefix)) { continue; }
+            const existingIdentity = existingKey.slice(rootPrefix.length);
+            // ASCII folding is only a bounded candidate prefilter. The actual
+            // alias proof below is filesystem identity, never string equality.
+            if (asciiCaseFold(existingIdentity) !== foldedRequested) { continue; }
+            if (!this.sameExistingFilesystemEntry(filePath, existingPath)) { continue; }
+            if (matched && path.resolve(matched) !== path.resolve(existingPath)) {
+                return undefined;
+            }
+            matched = existingPath;
+        }
+        return matched;
+    }
+
     private canonicalTrackingPath(
         filePath: string,
         preserveStoredKey = false,
@@ -2657,6 +2694,10 @@ export class DiffTracker {
             identityBudget
         );
         this.assertPathIdentityBudget(identityBudget);
+        if (!preserveStoredKey && resolvedIdentity.runtimeFallbackExhausted === true) {
+            const established = this.establishedCanonicalRuntimeAlias(folder, relativePosix, filePath);
+            if (established) { return established; }
+        }
         const key = `${folder.uri.toString()}\0${resolvedIdentity.identity}`;
         const resolvedPath = vscode.Uri.file(path.join(
             folder.uri.fsPath,
@@ -4760,11 +4801,37 @@ export class DiffTracker {
         });
     }
 
+    private refreshIgnoreMatchersAfterLivePolicyChange(): void {
+        const epoch = this.sessionEpoch;
+        void this.refreshIgnoreMatchers().catch(error => {
+            // A stopped session will revalidate policy before the next Start.
+            // Whole Workspace does not use ordinary ignore policy for membership.
+            if (!this.isCurrentEpoch(epoch) || !this.isRecording ||
+                !this.ordinaryIgnorePolicyAffectsCoverage()) {
+                return;
+            }
+            void this.pauseRecordingForUnpersistableCoverage(
+                'Monitoring policy refresh could not complete within bounded preparation; recording is paused until the baseline is rebuilt.',
+                error
+            );
+        });
+    }
+
     private async refreshIgnoreMatchers(identityEvidence?: PathIdentityWorkBudget): Promise<void> {
         let latest = this.loadIgnoreMatchers(++this.ignoreRefreshVersion, identityEvidence);
         this.ignoreRefreshPromise = latest;
         while (true) {
-            await latest;
+            try {
+                await latest;
+            } catch (error) {
+                // A superseded bounded refresh must not fail a caller after a
+                // newer policy refresh has become authoritative.
+                if (latest !== this.ignoreRefreshPromise) {
+                    latest = this.ignoreRefreshPromise;
+                    continue;
+                }
+                throw error;
+            }
             if (latest === this.ignoreRefreshPromise) { return; }
             latest = this.ignoreRefreshPromise;
         }

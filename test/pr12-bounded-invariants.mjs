@@ -757,6 +757,37 @@ export function registerPR12BoundedInvariants(h) {
         }
     },'rules'));
 
+    test('PR12 AUDIT live Rules policy refresh fails closed when bounded discovery cannot complete',()=>fixture(async({tracker,dir})=>{
+        const policy=path.join(dir,'.gitignore');
+        fs.writeFileSync(policy,'first/**\n');
+        await tracker.refreshIgnoreMatchers();
+        tracker.scanCoverage=tracker.ignoreFingerprint;
+        const epoch=tracker.sessionEpoch;
+
+        // Force the next committed live-policy refresh to exceed its bounded
+        // discovery allowance while the previously valid matcher is still live.
+        tracker.maxScopePreflightEntries=1;
+        for(let i=0;i<4;i++)fs.mkdirSync(path.join(dir,`live-policy-${i}`));
+        setVsCodeExcludes({'files.exclude':{'newly-excluded/**':true}});
+        fireConfigurationChanged('files.exclude');
+
+        await tracker.ignoreRefreshPromise.catch(()=>undefined);
+        for(let i=0;i<20&&tracker.sessionEpoch===epoch;i++){
+            await new Promise(resolve=>setImmediate(resolve));
+        }
+        await tracker.persistStateWriteQueue.catch(()=>undefined);
+
+        assert.ok(tracker.sessionEpoch>epoch,
+            'failed live policy refresh must invalidate the generation using the stale matcher');
+        assert.equal(tracker.isRecording,false,
+            'Rules recording must pause instead of continuing with a stale matcher');
+        assert.equal(tracker.externalWatcherEnabled,false);
+        assert.equal(tracker.baselineBuilding,true);
+        assert.equal(tracker.snapshotInitialized,false);
+        assert.equal(tracker.scanCoverage,undefined);
+        assert.match(tracker.persistenceIssue??'',/policy refresh.*paused|recording is paused/i);
+    },'rules'));
+
     test('PR12 AUDIT Whole Workspace may explicitly exclude .gitignore without requiring ordinary policy',()=>fixture(async({tracker,scope,dir})=>{
         fs.writeFileSync(path.join(dir,'.gitignore'),'ignored.txt\n');
         fs.writeFileSync(path.join(dir,'ignored.txt'),'still in Whole Workspace');
@@ -1271,6 +1302,86 @@ export function registerPR12BoundedInvariants(h) {
             assert.ok(Math.max(...readsPerOpen.map(reads=>reads()))<=20001,
                 'every runtime directory enumeration remains individually bounded even when the physical entry is beyond the scan cap');
         } finally {fs.opendirSync=originalOpen;}
+    }));
+
+    test('PR12 AUDIT runtime identity cap reuses an established canonical key for a filesystem alias',()=>fixture(async({tracker,dir})=>{
+        caseIdentity(tracker,false);
+        const actual=path.join(dir,'EstablishedKey.txt');
+        const alias=path.join(dir,'establishedkey.txt');
+        fs.writeFileSync(actual,'tracked');
+        tracker.fileSnapshots.set(actual,'baseline');
+        tracker.baselineExistingFiles.add(actual);
+        assert.equal(tracker.canonicalTrackingPath(actual,true),actual);
+        const initialKeys=tracker.canonicalTrackingPaths.size;
+
+        const originalOpen=fs.opendirSync;
+        await withLookups([[alias,actual]],[],async()=>{
+            const wrapped=fs.opendirSync;
+            fs.opendirSync=(value,...args)=>{
+                if(path.resolve(String(value))!==path.resolve(dir))return wrapped(value,...args);
+                let index=0;
+                return {
+                    readSync(){
+                        index++;
+                        if(index<=25000)return {
+                            name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                            isSymbolicLink:()=>false
+                        };
+                        return null;
+                    },
+                    closeSync(){}
+                };
+            };
+            try {
+                const canonical=tracker.canonicalTrackingPath(alias);
+                assert.equal(path.resolve(canonical),path.resolve(actual),
+                    'bounded spelling recovery must reuse the already-established physical-file key');
+                assert.equal(tracker.canonicalTrackingPaths.size,initialKeys,
+                    'the alternate-case URI must not create a second canonical identity');
+            } finally {
+                fs.opendirSync=wrapped;
+            }
+        });
+        fs.opendirSync=originalOpen;
+    }));
+
+    test('PR12 AUDIT runtime canonical alias recovery never merges distinct case-sensitive files',()=>fixture(async({tracker,dir})=>{
+        if(detectLocalPathCaseSensitivity(dir)!==true){
+            console.log('SKIP PR12 distinct-case canonical-key fixture requires a case-sensitive directory');
+            return;
+        }
+        caseIdentity(tracker,false);
+        const upper=path.join(dir,'Distinct.txt');
+        const lower=path.join(dir,'distinct.txt');
+        fs.writeFileSync(upper,'upper');
+        fs.writeFileSync(lower,'lower');
+        tracker.fileSnapshots.set(upper,'upper baseline');
+        tracker.baselineExistingFiles.add(upper);
+        assert.equal(tracker.canonicalTrackingPath(upper,true),upper);
+
+        const originalOpen=fs.opendirSync;
+        fs.opendirSync=(value,...args)=>{
+            if(path.resolve(String(value))!==path.resolve(dir))return originalOpen(value,...args);
+            let index=0;
+            return {
+                readSync(){
+                    index++;
+                    if(index<=25000)return {
+                        name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                        isSymbolicLink:()=>false
+                    };
+                    return null;
+                },
+                closeSync(){}
+            };
+        };
+        try {
+            const canonical=tracker.canonicalTrackingPath(lower);
+            assert.equal(path.resolve(canonical),path.resolve(lower),
+                'ASCII-case prefilter alone must never merge two distinct filesystem entries');
+        } finally {
+            fs.opendirSync=originalOpen;
+        }
     }));
 
     test('PR12 AUDIT path identity fallback consumes the caller work budget',()=>fixture(async({dir})=>{
