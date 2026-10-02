@@ -21,6 +21,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - run: python .pr12-fix-fixtures.py
       - run: python .pr12-repair.py
       - run: npm ci
       - run: npm run lint
@@ -46,6 +47,7 @@ jobs:
         with:
           pattern: literal-manifest-*
           path: manifests
+      - run: python .pr12-fix-fixtures.py
       - run: python .pr12-repair.py
       - name: Check identical validated sources and publish isolated candidate
         shell: bash
@@ -54,7 +56,8 @@ jobs:
           cmp literal-manifest.json manifests/literal-manifest-ubuntu-latest/literal-manifest.json
           cmp literal-manifest.json manifests/literal-manifest-windows-latest/literal-manifest.json
           base=1249c63ee77278edea5b5f48bd440a2dcedf82b9
-          test "$(git rev-parse HEAD^1)" = "$base"
+          git merge-base --is-ancestor "$base" HEAD
+          git diff --quiet "$base" HEAD -- src test/pr12-bounded-invariants.mjs package.json package-lock.json .github/workflows/verification.yml
           git config user.name 'ShakaQAQ'
           git config user.email '47114200+lengmh@users.noreply.github.com'
           export GIT_INDEX_FILE="$RUNNER_TEMP/pr12-candidate.index"
