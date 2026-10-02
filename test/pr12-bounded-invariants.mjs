@@ -1319,24 +1319,35 @@ export function registerPR12BoundedInvariants(h) {
     },'rules'));
 
     test('PR12 AUDIT runtime scan cap does not turn unrelated exclusions into matches',()=>fixture(async({tracker,dir})=>{
-        const actualParent=path.join(dir,'Big');
-        fs.mkdirSync(actualParent);
+        // Use an isolated logical root whose case probe is itself simulated as
+        // insensitive. This keeps the alias assertion internally consistent on
+        // Linux instead of pairing a false root flag with a truly sensitive root.
+        const runtimeRoot=path.join(dir,'runtime-exclusion-root');
+        const actualParent=path.join(runtimeRoot,'Big');
+        fs.mkdirSync(actualParent,{recursive:true});
         const target=path.join(actualParent,'late.txt');
+        const witness=path.join(runtimeRoot,'ProbeName');
         fs.writeFileSync(target,'tracked');
-        const aliasParent=path.join(dir,'big');
+        fs.writeFileSync(witness,'probe');
+        const aliasParent=path.join(runtimeRoot,'big');
+        const witnessAlias=path.join(runtimeRoot,'probeName');
 
         const originalOpen=fs.opendirSync;
         try {
-            await withLookups([[aliasParent,actualParent]],[],async()=>{
+            await withLookups([[aliasParent,actualParent],[witnessAlias,witness]],[],async()=>{
                 const wrapped=fs.opendirSync;
                 fs.opendirSync=(value,...args)=>{
-                    if(path.resolve(String(value))!==path.resolve(dir))return wrapped(value,...args);
+                    if(path.resolve(String(value))!==path.resolve(runtimeRoot))return wrapped(value,...args);
                     let index=0;
                     return {
                         readSync(){
                             index++;
-                            if(index<=25000)return {
-                                name:`synthetic-${String(index).padStart(5,'0')}.txt`,
+                            if(index===1)return {
+                                name:'ProbeName',
+                                isSymbolicLink:()=>false
+                            };
+                            if(index<=25001)return {
+                                name:`synthetic-${String(index-1).padStart(5,'0')}.txt`,
                                 isSymbolicLink:()=>false
                             };
                             return null;
@@ -1345,7 +1356,11 @@ export function registerPR12BoundedInvariants(h) {
                     };
                 };
                 try {
-                    const identity={...tracker.currentWorkspaceRootIdentities()[0],caseSensitive:false};
+                    const identity={
+                        ...tracker.currentWorkspaceRootIdentities()[0],
+                        uri:Uri.file(runtimeRoot).toString(),
+                        caseSensitive:false
+                    };
 
                     const unrelated={...scopeFor(tracker,'rules',[
                         {scope:'all',pattern:'/different/**'}
