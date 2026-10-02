@@ -1302,8 +1302,8 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(budget.exhausted,true,
                 'identity lookup must expose shared-budget exhaustion instead of scanning past it');
             assert.equal(resolved.unavailable,true);
-            assert.ok(reads<=5,
-                'shared identity lookup must not inspect entries beyond the caller allowance');
+            assert.ok(reads<=6,
+                'shared identity lookup may read one uncharged lookahead to distinguish EOF from an entry beyond the caller allowance');
             assert.equal(opens,1,
                 'budget exhaustion must stop before an additional fallback scan');
         } finally {fs.opendirSync=originalOpen;}
