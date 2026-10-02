@@ -1405,8 +1405,8 @@ export function registerPR12BoundedInvariants(h) {
                 'async iteration may fetch one lookahead entry before the loop body observes the exhausted budget');
             assert.equal(asyncSawTarget,false,
                 'bounded preflight must not discover the late real target outside its entry allowance');
-            assert.ok(syncReads<=5,
-                'Rules Apply must not perform identity fallback work outside the shared preparation allowance');
+            assert.ok(syncReads<=6,
+                'Rules Apply may read one uncharged lookahead to distinguish EOF from an entry beyond the shared preparation allowance');
             assert.equal(tracker.fileSnapshots.has(target),false);
         } finally {
             fs.opendirSync=originalOpen;
