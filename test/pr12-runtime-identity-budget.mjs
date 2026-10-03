@@ -83,6 +83,62 @@ export function registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor) {
         }));
     }
 
+    test('PR12 BUDGET one scope decision shares runtime identity work across exclusions', () => fixture(async ({tracker, dir}) => {
+        const tree = deepTree(dir);
+        invalidate(tree);
+        await lateEnumeration(tree, async counts => {
+            const identity = {name: 'deep', uri: pathToFileURL(tree.root).toString(), caseSensitive: false};
+            const excludes = Array.from({length: 20}, (_, index) => ({scope: 'all', pattern: `/Different${index}/**`}));
+            const scoped = {...scopeFor(tracker, 'rules'), roots: [identity], excludes};
+            const decision = evaluateConfiguredScope(scoped, identity, tree.relative, false);
+            console.log(`BUDGET scope-rules: ${counts.reads} reads; ${counts.opens} opens`);
+            assert.equal(decision.monitored, true);
+            assert.equal(decision.source, 'ordinaryPolicy');
+            assert.ok(counts.reads <= 30000 + 2 * 3,
+                `one scope decision must share runtime identity allowances; reads=${counts.reads}`);
+        });
+    }));
+
+    test('PR12 BUDGET exhausted decision context still honors a proven alias exclusion', () => fixture(async ({tracker, dir}) => {
+        const tree = deepTree(dir);
+        invalidate(tree);
+        const alpha = path.join(tree.root, 'alpha');
+        const beta = path.join(alpha, 'beta');
+        const leaf = path.join(beta, 'leaf.txt');
+        const aliases = [[leaf, tree.target], [beta, tree.parent], [alpha, path.join(tree.root, 'Alpha')]];
+        await withLookups(aliases, [], async () => lateEnumeration(tree, async counts => {
+            const identity = {name: 'deep', uri: pathToFileURL(tree.root).toString(), caseSensitive: false};
+            const unrelated = Array.from({length: 20}, (_, index) => ({scope: 'all', pattern: `/Different${index}/**`}));
+            const scoped = {...scopeFor(tracker, 'rules'), roots: [identity],
+                excludes: [...unrelated, {scope: 'all', pattern: '/alpha/beta/leaf.txt'}]};
+            const decision = evaluateConfiguredScope(scoped, identity, tree.relative, false);
+            assert.equal(decision.monitored, false,
+                'budget exhaustion must not turn a proven existing alias exclusion into permission');
+            assert.equal(decision.source, 'explicitExclude');
+            assert.ok(counts.reads <= 30000 + 2 * 3,
+                `alias proof must not reopen a fresh runtime scan per rule; reads=${counts.reads}`);
+        }));
+    }));
+
+    test('PR12 BUDGET exhausted decision context still honors a proven alias include', () => fixture(async ({tracker, dir}) => {
+        const tree = deepTree(dir);
+        invalidate(tree);
+        const alpha = path.join(tree.root, 'alpha');
+        const aliases = [[alpha, path.join(tree.root, 'Alpha')]];
+        await withLookups(aliases, [], async () => lateEnumeration(tree, async counts => {
+            const identity = {name: 'deep', uri: pathToFileURL(tree.root).toString(), caseSensitive: false};
+            const unrelated = Array.from({length: 20}, (_, index) => ({scope: 'all', pattern: `/Different${index}/**`}));
+            const scoped = {...scopeFor(tracker, 'rules'), roots: [identity], excludes: unrelated,
+                includes: [{scope: 'all', path: 'alpha/Beta/Leaf.txt'}]};
+            const decision = evaluateConfiguredScope(scoped, identity, tree.relative, true);
+            assert.equal(decision.monitored, true,
+                'budget exhaustion must not drop a proven existing alias include');
+            assert.equal(decision.source, 'explicitInclude');
+            assert.ok(counts.reads <= 30000 + 2 * 3,
+                `alias include must not reopen a fresh runtime scan per rule; reads=${counts.reads}`);
+        }));
+    }));
+
     test('PR12 BUDGET exhausted runtime still records a changed deep existing file', () => fixture(async ({tracker, dir}) => {
         const tree = deepTree(dir);
         await tracker.refreshIgnoreMatchers();

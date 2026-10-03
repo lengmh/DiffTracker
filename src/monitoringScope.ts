@@ -5,7 +5,9 @@ import * as fs from 'fs';
 import ignore from 'ignore';
 import {
     asciiCaseFold,
+    createPathIdentityRuntimeContext,
     detectLocalPathCaseSensitivity,
+    PathIdentityRuntimeContext,
     PathIdentityWorkBudget,
     RelativePathIdentity,
     sameExistingDirectoryEntry,
@@ -523,7 +525,8 @@ function sameRelativeFilesystemIdentity(
     root: WorkspaceRootIdentity,
     leftValue: string,
     rightValue: string,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const leftRequested = normalizeRelativeParts(leftValue);
     const rightRequested = normalizeRelativeParts(rightValue);
@@ -534,8 +537,8 @@ function sameRelativeFilesystemIdentity(
     if (!rootPath || typeof root.caseSensitive !== 'boolean') { return false; }
     const leftRelative = leftRequested.join('/');
     const rightRelative = rightRequested.join('/');
-    const left = resolveRelativePathIdentity(rootPath, leftRelative, root.caseSensitive, workBudget);
-    const right = resolveRelativePathIdentity(rootPath, rightRelative, root.caseSensitive, workBudget);
+    const left = resolveRelativePathIdentity(rootPath, leftRelative, root.caseSensitive, workBudget, runtimeContext);
+    const right = resolveRelativePathIdentity(rootPath, rightRelative, root.caseSensitive, workBudget, runtimeContext);
     const leftResolved = normalizeRelativeParts(left.resolvedRelativePath);
     const rightResolved = normalizeRelativeParts(right.resolvedRelativePath);
 
@@ -568,7 +571,8 @@ function includeCoversRelativePath(
     relativePath: string,
     directory: boolean,
     root: WorkspaceRootIdentity,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const includeParts = normalizeRelativeParts(includePath);
     const targetParts = normalizeRelativeParts(relativePath);
@@ -577,14 +581,16 @@ function includeCoversRelativePath(
             root,
             includeParts.join('/'),
             targetParts.slice(0, includeParts.length).join('/'),
-            workBudget
+            workBudget,
+            runtimeContext
         );
     }
     return directory && sameRelativeFilesystemIdentity(
         root,
         targetParts.join('/'),
         includeParts.slice(0, targetParts.length).join('/'),
-        workBudget
+        workBudget,
+        runtimeContext
     );
 }
 
@@ -602,14 +608,15 @@ export function isHardUnmonitorableRelativePath(
     relativePath: string,
     identity: boolean | WorkspaceRootIdentity = true,
     leafIsDirectory = false,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const rootPath = typeof identity === 'boolean' ? undefined : localRootPath(identity);
     const rootCaseSensitive = typeof identity === 'boolean'
         ? identity
         : identity.caseSensitive ?? false;
     const resolved = rootPath
-        ? resolveRelativePathIdentity(rootPath, relativePath, rootCaseSensitive, workBudget)
+        ? resolveRelativePathIdentity(rootPath, relativePath, rootCaseSensitive, workBudget, runtimeContext)
         : undefined;
     const parts = (resolved?.resolvedRelativePath ?? relativePath)
         .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
@@ -638,7 +645,8 @@ export function isHardUnmonitorableRelativePath(
             rootPath,
             canonicalPrefix,
             rootCaseSensitive,
-            workBudget
+            workBudget,
+            runtimeContext
         );
         if (identityUnavailableForSafety(canonical, index + 1)) { return true; }
         if (canonical.verifiedPrefixLength === index + 1 &&
@@ -648,7 +656,8 @@ export function isHardUnmonitorableRelativePath(
                 identity as WorkspaceRootIdentity,
                 targetPrefix,
                 canonicalPrefix,
-                workBudget
+                workBudget,
+                runtimeContext
             );
     });
 }
@@ -702,13 +711,14 @@ function explicitExcludeMatches(
     relativePath: string,
     directory: boolean,
     root: WorkspaceRootIdentity,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const body = pattern.replace(/^\//, '').replace(/\/$/, '');
     const components = body.split('/');
     const rootPath = localRootPath(root);
     const resolved = rootPath
-        ? resolveRelativePathIdentity(rootPath, relativePath, root.caseSensitive ?? false, workBudget)
+        ? resolveRelativePathIdentity(rootPath, relativePath, root.caseSensitive ?? false, workBudget, runtimeContext)
         : undefined;
     const target = (resolved?.resolvedRelativePath ?? relativePath).replace(/\/$/, '').split('/').filter(Boolean);
     const directoryOnly = pattern.endsWith('/');
@@ -725,7 +735,8 @@ function explicitExcludeMatches(
                 rootPath,
                 [...target.slice(0, index), literal].join('/'),
                 root.caseSensitive ?? false,
-                workBudget
+                workBudget,
+                runtimeContext
             );
             // Unreadable/ambiguous identity must not turn an exclusion into
             // permission to read. A runtime spelling cap with successful lookup
@@ -849,18 +860,22 @@ export function evaluateConfiguredScope(
         return { monitored: false, source: 'identityUnknown' };
     }
     const caseSensitive = root.caseSensitive;
-    if (isHardUnmonitorableRelativePath(rel, root, directory, workBudget)) {
+    // One normal runtime scope decision owns one identity allowance. Every hard
+    // boundary, exclusion, final identity gate and include in this decision
+    // reuses it. Preparation continues to use only the caller-owned workBudget.
+    const runtimeContext = workBudget ? undefined : createPathIdentityRuntimeContext();
+    if (isHardUnmonitorableRelativePath(rel, root, directory, workBudget, runtimeContext)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (explicitExcludeMatches(rule.pattern, rel, directory, root, workBudget)) {
+        if (explicitExcludeMatches(rule.pattern, rel, directory, root, workBudget, runtimeContext)) {
             return { monitored: false, source: 'explicitExclude' };
         }
     }
     const rootPath = localRootPath(root);
     if (rootPath) {
-        const resolvedIdentity = resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget);
+        const resolvedIdentity = resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget, runtimeContext);
         const componentCount = rel.replace(/\/$/, '').split('/').filter(Boolean).length;
         if (identityUnavailableForSafety(resolvedIdentity, componentCount)) {
             return { monitored: false, source: 'identityUnknown' };
@@ -868,7 +883,7 @@ export function evaluateConfiguredScope(
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (includeCoversRelativePath(rule.path, rel, directory, root, workBudget)) {
+        if (includeCoversRelativePath(rule.path, rel, directory, root, workBudget, runtimeContext)) {
             return { monitored: true, source: 'explicitInclude' };
         }
     }

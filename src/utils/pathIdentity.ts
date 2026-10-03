@@ -22,11 +22,27 @@ export interface PathIdentityWorkBudget {
     }>;
 }
 
-// Internal phase is explicit: a runtime allowance must never be mistaken for
-// the caller-owned preparation budget merely because a budget object exists.
+// Runtime identity work may be shared by one higher-level decision (for
+// example, one configured-scope evaluation) without becoming a preparation
+// budget. Keep the phase explicit so runtime exhaustion preserves lookup
+// evidence while caller-owned preparation remains fail-closed.
+export interface PathIdentityRuntimeContext {
+    readonly kind: 'runtime';
+    budget: PathIdentityWorkBudget;
+    prefixBudget: PathIdentityWorkBudget;
+}
+
+export function createPathIdentityRuntimeContext(): PathIdentityRuntimeContext {
+    return {
+        kind: 'runtime',
+        budget: { remainingEntries: maxRuntimeIdentityFallbackWorkEntries },
+        prefixBudget: { remainingEntries: maxIdentityDirectoryEntries }
+    };
+}
+
 type IdentityLookupContext =
     | { kind: 'preparation'; budget: PathIdentityWorkBudget }
-    | { kind: 'runtime'; budget: PathIdentityWorkBudget; prefixBudget: PathIdentityWorkBudget };
+    | PathIdentityRuntimeContext;
 
 interface DirectoryEntryListing {
     entries: fs.Dirent[];
@@ -405,7 +421,8 @@ export function resolveRelativePathIdentity(
     rootPath: string,
     relativePath: string,
     _caseSensitive: boolean,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): RelativePathIdentity {
     const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '')
         .split('/').filter(Boolean);
@@ -447,8 +464,7 @@ export function resolveRelativePathIdentity(
     // Preparation keeps its original shared budget and fail-closed semantics.
     const context: IdentityLookupContext = workBudget
         ? { kind: 'preparation', budget: workBudget }
-        : { kind: 'runtime', budget: { remainingEntries: maxRuntimeIdentityFallbackWorkEntries },
-            prefixBudget: { remainingEntries: maxIdentityDirectoryEntries } };
+        : runtimeContext ?? createPathIdentityRuntimeContext();
     const prefixBudget = context.kind === 'runtime' ? context.prefixBudget : undefined;
     const resolved: string[] = [];
     let current = path.resolve(rootPath);
