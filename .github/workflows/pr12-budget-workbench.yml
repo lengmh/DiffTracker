@@ -1,0 +1,42 @@
+name: PR12 budget workbench
+on:
+  push:
+    branches: [validation/pr12-runtime-budget-20261003]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  workbench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Capture review evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api graphql --paginate -f query='query($endCursor:String){repository(owner:"lengmh",name:"DiffTracker"){pullRequest(number:12){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:100){nodes{databaseId body createdAt url originalCommit{oid} commit{oid}}}}}}}}' --slurp > /tmp/pr12-threads.json
+          gh api --paginate repos/lengmh/DiffTracker/pulls/12/reviews --slurp > /tmp/pr12-reviews.json
+          gh api repos/lengmh/DiffTracker/issues/comments/5861778811 > /tmp/pr12-postmortem.json
+          gh api repos/lengmh/DiffTracker/issues/comments/5956351466 > /tmp/pr12-review-request.json
+      - name: Export credential-free workbench
+        run: |
+          mkdir -p /tmp/pr12-workbench
+          git archive 394e34420e405c8a4d2242a124e0cc5d1cca73c5 | tar -x -C /tmp/pr12-workbench
+          cp -a node_modules /tmp/pr12-workbench/
+          git bundle create /tmp/pr12-workbench/history.bundle --all
+          cp /tmp/pr12-*.json /tmp/pr12-workbench/
+          tar -czf /tmp/pr12-workbench.tar.gz -C /tmp/pr12-workbench .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr12-budget-workbench
+          path: /tmp/pr12-workbench.tar.gz
+          retention-days: 3
+          if-no-files-found: error
