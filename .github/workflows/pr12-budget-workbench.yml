@@ -1,13 +1,17 @@
-name: PR12 budget workbench
+name: PR12 runtime budget prepublication
 on:
   push:
     branches: [validation/pr12-runtime-budget-20261003]
 permissions:
   contents: read
-  pull-requests: read
 jobs:
-  workbench:
-    runs-on: ubuntu-latest
+  quality:
+    name: Red-green quality (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,25 +22,82 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Capture review evidence
+      - run: python .pr12-budget-patch.py register
+      - run: npm run compile
+      - name: Prove original aggregate defect
+        shell: python
+        run: |
+          import os, subprocess, pathlib
+          env={**os.environ,'DT_TEST_FILTER':'PR12 BUDGET'}
+          result=subprocess.run(['node','test/tracker-safety.mjs'],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          text=result.stdout.decode('utf-8',errors='replace')
+          pathlib.Path('budget-red.log').write_text(text,encoding='utf-8')
+          failures=[line for line in text.splitlines() if line.startswith('FAIL ')]
+          print('\n'.join(line for line in text.splitlines() if line.startswith(('BUDGET','FAIL','PASS','7/11'))))
+          assert result.returncode!=0 and len(failures)==4 and all('total scans' in line for line in failures),text
+          assert '7/11 production tracker regressions passed' in text,text
+      - run: python .pr12-budget-patch.py fix
+      - run: python .pr12-budget-patch.py manifest
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:performance
+      - uses: actions/upload-artifact@v4
+        with:
+          name: budget-evidence-${{ matrix.os }}
+          path: |
+            budget-manifest.json
+            budget-red.log
+          retention-days: 7
+          if-no-files-found: error
+  candidate:
+    name: Prepare validated source-only candidate
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: budget-evidence-*
+          path: evidence
+      - run: python .pr12-budget-patch.py register
+      - run: python .pr12-budget-patch.py fix
+      - run: python .pr12-budget-patch.py manifest
+      - name: Build historical evidence ledger
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api graphql --paginate -f query='query($endCursor:String){repository(owner:"lengmh",name:"DiffTracker"){pullRequest(number:12){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:100){nodes{databaseId body createdAt url originalCommit{oid} commit{oid}}}}}}}}' --slurp > /tmp/pr12-threads.json
-          gh api --paginate repos/lengmh/DiffTracker/pulls/12/reviews --slurp > /tmp/pr12-reviews.json
-          gh api repos/lengmh/DiffTracker/issues/comments/5861778811 > /tmp/pr12-postmortem.json
-          gh api repos/lengmh/DiffTracker/issues/comments/5956351466 > /tmp/pr12-review-request.json
-      - name: Export credential-free workbench
+          gh api graphql --paginate -f query='query($endCursor:String){repository(owner:"lengmh",name:"DiffTracker"){pullRequest(number:12){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:100){nodes{databaseId body createdAt url originalCommit{oid} commit{oid}}}}}}}}' --slurp > budget-threads.json
+          python .pr12-budget-ledger.py
+      - name: Publish candidate without changing PR head
         run: |
-          mkdir -p /tmp/pr12-workbench
-          git archive 394e34420e405c8a4d2242a124e0cc5d1cca73c5 | tar -x -C /tmp/pr12-workbench
-          cp -a node_modules /tmp/pr12-workbench/
-          git bundle create /tmp/pr12-workbench/history.bundle --all
-          cp /tmp/pr12-*.json /tmp/pr12-workbench/
-          tar -czf /tmp/pr12-workbench.tar.gz -C /tmp/pr12-workbench .
+          set -euo pipefail
+          cmp budget-manifest.json evidence/budget-evidence-ubuntu-latest/budget-manifest.json
+          cmp budget-manifest.json evidence/budget-evidence-windows-latest/budget-manifest.json
+          base=394e34420e405c8a4d2242a124e0cc5d1cca73c5
+          git diff --quiet "$base" HEAD -- src test/pr12-bounded-invariants.mjs package.json package-lock.json .github/workflows/verification.yml
+          git config user.name 'ShakaQAQ'
+          git config user.email '47114200+lengmh@users.noreply.github.com'
+          export GIT_INDEX_FILE="$RUNNER_TEMP/pr12-budget.index"
+          git read-tree "$base"
+          git add src/utils/pathIdentity.ts test/pr12-bounded-invariants.mjs test/pr12-runtime-identity-budget.mjs docs/pr12-review-evidence-2026-10-03.md
+          tree=$(git write-tree)
+          candidate=$(printf '%s\n' 'fix(s4a): share runtime identity work across complete path lookups' | git commit-tree "$tree" -p "$base")
+          git diff-tree --stat "$base" "$candidate"
+          git push origin "$candidate:refs/heads/validation/pr12-runtime-budget-candidate-20261003"
+          echo "CANDIDATE_SHA=$candidate"
+          echo "$candidate" > candidate-sha.txt
+          git diff "$base" "$candidate" > pr12-runtime-budget.patch
       - uses: actions/upload-artifact@v4
         with:
-          name: pr12-budget-workbench
-          path: /tmp/pr12-workbench.tar.gz
-          retention-days: 3
-          if-no-files-found: error
+          name: pr12-runtime-budget-result
+          path: |
+            candidate-sha.txt
+            pr12-runtime-budget.patch
+            docs/pr12-review-evidence-2026-10-03.md
+            budget-manifest.json
+          retention-days: 7
