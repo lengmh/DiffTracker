@@ -1,0 +1,69 @@
+name: S4-B candidate publish
+
+on:
+  push:
+    branches:
+      - validation/s4b-publish-20261004
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Prepare clean candidate from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R .s4b-payload /tmp/s4b-payload
+          git fetch origin main
+          git switch -C feat/0.8-s4b-supplemental-coverage origin/main
+
+          base64 -d /tmp/s4b-payload/diffTracker.patch.gz.b64 | gzip -d > /tmp/diffTracker.patch
+          base64 -d /tmp/s4b-payload/pr12-bounded.patch.gz.b64 | gzip -d > /tmp/pr12-bounded.patch
+          base64 -d /tmp/s4b-payload/tracker-safety.patch.gz.b64 | gzip -d > /tmp/tracker-safety.patch
+          base64 -d /tmp/s4b-payload/extension.patch.gz.b64 | gzip -d > /tmp/extension.patch
+
+          patch -p4 < /tmp/diffTracker.patch
+          patch -p4 < /tmp/pr12-bounded.patch
+          patch -p4 < /tmp/tracker-safety.patch
+          patch -p4 < /tmp/extension.patch
+          base64 -d /tmp/s4b-payload/newtest.mjs.gz.b64 | gzip -d > test/s4b-supplemental-coverage.mjs
+
+          actual="$(git status --short | awk '{print $2}' | sort)"
+          expected="$(printf '%s\n'             src/diffTracker.ts             test/host/suite/extension.test.cjs             test/pr12-bounded-invariants.mjs             test/s4b-supplemental-coverage.mjs             test/tracker-safety.mjs | sort)"
+          test "$actual" = "$expected"
+
+      - name: Validate bounded S4-B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run compile
+          DT_TEST_FILTER='S4-B' node test/tracker-safety.mjs
+          DT_TEST_FILTER='S3 broad include defers' node test/tracker-safety.mjs
+          DT_TEST_FILTER='leading-space watcher blind spots' node test/tracker-safety.mjs
+          DT_TEST_FILTER='watcherExclude change pauses' node test/tracker-safety.mjs
+          DT_TEST_FILTER='watcherExclude changing during scope preparation' node test/tracker-safety.mjs
+          npm run lint
+          npm run test:performance
+
+      - name: Publish source-only candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ShakaQAQ"
+          git config user.email "47114200+lengmh@users.noreply.github.com"
+          git add             src/diffTracker.ts             test/host/suite/extension.test.cjs             test/pr12-bounded-invariants.mjs             test/s4b-supplemental-coverage.mjs             test/tracker-safety.mjs
+          git commit -m "feat(s4b): add bounded supplemental watcher coverage"
+          git push origin HEAD:refs/heads/feat/0.8-s4b-supplemental-coverage
