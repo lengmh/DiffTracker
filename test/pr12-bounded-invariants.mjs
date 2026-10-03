@@ -1,3 +1,4 @@
+import { registerPR12RuntimeBudgetRegressions } from './pr12-runtime-identity-budget.mjs';
 import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -41,6 +42,7 @@ export function registerPR12BoundedInvariants(h) {
         }
     }
     registerPR12LiteralEntryRegressions(h, fixture, scopeFor);
+    registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 

@@ -22,6 +22,12 @@ export interface PathIdentityWorkBudget {
     }>;
 }
 
+// Internal phase is explicit: a runtime allowance must never be mistaken for
+// the caller-owned preparation budget merely because a budget object exists.
+type IdentityLookupContext =
+    | { kind: 'preparation'; budget: PathIdentityWorkBudget }
+    | { kind: 'runtime'; budget: PathIdentityWorkBudget; prefixBudget: PathIdentityWorkBudget };
+
 interface DirectoryEntryListing {
     entries: fs.Dirent[];
     byName: Map<string, fs.Dirent>;
@@ -44,7 +50,10 @@ function directoryIdentitySignature(directory: string): string {
     return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
-function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing {
+function readIdentityDirectoryEntries(
+    directory: string,
+    prefixBudget?: PathIdentityWorkBudget
+): DirectoryEntryListing {
     const handle = fs.opendirSync(directory);
     try {
         const entries: fs.Dirent[] = [];
@@ -52,9 +61,10 @@ function readIdentityDirectoryEntries(directory: string): DirectoryEntryListing 
         while (true) {
             const entry = handle.readSync();
             if (!entry) { return { entries, byName, complete: true }; }
-            if (entries.length >= maxIdentityDirectoryEntries) {
+            if (entries.length >= maxIdentityDirectoryEntries || !identityWorkAvailable(prefixBudget)) {
                 return { entries, byName, complete: false };
             }
+            consumeIdentityEntry(prefixBudget);
             entries.push(entry);
             byName.set(entry.name, entry);
         }
@@ -233,7 +243,8 @@ function invalidateDirectoryEntries(directory: string): void {
 
 function directoryEntries(
     directory: string,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    runtimePrefixBudget?: PathIdentityWorkBudget
 ): DirectoryEntryListing {
     const before = directoryIdentitySignature(directory);
     const cached = directoryEntriesCache.get(directory);
@@ -251,7 +262,14 @@ function directoryEntries(
         // the caller will stream the requested entry below.
         return { entries: [], byName: new Map(), complete: false };
     }
-    const listing = readIdentityDirectoryEntries(directory);
+    // Cache hits above cost no new directory reads. Cold/invalidated cache
+    // construction shares one prefix allowance across the entire runtime path,
+    // independently of the spelling-recovery allowance. Do not cache a fabricated
+    // empty listing when an earlier component used the remaining prefix budget.
+    if (runtimePrefixBudget && runtimePrefixBudget.remainingEntries <= 0) {
+        return { entries: [], byName: new Map(), complete: false };
+    }
+    const listing = readIdentityDirectoryEntries(directory, runtimePrefixBudget);
     if (directoryIdentitySignature(directory) === before) {
         if (directoryEntriesCache.size >= 4096 ||
             cachedDirectoryEntryCount + listing.entries.length > maxIdentityDirectoryEntries) {
@@ -281,9 +299,10 @@ function streamDirectoryEntryIdentity(
     directory: string,
     requested: string,
     requestedPath: string,
-    workBudget?: PathIdentityWorkBudget
+    context: IdentityLookupContext
 ): { actual?: string; unavailable: boolean; runtimeFallbackExhausted?: boolean } {
-    const budget = workBudget ?? { remainingEntries: maxRuntimeIdentityFallbackWorkEntries };
+    const budget = context.budget;
+    const workBudget = context.kind === 'preparation' ? context.budget : undefined;
     const directoryKey = path.resolve(directory);
     const exactKey = directoryKey + '\0' + requested;
     const beforeSignature = directoryIdentitySignature(directory);
@@ -299,6 +318,9 @@ function streamDirectoryEntryIdentity(
     }
 
     if (!evidence) {
+        if (context.kind === 'runtime' && !identityWorkAvailable(budget)) {
+            return { unavailable: true, runtimeFallbackExhausted: true };
+        }
         const entries: fs.Dirent[] = [];
         const byName = new Map<string, fs.Dirent>();
         let complete = false;
@@ -333,7 +355,7 @@ function streamDirectoryEntryIdentity(
         if (!complete) {
             return {
                 unavailable: true,
-                runtimeFallbackExhausted: !workBudget && budget.exhausted === true
+                runtimeFallbackExhausted: context.kind === 'runtime' && budget.exhausted === true
             };
         }
     }
@@ -351,7 +373,7 @@ function streamDirectoryEntryIdentity(
     if (!evidence.complete) {
         return {
             unavailable: true,
-            runtimeFallbackExhausted: !workBudget && budget.exhausted === true
+            runtimeFallbackExhausted: context.kind === 'runtime' && budget.exhausted === true
         };
     }
 
@@ -419,6 +441,15 @@ export function resolveRelativePathIdentity(
         }
     }
 
+    // Allocate once per path lookup, never once per component. Retain the
+    // existing 10k cache-prefix and 20k fallback allowances, but bound their
+    // totals even across several oversized directories and cache invalidations.
+    // Preparation keeps its original shared budget and fail-closed semantics.
+    const context: IdentityLookupContext = workBudget
+        ? { kind: 'preparation', budget: workBudget }
+        : { kind: 'runtime', budget: { remainingEntries: maxRuntimeIdentityFallbackWorkEntries },
+            prefixBudget: { remainingEntries: maxIdentityDirectoryEntries } };
+    const prefixBudget = context.kind === 'runtime' ? context.prefixBudget : undefined;
     const resolved: string[] = [];
     let current = path.resolve(rootPath);
     let physicalPrefixAvailable = true;
@@ -455,12 +486,12 @@ export function resolveRelativePathIdentity(
                     }
 
                     let listing = actual === undefined
-                        ? directoryEntries(current, workBudget)
+                        ? directoryEntries(current, workBudget, prefixBudget)
                         : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
                     let exact = actual === undefined ? listing.byName.get(requested) : undefined;
                     if (!exact && listing.complete) {
                         invalidateDirectoryEntries(current);
-                        listing = directoryEntries(current, workBudget);
+                        listing = directoryEntries(current, workBudget, prefixBudget);
                         exact = listing.byName.get(requested);
                     }
                     if (actual === undefined) {
@@ -471,7 +502,7 @@ export function resolveRelativePathIdentity(
                                 current,
                                 requested,
                                 requestedPath,
-                                workBudget
+                                context
                             );
                             actual = streamed.actual;
                             if (streamed.unavailable) {
