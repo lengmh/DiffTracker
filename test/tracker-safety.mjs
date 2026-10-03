@@ -1,3 +1,4 @@
+import { registerPR12BoundedInvariants } from './pr12-bounded-invariants.mjs';
 import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
 /** Production regression tests. Only the VS Code API boundary is faked.
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
@@ -19,6 +20,17 @@ const barriers = new Map();
 function deferred() { let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve}; }
 function pause(p,operation) { const entered=deferred(),release=deferred(); barriers.set(`${p}:${operation}`,{entered,release}); return {entered:entered.promise,release:release.resolve}; }
 async function boundary(p,operation) { const key=`${p}:${operation}`, barrier=barriers.get(key); if(barrier){barriers.delete(key); barrier.entered.resolve(); await barrier.release.promise;} }
+const policyNativeOpen=fs.promises.open;
+fs.promises.open=async(target,...args)=>{
+    const handle=await policyNativeOpen(target,...args);
+    if(path.basename(String(target))==='.gitignore'||String(target).endsWith(path.join('.git','info','exclude'))){
+        const read=handle.read.bind(handle);
+        handle.read=async(...readArgs)=>{fault(String(target),'read');const result=await read(...readArgs);await boundary(String(target),'read');return result;};
+    }
+    return handle;
+};
+const policyNativeOpendir=fs.promises.opendir;
+fs.promises.opendir=async(...args)=>{await boundary(root,'ignoreScan');return policyNativeOpendir(...args);};
 let automationOnly=false;
 let watchExclude=[];
 let listedFiles=[];
@@ -31,6 +43,21 @@ const docs = [];
 const watcherInstances = [];
 const counters = { apply: 0, save: 0, write: 0 };
 const nativeDirectoryWatchers = [];
+const nativeWriteFileSync = fs.writeFileSync.bind(fs);
+const policyArtifacts = new Set();
+fs.writeFileSync = function(target,...args) {
+    const resolved=path.resolve(String(target));
+    if(path.basename(resolved)==='.gitignore' ||
+        resolved.endsWith(path.join('.git','info','exclude'))) {
+        policyArtifacts.add(resolved);
+    }
+    return nativeWriteFileSync(target,...args);
+};
+const clearPriorPolicyArtifacts=()=>{
+    for(const policy of policyArtifacts) fs.rmSync(policy,{force:true});
+    policyArtifacts.clear();
+};
+
 const nativeWatch = fs.watch;
 fs.watch = (directory, options, listener) => {
     fault(root, 'watcher');
@@ -855,6 +882,163 @@ test('DT-07 explicit archive-and-rebuild resets only the changed repository',asy
     const archive=JSON.parse(fs.readFileSync(path.join(storage,'session-state.archive.json'),'utf8'));
     assert.ok(archive.fileSnapshots.some(([savedPath,text])=>savedPath===p&&text==='base'));
 });
+test('S4-A repository rebuild enforces persisted-byte budget before durable publication',async()=>{
+    const repoDir=path.join(root,'repo-rebuild-byte-budget');
+    fs.mkdirSync(repoDir,{recursive:true});
+    const existing=path.join(repoDir,'existing.m');
+    const candidates=Array.from({length:20},(_,candidateIndex)=>{
+        const target=path.join(repoDir,`candidate-${candidateIndex}.m`);
+        fs.writeFileSync(target,String(candidateIndex%10).repeat(900));
+        return target;
+    });
+    seed(existing,'old baseline','branch content');
+    const base={repoRoot:repoDir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const current={...base,headName:'feature',headCommit:'bbb'};
+    tracker.setBaselineGitContexts([base]);tracker.observeGitContext(current);
+    const storage=path.join(root,`storage-${index++}`);
+    tracker.storageUri=Uri.file(storage);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const beforeBytes=Buffer.byteLength(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),'utf8');
+    tracker.maxPersistedBytes=beforeBytes+1700;
+    const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+    const originalReadFile=vscode.workspace.fs.readFile;
+    let candidateReads=0;
+    tracker.findScopeFilesUnderDirectory=async()=>candidates.map(Uri.file);
+    vscode.workspace.fs.readFile=async uri=>{
+        if(candidates.includes(uri.fsPath)) candidateReads++;
+        return originalReadFile(uri);
+    };
+    try{
+        assert.equal(await tracker.rebuildRepositoryBaseline(repoDir,current),false);
+        await new Promise(resolve=>setTimeout(resolve,25));
+        assert.ok(candidateReads<candidates.length,
+            'failed rebuild budget must stop before reading the entire candidate set');
+        assert.equal(tracker.getOriginalContent(existing),'old baseline',
+            'failed rebuild must restore the archived baseline');
+        const state=tracker.buildPersistedState();
+        assert.ok(state);
+        assert.ok(Buffer.byteLength(JSON.stringify(state),'utf8')<=tracker.maxPersistedBytes,
+            'rebuild candidate must not retain content beyond the persistence byte budget');
+    } finally {
+        vscode.workspace.fs.readFile=originalReadFile;
+        tracker.findScopeFilesUnderDirectory=originalFind;
+    }
+});
+
+test('S4-A parent repository rebuild prunes nested repositories before charging traversal budget',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const repoRoot=file('parent-repo-prune');
+    const nestedRepo=path.join(repoRoot,'nested-repo');
+    fs.mkdirSync(nestedRepo,{recursive:true});
+    const parentProbe=path.join(repoRoot,'ProbeName');
+    const parentFile=path.join(repoRoot,'parent.txt');
+    const nestedFile=path.join(nestedRepo,'nested.txt');
+    fs.writeFileSync(parentProbe,'probe');
+    fs.writeFileSync(parentFile,'parent branch baseline');
+    fs.writeFileSync(nestedFile,'nested current');
+    for(let i=0;i<8;i++) fs.writeFileSync(path.join(nestedRepo,`bulk-${i}.txt`),'nested');
+    const folder={uri:Uri.file(repoRoot),name:'parent-repo'};
+    const getFolder=uri=>{
+        const relative=path.relative(repoRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(file('parent-repo-prune-storage')));
+        tracker.isRecording=false;tracker.externalWatcherEnabled=false;tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        tracker.fileSnapshots.set(parentFile,'parent old baseline');
+        tracker.fileSnapshots.set(nestedFile,'nested old baseline');
+        tracker.baselineExistingFiles.add(parentFile);
+        tracker.baselineExistingFiles.add(nestedFile);
+
+        const parentBase={repoRoot,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+        const nestedBase={repoRoot:nestedRepo,kind:'repository',headName:'main',headCommit:'nnn',detached:false,inProgress:false};
+        const parentCurrent={...parentBase,headName:'feature',headCommit:'bbb'};
+        tracker.setBaselineGitContexts([parentBase,nestedBase]);
+        tracker.observeGitContext(parentCurrent);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+
+        assert.equal(await tracker.rebuildRepositoryBaseline(repoRoot,parentCurrent),true);
+        assert.equal(tracker.getOriginalContent(parentFile),'parent branch baseline');
+        assert.equal(tracker.getOriginalContent(nestedFile),'nested old baseline',
+            'parent rebuild must preserve baselines owned by the nested repository');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+for(const layout of ['ancestor-repo','repo-workspace-with-nested-root']) test(`S4-A repository rebuild scans all overlapping workspace slices: ${layout}`,async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const repoDir=file(`rebuild-overlap-${layout}`);
+    const outerWorkspace=layout==='ancestor-repo'?path.join(repoDir,'pkg'):repoDir;
+    const nestedWorkspace=path.join(outerWorkspace,'nested');
+    fs.mkdirSync(nestedWorkspace,{recursive:true});
+    const outerFile=path.join(outerWorkspace,'outer.txt');
+    const nestedFile=path.join(nestedWorkspace,'nested.txt');
+    fs.writeFileSync(outerFile,'outer branch baseline');
+    fs.writeFileSync(nestedFile,'nested branch baseline');
+    fs.writeFileSync(path.join(outerWorkspace,'ProbeName'),'outer probe');
+    fs.writeFileSync(path.join(nestedWorkspace,'ProbeName'),'nested probe');
+    const outerFolder={uri:Uri.file(outerWorkspace),name:'outer'};
+    const nestedFolder={uri:Uri.file(nestedWorkspace),name:'nested'};
+    const getFolder=uri=>[nestedFolder,outerFolder].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    try{
+        vscode.workspace.workspaceFolders=[outerFolder,nestedFolder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(file(`rebuild-overlap-storage-${layout}`)));
+        tracker.isRecording=false;tracker.externalWatcherEnabled=false;tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        tracker.fileSnapshots.set(outerFile,'outer old baseline');
+        tracker.fileSnapshots.set(nestedFile,'nested old baseline');
+        tracker.baselineExistingFiles.add(outerFile);
+        tracker.baselineExistingFiles.add(nestedFile);
+        const base={repoRoot:repoDir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+        const current={...base,headName:'feature',headCommit:'bbb'};
+        tracker.setBaselineGitContexts([base]);
+        tracker.observeGitContext(current);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+
+        assert.equal(await tracker.rebuildRepositoryBaseline(repoDir,current),true);
+        assert.equal(tracker.getOriginalContent(outerFile),'outer branch baseline');
+        assert.equal(tracker.getOriginalContent(nestedFile),'nested branch baseline',
+            'nested workspace roots inside the repository must receive replacement baselines too');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('DT-07 repository rebuild watches files already captured while later files are scanning',async()=>{
     const repo=path.join(root,'repo-rebuild-watcher-gap');fs.mkdirSync(repo);
     const p=path.join(repo,'first.m'),q=path.join(repo,'blocked.m');seed(p,'old','branch baseline');seed(q,'old','branch baseline');
@@ -1935,6 +2119,66 @@ test('AUDIT-18 directory creation during ignore discovery cannot accept its chil
     fs.mkdirSync(dir);fs.writeFileSync(p,'new child');emitWatcher('create',Uri.file(dir));gate.release();
     await waitUntil(()=>tracker.getBaselineState()==='ready');assert.equal(tracker.getOriginalContent(p),undefined);assert.ok(pending(p)?.unavailableReason);
 });
+test('S4-A startup ignores a lone stale create proven to predate watcher activation',async()=>{
+    const p=file('startup-preexisting-create.txt');
+    fs.writeFileSync(p,'before start');
+    await new Promise(resolve=>setTimeout(resolve,2100));
+    listedFiles=[Uri.file(p)];
+    const gate=pause(root,'ignoreScan');
+    tracker.startRecording();
+    await gate.entered;
+    emitWatcher('create',Uri.file(p));
+    gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),'before start');
+    assert.equal(pending(p),undefined);
+});
+
+test('S4-A startup keeps a genuine post-Start create unresolved',async()=>{
+    const p=file('startup-post-create.txt');
+    const gate=pause(root,'ignoreScan');
+    tracker.startRecording();
+    await gate.entered;
+    await new Promise(resolve=>setTimeout(resolve,5));
+    fs.writeFileSync(p,'created after start');
+    listedFiles=[Uri.file(p)];
+    emitWatcher('create',Uri.file(p));
+    gate.release();
+    await waitUntil(()=>tracker.getBaselineState()==='ready');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.ok(pending(p)?.unavailableReason);
+});
+
+test('S4-A startup rounded-back timestamps remain ambiguous inside the safety margin',async()=>{
+    const p=file('startup-rounded-create.txt');
+    fs.writeFileSync(p,'rounded');
+    const boundaryMs=Date.now();
+    const boundaryMono=process.hrtime.bigint();
+    const event={uri:Uri.file(p),firstKind:'create',kind:'create'};
+    const originalStatSync=fs.statSync;
+    try{
+        fs.statSync=(target,...args)=>{
+            const stat=originalStatSync(target,...args);
+            if(path.resolve(String(target))!==path.resolve(p)) return stat;
+            const rounded=Object.create(stat);
+            const value=boundaryMs-1000;
+            Object.defineProperties(rounded,{
+                birthtimeMs:{value,configurable:true},
+                mtimeMs:{value,configurable:true},
+                ctimeMs:{value,configurable:true}
+            });
+            return rounded;
+        };
+        assert.equal(
+            tracker.startupCreatePredatesWatchBoundary(event,boundaryMs,boundaryMono),
+            false,
+            'timestamps only one second before activation are ambiguous under the 2s safety margin'
+        );
+    } finally {
+        fs.statSync=originalStatSync;
+    }
+});
+
 for(const resource of ['directory','file']) test(`AUDIT-19 startup transient ${resource} leaves no persistent review entry`,async()=>{
     const p=file('transient'),storage=file('storage');tracker.storageUri=Uri.file(storage);
     const gate=pause(root,'ignoreScan');tracker.startRecording();await gate.entered;
@@ -2792,6 +3036,54 @@ for(const scopeName of ['sub[1]','#scope','!scope']) test(`ROUND26 nested ignore
     try{tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');for(const p of files){const result=spawnSync('git',['check-ignore','--no-index','-q','--',path.relative(dir,p)],{cwd:dir});assert.ok(result.status===0||result.status===1);assert.equal(tracker.testIgnorePath(p).ignored,result.status===0,path.relative(dir,p));assert.equal(tracker.getOriginalContent(p),result.status===0?undefined:'content',path.relative(dir,p));}}
     finally{vscode.workspace.workspaceFolders=folders;vscode.workspace.getWorkspaceFolder=folderFor;}
 });
+test('S4-A populated Whole Workspace creation stops at remaining text-snapshot capacity',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-created-capacity-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'created-capacity'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+        tracker.maxPersistedSnapshots=1;
+        const probe=path.join(workspaceRoot,'ProbeName');
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        const dir=path.join(workspaceRoot,'copied');
+        const child=path.join(dir,'child.txt');
+        fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(child,'new');
+        await tracker.onExternalFileCreated(Uri.file(dir));
+        assert.equal(tracker.fileSnapshots.has(child),false,
+            'a populated create must not consume unused opaque/unresolved slots when text capacity is full');
+        assert.equal(pending(child),undefined);
+        assert.match(subtreeGap(dir)?.reason??'',/could not be scanned|coverage/i);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
 test('ROUND26 populated directory notification records every included descendant without rule changes',async()=>{
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');
     const dir=file('copied'),a=path.join(dir,'a.txt'),b=path.join(dir,'deep','empty.txt');fs.mkdirSync(path.dirname(b),{recursive:true});fs.writeFileSync(a,'copied');fs.writeFileSync(b,'');listedFiles=[Uri.file(a),Uri.file(b)];
@@ -2877,19 +3169,24 @@ for(const block of [false,true]) for(const failure of ['write','git']) for(const
 for(const failure of ['limit','quota','read']) test(`ROUND27 watcher ${failure} cleans partial coverage and still discovers files`,async()=>{
     const existing=file('watched-existing');fs.mkdirSync(existing);tracker.watchImportedDirectory(existing,tracker.sessionEpoch);
     const dir=file('watch-limit'),child=path.join(dir,'deep'),p=path.join(child,'file.txt');fs.mkdirSync(child,{recursive:true});fs.writeFileSync(p,'imported');listedFiles=[Uri.file(p)];
-    const originalWatch=fs.watch,originalRead=fs.promises.readdir;
+    const originalWatch=fs.watch,originalOpen=fs.promises.opendir;
+    let failWatchRead=true;
     if(failure==='limit')tracker.maxImportedDirectoryWatchers=2;
     if(failure==='quota')fs.watch=(directory,...args)=>{if(directory===child)throw error('ENOSPC');return originalWatch(directory,...args);};
-    if(failure==='read')fs.promises.readdir=async(directory,...args)=>{if(directory===child)throw error('EACCES');return originalRead(directory,...args);};
+    if(failure==='read')fs.promises.opendir=async(directory,...args)=>{
+        if(directory===child&&failWatchRead){failWatchRead=false;throw error('EACCES');}
+        return originalOpen(directory,...args);
+    };
     try{
         for(let attempt=0;attempt<2;attempt++){
+            failWatchRead=true;
             await tracker.onExternalFileCreated(Uri.file(dir));
             assert.equal(pending(p)?.currentContent,'imported');assert.equal(pending(p)?.unavailableReason,undefined);
             assert.equal(pending(dir),undefined);
             assert.match(subtreeGap(dir)?.reason??'',/watch coverage is incomplete/);
             assert.deepEqual(nativeDirectoryWatchers.filter(w=>w.active).map(w=>w.directory),[existing]);
         }
-    }finally{fs.watch=originalWatch;fs.promises.readdir=originalRead;}
+    }finally{fs.watch=originalWatch;fs.promises.opendir=originalOpen;}
 });
 
 
@@ -2975,21 +3272,21 @@ for(const failScan of [false,true]) test(`ROUND27 same-fingerprint watch retry r
 for(const failResume of [false,true]) test(`ROUND27 stale failed ${failResume?'watch resume':'reconciliation'} cannot overwrite a newer success`,async()=>{
     tracker.storageUri=Uri.file(file('storage'));tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('stale-reconcile'),p=path.join(dir,'known.txt');fs.mkdirSync(dir);fs.writeFileSync(p,'base');listedFiles=[Uri.file(p)];await tracker.onExternalFileCreated(Uri.file(dir));await tracker.keepAllChangesInFile(p);
     const watcher=nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir);watcher.error(error('ENOSPC'));await waitUntil(()=>!!subtreeGap(dir));assert.equal(pending(dir),undefined);
-    const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,read=fs.promises.readdir;let first=true;
-    if(failResume)fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return read(directory,...args);};
+    const entered=deferred(),release=deferred(),find=vscode.workspace.findFiles,open=fs.promises.opendir;let first=true;
+    if(failResume)fs.promises.opendir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;throw error('old resume');}return open(directory,...args);};
     else vscode.workspace.findFiles=async pattern=>{if(pattern.pattern==='**/*'&&first){first=false;entered.resolve();await release.promise;throw error('old scan');}return find(pattern);};
     const old=tracker.refreshIgnoreMatchers();const oldResult=old.then(()=>null,e=>e);
     try{await entered.promise;if(failResume){nativeDirectoryWatchers.find(w=>w.active&&w.directory===dir).error(error('ENOSPC'));}fs.writeFileSync(p,'latest');const latest=tracker.refreshIgnoreMatchers();if(failResume)release.resolve();await latest;assert.equal(pending(p)?.currentContent,'latest');assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);release.resolve();assert.equal(await oldResult,null);assert.equal(subtreeGap(dir),undefined);assert.equal(pending(dir),undefined);assert.equal(tracker.fileSnapshots.has(dir),false);}
-    finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.readdir=read;}
+    finally{release.resolve();await oldResult;vscode.workspace.findFiles=find;fs.promises.opendir=open;}
 });
 
 
 for(const stop of [false,true]) test(`ROUND27 overlapping successful watch resume retains reconciliation (stop=${stop})`,async()=>{
     tracker.startRecording();await waitUntil(()=>tracker.getBaselineState()==='ready');const dir=file('overlap-resume'),sub=dir,p=path.join(sub,'known.txt'),deleted=path.join(sub,'deleted.txt');fs.mkdirSync(sub,{recursive:true});for(const f of [p,deleted])fs.writeFileSync(f,'base');listedFiles=[p,deleted].map(Uri.file);await tracker.onExternalFileCreated(Uri.file(dir));for(const f of [p,deleted])await tracker.keepAllChangesInFile(f);
     watchExclude=[path.basename(dir)+'/'];await tracker.refreshIgnoreMatchers();fs.writeFileSync(p,'gap edit');fs.unlinkSync(deleted);const q=path.join(sub,'gap-new.txt');fs.writeFileSync(q,'gap new');listedFiles=[p,q].map(Uri.file);watchExclude=[];
-    const read=fs.promises.readdir,entered=deferred(),release=deferred();let first=true;fs.promises.readdir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return read(directory,...args);};
+    const open=fs.promises.opendir,entered=deferred(),release=deferred();let first=true;fs.promises.opendir=async(directory,...args)=>{if(directory===dir&&first){first=false;entered.resolve();await release.promise;}return open(directory,...args);};
     const old=tracker.refreshIgnoreMatchers();try{await entered.promise;const newer=tracker.refreshIgnoreMatchers();if(stop)tracker.stopRecording();release.resolve();await Promise.all([old,newer]);if(stop){assert.equal(nativeDirectoryWatchers.filter(w=>w.active).length,0);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);return;}assert.equal(pending(p)?.currentContent,'gap edit');assert.equal(pending(deleted)?.isDeleted,true);assert.ok(pending(q));assert.ok(pending(q)?.unavailableReason);assert.equal(tracker.pendingImportedDirectoryReconciliation.size,0);}
-    finally{release.resolve();await old;fs.promises.readdir=read;}
+    finally{release.resolve();await old;fs.promises.opendir=open;}
 });
 
 registerOpaqueBaselineInvariants({
@@ -3068,6 +3365,1667 @@ test('S3 broad include defers when watcherExclude can hide a descendant',async()
     };
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
     assert.equal(result.status,'requiresS4',JSON.stringify(result));
+});
+
+
+test('S4-A bounded preflight discovers Whole Workspace candidates without reading contents or mutating baseline',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-preflight-workspace');
+    const keptDir=path.join(workspaceRoot,'kept');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    const gitDir=path.join(workspaceRoot,'.git');
+    fs.mkdirSync(keptDir,{recursive:true});
+    fs.mkdirSync(excludedDir,{recursive:true});
+    fs.mkdirSync(gitDir,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const keptFile=path.join(keptDir,'visible.txt');
+    fs.writeFileSync(keptFile,'visible');
+    fs.writeFileSync(path.join(excludedDir,'secret.txt'),'secret');
+    fs.writeFileSync(path.join(gitDir,'config'),'git metadata');
+    faults.set(keptFile,{read:error('preflight-must-not-read-content')});
+
+    const folder={uri:Uri.file(workspaceRoot),name:'preflight'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(roots.length,1);
+        assert.equal(typeof roots[0].caseSensitive,'boolean');
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],
+            scopeRevision:'s4a-preflight-whole'
+        };
+        const before={
+            text:tracker.fileSnapshots.size,
+            opaque:tracker.opaqueBaselineFiles.size,
+            unresolved:tracker.unresolvedBaselineFiles.size,
+            effective:tracker.getEffectiveMonitoringScope()
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.truncated,false);
+        assert.equal(result.candidateFiles,2,'ProbeName and kept/visible.txt are Whole Workspace candidates');
+        assert.ok(result.skippedExplicitExclusions>=1,'explicitly excluded descendants are pruned');
+        assert.ok(result.skippedHardBoundaries>=1,'.git remains an unmonitorable hard boundary');
+        assert.equal(tracker.fileSnapshots.size,before.text);
+        assert.equal(tracker.opaqueBaselineFiles.size,before.opaque);
+        assert.equal(tracker.unresolvedBaselineFiles.size,before.unresolved);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before.effective,
+            'preflight must not publish the candidate scope or establish baseline state');
+    } finally {
+        faults.delete(keptFile);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Rules preflight prunes ordinary-policy ignored directories unless explicitly included',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-rules-preflight-ignore');
+    const ignoredDir=path.join(workspaceRoot,'node_modules');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    fs.mkdirSync(ignoredDir,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(path.join(ignoredDir,'needed.txt'),'needed');
+    fs.writeFileSync(gitignore,'node_modules/\n');
+    const folder={uri:Uri.file(workspaceRoot),name:'rules-preflight'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let ignoredOpendirAttempts=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        await tracker.refreshIgnoreMatchers();
+        const roots=tracker.currentWorkspaceRootIdentities();
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(ignoredDir)){
+                ignoredOpendirAttempts++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+
+        const ordinaryScope={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[],scopeRevision:'rules-ignore-prune'
+        };
+        const ordinary=await tracker.preflightConfiguredMonitoringScope(ordinaryScope,()=>true);
+        assert.equal(ordinary.status,'ready',JSON.stringify(ordinary));
+        assert.equal(ordinary.unreadableDirectoryCount,0,
+            'ordinary-policy ignored directories must not be opened during Rules preflight');
+        assert.equal(ignoredOpendirAttempts,0);
+
+        const includedScope={
+            ...ordinaryScope,
+            includes:[{scope:'all',path:'node_modules/needed.txt'}],
+            scopeRevision:'rules-ignore-explicit-include'
+        };
+        const included=await tracker.preflightConfiguredMonitoringScope(includedScope,()=>true);
+        assert.equal(included.status,'ready',JSON.stringify(included));
+        assert.equal(included.unreadableDirectoryCount,1,
+            'explicit include keeps traversal obligation through an ordinarily ignored directory');
+        assert.equal(ignoredOpendirAttempts,1);
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Rules preflight rebuilds existing-root matcher when an explicit subtree exclusion is removed',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('preflight-existing-root-scope-expansion');
+    const vendor=path.join(workspaceRoot,'vendor');
+    const generated=path.join(vendor,'generated');
+    const gitignore=path.join(vendor,'.gitignore');
+    fs.mkdirSync(generated,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(gitignore,'generated/\n');
+    fs.writeFileSync(path.join(generated,'bulk.txt'),'ignored by nested policy');
+    const folder={uri:Uri.file(workspaceRoot),name:'existing-scope-expansion'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let generatedOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+
+        const committed={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],
+            excludes:[{scope:'all',pattern:'vendor/**'}],scopeRevision:''
+        };
+        committed.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:committed.mode,roots:committed.roots,includes:committed.includes,excludes:committed.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=committed;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.ignoreMatchers.get(workspaceRoot)?.ignores('vendor/generated/'),false,
+            'committed matcher must omit nested policy from the explicitly excluded subtree');
+
+        const requested={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        requested.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:requested.mode,roots:requested.roots,includes:requested.includes,excludes:requested.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(generated)){
+                generatedOpens++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(requested,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.unreadableDirectoryCount,0,
+            'candidate-scope nested ignore policy must prune generated before traversal');
+        assert.equal(generatedOpens,0);
+        assert.equal(tracker.ignoreMatchers.get(workspaceRoot)?.ignores('vendor/generated/'),false,
+            'candidate matcher must remain local to preflight and not overwrite committed matcher state');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Rules preflight loads ordinary ignore policy for a newly added workspace root',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=file('preflight-existing-root');
+    const rootB=file('preflight-added-root');
+    const ignoredDir=path.join(rootB,'node_modules');
+    fs.mkdirSync(rootA,{recursive:true});
+    fs.mkdirSync(ignoredDir,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
+    fs.writeFileSync(path.join(ignoredDir,'package.txt'),'ignored');
+    const folderA={uri:Uri.file(rootA),name:'existing'};
+    const folderB={uri:Uri.file(rootB),name:'added'};
+    const getFolder=uri=>[folderA,folderB].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    const originalOpendir=fs.promises.opendir;
+    let ignoredOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folderA];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        vscodeExcludes['files.exclude']={node_modules:true};
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.ignoreMatchers.has(rootB),false);
+
+        vscode.workspace.workspaceFolders=[folderA,folderB];
+        workspaceChanged({added:[folderB],removed:[]});
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'rules',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(ignoredDir)){
+                ignoredOpens++;
+                throw error('EACCES');
+            }
+            return originalOpendir(target,...args);
+        };
+        const result=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(result.status,'ready',JSON.stringify(result));
+        assert.equal(result.unreadableDirectoryCount,0,
+            'new-root node_modules must be pruned by ordinary policy before traversal');
+        assert.equal(ignoredOpens,0);
+        assert.equal(tracker.ignoreMatchers.has(rootB),false,
+            'preflight may build a local matcher but must not publish candidate matcher state');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A bounded preflight truncates at its work budget and invalidates stale requests',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-preflight-limit');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    for(let index=0;index<8;index++) fs.writeFileSync(path.join(workspaceRoot,`file-${index}.txt`),'x');
+    const folder={uri:Uri.file(workspaceRoot),name:'preflight-limit'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[],scopeRevision:'s4a-preflight-limit'
+        };
+        const bounded=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(bounded.status,'ready',JSON.stringify(bounded));
+        assert.equal(bounded.truncated,true);
+        assert.equal(bounded.entryLimit,3);
+        assert.equal(bounded.inspectedEntries,3);
+        assert.ok(bounded.candidateFiles<=3);
+        const stale=await tracker.preflightConfiguredMonitoringScope(scope,()=>false);
+        assert.equal(stale.status,'conflict');
+        assert.equal(stale.inspectedEntries,0);
+        assert.match(stale.reason,/changed before preflight/i);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace publishes only after candidate baselines are durably prepared',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-whole-apply');
+    const storage=file('s4a-whole-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const ordinary=path.join(workspaceRoot,'ordinary-ignored.txt');
+    const visible=path.join(workspaceRoot,'visible.txt');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    fs.mkdirSync(excludedDir,{recursive:true});
+    const excluded=path.join(excludedDir,'secret.txt');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    fs.writeFileSync(gitignore,'ordinary-ignored.txt\n');
+    fs.writeFileSync(ordinary,'ordinary baseline');
+    fs.writeFileSync(visible,'visible baseline');
+    fs.writeFileSync(excluded,'secret');
+    const folder={uri:Uri.file(workspaceRoot),name:'whole'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],
+            scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+        assert.equal(tracker.getOriginalContent(ordinary),'ordinary baseline',
+            'Whole Workspace overrides ordinary ignore policy during candidate capture');
+        assert.equal(tracker.getOriginalContent(visible),'visible baseline');
+        assert.equal(tracker.getOriginalContent(excluded),undefined,'explicit exclusions remain outside Whole Workspace');
+        assert.equal(pending(ordinary),undefined);
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        assert.equal(saved.effectiveMonitoringScope.mode,'wholeWorkspace');
+        assert.ok(saved.fileSnapshots.some(([filePath])=>filePath===ordinary),
+            'candidate baseline must be durable before effective scope publication returns applied');
+    } finally {
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A exclude-removal expansion captures newly admitted resources before publication',async()=>{
+    const generated=file('s4a-generated');
+    fs.mkdirSync(generated,{recursive:true});
+    const admitted=path.join(generated,'new.txt');
+    fs.writeFileSync(admitted,'newly admitted baseline');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    assert.ok(roots.length>0,'fixture must expose at least one verified workspace root');
+    const relativeGenerated=path.relative(root,generated).split(path.sep).join('/');
+    const effective={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:`${relativeGenerated}/**`}],
+        scopeRevision:''
+    };
+    effective.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:effective.mode,roots:effective.roots,includes:effective.includes,excludes:effective.excludes
+    })).digest('hex');
+    tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(effective));
+    const requested={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[],scopeRevision:''
+    };
+    requested.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:requested.mode,roots:requested.roots,includes:requested.includes,excludes:requested.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(admitted),'newly admitted baseline');
+    assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,requested.scopeRevision);
+});
+
+test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-start-byte-workspace');
+    const storage=file('s4a-start-byte-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    const files=Array.from({length:20},(_,indexValue)=>{
+        const target=path.join(workspaceRoot,`candidate-${indexValue}.txt`);
+        fs.writeFileSync(target,String(indexValue%10).repeat(900));
+        return target;
+    });
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'start-byte'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    let originalFind;
+    const originalReadFile=vscode.workspace.fs.readFile;
+    let candidateReads=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+        const projected=tracker.ignoreFingerprint;
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=projected;
+        tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(state),'utf8')+1500;
+        originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        tracker.findScopeFilesUnderDirectory=async()=>files.map(Uri.file);
+        vscode.workspace.fs.readFile=async uri=>{
+            if(files.includes(uri.fsPath)) candidateReads++;
+            return originalReadFile(uri);
+        };
+
+        await assert.rejects(
+            ()=>tracker.initializeWorkspaceSnapshots(),
+            /persisted byte capacity|exceed.*bytes/i
+        );
+        await new Promise(resolve=>setTimeout(resolve,25));
+        assert.ok(candidateReads<files.length,
+            'a failed Start budget must stop workers before the full candidate set is read');
+        const retained=tracker.buildPersistedState();
+        assert.ok(retained);
+        assert.ok(Buffer.byteLength(JSON.stringify(retained),'utf8')<=tracker.maxPersistedBytes,
+            'Start must stop retaining baselines before the durable byte limit is exceeded');
+        assert.equal(tracker.getBaselineState(),'building');
+    } finally {
+        vscode.workspace.fs.readFile=originalReadFile;
+        if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A universal root exclusion prunes preflight and candidate traversal before opendir',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-universal-prune-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    for(let n=0;n<5;n++) fs.writeFileSync(path.join(workspaceRoot,`entry-${n}.txt`),'x');
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'universal-prune'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let rootOpens=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=1;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],
+            excludes:[{scope:'all',pattern:'**'}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))===path.resolve(workspaceRoot)) rootOpens++;
+            return originalOpendir(target,...args);
+        };
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.inspectedEntries,0);
+        assert.equal(preflight.truncated,false);
+        const files=await tracker.enumerateConfiguredCandidateFiles(
+            scope,tracker.sessionEpoch,undefined,undefined,{remainingEntries:1}
+        );
+        assert.deepEqual(files,[]);
+        assert.equal(rootOpens,0,'universally excluded roots must be pruned before opening the directory');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace Start does not charge a candidate excluded while its read is pending',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('start-late-exclusion-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    const candidate=path.join(workspaceRoot,'candidate.txt');
+    fs.writeFileSync(candidate,'x'.repeat(2048));
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'late-exclusion'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    let originalFind;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(file('start-late-exclusion-storage')));
+        originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        tracker.findScopeFilesUnderDirectory=async()=>[Uri.file(candidate)];
+
+        await tracker.refreshIgnoreMatchers();
+        const state=tracker.buildPersistedState();
+        state.scanCoverage=tracker.ignoreFingerprint;
+        tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(state),'utf8')+256;
+
+        const gate=pause(candidate,'read');
+        const scanning=tracker.initializeWorkspaceSnapshots();
+        await gate.entered;
+        const pendingScope={...scope,excludes:[{scope:'all',pattern:'candidate.txt'}],scopeRevision:'pending'};
+        tracker.setPendingMonitoringScope(pendingScope);
+        gate.release();
+        await scanning;
+
+        assert.equal(tracker.getOriginalContent(candidate),undefined);
+        assert.equal(tracker.getBaselineState(),'ready',
+            'a candidate rejected after its read must not consume the persistence budget');
+    } finally {
+        if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace Start does not double-charge existing unresolved startup evidence',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('start-existing-unresolved-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    const candidate=path.join(workspaceRoot,'candidate.txt');
+    fs.writeFileSync(candidate,'candidate');
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(workspaceRoot),name:'existing-unresolved'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    let originalFind;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(file('start-existing-unresolved-storage')));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=false;tracker.baselineBuilding=true;
+        tracker.maxPersistedSnapshots=1;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        tracker.unresolvedBaselineFiles.set(candidate,'File changed during ignore discovery; before-image is unknown');
+        tracker.scanUncertainFiles.add(candidate);
+        originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
+        tracker.findScopeFilesUnderDirectory=async()=>[Uri.file(candidate)];
+
+        await tracker.initializeWorkspaceSnapshots();
+        assert.equal(tracker.getBaselineState(),'ready');
+        assert.equal(tracker.unresolvedBaselineFiles.size,1);
+        assert.match(tracker.unresolvedBaselineFiles.get(candidate)??'',/before-image is unknown/i);
+        assert.equal(tracker.getOriginalContent(candidate),undefined);
+    } finally {
+        if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A stopped Whole Workspace apply publishes scope without acquiring before-images, then Start rebuilds them',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-stopped-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const candidate=path.join(workspaceRoot,'candidate.txt');
+    fs.writeFileSync(candidate,'stopped candidate');
+    const folder={uri:Uri.file(workspaceRoot),name:'stopped-whole'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.stopRecording();
+        const roots=tracker.currentWorkspaceRootIdentities();
+        assert.equal(roots.length,1);
+        assert.equal(typeof roots[0].caseSensitive,'boolean');
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(result.capturedBaselines,0);
+        assert.equal(tracker.getOriginalContent(candidate),undefined,
+            'Apply while stopped must not acquire a new before-image');
+        assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+        tracker.startRecording();
+        await waitUntil(()=>tracker.getBaselineState()==='ready',2000);
+        assert.equal(tracker.getIsRecording(),true);
+        assert.equal(tracker.getOriginalContent(candidate),'stopped candidate',
+            'Start must rebuild the Whole Workspace baseline under the already-effective scope');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A persisted Whole Workspace recording restores when no supplemental coverage gap exists',async()=>{
+    const storage=file('s4a-whole-restore-storage');
+    const candidate=file('s4a-whole-restore.txt');
+    fs.writeFileSync(candidate,'whole restore baseline');
+    tracker.storageUri=Uri.file(storage);
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    assert.equal(tracker.getOriginalContent(candidate),'whole restore baseline');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    const outcome=await tracker.restorePersistedState();
+    assert.equal(outcome,'restored');
+    assert.equal(tracker.getIsRecording(),true);
+    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+    assert.equal(tracker.getOriginalContent(candidate),'whole restore baseline');
+});
+
+test('S4-A persistence capacity remains independent across baseline categories for apply and restore',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-category-mix-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    const probe=path.join(workspaceRoot,'ProbeName');
+    const opaque=path.join(workspaceRoot,'opaque.bin');
+    const admitted=path.join(workspaceRoot,'admitted.txt');
+    const restoredCandidate=path.join(workspaceRoot,'restored.txt');
+    fs.writeFileSync(probe,'probe');
+    fs.writeFileSync(opaque,Buffer.from([0,1,2,3]));
+    fs.writeFileSync(admitted,'admitted');
+    const folder={uri:Uri.file(workspaceRoot),name:'category-mix'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=2;
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        const opaqueStat=fs.statSync(opaque);
+        tracker.opaqueBaselineFiles.set(opaque,{
+            reason:'Binary content is unsupported',
+            size:opaqueStat.size,
+            mtime:opaqueStat.mtimeMs,
+            fingerprint:'a'.repeat(64)
+        });
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const applied=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(applied.status,'applied',JSON.stringify(applied));
+        assert.equal(tracker.getOriginalContent(admitted),'admitted',
+            'one text slot remains even though the combined durable-resource count already equals the per-category limit');
+
+        fs.writeFileSync(restoredCandidate,'restored');
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=2;
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.baselineExistingFiles.add(probe);
+        tracker.opaqueBaselineFiles.set(opaque,{
+            reason:'Binary content is unsupported',
+            size:opaqueStat.size,
+            mtime:opaqueStat.mtimeMs,
+            fingerprint:'a'.repeat(64)
+        });
+        tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(scope));
+        await tracker.refreshIgnoreMatchers();
+        await tracker.discoverRestoredFiles(tracker.sessionEpoch);
+        assert.ok(tracker.unresolvedBaselineFiles.has(admitted));
+        assert.ok(tracker.unresolvedBaselineFiles.has(restoredCandidate),
+            'restore must use the unresolved category capacity instead of a combined global resource count');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A per-category capacity overflow stops later candidate reads',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-category-overflow-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const first=path.join(workspaceRoot,'first.txt');
+    const overflow=path.join(workspaceRoot,'overflow.txt');
+    const guarded=path.join(workspaceRoot,'guarded.txt');
+    fs.writeFileSync(first,'first');
+    fs.writeFileSync(overflow,'overflow');
+    fs.writeFileSync(guarded,'must not be read');
+    const folder={uri:Uri.file(workspaceRoot),name:'category-overflow'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    let originalEnumerate;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxPersistedSnapshots=1;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[first,overflow,guarded];
+        faults.set(guarded,{read:error('later-candidate-read-after-category-overflow')});
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason??'',/text.*snapshot.*capacity|snapshot.*capacity.*text/i);
+        assert.doesNotMatch(result.reason??'',/later-candidate-read-after-category-overflow/);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.getOriginalContent(first),undefined,
+            'category-capacity failure must roll back earlier candidate baselines');
+        assert.equal(tracker.getOriginalContent(overflow),undefined);
+        assert.equal(tracker.getOriginalContent(guarded),undefined);
+    } finally {
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
+        faults.delete(guarded);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace falls back to lstat for unknown Dirent types',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('unknown-dirent-workspace');
+    const nested=path.join(workspaceRoot,'nested');
+    fs.mkdirSync(nested,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const unknownFile=path.join(workspaceRoot,'unknown.txt');
+    const nestedFile=path.join(nested,'child.txt');
+    fs.writeFileSync(unknownFile,'unknown');
+    fs.writeFileSync(nestedFile,'nested');
+    const folder={uri:Uri.file(workspaceRoot),name:'unknown-dirent'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    const unknown=name=>({
+        name,
+        isSymbolicLink:()=>false,
+        isDirectory:()=>false,
+        isFile:()=>false
+    });
+    const knownFile=name=>({
+        name,
+        isSymbolicLink:()=>false,
+        isDirectory:()=>false,
+        isFile:()=>true
+    });
+    const originalOpendir=fs.promises.opendir;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        fs.promises.opendir=async(target,...args)=>{
+            if(path.resolve(String(target))!==path.resolve(workspaceRoot)){
+                return originalOpendir(target,...args);
+            }
+            const entries=[knownFile('ProbeName'),unknown('unknown.txt'),unknown('nested')];
+            return {
+                readSync:()=>entries.shift()??null,
+                closeSync:()=>{}
+            };
+        };
+
+        const files=await tracker.enumerateConfiguredCandidateFiles(scope,tracker.sessionEpoch);
+        const canonical=new Set(files.map(filePath=>path.resolve(filePath)));
+        assert.ok(canonical.has(path.resolve(unknownFile)),
+            'unknown file Dirent must be classified with lstat');
+        assert.ok(canonical.has(path.resolve(nestedFile)),
+            'unknown directory Dirent must be classified with lstat and traversed');
+    } finally {
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A candidate preparation bounds directory-only traversal after truncated preflight',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-directory-budget-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    for(let index=0;index<8;index++){
+        fs.mkdirSync(path.join(workspaceRoot,`empty-${index}`),{recursive:true});
+    }
+    const folder={uri:Uri.file(workspaceRoot),name:'directory-budget'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=3;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.truncated,true,'precondition: advisory preflight reaches its entry budget');
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason,/preparation work budget.*directory entries/i);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before,
+            'bounded preparation failure must not publish any part of Whole Workspace');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A persisted-byte capacity failure restores the prior durable scope atomically',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-byte-workspace');
+    const storage=file('s4a-byte-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const large=path.join(workspaceRoot,'large.txt');
+    fs.writeFileSync(large,'x'.repeat(4096));
+    const folder={uri:Uri.file(workspaceRoot),name:'bytes'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const primary=path.join(storage,'session-state.json');
+        const beforeRaw=fs.readFileSync(primary,'utf8');
+        const beforeState=JSON.parse(beforeRaw);
+        tracker.maxPersistedBytes=Buffer.byteLength(beforeRaw,'utf8')+512;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason,/durably|persist|state exceeds/i);
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,beforeState.effectiveMonitoringScope.scopeRevision);
+        assert.equal(tracker.getOriginalContent(large),undefined);
+        const afterState=JSON.parse(fs.readFileSync(primary,'utf8'));
+        assert.equal(afterState.effectiveMonitoringScope.scopeRevision,beforeState.effectiveMonitoringScope.scopeRevision);
+        assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false,
+            'safe rollback clears the candidate incomplete-write marker');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A persisted-byte budget aborts candidate capture before later reads',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-byte-early-workspace');
+    const storage=file('s4a-byte-early-storage');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.mkdirSync(storage,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const first=path.join(workspaceRoot,'first.txt');
+    const overflow=path.join(workspaceRoot,'overflow.txt');
+    const guarded=path.join(workspaceRoot,'guarded.txt');
+    fs.writeFileSync(first,'a'.repeat(256));
+    fs.writeFileSync(overflow,'b'.repeat(4096));
+    fs.writeFileSync(guarded,'must not be read');
+    const folder={uri:Uri.file(workspaceRoot),name:'byte-early'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative))
+            ? folder : undefined;
+    };
+    let originalEnumerate;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker(Uri.file(storage));
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const committed=tracker.effectiveMonitoringScope;
+        tracker.effectiveMonitoringScope=JSON.parse(JSON.stringify(scope));
+        const candidateBaseBytes=Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
+        tracker.effectiveMonitoringScope=committed;
+        tracker.maxPersistedBytes=candidateBaseBytes+1024;
+
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[first,overflow,guarded];
+        faults.set(guarded,{read:error('later-candidate-read-after-byte-overflow')});
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'failed',JSON.stringify(result));
+        assert.match(result.reason??'',/persisted.*byte|byte.*capacity|exceed.*bytes/i);
+        assert.doesNotMatch(result.reason??'',/later-candidate-read-after-byte-overflow/);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        assert.equal(tracker.getOriginalContent(first),undefined,
+            'byte-capacity failure must roll back earlier candidate baselines');
+        assert.equal(tracker.getOriginalContent(overflow),undefined);
+        assert.equal(tracker.getOriginalContent(guarded),undefined);
+    } finally {
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
+        faults.delete(guarded);
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A rollback retains candidate-only change evidence instead of accepting it on retry',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-event-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const gitignore=path.join(workspaceRoot,'.gitignore');
+    const candidateOnly=path.join(workspaceRoot,'candidate-only.txt');
+    const guarded=path.join(workspaceRoot,'guarded-after-event.txt');
+    fs.writeFileSync(gitignore,'candidate-only.txt\nguarded-after-event.txt\n');
+    fs.writeFileSync(candidateOnly,'before preparation');
+    fs.writeFileSync(guarded,'must not be read after invalidation');
+    const folder={uri:Uri.file(workspaceRoot),name:'event'};
+    let originalEnumerate;
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+            ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        listedIgnores=[Uri.file(gitignore)];
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.testIgnorePath(candidateOnly).ignored,true,'precondition: old Rules scope ignores the file');
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        const before=tracker.getEffectiveMonitoringScope();
+        originalEnumerate=tracker.enumerateConfiguredCandidateFiles.bind(tracker);
+        tracker.enumerateConfiguredCandidateFiles=async()=>[candidateOnly,guarded];
+        faults.set(guarded,{read:error('continued-reading-after-transaction-invalidated')});
+        const gate=pause(candidateOnly,'read');
+        const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        await gate.entered;
+        fs.writeFileSync(candidateOnly,'changed during preparation');
+        await tracker.onExternalFileChanged(Uri.file(candidateOnly));
+        gate.release();
+        const result=await applying;
+        assert.notEqual(result.status,'applied',JSON.stringify(result));
+        assert.doesNotMatch(result.reason??'',/continued-reading-after-transaction-invalidated/);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+        const review=pending(candidateOnly);
+        assert.equal(review?.reviewKind,'unknown');
+        assert.match(review?.unavailableReason??'',/rejected monitoring-scope preparation/i);
+        assert.ok(tracker.getRetainedReviewPaths().includes(candidateOnly),
+            'candidate-only uncertainty remains retained outside the restored Rules scope');
+        assert.equal(tracker.getOriginalContent(candidateOnly),undefined,
+            'the changed bytes must never become an accepted baseline during rollback');
+    } finally {
+        if(originalEnumerate) tracker.enumerateConfiguredCandidateFiles=originalEnumerate;
+        faults.delete(guarded);
+        listedIgnores=[];
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A broad preparation aborts traversal immediately after transaction invalidation',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('s4a-invalidated-enumeration');
+    const nested=path.join(workspaceRoot,'late');
+    fs.mkdirSync(nested,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    const trigger=path.join(workspaceRoot,'trigger.txt');
+    fs.writeFileSync(trigger,'before');
+    for(let index=0;index<8;index++) fs.writeFileSync(path.join(nested,`file-${index}.txt`),'x');
+    const folder={uri:Uri.file(workspaceRoot),name:'invalidated-enumeration'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    const originalOpendir=fs.promises.opendir;
+    let enteredResolve,releaseResolve;
+    const entered=new Promise(resolve=>{enteredResolve=resolve;});
+    const release=new Promise(resolve=>{releaseResolve=resolve;});
+    let nestedReads=0;
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        fs.promises.opendir=async(target,...args)=>{
+            const handle=await originalOpendir(target,...args);
+            if(tracker.baselineTransaction && path.resolve(String(target))===path.resolve(nested)){
+                enteredResolve();
+                await release;
+                const originalRead=handle.readSync.bind(handle);
+                handle.readSync=(...readArgs)=>{
+                    nestedReads++;
+                    return originalRead(...readArgs);
+                };
+            }
+            return handle;
+        };
+
+        const before=tracker.getEffectiveMonitoringScope();
+        const applying=tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        await entered;
+        fs.writeFileSync(trigger,'changed during enumeration');
+        await tracker.onExternalFileChanged(Uri.file(trigger));
+        releaseResolve();
+        const result=await applying;
+        assert.notEqual(result.status,'applied',JSON.stringify(result));
+        assert.match(result.reason??'',/invalidated|workspace activity|preparation/i);
+        assert.equal(nestedReads,0,
+            'the directory returned after invalidation must not be inspected');
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    } finally {
+        releaseResolve?.();
+        fs.promises.opendir=originalOpendir;
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace ignores watcher blind spots wholly covered by explicit exclusions',async()=>{
+    const storage=file('s4a-covered-watcher-storage');
+    tracker.storageUri=Uri.file(storage);
+    const vendor=file('vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'ignored.txt'),'ignored');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const before=tracker.getEffectiveMonitoringScope();
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(path.join(vendor,'ignored.txt')),undefined,
+        'the explicitly excluded blind spot remains outside target scope');
+    assert.notDeepEqual(tracker.getEffectiveMonitoringScope(),before);
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    const restored=await tracker.restorePersistedState();
+    assert.equal(restored,'restored',
+        'an explicitly excluded watcher blind spot must not pause a persisted Whole Workspace scope');
+    assert.equal(tracker.getEffectiveMonitoringScope().mode,'wholeWorkspace');
+});
+
+for(const scenario of [
+    {name:'identical wildcard exclusion',watcher:'**/generated/**',exclude:'**/generated/**',visible:true},
+    {name:'universal wildcard exclusion',watcher:'**/generated/**',exclude:'**',visible:false}
+]) test(`S4-A Whole Workspace accepts ${scenario.name} covering watcher blind spots`,async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('wildcard-watch-workspace');
+    const generated=path.join(workspaceRoot,'generated');
+    fs.mkdirSync(generated,{recursive:true});
+    fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+    fs.writeFileSync(path.join(generated,'hidden.txt'),'hidden');
+    const visible=path.join(workspaceRoot,'visible.txt');
+    fs.writeFileSync(visible,'visible');
+    const folder={uri:Uri.file(workspaceRoot),name:'wildcard-watch'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        vscodeExcludes['files.watcherExclude']={[scenario.watcher]:true};
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:scenario.exclude}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+
+        const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.equal(tracker.getOriginalContent(path.join(generated,'hidden.txt')),undefined,
+            'watcher-hidden resources must also be outside the configured scope');
+        assert.equal(tracker.getOriginalContent(visible),scenario.visible?'visible':undefined);
+    } finally {
+        vscodeExcludes['files.watcherExclude']={};
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A exact watcher prefix is not covered by a descendant-only exclusion',async()=>{
+    const vendor=file('exact-watcher-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/watcherExclude|supplemental/i);
+});
+
+test('S4-A Whole Workspace discovery skips generic explicit-include findFiles fallback',async()=>{
+    const vendor=file('whole-fallback-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeVendor}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    tracker.effectiveMonitoringScope=scope;
+    await tracker.refreshIgnoreMatchers();
+    const originalFindFiles=vscode.workspace.findFiles;
+    let findCalls=0;
+    vscode.workspace.findFiles=async()=>{
+        findCalls++;
+        throw error('unbounded-include-fallback');
+    };
+    try{
+        const files=await tracker.findScopeFilesUnderDirectory(root);
+        assert.equal(findCalls,0,'Whole Workspace discovery must remain on the bounded direct enumerator');
+        assert.equal(files.some(uri=>uri.fsPath===path.join(vendor,'child.txt')),false,
+            'explicitly excluded descendants remain outside Whole Workspace discovery');
+    } finally {
+        vscode.workspace.findFiles=originalFindFiles;
+    }
+});
+
+test('S4-A per-folder Whole Workspace scans do not reseed nested roots into the shared work budget',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const outerRoot=file('per-folder-outer');
+    const nestedRoot=path.join(outerRoot,'nested');
+    fs.mkdirSync(nestedRoot,{recursive:true});
+    const outerProbe=path.join(outerRoot,'ProbeName');
+    const outerFile=path.join(outerRoot,'outer.txt');
+    const nestedProbe=path.join(nestedRoot,'ProbeName');
+    const nestedFile=path.join(nestedRoot,'nested.txt');
+    fs.writeFileSync(outerProbe,'outer probe');
+    fs.writeFileSync(outerFile,'outer');
+    fs.writeFileSync(nestedProbe,'nested probe');
+    fs.writeFileSync(nestedFile,'nested');
+    const outer={uri:Uri.file(outerRoot),name:'outer'};
+    const nested={uri:Uri.file(nestedRoot),name:'nested'};
+    const getFolder=uri=>[nested,outer].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    try{
+        vscode.workspace.workspaceFolders=[outer,nested];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        // Unique per-folder traversal inspects 3 outer entries (including the
+        // nested-root boundary) plus 2 nested entries. Reseeding the nested root
+        // during the outer call would consume 7 entries and fail this budget.
+        const budget={remainingEntries:5};
+        const outerFiles=await tracker.findScopeFilesUnderDirectory(outerRoot,budget);
+        const nestedFiles=await tracker.findScopeFilesUnderDirectory(nestedRoot,budget);
+        assert.equal(budget.remainingEntries,0);
+        assert.equal(outerFiles.some(uri=>uri.fsPath===nestedFile),false,
+            'the parent per-folder scan must stop at the nested workspace boundary');
+        assert.equal(nestedFiles.some(uri=>uri.fsPath===nestedFile),true);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace restore shares traversal and capacity budgets across roots',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const rootA=file('restore-budget-root-a');
+    const rootB=file('restore-budget-root-b');
+    fs.mkdirSync(rootA,{recursive:true});
+    fs.mkdirSync(rootB,{recursive:true});
+    fs.writeFileSync(path.join(rootA,'ProbeName'),'a');
+    fs.writeFileSync(path.join(rootB,'ProbeName'),'b');
+    const folderA={uri:Uri.file(rootA),name:'restore-a'};
+    const folderB={uri:Uri.file(rootB),name:'restore-b'};
+    const getFolder=uri=>[folderA,folderB].find(folder=>{
+        const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        );
+    });
+    try{
+        vscode.workspace.workspaceFolders=[folderA,folderB];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+
+        tracker.maxPersistedSnapshots=1;
+        await assert.rejects(
+            ()=>tracker.discoverRestoredFiles(tracker.sessionEpoch),
+            /snapshot capacity.*exceed/i,
+            'restore capacity must be shared across roots rather than reset per folder'
+        );
+        assert.equal(tracker.fileSnapshots.size,0,
+            'capacity failure happens before restored candidates are published');
+
+        tracker.maxPersistedSnapshots=100;
+        tracker.maxScopePreflightEntries=1;
+        await assert.rejects(
+            ()=>tracker.discoverRestoredFiles(tracker.sessionEpoch),
+            /preparation work budget.*directory entries/i,
+            'restore traversal budget must be shared across roots rather than reset per folder'
+        );
+        assert.equal(tracker.fileSnapshots.size,0,
+            'work-budget failure also leaves restore candidate publication untouched');
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A Whole Workspace assigns nested paths to the deepest workspace root once',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const parentRoot=file('nested-owner-parent');
+    const childRoot=path.join(parentRoot,'pkg');
+    fs.mkdirSync(childRoot,{recursive:true});
+    fs.writeFileSync(path.join(parentRoot,'ProbeName'),'parent');
+    fs.writeFileSync(path.join(childRoot,'ProbeName'),'child');
+    fs.writeFileSync(path.join(childRoot,'leaf.txt'),'leaf');
+    const parentFolder={uri:Uri.file(parentRoot),name:'parent'};
+    const childFolder={uri:Uri.file(childRoot),name:'child'};
+    const getFolder=uri=>{
+        const inRoot=folder=>{
+            const relative=path.relative(folder.uri.fsPath,uri.fsPath);
+            return relative===''||(relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative));
+        };
+        return [childFolder,parentFolder].find(inRoot);
+    };
+    try{
+        vscode.workspace.workspaceFolders=[parentFolder,childFolder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        tracker.maxScopePreflightEntries=4;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),includes:[],excludes:[],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        await tracker.refreshIgnoreMatchers();
+
+        const preflight=await tracker.preflightConfiguredMonitoringScope(scope,()=>true);
+        assert.equal(preflight.status,'ready',JSON.stringify(preflight));
+        assert.equal(preflight.truncated,false,'nested child root must not consume the entry budget twice');
+        assert.equal(preflight.inspectedEntries,4);
+
+        const budget={remainingEntries:4};
+        const files=await tracker.enumerateConfiguredCandidateFiles(
+            scope,tracker.sessionEpoch,undefined,undefined,budget
+        );
+        const canonical=new Set(files.map(filePath=>path.resolve(filePath)));
+        assert.equal(canonical.size,3);
+        assert.ok(canonical.has(path.resolve(path.join(parentRoot,'ProbeName'))));
+        assert.ok(canonical.has(path.resolve(path.join(childRoot,'ProbeName'))));
+        assert.ok(canonical.has(path.resolve(path.join(childRoot,'leaf.txt'))));
+        assert.equal(budget.remainingEntries,0);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A restore filters out-of-scope open editors before charging shared capacity',async()=>{
+    const previousFolders=vscode.workspace.workspaceFolders;
+    const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+    const workspaceRoot=file('restore-open-filter-workspace');
+    fs.mkdirSync(workspaceRoot,{recursive:true});
+    const probe=path.join(workspaceRoot,'ProbeName');
+    const baseline=path.join(workspaceRoot,'baseline.txt');
+    const excludedDir=path.join(workspaceRoot,'excluded');
+    const excluded=path.join(excludedDir,'open.txt');
+    const external=file('restore-open-filter-external.txt');
+    fs.mkdirSync(excludedDir,{recursive:true});
+    fs.writeFileSync(probe,'probe');
+    fs.writeFileSync(baseline,'baseline');
+    fs.writeFileSync(excluded,'excluded open');
+    fs.writeFileSync(external,'external open');
+
+    const folder={uri:Uri.file(workspaceRoot),name:'restore-open-filter'};
+    const getFolder=uri=>{
+        const relative=path.relative(workspaceRoot,uri.fsPath);
+        return relative===''||(
+            relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)
+        ) ? folder : undefined;
+    };
+    try{
+        vscode.workspace.workspaceFolders=[folder];
+        vscode.workspace.getWorkspaceFolder=getFolder;
+        await tracker.dispose();
+        tracker=new DiffTracker();
+        tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+        const roots=tracker.currentWorkspaceRootIdentities();
+        const scope={
+            kind:'configured',mode:'wholeWorkspace',
+            roots:roots.map(identity=>({...identity})),
+            includes:[],excludes:[{scope:'all',pattern:'excluded/**'}],scopeRevision:''
+        };
+        scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+            model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+        })).digest('hex');
+        tracker.effectiveMonitoringScope=scope;
+        // Real restore refreshes ignore/scope matchers before offline discovery.
+        // Preserve that production precondition for this custom workspace fixture.
+        await tracker.refreshIgnoreMatchers();
+
+        tracker.fileSnapshots.set(probe,'probe');
+        tracker.fileSnapshots.set(baseline,'baseline');
+        tracker.baselineExistingFiles.add(probe);
+        tracker.baselineExistingFiles.add(baseline);
+        tracker.maxPersistedSnapshots=2;
+
+        document(excluded);
+        document(external);
+
+        await tracker.discoverRestoredFiles(tracker.sessionEpoch);
+        assert.equal(tracker.fileSnapshots.size,2,
+            'out-of-scope open editors must not consume capacity or become restore candidates');
+        assert.equal(tracker.getOriginalContent(excluded),undefined);
+        assert.equal(tracker.getOriginalContent(external),undefined);
+    } finally {
+        vscode.workspace.workspaceFolders=previousFolders;
+        vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+    }
+});
+
+test('S4-A watcher-excluded include shadowed by explicit exclusion does not require S4-B',async()=>{
+    const storage=file('s4a-shadowed-include-storage');
+    tracker.storageUri=Uri.file(storage);
+    const vendor=file('shadowed-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    const shadowed=path.join(vendor,'file.txt');
+    fs.writeFileSync(shadowed,'shadowed');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const relativeFile=path.relative(root,shadowed).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeFile}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],
+        scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.equal(tracker.getOriginalContent(shadowed),undefined,
+        'excluded include target remains outside the effective monitoring scope');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    assert.equal(await tracker.restorePersistedState(),'restored',
+        'restore must preserve exclusion precedence over the shadowed include');
+});
+
+test('S4-A Rules file include requires S4-B when an ancestor directory is watcher-excluded',async()=>{
+    const vendor=file('watcher-ancestor-vendor');
+    const includeFile=path.join(vendor,'file.txt');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(includeFile,'included');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const relativeFile=path.relative(root,includeFile).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeFile}],excludes:[],scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/watcherExclude|supplemental/i);
+});
+
+test('S4-A Rules include prefix still requires coverage when only descendants are excluded',async()=>{
+    const vendor=file('rules-prefix-vendor');
+    fs.mkdirSync(vendor,{recursive:true});
+    fs.writeFileSync(path.join(vendor,'child.txt'),'child');
+    const relativeVendor=path.relative(root,vendor).split(path.sep).join('/');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const scope={
+        kind:'configured',mode:'rules',
+        roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeVendor}],
+        excludes:[{scope:'all',pattern:`${relativeVendor}/**`}],
+        scopeRevision:''
+    };
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+
+    vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
+    const exact=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(exact.status,'requiresS4',JSON.stringify(exact));
+    assert.match(exact.reason,/watcherExclude|supplemental/i,
+        'descendant-only exclusion must not hide a blind spot at the include prefix itself');
+
+    vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
+    const descendantsOnly=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(descendantsOnly.status,'applied',JSON.stringify(descendantsOnly));
+});
+
+test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without publication',async()=>{
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const before=tracker.getEffectiveMonitoringScope();
+    vscodeExcludes['files.watcherExclude']={'**/node_modules/*/**':true};
+    const scope={
+        kind:'configured',mode:'wholeWorkspace',
+        roots:roots.map(identity=>({...identity})),
+        includes:[],excludes:[],scopeRevision:'s4a-whole-watcher-gap'
+    };
+    const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.match(result.reason,/S4-B supplemental observation coverage/i);
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
 });
 
 test('S3 restore-prefixed ordinary files are not treated as watcher hard boundaries',async()=>{
@@ -3250,6 +5208,16 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
     }
 });
 
+registerPR12BoundedInvariants({
+    test, vscode, Uri, DiffTracker, file, document,
+    getTracker: () => tracker, setTracker: value => { tracker=value; },
+    setListedIgnores: value => { listedIgnores=value; },
+    setVsCodeExcludes: value => { vscodeExcludes=value; },
+    fireConfigurationChanged: key => configurationChanged({
+        affectsConfiguration: name => name === key
+    })
+});
+
 registerStateSchemaCompatibility({
     test, root, Uri, DiffTracker, faults, file, pending,
     getTracker: () => tracker,
@@ -3285,6 +5253,10 @@ if(process.env.DT_AUDIT_ONLY==='1') { const selected=tests.filter(t=>t.name.star
 if(process.env.DT_KNOWN_P0==='1'||process.env.DT_LEGACY_MANUAL==='1') {tests.splice(stage1Count+4);tests.splice(0,stage1Count+(process.env.DT_LEGACY_MANUAL==='1'?2:0));}
 let failures=0;
 for(const {name,run} of tests) {
+    // Configured-scope policy discovery now reads the real filesystem. Keep
+    // top-level regressions isolated so a .gitignore created by one fixture
+    // cannot alter a later fixture merely because they share the harness root.
+    clearPriorPolicyArtifacts();
     docs.length=0; watcherInstances.length=0; nativeDirectoryWatchers.length=0; faults.clear(); barriers.clear(); automationOnly=false;watchExclude=[];listedFiles=[];listedIgnores=[];vscodeExcludes={}; tracker=new DiffTracker();
     tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
     try { await run(); console.log(`PASS ${name}`); }

@@ -1,6 +1,92 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+const maxIdentityDirectoryEntries = 10000;
+const maxCaseSensitivityProbeWorkEntries = maxIdentityDirectoryEntries;
+const maxRuntimeIdentityFallbackWorkEntries = maxIdentityDirectoryEntries * 2;
+
+export interface PathIdentityWorkBudget {
+    remainingEntries: number;
+    exhausted?: boolean;
+    // Sparse operation-local cache for exact/alias physical spellings.
+    exactEntries?: Map<string, { signature: string; actual: string }>;
+    physicalPaths?: Set<string>;
+    // Bounded directory evidence acquired by this preparation. Entries stored
+    // here have already consumed the operation work allowance, so later identity
+    // queries for the same parent must reuse them instead of reopening/scanning.
+    directoryEvidence?: Map<string, {
+        signature: string;
+        entries: fs.Dirent[];
+        byName: Map<string, fs.Dirent>;
+        complete: boolean;
+    }>;
+}
+
+// Runtime identity work may be shared by one higher-level decision (for
+// example, one configured-scope evaluation) without becoming a preparation
+// budget. Keep the phase explicit so runtime exhaustion preserves lookup
+// evidence while caller-owned preparation remains fail-closed.
+export interface PathIdentityRuntimeContext {
+    readonly kind: 'runtime';
+    budget: PathIdentityWorkBudget;
+    prefixBudget: PathIdentityWorkBudget;
+}
+
+export function createPathIdentityRuntimeContext(): PathIdentityRuntimeContext {
+    return {
+        kind: 'runtime',
+        budget: { remainingEntries: maxRuntimeIdentityFallbackWorkEntries },
+        prefixBudget: { remainingEntries: maxIdentityDirectoryEntries }
+    };
+}
+
+type IdentityLookupContext =
+    | { kind: 'preparation'; budget: PathIdentityWorkBudget }
+    | PathIdentityRuntimeContext;
+
+interface DirectoryEntryListing {
+    entries: fs.Dirent[];
+    byName: Map<string, fs.Dirent>;
+    complete: boolean;
+}
+
+function identityWorkAvailable(budget?: PathIdentityWorkBudget): boolean {
+    if (!budget) { return true; }
+    if (budget.remainingEntries > 0) { return true; }
+    budget.exhausted = true;
+    return false;
+}
+
+function consumeIdentityEntry(budget?: PathIdentityWorkBudget): void {
+    if (budget) { budget.remainingEntries--; }
+}
+
+function directoryIdentitySignature(directory: string): string {
+    const stat = fs.statSync(directory);
+    return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+function readIdentityDirectoryEntries(
+    directory: string,
+    prefixBudget?: PathIdentityWorkBudget
+): DirectoryEntryListing {
+    const handle = fs.opendirSync(directory);
+    try {
+        const entries: fs.Dirent[] = [];
+        const byName = new Map<string, fs.Dirent>();
+        while (true) {
+            const entry = handle.readSync();
+            if (!entry) { return { entries, byName, complete: true }; }
+            if (entries.length >= maxIdentityDirectoryEntries || !identityWorkAvailable(prefixBudget)) {
+                return { entries, byName, complete: false };
+            }
+            consumeIdentityEntry(prefixBudget);
+            entries.push(entry);
+            byName.set(entry.name, entry);
+        }
+    } finally { handle.closeSync(); }
+}
+
 export function asciiCaseFold(value: string): string {
     return value.replace(/[A-Z]/g, character => character.toLowerCase());
 }
@@ -34,20 +120,25 @@ function sameExistingResource(left: string, right: string): boolean | undefined 
     }
 }
 
-function caseEquivalentEntries(parent: string, requested: string): string[] | undefined {
+function caseEquivalentEntries(
+    parent: string,
+    requested: string,
+    knownEntries?: readonly fs.Dirent[]
+): string[] | undefined {
     try {
         const folded = asciiCaseFold(requested);
-        return fs.readdirSync(parent).filter(name => asciiCaseFold(name) === folded);
+        const entries = knownEntries ?? directoryEntries(parent).entries;
+        return entries.map(entry => entry.name).filter(name => asciiCaseFold(name) === folded);
     } catch {
         return undefined;
     }
 }
 
-function probeExistingPath(existingPath: string): boolean | undefined {
+function probeExistingPath(existingPath: string, knownParentEntries?: readonly fs.Dirent[]): boolean | undefined {
     const base = path.basename(existingPath);
     if (!base) { return undefined; }
     const parent = path.dirname(existingPath);
-    const equivalentEntries = caseEquivalentEntries(parent, base);
+    const equivalentEntries = caseEquivalentEntries(parent, base, knownParentEntries);
 
     if (equivalentEntries) {
         // Two separately named directory entries that differ only by case prove
@@ -79,9 +170,23 @@ function probeExistingPath(existingPath: string): boolean | undefined {
     const same = sameExistingResource(existingPath, alternate);
     if (same === false) { return true; }
     if (same === true) {
-        // When the parent listing proves that only the requested spelling exists,
-        // a differently-cased lookup resolving to it is sufficient evidence for
-        // an insensitive boundary. Without listing evidence, remain unverified.
+        // A case-sensitive directory can still contain a differently-cased
+        // hard link or symlink to the same resource. The bounded parent prefix
+        // may not contain that second spelling, so distinguish a real second
+        // directory entry before accepting insensitive lookup semantics.
+        try {
+            const existing = fs.lstatSync(existingPath);
+            const alternateEntry = fs.lstatSync(alternate);
+            if (existing.isSymbolicLink() !== alternateEntry.isSymbolicLink() ||
+                fs.realpathSync.native(existingPath) !== fs.realpathSync.native(alternate)) {
+                return true;
+            }
+        } catch {
+            return undefined;
+        }
+        // When the bounded parent prefix proves the requested spelling exists,
+        // a differently-cased lookup resolving to that same canonical entry is
+        // sufficient evidence for an insensitive boundary.
         return equivalentEntries?.includes(base) ? false : undefined;
     }
     return undefined;
@@ -89,21 +194,31 @@ function probeExistingPath(existingPath: string): boolean | undefined {
 
 export function detectLocalPathCaseSensitivity(
     rootPath: string,
-    _platform: NodeJS.Platform = process.platform
+    _platform: NodeJS.Platform = process.platform,
+    workBudget?: PathIdentityWorkBudget
 ): boolean | undefined {
     // The parent directory's lookup of the workspace-root name is never proof
     // of lookup semantics *inside* that workspace. Per-directory case behavior,
     // symlink/junction targets and mount points can all differ without a device
     // boundary that is visible from the parent.
+    const budget = workBudget ?? { remainingEntries: maxCaseSensitivityProbeWorkEntries };
+    let handle: fs.Dir | undefined;
     try {
-        const entries = fs.readdirSync(rootPath, { withFileTypes: true });
-        for (const entry of entries.slice(0, 128)) {
-            if (entry.isSymbolicLink()) { continue; }
-            const probe = probeExistingPath(path.join(rootPath, entry.name));
+        handle = fs.opendirSync(rootPath);
+        while (identityWorkAvailable(budget)) {
+            const entry = handle.readSync();
+            if (!entry) { break; }
+            consumeIdentityEntry(budget);
+            if (entry.isSymbolicLink() || !toggleAsciiCase(entry.name)) { continue; }
+            const probe = probeExistingPath(path.join(rootPath, entry.name), [entry]);
             if (probe !== undefined) { return probe; }
         }
     } catch {
         // Fall through to the fail-closed result below.
+    } finally {
+        if (handle) {
+            try { handle.closeSync(); } catch { /* Preserve the probe result/failure. */ }
+        }
     }
 
     // Empty roots, unreadable roots, or roots without an internally probeable
@@ -116,26 +231,76 @@ export interface RelativePathIdentity {
     resolvedRelativePath: string;
     verifiedPrefixLength: number;
     unavailable: boolean;
+    // Components for which the requested lookup itself was proven to exist,
+    // even when bounded runtime enumeration could not recover physical spelling.
+    lookupVerifiedPrefixLength: number;
+    // True only when the remaining uncertainty is caused solely by the runtime
+    // fallback cap. Preparation budgets never set this escape hatch.
+    runtimeFallbackExhausted?: boolean;
 }
 
 // Cache listings, not case semantics or lookup results. Every reuse verifies the
 // parent identity/metadata; each selected entry is still lstat'ed. In particular,
 // a failed or ambiguous lookup is never cached as an equivalent spelling.
-const directoryEntriesCache = new Map<string, { signature: string; entries: fs.Dirent[] }>();
-function directoryEntries(directory: string): fs.Dirent[] {
-    const signature = (): string => {
-        const stat = fs.statSync(directory);
-        return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.mtimeMs}:${stat.ctimeMs}`;
-    };
-    const before = signature();
+const directoryEntriesCache = new Map<string, {
+    signature: string;
+    entries: fs.Dirent[];
+    byName: Map<string, fs.Dirent>;
+    complete: boolean;
+}>();
+let cachedDirectoryEntryCount = 0;
+
+function invalidateDirectoryEntries(directory: string): void {
     const cached = directoryEntriesCache.get(directory);
-    if (cached?.signature === before) { return cached.entries; }
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
-    if (signature() === before) {
-        if (directoryEntriesCache.size >= 4096) { directoryEntriesCache.clear(); }
-        directoryEntriesCache.set(directory, { signature: before, entries });
+    if (!cached) { return; }
+    directoryEntriesCache.delete(directory);
+    cachedDirectoryEntryCount = Math.max(0, cachedDirectoryEntryCount - cached.entries.length);
+}
+
+function directoryEntries(
+    directory: string,
+    workBudget?: PathIdentityWorkBudget,
+    runtimePrefixBudget?: PathIdentityWorkBudget
+): DirectoryEntryListing {
+    const before = directoryIdentitySignature(directory);
+    const cached = directoryEntriesCache.get(directory);
+    if (cached?.signature === before) {
+        return {
+            entries: cached.entries,
+            byName: cached.byName,
+            complete: cached.complete
+        };
     }
-    return entries;
+    if (cached) { invalidateDirectoryEntries(directory); }
+    if (workBudget) {
+        // Preparation must pay only for identity work it actually needs. Do not
+        // spend the shared allowance materializing a reusable 10k prefix cache;
+        // the caller will stream the requested entry below.
+        return { entries: [], byName: new Map(), complete: false };
+    }
+    // Cache hits above cost no new directory reads. Cold/invalidated cache
+    // construction shares one prefix allowance across the entire runtime path,
+    // independently of the spelling-recovery allowance. Do not cache a fabricated
+    // empty listing when an earlier component used the remaining prefix budget.
+    if (runtimePrefixBudget && runtimePrefixBudget.remainingEntries <= 0) {
+        return { entries: [], byName: new Map(), complete: false };
+    }
+    const listing = readIdentityDirectoryEntries(directory, runtimePrefixBudget);
+    if (directoryIdentitySignature(directory) === before) {
+        if (directoryEntriesCache.size >= 4096 ||
+            cachedDirectoryEntryCount + listing.entries.length > maxIdentityDirectoryEntries) {
+            directoryEntriesCache.clear();
+            cachedDirectoryEntryCount = 0;
+        }
+        directoryEntriesCache.set(directory, {
+            signature: before,
+            entries: listing.entries,
+            byName: listing.byName,
+            complete: listing.complete
+        });
+        cachedDirectoryEntryCount += listing.entries.length;
+    }
+    return listing;
 }
 
 function sameEntryLookup(left: string, right: string): boolean {
@@ -146,61 +311,277 @@ function sameEntryLookup(left: string, right: string): boolean {
         fs.realpathSync.native(left) === fs.realpathSync.native(right);
 }
 
+function streamDirectoryEntryIdentity(
+    directory: string,
+    requested: string,
+    requestedPath: string,
+    context: IdentityLookupContext
+): { actual?: string; unavailable: boolean; runtimeFallbackExhausted?: boolean } {
+    const budget = context.budget;
+    const workBudget = context.kind === 'preparation' ? context.budget : undefined;
+    const directoryKey = path.resolve(directory);
+    const exactKey = directoryKey + '\0' + requested;
+    const beforeSignature = directoryIdentitySignature(directory);
+    const cachedExact = workBudget?.exactEntries?.get(exactKey);
+    if (cachedExact?.signature === beforeSignature) {
+        return { actual: cachedExact.actual, unavailable: false };
+    }
+
+    let evidence = workBudget?.directoryEvidence?.get(directoryKey);
+    if (evidence?.signature !== beforeSignature) {
+        workBudget?.directoryEvidence?.delete(directoryKey);
+        evidence = undefined;
+    }
+
+    if (!evidence) {
+        if (context.kind === 'runtime' && !identityWorkAvailable(budget)) {
+            return { unavailable: true, runtimeFallbackExhausted: true };
+        }
+        const entries: fs.Dirent[] = [];
+        const byName = new Map<string, fs.Dirent>();
+        let complete = false;
+        const handle = fs.opendirSync(directory);
+        try {
+            while (true) {
+                // Reading EOF is not identity work. Probe first so a directory
+                // with exactly N entries can prove completeness with an N-entry
+                // allowance; a non-null N+1 lookahead still exhausts the bound.
+                const entry = handle.readSync();
+                if (!entry) { complete = true; break; }
+                if (!identityWorkAvailable(budget)) { break; }
+                consumeIdentityEntry(budget);
+                entries.push(entry);
+                byName.set(entry.name, entry);
+                if (entry.name === requested) {
+                    if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+                        (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                            signature: beforeSignature,
+                            actual: entry.name
+                        });
+                    }
+                    return { actual: entry.name, unavailable: false };
+                }
+            }
+        } finally { handle.closeSync(); }
+
+        evidence = { signature: beforeSignature, entries, byName, complete };
+        if (workBudget && directoryIdentitySignature(directory) === beforeSignature) {
+            (workBudget.directoryEvidence ??= new Map()).set(directoryKey, evidence);
+        }
+        if (!complete) {
+            return {
+                unavailable: true,
+                runtimeFallbackExhausted: context.kind === 'runtime' && budget.exhausted === true
+            };
+        }
+    }
+
+    const exact = evidence.byName.get(requested);
+    if (exact) {
+        if (workBudget) {
+            (workBudget.exactEntries ??= new Map()).set(exactKey, {
+                signature: evidence.signature,
+                actual: exact.name
+            });
+        }
+        return { actual: exact.name, unavailable: false };
+    }
+    if (!evidence.complete) {
+        return {
+            unavailable: true,
+            runtimeFallbackExhausted: context.kind === 'runtime' && budget.exhausted === true
+        };
+    }
+
+    // An exact spelling is absent. A successful lookup can only be accepted as
+    // an alias when the bounded directory evidence contains a unique ASCII-case
+    // equivalent physical spelling that resolves to the same entry. Do not scan
+    // every unrelated entry with lstat/realpath and do not use Unicode JS folding.
+    const folded = asciiCaseFold(requested);
+    const candidates = evidence.entries.filter(entry => asciiCaseFold(entry.name) === folded);
+    if (candidates.length !== 1) { return { unavailable: true }; }
+    const candidate = candidates[0];
+    try {
+        if (!sameEntryLookup(requestedPath, path.join(directory, candidate.name))) {
+            return { unavailable: true };
+        }
+    } catch {
+        return { unavailable: true };
+    }
+    if (workBudget) {
+        (workBudget.exactEntries ??= new Map()).set(exactKey, {
+            signature: evidence.signature,
+            actual: candidate.name
+        });
+    }
+    return { actual: candidate.name, unavailable: false };
+}
+
 export function resolveRelativePathIdentity(
     rootPath: string,
     relativePath: string,
-    _caseSensitive: boolean
+    _caseSensitive: boolean,
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): RelativePathIdentity {
     const parts = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '')
         .split('/').filter(Boolean);
+
+    if (parts.length > 0 && workBudget?.physicalPaths) {
+        let observed = path.resolve(rootPath);
+        let allObserved = true;
+        for (const part of parts) {
+            observed = path.join(observed, part);
+            if (!workBudget.physicalPaths.has(path.resolve(observed))) {
+                allObserved = false;
+                break;
+            }
+            try {
+                if (fs.lstatSync(observed).isSymbolicLink()) {
+                    allObserved = false;
+                    break;
+                }
+            } catch {
+                allObserved = false;
+                break;
+            }
+        }
+        if (allObserved) {
+            const value = parts.join('/');
+            return {
+                identity: value,
+                resolvedRelativePath: value,
+                verifiedPrefixLength: parts.length,
+                unavailable: false,
+                lookupVerifiedPrefixLength: parts.length
+            };
+        }
+    }
+
+    // Allocate once per path lookup, never once per component. Retain the
+    // existing 10k cache-prefix and 20k fallback allowances, but bound their
+    // totals even across several oversized directories and cache invalidations.
+    // Preparation keeps its original shared budget and fail-closed semantics.
+    const context: IdentityLookupContext = workBudget
+        ? { kind: 'preparation', budget: workBudget }
+        : runtimeContext ?? createPathIdentityRuntimeContext();
+    const prefixBudget = context.kind === 'runtime' ? context.prefixBudget : undefined;
     const resolved: string[] = [];
     let current = path.resolve(rootPath);
     let physicalPrefixAvailable = true;
+    let lookupPrefixAvailable = true;
     let verifiedPrefixLength = 0;
+    let lookupVerifiedPrefixLength = 0;
     let unavailable = false;
+    let runtimeFallbackExhausted = false;
+    let nonRuntimeUnavailable = false;
 
-    for (const requested of parts) {
+    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+        const requested = parts[partIndex];
         let actual: string | undefined;
-        if (physicalPrefixAvailable) {
+        if (lookupPrefixAvailable) {
             try {
-                const entries = directoryEntries(current);
                 const requestedPath = path.join(current, requested);
-                // Successful lookup is mandatory even for an ASCII candidate:
-                // the current directory can differ from the workspace root.
+                // Existence is checked before any directory enumeration. A
+                // successful lookup remains useful coverage evidence even when
+                // the bounded runtime spelling scan later exhausts its cap.
                 const requestedStat = fs.lstatSync(requestedPath);
-                const exact = entries.find(entry => entry.name === requested);
-                if (exact) {
-                    actual = exact.name;
-                } else {
-                    const matches = entries.filter(entry => {
-                        try { return sameEntryLookup(requestedPath, path.join(current, entry.name)); }
-                        catch { return false; }
-                    });
-                    // Separately named hard links remain distinct entries. An
-                    // ambiguous alias is not permission to merge their scopes.
-                    if (matches.length === 1) { actual = matches[0].name; }
-                    else { unavailable = true; }
-                }
-                if (actual !== undefined) {
-                    verifiedPrefixLength++;
-                    if (requestedStat.isSymbolicLink()) {
-                        physicalPrefixAvailable = false;
-                        unavailable = true;
+                lookupVerifiedPrefixLength++;
+
+                if (requestedStat.isSymbolicLink()) {
+                    unavailable = true;
+                    nonRuntimeUnavailable = true;
+                    physicalPrefixAvailable = false;
+                } else if (physicalPrefixAvailable) {
+                    // A verified case-sensitive workspace root makes successful
+                    // lookup of an exact first component sufficient physical
+                    // evidence. Descendant components still require filesystem
+                    // spelling proof because per-directory semantics may differ.
+                    if (partIndex === 0 && _caseSensitive === true) {
+                        actual = requested;
+                    }
+
+                    let listing = actual === undefined
+                        ? directoryEntries(current, workBudget, prefixBudget)
+                        : { entries: [], byName: new Map<string, fs.Dirent>(), complete: false };
+                    let exact = actual === undefined ? listing.byName.get(requested) : undefined;
+                    if (!exact && listing.complete) {
+                        invalidateDirectoryEntries(current);
+                        listing = directoryEntries(current, workBudget, prefixBudget);
+                        exact = listing.byName.get(requested);
+                    }
+                    if (actual === undefined) {
+                        if (exact) {
+                            actual = exact.name;
+                        } else {
+                            const streamed = streamDirectoryEntryIdentity(
+                                current,
+                                requested,
+                                requestedPath,
+                                context
+                            );
+                            actual = streamed.actual;
+                            if (streamed.unavailable) {
+                                unavailable = true;
+                                if (streamed.runtimeFallbackExhausted) {
+                                    runtimeFallbackExhausted = true;
+                                } else {
+                                    nonRuntimeUnavailable = true;
+                                }
+                            }
+                        }
+                    }
+                    if (actual !== undefined) {
+                        verifiedPrefixLength++;
                     }
                 }
             } catch (error) {
+                lookupPrefixAvailable = false;
+                physicalPrefixAvailable = false;
                 const code = (error as NodeJS.ErrnoException).code;
-                if (code !== 'ENOENT' && code !== 'ENOTDIR') { unavailable = true; }
+                if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+                    unavailable = true;
+                    nonRuntimeUnavailable = true;
+                }
             }
         }
         if (actual === undefined) { physicalPrefixAvailable = false; }
-        // Missing descendants have no proven case mode. Never inherit a root
-        // boolean or apply Unicode/ASCII folding to these unproved components.
+        // Once physical spelling is unresolved, continue existence checks through
+        // the requested alias path. This preserves coverage for a deep existing
+        // path without pretending that its canonical spelling was established.
         resolved.push(actual ?? requested);
         current = path.join(current, actual ?? requested);
     }
     const value = resolved.join('/');
-    return { identity: value, resolvedRelativePath: value, verifiedPrefixLength, unavailable };
+    const runtimeOnly = runtimeFallbackExhausted && !nonRuntimeUnavailable &&
+        lookupVerifiedPrefixLength === parts.length;
+    return {
+        identity: value,
+        resolvedRelativePath: value,
+        verifiedPrefixLength,
+        unavailable,
+        lookupVerifiedPrefixLength,
+        runtimeFallbackExhausted: runtimeOnly || undefined
+    };
+}
+
+/** Prove one directory entry, not merely a shared hard-link inode.
+ * Missing entries are distinct; inaccessible identity remains unknown.
+ * Native canonical paths preserve distinct hard-link names without enumeration.
+ */
+export function sameExistingDirectoryEntry(left: string, right: string): boolean | undefined {
+    try {
+        const a = fs.lstatSync(left);
+        const b = fs.lstatSync(right);
+        if (a.isSymbolicLink() || b.isSymbolicLink()) { return false; }
+        if (a.ino !== 0 && b.ino !== 0 && (a.dev !== b.dev || a.ino !== b.ino)) {
+            return false;
+        }
+        return fs.realpathSync.native(left) === fs.realpathSync.native(right);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === 'ENOENT' || code === 'ENOTDIR' ? false : undefined;
+    }
 }
 
 export function pathIdentityText(value: string, caseSensitive: boolean): string {

@@ -4,10 +4,11 @@ import * as Diff from 'diff';
 import * as path from 'path';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
+import { fileURLToPath } from 'url';
 import ignore, { Ignore } from 'ignore';
 import { compareGitContexts, GitContextSnapshot } from './gitContext';
-import { detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
-import { CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
+import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity, sameExistingDirectoryEntry } from './utils/pathIdentity';
+import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -112,6 +113,87 @@ interface ImportedDirectoryWatch {
     watcher: vscode.Disposable;
     epoch: number;
     provenAbsent: boolean;
+}
+
+interface CandidateCapacityGuard {
+    // Coarse pre-read bound only. A candidate's durable category is unknown
+    // until its current state has been read, so category limits are enforced
+    // separately before the baseline is retained.
+    remaining: number;
+    exemptPaths: ReadonlySet<string>;
+    countedCandidates: Set<string>;
+}
+
+/** Revision tracking avoids rescanning the unresolved ledger after each
+ * scanner-owned write, while still detecting equal-size live replacements. */
+class UnresolvedBaselineMap extends Map<string, string> {
+    public revision = 0;
+    public constructor(entries?: Iterable<readonly [string, string]>) {
+        super();
+        if (entries) { for (const [key, value] of entries) { super.set(key, value); } }
+    }
+    public set(key: string, value: string): this {
+        if (!this.has(key) || this.get(key) !== value) { this.revision++; }
+        return super.set(key, value);
+    }
+    public delete(key: string): boolean {
+        const removed = super.delete(key);
+        if (removed) { this.revision++; }
+        return removed;
+    }
+    public clear(): void {
+        if (this.size > 0) { this.revision++; }
+        super.clear();
+    }
+}
+
+class IgnoreDiscoveryError extends Error {
+    public constructor(public readonly limit: 'entries' | 'bytes' | 'invalidated', message: string) {
+        super(message);
+    }
+}
+
+interface IgnoreDiscoveryBudget {
+    // Directory/policy traversal allowance for this discovery phase.
+    remainingEntries: number;
+    // Identity fallback allowance may be shared across the whole Apply.
+    identityBudget: PathIdentityWorkBudget;
+    remainingBytes: number;
+    seenEntries: Set<string>;
+    policyBytes: Map<string, number>;
+    stillCurrent: () => boolean;
+    onUnreadableDirectory?: (directory: string, error: unknown) => void;
+}
+
+interface CandidatePersistenceBudget {
+    remainingBytes: number;
+    fileSnapshots: number;
+    fileModes: number;
+    baselineExistingFiles: number;
+    unresolvedBaselineFiles: number;
+    opaqueBaselineFiles: number;
+    coverageGaps: number;
+    failedReason?: string;
+    accountedUnresolvedBaselineFiles: Map<string, string>;
+    observedUnresolvedBaselineFiles: Map<string, string>;
+    observedUnresolvedMap: Map<string, string>;
+    observedUnresolvedRevision?: number;
+}
+
+interface ImportedDirectoryRollbackState {
+    fileSnapshots: Map<string, string>;
+    fileModes: Map<string, number>;
+    baselineExistingFiles: Set<string>;
+    unresolvedBaselineFiles: Map<string, string>;
+    opaqueBaselineFiles: Map<string, OpaqueBaselineState>;
+    trackedChanges: Map<string, FileDiff>;
+    lineChanges: Map<string, LineChange[]>;
+    inlineViews: Map<string, InlineDiffView>;
+    postBaselineUnknownFiles: Set<string>;
+    retainedReviewPaths: Set<string>;
+    coverageGaps: Map<string, CoverageGapRecord>;
+    pendingReconciliation: Set<string>;
+    revertHistory: PersistedRevertRecord[];
 }
 
 interface BaselineTransaction {
@@ -222,10 +304,44 @@ export interface MonitoringScopeApplyResult {
     capturedBaselines: number;
 }
 
+export interface MonitoringScopePreflightDirectorySummary {
+    root: string;
+    path: string;
+    entries: number;
+}
+
+export interface MonitoringScopePreflightDiagnostic {
+    root: string;
+    path: string;
+    reason: string;
+}
+
+export interface MonitoringScopePreflightResult {
+    status: 'ready' | 'conflict' | 'failed';
+    scopeRevision: string;
+    inspectedEntries: number;
+    candidateFiles: number;
+    candidateDirectories: number;
+    skippedSymlinks: number;
+    skippedHardBoundaries: number;
+    skippedExplicitExclusions: number;
+    truncated: boolean;
+    entryLimit: number;
+    unreadableDirectoryCount: number;
+    unreadableDirectories: MonitoringScopePreflightDiagnostic[];
+    largestDirectories: MonitoringScopePreflightDirectorySummary[];
+    reason?: string;
+}
+
 type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
     | { kind: 'unavailable'; reason: string; reasonCode?: string; targetKind?: 'file' | 'directory'; size?: number; mtime?: number; fingerprint?: string };
+
+type CandidateBaselinePlan =
+    | { kind: 'text'; content: string; mode?: number; baselineExists: boolean }
+    | { kind: 'opaque'; state: Extract<CurrentFileState, { kind: 'unavailable' }> & { size: number; mtime: number } }
+    | { kind: 'unresolved'; reason: string };
 
 export class DiffTracker {
     private sessionEpoch = 0;
@@ -242,6 +358,9 @@ export class DiffTracker {
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
     private initialIgnoreEpoch?: number;
+    private initialWatchBoundaryMs?: number;
+    private initialWatchBoundaryMonotonicNs?: bigint;
+    private readonly startupTimestampSafetyMarginMs = 2000;
     private initialIgnoreEvents = new Map<string, StartupEvent>();
     private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
     // Only same-session post-baseline notifications can be resolved by a later
@@ -300,6 +419,8 @@ export class DiffTracker {
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
         this.restoringEpoch = undefined;
         this.initialIgnoreEpoch = undefined;
+        this.initialWatchBoundaryMs = undefined;
+        this.initialWatchBoundaryMonotonicNs = undefined;
         this.initialIgnoreEvents.clear();
         this.restoreEvents.clear();
         this.postBaselineUnknownFiles.clear();
@@ -483,7 +604,7 @@ export class DiffTracker {
     private activeWriteFiles = new Set<string>();
     private fileSnapshots = new Map<string, string>();
     private baselineExistingFiles = new Set<string>();
-    private unresolvedBaselineFiles = new Map<string, string>();
+    private unresolvedBaselineFiles: Map<string, string> = new UnresolvedBaselineMap();
     private opaqueBaselineFiles = new Map<string, OpaqueBaselineState>();
     private trackedChanges = new Map<string, FileDiff>();
     private trackedChangesVersion = 0;
@@ -502,6 +623,7 @@ export class DiffTracker {
     private ignoreRefreshVersion = 0;
     private ignoreRefreshPromise: Promise<void> = Promise.resolve();
     private ignoreFingerprint?: string;
+    private ignorePolicyRevision = 0;
     private scanCoverage?: string;
     private effectiveMonitoringScope: EffectiveMonitoringScope;
     // Scope preparation temporarily stages matcher/baseline state. Public
@@ -520,6 +642,11 @@ export class DiffTracker {
     // scope until configured publication succeeds atomically.
     private committedLegacyWatchExcludeByRoot = new Map<string, string[]>();
     private coverageGeneration = 0;
+    // Lightweight invalidation token for files.watcherExclude. Scope Apply
+    // performs the expensive filesystem-aware coverage qualification once;
+    // later transaction checks compare this token instead of re-running
+    // identity discovery and consuming the operation budget repeatedly.
+    private watcherCoverageRevision = 0;
     private ignoreResultCache = new Map<string, boolean>();
     private readonly ignoreResultCacheMaxEntries = 5000;
     private externalWatcherEnabled = false;
@@ -543,6 +670,16 @@ export class DiffTracker {
     private readonly persistedStateArchiveFileName = 'session-state.archive.json';
     private readonly maxPersistedSnapshots = 10000;
     private readonly maxPersistedBytes = 50 * 1024 * 1024;
+    // Preflight is advisory discovery, not a project-size rejection threshold.
+    // Hitting this bound returns a truncated lower-fidelity estimate rather than
+    // publishing a partial scope or silently dropping resources.
+    private readonly maxScopePreflightEntries = 10000;
+    // Identity proof has its own operation-wide hard bound when it is not
+    // deliberately sharing a scope traversal allowance (for example repository
+    // rebuild and watcher-coverage qualification).
+    private readonly maxPathIdentityPreparationEntries = 10000;
+    private readonly maxScopePreflightDiagnostics = 20;
+    private readonly maxScopePreflightDirectorySummaries = 10;
     private readonly maxRevertHistory = 10;
     private nextRevertRecordId = 1;
     private revertHistory: PersistedRevertRecord[] = [];
@@ -601,21 +738,30 @@ export class DiffTracker {
 
         this.disposables.push(
             vscode.workspace.onDidChangeConfiguration(e => {
-                const watcherCoverageChanged = e.affectsConfiguration('files.watcherExclude');
-                if (
+                const automationPolicyChanged =
                     e.affectsConfiguration('diffTracker.onlyTrackAutomatedChanges') ||
-                    e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges') ||
-                    e.affectsConfiguration('diffTracker.watchExclude') ||
-                    watcherCoverageChanged ||
+                    e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges');
+                const legacyWatchPolicyChanged = e.affectsConfiguration('diffTracker.watchExclude');
+                const watcherCoverageChanged = e.affectsConfiguration('files.watcherExclude');
+                const ordinaryExcludeChanged =
                     e.affectsConfiguration('search.exclude') ||
-                    e.affectsConfiguration('files.exclude')
-                ) {
+                    e.affectsConfiguration('files.exclude');
+                if (automationPolicyChanged || legacyWatchPolicyChanged ||
+                    watcherCoverageChanged || ordinaryExcludeChanged) {
                     if (watcherCoverageChanged) {
+                        this.watcherCoverageRevision++;
                         this.invalidateConfiguredScopeForWatcherCoverage();
                     }
-                    this.scanCoverage = undefined;
-                    this.schedulePersistState();
-                    this.refreshIgnoreMatchers().catch(() => undefined);
+                    const coverageRelevantChange =
+                        automationPolicyChanged ||
+                        legacyWatchPolicyChanged ||
+                        watcherCoverageChanged ||
+                        (this.ordinaryIgnorePolicyAffectsCoverage() && ordinaryExcludeChanged);
+                    if (coverageRelevantChange) {
+                        this.scanCoverage = undefined;
+                        this.schedulePersistState();
+                    }
+                    this.refreshIgnoreMatchersAfterLivePolicyChange();
                 }
             })
         );
@@ -695,8 +841,6 @@ export class DiffTracker {
             state.effectiveMonitoringScope.roots,
             currentRootIdentities
         );
-        const wholeWorkspaceNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
-            state.effectiveMonitoringScope.mode === 'wholeWorkspace';
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
         const configuredScopeNeedsReconciliation = state.effectiveMonitoringScope.kind === 'configured'
             ? (() => {
@@ -709,12 +853,11 @@ export class DiffTracker {
                     live.scope.scopeRevision !== state.effectiveMonitoringScope.scopeRevision;
             })()
             : false;
-        const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured' &&
-            state.effectiveMonitoringScope.mode === 'rules'
-            ? this.explicitIncludeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
+        const watcherCoverageNeedsS4 = state.effectiveMonitoringScope.kind === 'configured'
+            ? this.configuredScopeNeedsSupplementalCoverage(state.effectiveMonitoringScope)
             : undefined;
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
-            configuredScopeNeedsReconciliation || wholeWorkspaceNeedsS4 || !!watcherCoverageNeedsS4;
+            configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         this.coverageGaps = new Map(state.coverageGaps);
@@ -725,7 +868,7 @@ export class DiffTracker {
         this.fileSnapshots = new Map(state.fileSnapshots);
         this.fileModes = new Map(state.fileModes);
         this.baselineExistingFiles = new Set(state.baselineExistingFiles);
-        this.unresolvedBaselineFiles = new Map(state.unresolvedBaselineFiles);
+        this.unresolvedBaselineFiles = new UnresolvedBaselineMap(state.unresolvedBaselineFiles);
         this.opaqueBaselineFiles = new Map(state.opaqueBaselineFiles);
         this.canonicalTrackingPaths.clear();
         for (const filePath of new Set([
@@ -829,16 +972,14 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
             this.persistenceIssue = watcherCoverageNeedsS4
-                ? `Effective include ${watcherCoverageNeedsS4} intersects files.watcherExclude; review is paused until the scope is narrowed or S4-W coverage exists, then the baseline is rebuilt.`
+                ? `Effective monitoring scope requires supplemental coverage at ${watcherCoverageNeedsS4}; review is paused until the scope is narrowed or S4-B coverage exists, then the baseline is rebuilt.`
                 : state.baselineState === 'building'
                     ? 'Recovered a partial baseline scan in paused mode; rebuild the baseline before review actions.'
                     : !rootsMatch
                         ? 'Workspace roots differ from the persisted session; review is paused until an explicit baseline rebuild.'
                         : !scopeRootsMatch
                             ? 'Workspace root identity differs from the effective monitoring scope; review is paused until the scope is reconciled.'
-                            : configuredScopeNeedsReconciliation
-                                ? 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.'
-                                : 'Whole Workspace scope is preserved but paused until S4-W establishes bounded preparation and observation coverage.';
+                            : 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.';
             return 'incomplete';
         }
         return loaded.kind === 'recovered' ? 'recovered' : 'restored';
@@ -859,15 +1000,11 @@ export class DiffTracker {
             vscode.window.showWarningMessage(`Code Diff Tracker: ${identityIssue}. Recording remains paused.`);
             return;
         }
-        if (this.effectiveMonitoringScope.kind === 'configured' && this.effectiveMonitoringScope.mode === 'wholeWorkspace') {
-            vscode.window.showWarningMessage('Code Diff Tracker: Whole Workspace preparation requires the S4-W coverage path before recording can start.');
-            return;
-        }
         if (this.effectiveMonitoringScope.kind === 'configured') {
-            const watcherCoverageIssue = this.explicitIncludeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
+            const watcherCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(this.effectiveMonitoringScope);
             if (watcherCoverageIssue) {
                 vscode.window.showWarningMessage(
-                    `Code Diff Tracker: Effective include ${watcherCoverageIssue} intersects files.watcherExclude. Narrow the scope or wait for S4-W supplemental coverage before rebuilding.`
+                    `Code Diff Tracker: Effective monitoring scope requires supplemental coverage at ${watcherCoverageIssue}. Narrow the scope or wait for S4-B supplemental coverage before rebuilding.`
                 );
                 return;
             }
@@ -908,6 +1045,11 @@ export class DiffTracker {
         try {
             // Watch immediately, but classify paths and capture documents only
             // after ignore discovery. Startup events cannot establish a before-image.
+            // The wall-clock boundary is used only to reject a synthetic/late
+            // create when file birth/content metadata proves it predates watcher
+            // activation. Ambiguous timestamps remain conservative uncertainty.
+            this.initialWatchBoundaryMs = Date.now();
+            this.initialWatchBoundaryMonotonicNs = process.hrtime.bigint();
             this.initialIgnoreEpoch = epoch;
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
             void this.initializeWorkspaceSnapshots().catch(() => {
@@ -916,6 +1058,8 @@ export class DiffTracker {
                 }
             });
         } catch (error) {
+            this.initialWatchBoundaryMs = undefined;
+            this.initialWatchBoundaryMonotonicNs = undefined;
             this.disposeFileWatchers();
             this.externalWatcherEnabled = false;
             vscode.window.showWarningMessage('Code Diff Tracker: Cannot establish file watcher coverage; baseline remains incomplete.');
@@ -1015,7 +1159,7 @@ export class DiffTracker {
             fileSnapshots: new Map(this.fileSnapshots),
             fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             trackedChanges: new Map(this.trackedChanges),
             lineChanges: new Map(this.lineChanges),
@@ -1190,7 +1334,7 @@ export class DiffTracker {
         this.fileSnapshots = new Map();
         this.fileModes = new Map();
         this.baselineExistingFiles = new Set();
-        this.unresolvedBaselineFiles = new Map();
+        this.unresolvedBaselineFiles = new UnresolvedBaselineMap();
         this.opaqueBaselineFiles = new Map();
         this.retainedReviewPaths = new Set();
         this.coverageGaps = new Map();
@@ -1252,7 +1396,7 @@ export class DiffTracker {
         this.fileSnapshots = new Map();
         this.fileModes = new Map();
         this.baselineExistingFiles = new Set();
-        this.unresolvedBaselineFiles = new Map();
+        this.unresolvedBaselineFiles = new UnresolvedBaselineMap();
         this.opaqueBaselineFiles = new Map();
         this.retainedReviewPaths = new Set();
         this.coverageGaps = new Map();
@@ -1308,13 +1452,20 @@ export class DiffTracker {
         return watcher;
     }
 
+    private ordinaryIgnorePolicyAffectsCoverage(): boolean {
+        return this.effectiveMonitoringScope.kind !== 'configured' ||
+            this.effectiveMonitoringScope.mode !== 'wholeWorkspace';
+    }
+
     private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         if (path.basename(uri.fsPath) === '.gitignore') {
-            this.scanCoverage = undefined;
-            this.schedulePersistState();
-            void this.refreshIgnoreMatchers().catch(() => undefined);
+            if (this.ordinaryIgnorePolicyAffectsCoverage()) {
+                this.scanCoverage = undefined;
+                this.schedulePersistState();
+            }
+            this.refreshIgnoreMatchersAfterLivePolicyChange();
         }
         if (this.restoringEpoch === epoch) {
             // A change does not invalidate the evidence that a path
@@ -1422,6 +1573,7 @@ export class DiffTracker {
 
     private async performImportedDirectoryResume(epoch: number, version: number): Promise<void> {
         if (!this.isRecording || !this.externalWatcherEnabled) { return; }
+        const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
         for (const [directory, previous] of Array.from(this.importedDirectoryWatchers)) {
             if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             if (this.importedDirectoryWatchers.get(directory)?.epoch === epoch ||
@@ -1430,7 +1582,7 @@ export class DiffTracker {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
                 // Register before exposing active watches to overlapping refreshes.
                 this.pendingImportedDirectoryReconciliation.add(directory);
-                await this.watchImportedTree(directory, epoch, previous.provenAbsent);
+                await this.watchImportedTree(directory, epoch, previous.provenAbsent, preparationBudget);
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
                 if (this.isFileNotFound(error)) { this.removeImportedDirectoryWatchers(directory); }
@@ -1479,7 +1631,12 @@ export class DiffTracker {
         return true;
     }
 
-    private async watchImportedTree(root: string, epoch: number, inheritedAbsence = false): Promise<void> {
+    private async watchImportedTree(
+        root: string,
+        epoch: number,
+        inheritedAbsence = false,
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
+    ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: ImportedDirectoryWatch; previous?: ImportedDirectoryWatch }>();
         try {
@@ -1492,12 +1649,32 @@ export class DiffTracker {
                 if (this.watchImportedDirectory(directory, epoch, inheritedAbsence)) {
                     installed.set(directory, { current: this.importedDirectoryWatchers.get(directory)!, previous });
                 }
-                const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-                if (!this.isCurrentEpoch(epoch)) { return; }
-                for (const entry of entries) {
-                    // Never follow symlink directories outside the validated tree.
-                    if (entry.isDirectory() && !entry.isSymbolicLink()) {
-                        pending.push(path.join(directory, entry.name));
+                let handle: fs.Dir | undefined;
+                try {
+                    handle = await fs.promises.opendir(directory);
+                    if (!this.isCurrentEpoch(epoch)) { return; }
+                    while (true) {
+                        const entry = handle.readSync();
+                        if (!entry) { break; }
+                        if (preparationBudget.remainingEntries <= 0) {
+                            throw new Error(
+                                `Monitoring scope preparation work budget would exceed ${this.maxScopePreflightEntries} inspected directory entries while installing imported-tree watchers`
+                            );
+                        }
+                        preparationBudget.remainingEntries--;
+                        // Never follow symlink directories outside the validated tree.
+                        // Some NFS/FUSE providers surface UV_DIRENT_UNKNOWN;
+                        // classifyDirectoryEntry supplies the same lstat fallback
+                        // used by bounded candidate enumeration.
+                        const entryKind = this.classifyDirectoryEntry(directory, entry);
+                        if (entryKind === 'directory') {
+                            pending.push(path.join(directory, entry.name));
+                        }
+                    }
+                } finally {
+                    if (handle) {
+                        try { handle.closeSync(); }
+                        catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
                     }
                 }
             }
@@ -1597,6 +1774,62 @@ export class DiffTracker {
             this.unresolvedBaselineFiles.set(filePath, reason);
         }
         this.setFileCoverageGap(filePath, 'scope-apply-event', reason);
+        this.markFileUnavailable(filePath, reason);
+    }
+
+    private configuredScopeMonitorsPath(
+        scope: CanonicalMonitoringScope,
+        uri: vscode.Uri,
+        directory = false
+    ): boolean {
+        if (uri.scheme !== 'file') { return false; }
+        const folder = vscode.workspace.getWorkspaceFolder(uri);
+        if (!folder || folder.uri.scheme !== 'file') { return false; }
+        const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+        if (typeof rootIdentity.caseSensitive !== 'boolean') { return false; }
+        const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
+        const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
+        const ordinaryIgnored = matcher?.ignores(relative) ?? false;
+        return evaluateConfiguredScope(scope, rootIdentity, relative, ordinaryIgnored, directory).monitored;
+    }
+
+    private preserveRejectedScopePreparationEvent(event: StartupEvent): void {
+        const filePath = this.canonicalTrackingPath(event.uri.fsPath);
+        let directory = false;
+        if (event.kind === 'delete') {
+            directory = this.hasHistoricalDirectoryProvenance(filePath);
+            if (!directory && !this.fileSnapshots.has(filePath) &&
+                !this.opaqueBaselineFiles.has(filePath) && !this.unresolvedBaselineFiles.has(filePath)) {
+                // The rejected candidate never committed a file/directory identity.
+                // Preserve uncertainty as subtree evidence rather than recreating
+                // the historical "Resource is a directory" phantom file review.
+                this.setSubtreeCoverageGap(
+                    filePath,
+                    'scope-preparation-delete-unknown-kind',
+                    'A resource disappeared during rejected monitoring-scope preparation; its prior kind and contents are unknown'
+                );
+                return;
+            }
+        } else {
+            try { directory = fs.lstatSync(filePath).isDirectory(); }
+            catch { directory = false; }
+        }
+        if (directory) {
+            this.setSubtreeCoverageGap(
+                filePath,
+                'scope-preparation-event',
+                'A directory changed during rejected monitoring-scope preparation; descendant state requires reconciliation'
+            );
+            return;
+        }
+
+        const reason =
+            'A file changed during rejected monitoring-scope preparation before a reliable before-image was committed';
+        if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
+            this.unresolvedBaselineFiles.set(filePath, reason);
+        }
+        this.setFileCoverageGap(filePath, 'scope-preparation-event', reason);
+        this.retainedReviewPaths.add(filePath);
         this.markFileUnavailable(filePath, reason);
     }
 
@@ -1845,6 +2078,67 @@ export class DiffTracker {
         this.persistenceIssue = message;
         this.persistenceFailed = true;
         console.error(message, error);
+    }
+
+    private async retainPersistenceFailureMarker(message: string): Promise<boolean> {
+        const epoch = this.sessionEpoch;
+        const storageUri = this.storageUri;
+        const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+        if (!storageUri || !failureUri) { return false; }
+
+        const task = async (): Promise<boolean> => {
+            if (epoch !== this.sessionEpoch) { return false; }
+            try {
+                await vscode.workspace.fs.createDirectory(storageUri);
+                if (epoch !== this.sessionEpoch) { return false; }
+                await vscode.workspace.fs.writeFile(
+                    failureUri,
+                    new TextEncoder().encode(message.slice(0, 1000))
+                );
+                return epoch === this.sessionEpoch;
+            } catch (error) {
+                if (epoch === this.sessionEpoch) {
+                    this.reportPersistenceIssue(
+                        'Failed to retain the mandatory coverage failure marker.',
+                        error
+                    );
+                }
+                return false;
+            }
+        };
+        this.persistStateWriteQueue = this.persistStateWriteQueue.then(task, task);
+        return this.persistStateWriteQueue;
+    }
+
+    private async pauseRecordingForUnpersistableCoverage(
+        message: string,
+        error?: unknown
+    ): Promise<void> {
+        // Invalidate every operation that began under the now-untrustworthy
+        // coverage generation before publishing the paused state. This also
+        // rolls back any enclosing baseline transaction and prevents an older
+        // async handler from scheduling a later write that could clear the
+        // durable failure marker.
+        this.advanceEpoch();
+        this.isRecording = false;
+        this.externalWatcherEnabled = false;
+        this.baselineBuilding = true;
+        this.snapshotInitialized = false;
+        this.scanCoverage = undefined;
+        this.clearAutomationSessions();
+        this.clearExternalChangeTimers();
+        this.clearDocumentChangeTimers();
+        this.clearWatcherSuppressionTimers();
+        this.disposeFileWatchers();
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+        }
+        this._onDidChangeRecordingState.fire(false);
+        this._onDidChangeBaselineState.fire('building');
+        await this.retainPersistenceFailureMarker(message);
+        this.reportPersistenceIssue(message, error);
+        this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
     }
 
     private async flushPersistState(
@@ -2339,7 +2633,40 @@ export class DiffTracker {
         return records;
     }
 
-    private canonicalTrackingPath(filePath: string, preserveStoredKey = false): string {
+    private sameExistingFilesystemEntry(left: string, right: string): boolean {
+        // An equal inode proves shared content, not the same directory entry.
+        // Unknown identity must not merge a new name into an established key.
+        return sameExistingDirectoryEntry(left, right) === true;
+    }
+
+    private establishedCanonicalRuntimeAlias(
+        folder: vscode.WorkspaceFolder,
+        relativePosix: string,
+        filePath: string
+    ): string | undefined {
+        const rootPrefix = `${folder.uri.toString()}\0`;
+        const foldedRequested = asciiCaseFold(relativePosix);
+        let matched: string | undefined;
+        for (const [existingKey, existingPath] of this.canonicalTrackingPaths) {
+            if (!existingKey.startsWith(rootPrefix)) { continue; }
+            const existingIdentity = existingKey.slice(rootPrefix.length);
+            // ASCII folding is only a bounded candidate prefilter. The actual
+            // alias proof below is filesystem identity, never string equality.
+            if (asciiCaseFold(existingIdentity) !== foldedRequested) { continue; }
+            if (!this.sameExistingFilesystemEntry(filePath, existingPath)) { continue; }
+            if (matched && path.resolve(matched) !== path.resolve(existingPath)) {
+                return undefined;
+            }
+            matched = existingPath;
+        }
+        return matched;
+    }
+
+    private canonicalTrackingPath(
+        filePath: string,
+        preserveStoredKey = false,
+        identityBudget?: PathIdentityWorkBudget
+    ): string {
         // Already-established keys are stable for the life of their baseline.
         if (!preserveStoredKey && (this.fileSnapshots.has(filePath) || this.opaqueBaselineFiles.has(filePath) ||
             this.unresolvedBaselineFiles.has(filePath))) { return filePath; }
@@ -2352,7 +2679,17 @@ export class DiffTracker {
             return filePath;
         }
         const relativePosix = this.toPosixPath(relative);
-        const resolvedIdentity = resolveRelativePathIdentity(folder.uri.fsPath, relativePosix, identity.caseSensitive);
+        const resolvedIdentity = resolveRelativePathIdentity(
+            folder.uri.fsPath,
+            relativePosix,
+            identity.caseSensitive,
+            identityBudget
+        );
+        this.assertPathIdentityBudget(identityBudget);
+        if (!preserveStoredKey && resolvedIdentity.runtimeFallbackExhausted === true) {
+            const established = this.establishedCanonicalRuntimeAlias(folder, relativePosix, filePath);
+            if (established) { return established; }
+        }
         const key = `${folder.uri.toString()}\0${resolvedIdentity.identity}`;
         const resolvedPath = vscode.Uri.file(path.join(
             folder.uri.fsPath,
@@ -2400,13 +2737,26 @@ export class DiffTracker {
         this.schedulePersistState();
     }
 
-    private pendingScopeExplicitlyExcludes(uri: vscode.Uri, directory = false): boolean {
+    private pendingScopeExplicitlyExcludes(
+        uri: vscode.Uri,
+        directory = false,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean {
         const scope = this.pendingMonitoringScope;
         if (!scope || uri.scheme !== 'file') { return false; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') { return false; }
         const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
-        return evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, directory).source === 'explicitExclude';
+        const decision = evaluateConfiguredScope(
+            scope,
+            this.workspaceRootIdentityForFolder(folder),
+            relPath,
+            false,
+            directory,
+            identityBudget
+        );
+        this.assertPathIdentityBudget(identityBudget);
+        return decision.source === 'explicitExclude';
     }
 
     private setCoverageGap(
@@ -2442,10 +2792,15 @@ export class DiffTracker {
         this.setCoverageGap(filePath, { targetKind: 'file', reasonCode, reason });
     }
 
-    private setSubtreeCoverageGap(directory: string, reasonCode: string, reason: string): void {
+    private setSubtreeCoverageGap(
+        directory: string,
+        reasonCode: string,
+        reason: string,
+        schedule = true
+    ): void {
         const key = path.resolve(directory);
         const previous = this.coverageGaps.get(key)?.subtree;
-        this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason });
+        this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason }, schedule);
         if (!previous || previous.reasonCode !== reasonCode || previous.reason !== reason) {
             this.emitTrackChangesEvent({ fullRefresh: true });
         }
@@ -2625,21 +2980,34 @@ export class DiffTracker {
         }
     }
 
-    public getExplicitlyExcludedPendingReviewPaths(scope: CanonicalMonitoringScope): string[] {
+    public getExplicitlyExcludedPendingReviewPaths(
+        scope: CanonicalMonitoringScope,
+        identityBudget?: PathIdentityWorkBudget
+    ): string[] {
         const results: string[] = [];
         for (const filePath of this.trackedChanges.keys()) {
             const uri = vscode.Uri.file(filePath);
             const folder = vscode.workspace.getWorkspaceFolder(uri);
             if (!folder || folder.uri.scheme !== 'file') { continue; }
             const relPath = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
-            const decision = evaluateConfiguredScope(scope, this.workspaceRootIdentityForFolder(folder), relPath, false, false);
+            const decision = evaluateConfiguredScope(
+                scope,
+                this.workspaceRootIdentityForFolder(folder),
+                relPath,
+                false,
+                false,
+                identityBudget
+            );
             if (decision.source === 'explicitExclude') { results.push(filePath); }
         }
         return results.sort((left, right) => left.localeCompare(right));
     }
 
-    public getExplicitlyExcludedReviewRevision(scope: CanonicalMonitoringScope): string {
-        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope).map(filePath => [
+    public getExplicitlyExcludedReviewRevision(
+        scope: CanonicalMonitoringScope,
+        identityBudget?: PathIdentityWorkBudget
+    ): string {
+        const entries = this.getExplicitlyExcludedPendingReviewPaths(scope, identityBudget).map(filePath => [
             filePath,
             { ...this.trackedChanges.get(filePath), timestamp: undefined },
             this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
@@ -2651,70 +3019,371 @@ export class DiffTracker {
         })).digest('hex');
     }
 
-    private async enumerateExplicitIncludeFiles(
-        rootPath: string,
+    public async preflightConfiguredMonitoringScope(
         scope: CanonicalMonitoringScope,
-        epoch: number
-    ): Promise<string[]> {
-        const files: string[] = [];
-        const pending = [rootPath];
-        while (pending.length > 0) {
-            if (!this.isCurrentEpoch(epoch)) { return files; }
-            const current = pending.pop()!;
-            const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(current));
-            if (!folder || folder.uri.scheme !== 'file') { continue; }
-            const relative = this.toPosixPath(path.relative(folder.uri.fsPath, current));
-            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
-            if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                isHardUnmonitorableRelativePath(relative, rootIdentity, true)) { continue; }
-            const currentDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, true);
-            if (currentDecision.source === 'explicitExclude') { continue; }
+        requestStillCurrent: () => boolean = () => true,
+        identityEvidence?: PathIdentityWorkBudget
+    ): Promise<MonitoringScopePreflightResult> {
+        const result: MonitoringScopePreflightResult = {
+            status: 'ready',
+            scopeRevision: scope.scopeRevision,
+            inspectedEntries: 0,
+            candidateFiles: 0,
+            candidateDirectories: 0,
+            skippedSymlinks: 0,
+            skippedHardBoundaries: 0,
+            skippedExplicitExclusions: 0,
+            truncated: false,
+            entryLimit: this.maxScopePreflightEntries,
+            unreadableDirectoryCount: 0,
+            unreadableDirectories: [],
+            largestDirectories: []
+        };
+        const conflict = (reason: string): MonitoringScopePreflightResult => ({
+            ...result, status: 'conflict', reason
+        });
+        const failed = (reason: string): MonitoringScopePreflightResult => ({
+            ...result, status: 'failed', reason
+        });
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
+            return conflict('Monitoring scope preflight is blocked by recovery or another baseline transaction.');
+        }
+        if (!requestStillCurrent()) {
+            return conflict('Monitoring scope request changed before preflight started.');
+        }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) { return conflict(identityIssue); }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
+            return conflict('Requested scope roots do not match the current local workspace identity.');
+        }
 
-            let entries: fs.Dirent[];
-            try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
-            catch (error) {
-                if (this.isFileNotFound(error)) { continue; }
-                throw error;
+        // Configuration/controller updates can leave a committed-scope matcher
+        // refresh in flight immediately before Apply starts. Drain only work that
+        // already existed before taking the preflight version snapshot; a refresh
+        // that begins after this barrier still invalidates candidate preparation.
+        let pendingRefresh = this.ignoreRefreshPromise;
+        while (true) {
+            try { await pendingRefresh; } catch { /* Candidate preflight rebuilds its own matcher below. */ }
+            if (!requestStillCurrent()) {
+                return conflict('Monitoring scope request changed while waiting for ignore-policy refresh.');
             }
-            if (!this.isCurrentEpoch(epoch)) { return files; }
+            if (pendingRefresh === this.ignoreRefreshPromise) { break; }
+            pendingRefresh = this.ignoreRefreshPromise;
+        }
+        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
+            return conflict('Monitoring scope preflight was invalidated while waiting for ignore-policy refresh.');
+        }
+        const refreshedIdentityIssue = this.getPathIdentityIssue();
+        if (refreshedIdentityIssue) { return conflict(refreshedIdentityIssue); }
+        if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
+            return conflict('Requested scope roots changed while waiting for ignore-policy refresh.');
+        }
 
-            for (const entry of entries) {
-                if (!this.isCurrentEpoch(epoch)) { return files; }
-                const child = path.join(current, entry.name);
-                const childRelative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
-                if (typeof rootIdentity.caseSensitive !== 'boolean' ||
-                    isHardUnmonitorableRelativePath(childRelative, rootIdentity, entry.isDirectory()) ||
-                    entry.isSymbolicLink()) { continue; }
-                const childDecision = evaluateConfiguredScope(
-                    scope, rootIdentity, childRelative, false, entry.isDirectory()
+        const epoch = this.sessionEpoch;
+        const ignorePolicyRevision = this.ignorePolicyRevision;
+        const contextStillCurrent = (): boolean =>
+            this.isCurrentEpoch(epoch) && requestStillCurrent() &&
+            ignorePolicyRevision === this.ignorePolicyRevision && !this.baselineTransaction &&
+            this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities());
+        // Preflight must evaluate ordinary ignore policy against the
+        // requested scope, not the committed matcher snapshot. Existing-root
+        // matchers may have skipped nested .gitignore files inside a subtree
+        // that the requested scope is now expanding back into.
+        const ignoreBudget = this.createIgnoreDiscoveryBudget(contextStillCurrent, identityEvidence);
+        const unreadablePolicyDirectories = new Set<string>();
+        ignoreBudget.onUnreadableDirectory = (directory, error) => {
+            const key = path.resolve(directory);
+            if (unreadablePolicyDirectories.has(key)) { return; }
+            unreadablePolicyDirectories.add(key);
+            result.unreadableDirectoryCount++;
+            if (result.unreadableDirectories.length >= this.maxScopePreflightDiagnostics) { return; }
+            const owner = this.owningWorkspaceFolderForTraversal(directory);
+            result.unreadableDirectories.push({
+                root: owner?.name ?? '',
+                path: owner ? this.toPosixPath(path.relative(owner.uri.fsPath, directory)) || '.' : directory,
+                reason: error instanceof Error ? error.message : String(error)
+            });
+        };
+        const preflightIgnoreMatchers = new Map<string, Ignore>();
+        for (const folder of this.getSupportedWorkspaceFolders()) {
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope,
+                this.workspaceRootIdentityForFolder(folder),
+                '',
+                ignoreBudget
+            )) {
+                this.checkIgnoreDiscovery(ignoreBudget);
+                continue;
+            }
+            this.checkIgnoreDiscovery(ignoreBudget);
+            try {
+                const matcher = await this.buildIgnoreMatcher(
+                    folder,
+                    [],
+                    undefined,
+                    scope,
+                    false,
+                    ignoreBudget
                 );
-                if (childDecision.source === 'explicitExclude') { continue; }
-                if (entry.isDirectory()) {
-                    pending.push(child);
-                } else if (entry.isFile()) {
-                    files.push(child);
+                if (!contextStillCurrent()) {
+                    return conflict('Monitoring scope request, session, or workspace identity changed while loading preflight ignore policy.');
                 }
+                preflightIgnoreMatchers.set(folder.uri.fsPath, matcher);
+            } catch (error) {
+                if (error instanceof IgnoreDiscoveryError && error.limit === 'invalidated') {
+                    return conflict(error.message);
+                }
+                if (error instanceof IgnoreDiscoveryError && error.limit === 'entries') {
+                    result.inspectedEntries = this.maxScopePreflightEntries - ignoreBudget.remainingEntries;
+                    result.truncated = true;
+                    result.reason = error.message;
+                    return result;
+                }
+                return failed(
+                    `Monitoring scope preflight could not load ordinary ignore policy for ${folder.name}: ${error instanceof Error ? error.message : String(error)}`
+                );
             }
         }
-        return files;
+        result.inspectedEntries = this.maxScopePreflightEntries - ignoreBudget.remainingEntries;
+        const pending = this.getSupportedWorkspaceFolders().map(folder => ({
+            folder,
+            directory: path.resolve(folder.uri.fsPath)
+        }));
+        const directorySummaries: MonitoringScopePreflightDirectorySummary[] = [];
+        const rememberUnreadable = (folder: vscode.WorkspaceFolder, directory: string, error: unknown): void => {
+            result.unreadableDirectoryCount++;
+            if (result.unreadableDirectories.length >= this.maxScopePreflightDiagnostics) { return; }
+            const relative = this.toPosixPath(path.relative(folder.uri.fsPath, directory)) || '.';
+            result.unreadableDirectories.push({
+                root: folder.name,
+                path: relative,
+                reason: error instanceof Error ? error.message : String(error)
+            });
+        };
+        while (pending.length > 0) {
+            if (!contextStillCurrent()) {
+                return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
+            }
+            const { folder, directory } = pending.pop()!;
+            if (unreadablePolicyDirectories.has(path.resolve(directory))) { continue; }
+            if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
+            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof rootIdentity.caseSensitive !== 'boolean') {
+                return conflict('Workspace path case-sensitivity could not be verified during preflight.');
+            }
+            const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope, rootIdentity, relativeDirectory, ignoreBudget.identityBudget
+            )) {
+                this.checkIgnoreDiscovery(ignoreBudget);
+                result.skippedExplicitExclusions++;
+                continue;
+            }
+            this.checkIgnoreDiscovery(ignoreBudget);
+            if (relativeDirectory && isHardUnmonitorableRelativePath(
+                relativeDirectory, rootIdentity, true, ignoreBudget.identityBudget
+            )) {
+                this.checkIgnoreDiscovery(ignoreBudget);
+                result.skippedHardBoundaries++;
+                continue;
+            }
+            this.checkIgnoreDiscovery(ignoreBudget);
+            if (relativeDirectory) {
+                const directoryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
+                const ordinaryDirectoryIgnored = directoryMatcher?.ignores(relativeDirectory + '/') ?? false;
+                const directoryDecision = evaluateConfiguredScope(
+                    scope, rootIdentity, relativeDirectory, ordinaryDirectoryIgnored, true, ignoreBudget.identityBudget
+                );
+                this.checkIgnoreDiscovery(ignoreBudget);
+                if (directoryDecision.source === 'explicitExclude') {
+                    result.skippedExplicitExclusions++;
+                    continue;
+                }
+                if (directoryDecision.source === 'hardBoundary' || directoryDecision.source === 'identityUnknown') {
+                    result.skippedHardBoundaries++;
+                    continue;
+                }
+                if (!directoryDecision.monitored) {
+                    continue;
+                }
+            }
+
+            let directoryEntries = 0;
+            try {
+                const handle = await fs.promises.opendir(directory);
+                for await (const entry of handle) {
+                    if (!contextStillCurrent()) {
+                        return conflict('Monitoring scope request, session, or workspace identity changed during preflight.');
+                    }
+                    const child = path.join(directory, entry.name);
+                    if (!ignoreBudget.seenEntries.has(path.resolve(child)) && ignoreBudget.remainingEntries <= 0) {
+                        result.truncated = true;
+                        result.reason ??=
+                            'Monitoring scope preparation work budget exhausted while enumerating directory entries';
+                        break;
+                    }
+                    this.consumeIgnoreDiscoveryEntry(ignoreBudget, child);
+                    result.inspectedEntries = this.maxScopePreflightEntries - ignoreBudget.remainingEntries;
+                    directoryEntries++;
+                    const entryKind = this.classifyDirectoryEntry(directory, entry);
+                    if (entryKind === 'missing' || entryKind === 'other') { continue; }
+                    if (entryKind === 'symlink') {
+                        result.skippedSymlinks++;
+                        continue;
+                    }
+                    this.notePhysicalIdentityPath(ignoreBudget.identityBudget, child);
+                    const isDirectory = entryKind === 'directory';
+                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                    if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) {
+                        continue;
+                    }
+                    if (isHardUnmonitorableRelativePath(
+                        relative, rootIdentity, isDirectory, ignoreBudget.identityBudget
+                    )) {
+                        this.checkIgnoreDiscovery(ignoreBudget);
+                        result.skippedHardBoundaries++;
+                        continue;
+                    }
+                    this.checkIgnoreDiscovery(ignoreBudget);
+                    const ordinaryMatcher = preflightIgnoreMatchers.get(folder.uri.fsPath);
+                    const ordinaryIgnored = ordinaryMatcher?.ignores(relative + (isDirectory ? '/' : '')) ?? false;
+                    const decision = evaluateConfiguredScope(
+                        scope, rootIdentity, relative, ordinaryIgnored, isDirectory, ignoreBudget.identityBudget
+                    );
+                    this.checkIgnoreDiscovery(ignoreBudget);
+                    if (decision.source === 'explicitExclude') {
+                        result.skippedExplicitExclusions++;
+                        continue;
+                    }
+                    if (decision.source === 'hardBoundary' || decision.source === 'identityUnknown') {
+                        result.skippedHardBoundaries++;
+                        continue;
+                    }
+                    if (!decision.monitored) {
+                        continue;
+                    }
+                    if (isDirectory) {
+                        result.candidateDirectories++;
+                        pending.push({ folder, directory: child });
+                    } else {
+                        result.candidateFiles++;
+                    }
+                }
+            } catch (error) {
+                if (error instanceof IgnoreDiscoveryError) {
+                    if (error.limit === 'invalidated') {
+                        return conflict(error.message);
+                    }
+                    if (error.limit === 'entries') {
+                        result.inspectedEntries = this.maxScopePreflightEntries - ignoreBudget.remainingEntries;
+                        result.truncated = true;
+                        result.reason = error.message;
+                    } else {
+                        return failed(error.message);
+                    }
+                } else if (!this.isFileNotFound(error)) {
+                    rememberUnreadable(folder, directory, error);
+                }
+            }
+
+            directorySummaries.push({
+                root: folder.name,
+                path: relativeDirectory || '.',
+                entries: directoryEntries
+            });
+            if (result.truncated) { break; }
+        }
+
+        result.largestDirectories = directorySummaries
+            .sort((left, right) => right.entries - left.entries ||
+                left.root.localeCompare(right.root) || left.path.localeCompare(right.path))
+            .slice(0, this.maxScopePreflightDirectorySummaries);
+
+        // A watcher-triggered matcher refresh can overlap preflight. Wait for the
+        // current refresh chain to settle before publication and reject only if
+        // the effective matcher fingerprint actually changed. A no-op refresh
+        // (for example a directory create with no new ignore policy) is harmless.
+        let finalRefresh = this.ignoreRefreshPromise;
+        while (true) {
+            try { await finalRefresh; } catch { /* Candidate matcher already reports its own read failures. */ }
+            if (!requestStillCurrent()) {
+                return conflict('Monitoring scope request changed while finalizing ignore-policy preparation.');
+            }
+            if (finalRefresh === this.ignoreRefreshPromise) { break; }
+            finalRefresh = this.ignoreRefreshPromise;
+        }
+        if (!contextStillCurrent()) {
+            return conflict('Monitoring scope ignore policy changed during preparation.');
+        }
+        return result;
     }
 
-    private async captureConfiguredIncludeBaselines(scope: CanonicalMonitoringScope, epoch: number): Promise<number> {
+    private assertPathIdentityBudget(budget?: PathIdentityWorkBudget): void {
+        if (!budget?.exhausted) { return; }
+        throw new Error(
+            'Monitoring scope preparation path-identity work budget exceeded; ' +
+            'narrow the scope or reduce oversized directory fan-out before retrying.'
+        );
+    }
+
+    private notePhysicalIdentityPath(
+        budget: PathIdentityWorkBudget | undefined,
+        targetPath: string
+    ): void {
+        if (!budget) { return; }
+        (budget.physicalPaths ??= new Set()).add(path.resolve(targetPath));
+    }
+
+    private async captureConfiguredIncludeBaselines(
+        scope: CanonicalMonitoringScope,
+        epoch: number,
+        preparationStillCurrent: () => boolean,
+        shared?: {
+            persistence: CandidatePersistenceBudget;
+            traversal: PathIdentityWorkBudget;
+            missingOnly: boolean;
+        },
+        identityEvidence?: PathIdentityWorkBudget
+    ): Promise<number> {
         let captured = 0;
+        const assertCurrent = (): void => {
+            if (!this.isCurrentEpoch(epoch) || !preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
+        };
+        assertCurrent();
+        const projectedScanCoverage = !this.isRecording || this.baselineBuilding ||
+            !this.snapshotInitialized || this.workspaceContextChanged ? undefined : this.ignoreFingerprint;
+        const persistenceBudget = shared?.persistence ?? this.createCandidatePersistenceBudget(projectedScanCoverage);
+        const preparationBudget = shared?.traversal ?? identityEvidence ?? {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        if (!shared?.traversal && !identityEvidence) {
+            preparationBudget.remainingEntries = this.maxScopePreflightEntries;
+            preparationBudget.exhausted = false;
+        }
+        const capacityGuard: CandidateCapacityGuard = {
+            remaining: this.remainingCandidatePersistenceSlots(),
+            exemptPaths: new Set([
+                ...this.fileSnapshots.keys(), ...this.unresolvedBaselineFiles.keys(),
+                ...this.opaqueBaselineFiles.keys(), ...this.trackedChanges.keys()
+            ]),
+            countedCandidates: new Set<string>()
+        };
+        const visitedDirectories = new Set<string>();
+        const visitedTargets = new Set<string>();
         const rootsByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
+        const eligible = (filePath: string): boolean => !this.hasCapturedBaseline(filePath) &&
+            !this.unresolvedBaselineFiles.has(filePath) && !this.trackedChanges.has(filePath) &&
+            !this.isPathIgnored(vscode.Uri.file(filePath), false, false, false, preparationBudget);
         const captureFile = async (filePath: string): Promise<void> => {
-            filePath = this.canonicalTrackingPath(filePath);
-            if (!this.isCurrentEpoch(epoch) || this.hasCapturedBaseline(filePath) ||
-                this.unresolvedBaselineFiles.has(filePath) || this.trackedChanges.has(filePath) ||
-                this.isPathIgnored(vscode.Uri.file(filePath), false, false)) { return; }
-            const targetError = this.isRecording
-                ? this.validateSnapshotTarget(filePath)
-                : this.validateResourceTarget(filePath);
-            if (targetError) { return; }
+            assertCurrent();
+            filePath = this.canonicalTrackingPath(filePath, false, preparationBudget);
+            if (!eligible(filePath) || this.validateSnapshotTarget(filePath, preparationBudget)) { return; }
             const state = await this.readCurrentFileState(filePath);
-            if (!this.isCurrentEpoch(epoch)) { return; }
-            this.recordScannedBaseline(filePath, state, 'workspace');
-            captured++;
+            assertCurrent();
+            if (!eligible(filePath)) { return; }
+            if (this.recordScannedBaseline(filePath, state, 'workspace', persistenceBudget)) { captured++; }
         };
 
         for (const rule of scope.includes) {
@@ -2722,39 +3391,800 @@ export class DiffTracker {
                 ? [rootsByName.get(rule.folder ?? '')].filter((value): value is vscode.WorkspaceFolder => !!value)
                 : this.getSupportedWorkspaceFolders();
             for (const folder of folders) {
-                if (!this.isCurrentEpoch(epoch)) { return captured; }
-                const target = this.canonicalTrackingPath(path.join(folder.uri.fsPath, ...rule.path.split('/')));
+                assertCurrent();
+                // Literal/absent targets must consume work as well; a large list
+                // of missing includes cannot bypass the directory-entry bound.
+                if (preparationBudget.remainingEntries <= 0) {
+                    throw new Error('Monitoring scope include preparation work budget exceeded; narrow the scope before retrying.');
+                }
+                preparationBudget.remainingEntries--;
+                const target = this.canonicalTrackingPath(
+                    path.join(folder.uri.fsPath, ...rule.path.split('/')),
+                    false,
+                    preparationBudget
+                );
+                if (visitedTargets.has(target)) { continue; }
+                visitedTargets.add(target);
+                const uri = vscode.Uri.file(target);
+                if (this.isPathIgnored(uri, false, false, false)) { continue; }
                 const targetError = this.validateResourceTarget(target);
                 if (targetError) { throw new Error(targetError); }
                 let stat: fs.Stats | undefined;
                 try { stat = fs.lstatSync(target); }
-                catch (error) {
-                    if (!this.isFileNotFound(error)) { throw error; }
-                }
+                catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
                 if (!stat) {
-                    if (!this.hasCapturedBaseline(target) && !this.unresolvedBaselineFiles.has(target)) {
-                        this.fileSnapshots.set(target, '');
-                        this.fileModes.delete(target);
-                        this.baselineExistingFiles.delete(target);
-                        this.opaqueBaselineFiles.delete(target);
-                        captured++;
+                    if (!eligible(target)) { continue; }
+                    if (this.hasDirtyDocument(target)) {
+                        await captureFile(target);
+                        continue;
                     }
+                    // Preserve S3's explicit missing-target absence provenance,
+                    // but reserve its exact text/count/byte cost before retention.
+                    this.consumeCandidatePersistenceBudget(target,
+                        { kind: 'text', content: '', baselineExists: false }, persistenceBudget);
+                    this.fileSnapshots.set(target, '');
+                    this.fileModes.delete(target);
+                    this.baselineExistingFiles.delete(target);
+                    this.opaqueBaselineFiles.delete(target);
+                    captured++;
                     continue;
                 }
                 if (stat.isSymbolicLink()) { throw new Error('Explicit include resolves through a symbolic link'); }
-                if (stat.isFile()) {
-                    await captureFile(target);
+                if (shared?.missingOnly) { continue; }
+                if (stat.isFile()) { await captureFile(target); continue; }
+                if (!stat.isDirectory()) { continue; }
+                // There is no legacy/unbudgeted acquisition path. Even repeated
+                // or contracting Rules Apply uses the shared streaming enumerator.
+                const files = await this.enumerateConfiguredCandidateFiles(
+                    scope, epoch, target, capacityGuard, preparationBudget, preparationStillCurrent,
+                    {
+                        seedOverlappingWorkspaceRoots: true,
+                        visitedDirectories,
+                        identityBudget: preparationBudget
+                    }
+                );
+                assertCurrent();
+                for (const filePath of files) { await captureFile(filePath); }
+            }
+        }
+        assertCurrent();
+        this.validateCandidatePersistenceProjection(persistenceBudget);
+        return captured;
+    }
+
+    private workspaceFolderOwnsTraversalPath(
+        folder: vscode.WorkspaceFolder,
+        targetPath: string
+    ): boolean {
+        const resolvedTarget = path.resolve(targetPath);
+        let owner: vscode.WorkspaceFolder | undefined;
+        let ownerLength = -1;
+        for (const candidate of this.getSupportedWorkspaceFolders()) {
+            const candidateRoot = path.resolve(candidate.uri.fsPath);
+            if (!this.pathBelongsToRoot(resolvedTarget, candidateRoot)) { continue; }
+            if (candidateRoot.length > ownerLength) {
+                owner = candidate;
+                ownerLength = candidateRoot.length;
+            }
+        }
+        return !!owner && path.resolve(owner.uri.fsPath) === path.resolve(folder.uri.fsPath);
+    }
+
+    private owningWorkspaceFolderForTraversal(targetPath: string): vscode.WorkspaceFolder | undefined {
+        const resolvedTarget = path.resolve(targetPath);
+        let owner: vscode.WorkspaceFolder | undefined;
+        let ownerLength = -1;
+        for (const candidate of this.getSupportedWorkspaceFolders()) {
+            const candidateRoot = path.resolve(candidate.uri.fsPath);
+            if (!this.pathBelongsToRoot(resolvedTarget, candidateRoot)) { continue; }
+            if (candidateRoot.length > ownerLength) {
+                owner = candidate;
+                ownerLength = candidateRoot.length;
+            }
+        }
+        return owner;
+    }
+
+    private classifyDirectoryEntry(
+        directory: string,
+        entry: fs.Dirent
+    ): 'file' | 'directory' | 'symlink' | 'other' | 'missing' {
+        if (entry.isSymbolicLink()) { return 'symlink'; }
+        if (entry.isDirectory()) { return 'directory'; }
+        if (entry.isFile()) { return 'file'; }
+        const child = path.join(directory, entry.name);
+        try {
+            const stat = fs.lstatSync(child);
+            if (stat.isSymbolicLink()) { return 'symlink'; }
+            if (stat.isDirectory()) { return 'directory'; }
+            if (stat.isFile()) { return 'file'; }
+            return 'other';
+        } catch (error) {
+            if (this.isFileNotFound(error)) { return 'missing'; }
+            throw error;
+        }
+    }
+
+    private async enumerateConfiguredCandidateFiles(
+        scope: CanonicalMonitoringScope,
+        epoch: number,
+        scanRoot?: string,
+        capacityGuard?: CandidateCapacityGuard,
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries },
+        preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch),
+        traversalOptions: {
+            seedOverlappingWorkspaceRoots?: boolean;
+            skipTraversalPath?: (targetPath: string) => boolean;
+            visitedDirectories?: Set<string>;
+            identityBudget?: PathIdentityWorkBudget;
+        } = {}
+    ): Promise<string[]> {
+        const files: string[] = [];
+        const identityBudget = traversalOptions.identityBudget ?? preparationBudget;
+        const countedCandidates = capacityGuard?.countedCandidates ?? new Set<string>();
+        const requestedRoot = scanRoot ? path.resolve(scanRoot) : undefined;
+        const pending: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = requestedRoot
+            ? (() => {
+                const seeds: Array<{ folder: vscode.WorkspaceFolder; directory: string }> = [];
+                const owner = this.owningWorkspaceFolderForTraversal(requestedRoot);
+                if (owner?.uri.scheme === 'file') {
+                    seeds.push({ folder: owner, directory: requestedRoot });
+                }
+
+                if (traversalOptions.seedOverlappingWorkspaceRoots) {
+                    // Repository scans may start above the opened workspace.
+                    // Seed each overlapping workspace slice explicitly because
+                    // parent traversal intentionally stops at nested ownership
+                    // boundaries. Per-folder Start/restore scans leave this off.
+                    for (const folder of this.getSupportedWorkspaceFolders()) {
+                        const folderRoot = path.resolve(folder.uri.fsPath);
+                        if (!this.pathBelongsToRoot(folderRoot, requestedRoot)) { continue; }
+                        seeds.push({ folder, directory: folderRoot });
+                    }
+                }
+
+                const seen = new Set<string>();
+                return seeds.filter(({ folder, directory }) => {
+                    const key = path.resolve(folder.uri.fsPath) + '\0' + path.resolve(directory);
+                    if (seen.has(key)) { return false; }
+                    seen.add(key);
+                    return true;
+                });
+            })()
+            : this.getSupportedWorkspaceFolders().map(folder => ({
+                folder,
+                directory: path.resolve(folder.uri.fsPath)
+            }));
+        while (pending.length > 0) {
+            if (!this.isCurrentEpoch(epoch)) { return files; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
+            const { folder, directory } = pending.pop()!;
+            if (traversalOptions.skipTraversalPath?.(directory)) { continue; }
+            if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
+            const rootIdentity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof rootIdentity.caseSensitive !== 'boolean') {
+                throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
+            }
+            const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope,
+                rootIdentity,
+                relativeDirectory,
+                identityBudget
+            )) {
+                this.assertPathIdentityBudget(identityBudget);
+                continue;
+            }
+            this.assertPathIdentityBudget(identityBudget);
+            if (relativeDirectory) {
+                const hardBoundary = isHardUnmonitorableRelativePath(
+                    relativeDirectory,
+                    rootIdentity,
+                    true,
+                    identityBudget
+                );
+                this.assertPathIdentityBudget(identityBudget);
+                if (hardBoundary ||
+                    this.isPathIgnored(vscode.Uri.file(directory), true, false, false, identityBudget)) {
                     continue;
                 }
-                if (!stat.isDirectory()) { continue; }
-                const files = await this.enumerateExplicitIncludeFiles(target, scope, epoch);
-                if (!this.isCurrentEpoch(epoch)) { return captured; }
-                for (const filePath of files) {
-                    if (!this.pathBelongsToRoot(filePath, target)) { continue; }
-                    await captureFile(filePath);
+            }
+            const visitKey = folder.uri.toString() + '\0' + path.resolve(directory);
+            if (traversalOptions.visitedDirectories?.has(visitKey)) { continue; }
+            traversalOptions.visitedDirectories?.add(visitKey);
+
+            let handle: fs.Dir | undefined;
+            try {
+                handle = await fs.promises.opendir(directory);
+                if (!this.isCurrentEpoch(epoch)) { return files; }
+                if (!preparationStillCurrent()) {
+                    throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+                }
+                // Keep the traversal streaming, but do not yield between every
+                // directory entry. Per-entry async iteration lets watcher events
+                // interleave with startup baseline discovery and can turn a
+                // pre-existing stopped-session file into scan-time uncertainty.
+                // readSync() preserves the earlier readdir scheduling boundary
+                // while still avoiding an unbounded Dirent[] allocation.
+                while (true) {
+                    const entry = handle.readSync();
+                    if (!entry) { break; }
+                    if (!this.isCurrentEpoch(epoch)) { return files; }
+                    const child = path.join(directory, entry.name);
+                    if (traversalOptions.skipTraversalPath?.(child)) { continue; }
+                    if (preparationBudget.remainingEntries <= 0) {
+                        throw new Error(
+                            `Monitoring scope preparation work budget would exceed ${this.maxScopePreflightEntries} inspected directory entries; add explicit exclusions or narrow the scope before retrying.`
+                        );
+                    }
+                    preparationBudget.remainingEntries--;
+
+                    const entryKind = this.classifyDirectoryEntry(directory, entry);
+                    if (entryKind === 'missing' || entryKind === 'other' || entryKind === 'symlink') { continue; }
+                    this.notePhysicalIdentityPath(identityBudget, child);
+                    const isDirectory = entryKind === 'directory';
+                    if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
+                    const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
+                    if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, identityBudget)) {
+                        this.assertPathIdentityBudget(identityBudget);
+                        continue;
+                    }
+                    this.assertPathIdentityBudget(identityBudget);
+                    if (this.isPathIgnored(vscode.Uri.file(child), isDirectory, false, false, identityBudget)) { continue; }
+                    if (isDirectory) {
+                        pending.push({ folder, directory: child });
+                    } else {
+                        const canonical = this.canonicalTrackingPath(child, false, identityBudget);
+                        if (capacityGuard && !capacityGuard.exemptPaths.has(canonical) &&
+                            !this.trackedChanges.has(canonical) && !countedCandidates.has(canonical)) {
+                            if (capacityGuard.remaining <= 0) {
+                                throw new Error(
+                                    `Monitoring scope snapshot capacity would exceed ${this.maxPersistedSnapshots} persisted resources; add explicit exclusions before retrying.`
+                                );
+                            }
+                            countedCandidates.add(canonical);
+                            capacityGuard.remaining--;
+                        }
+                        // Capacity accounting uses canonical identity, but discovery
+                        // keeps the raw directory-entry path. Downstream callers
+                        // already canonicalize at their established boundary.
+                        files.push(child);
+                    }
+                }
+            } catch (error) {
+                if (this.isFileNotFound(error)) { continue; }
+                throw error;
+            } finally {
+                if (handle) {
+                    try { handle.closeSync(); }
+                    catch (error) {
+                        if (!this.isFileNotFound(error)) { throw error; }
+                    }
                 }
             }
         }
+        return files;
+    }
+
+    private remainingCandidatePersistenceSlots(): number {
+        return Math.max(0, this.maxPersistedSnapshots - this.fileSnapshots.size) +
+            Math.max(0, this.maxPersistedSnapshots - this.unresolvedBaselineFiles.size) +
+            Math.max(0, this.maxPersistedSnapshots - this.opaqueBaselineFiles.size);
+    }
+
+    private createCandidatePersistenceBudget(projectedScanCoverage = this.scanCoverage): CandidatePersistenceBudget {
+        const state = this.buildPersistedState();
+        let remainingBytes = Number.POSITIVE_INFINITY;
+        let fileModes = [...this.fileModes.keys()].filter(filePath => this.fileSnapshots.has(filePath)).length;
+        let baselineExistingFiles = this.baselineExistingFiles.size;
+        if (state) {
+            // Scope Apply clears scanCoverage during preparation and restores the
+            // ready coverage fingerprint immediately before persistence. Reserve
+            // those final bytes now so candidate capture cannot fill the payload
+            // right up to the limit and defer rejection to final serialization.
+            state.scanCoverage = projectedScanCoverage;
+            const usedBytes = Buffer.byteLength(JSON.stringify(state), 'utf8');
+            if (usedBytes > this.maxPersistedBytes) {
+                throw new Error(
+                    'Monitoring scope persisted byte capacity already exceeds ' +
+                    this.maxPersistedBytes +
+                    ' bytes before candidate capture; narrow the scope before retrying.'
+                );
+            }
+            remainingBytes = this.maxPersistedBytes - usedBytes;
+            fileModes = state.fileModes.length;
+            baselineExistingFiles = state.baselineExistingFiles.length;
+        }
+        return {
+            remainingBytes,
+            fileSnapshots: this.fileSnapshots.size,
+            fileModes,
+            baselineExistingFiles,
+            unresolvedBaselineFiles: this.unresolvedBaselineFiles.size,
+            opaqueBaselineFiles: this.opaqueBaselineFiles.size,
+            coverageGaps: this.coverageGaps.size,
+            accountedUnresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            observedUnresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            observedUnresolvedMap: this.unresolvedBaselineFiles,
+            observedUnresolvedRevision: this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                ? this.unresolvedBaselineFiles.revision : undefined
+        };
+    }
+
+    private reserveCandidateCoverageGap(
+        targetPath: string,
+        evidence: CoverageGapEvidence,
+        budget: CandidatePersistenceBudget
+    ): void {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+
+        const key = evidence.targetKind === 'file'
+            ? this.canonicalTrackingPath(targetPath)
+            : path.resolve(targetPath);
+        const previous = this.coverageGaps.get(key);
+        const next: CoverageGapRecord = evidence.targetKind === 'file'
+            ? { ...previous, file: evidence }
+            : { ...previous, subtree: evidence };
+        let addedBytes: number;
+        if (previous) {
+            addedBytes =
+                Buffer.byteLength(JSON.stringify([key, next]), 'utf8') -
+                Buffer.byteLength(JSON.stringify([key, previous]), 'utf8');
+        } else {
+            if (budget.coverageGaps >= this.maxPersistedSnapshots) {
+                fail(
+                    'Monitoring scope coverage-gap capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; reconcile existing coverage gaps before retrying.'
+                );
+            }
+            addedBytes = this.serializedArrayAppendBytes(
+                budget.coverageGaps,
+                [key, next]
+            );
+        }
+        if (addedBytes > budget.remainingBytes) {
+            fail(
+                'Monitoring scope persisted byte capacity would exceed ' +
+                this.maxPersistedBytes +
+                ' bytes after reserving required coverage evidence.'
+            );
+        }
+        budget.remainingBytes -= addedBytes;
+        if (!previous) { budget.coverageGaps++; }
+    }
+
+    private validateCandidatePersistenceProjection(
+        budget: CandidatePersistenceBudget
+    ): string {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+
+        // First absorb live unresolved evidence into the incremental ledger, then
+        // validate the exact Session V4 payload. This final projection catches
+        // concurrently mutable durable evidence outside the baseline maps too,
+        // including coverage gaps and retained-review metadata.
+        this.synchronizeCandidateUnresolvedBudget(budget);
+        const state = this.buildPersistedState();
+        if (!state) { return ''; }
+        state.baselineState = 'ready';
+        if (!this.parsePersistedState(state)) {
+            fail(
+                'Monitoring scope final persistence projection exceeds Session V4 schema/count limits; ' +
+                'narrow the scope before retrying.'
+            );
+        }
+        const payload = JSON.stringify(state);
+        if (Buffer.byteLength(payload, 'utf8') > this.maxPersistedBytes) {
+            fail(
+                'Monitoring scope final persistence projection exceeds ' +
+                this.maxPersistedBytes +
+                ' bytes; narrow the scope before retrying.'
+            );
+        }
+        return payload;
+    }
+
+    private validateRestoreAdditionsProjection(
+        additions: readonly { filePath: string; plan: CandidateBaselinePlan }[]
+    ): void {
+        if (additions.length === 0) { return; }
+        const state = this.buildPersistedState();
+        if (!state) { return; }
+
+        const snapshots = new Map(state.fileSnapshots);
+        const modes = new Map(state.fileModes);
+        const existingFiles = new Set(state.baselineExistingFiles);
+        const unresolved = new Map(state.unresolvedBaselineFiles);
+        const opaque = new Map(state.opaqueBaselineFiles);
+
+        for (const { filePath, plan } of additions) {
+            if (plan.kind === 'text') {
+                snapshots.set(filePath, plan.content);
+                unresolved.delete(filePath);
+                opaque.delete(filePath);
+                if (plan.mode === undefined) { modes.delete(filePath); }
+                else { modes.set(filePath, plan.mode); }
+                if (plan.baselineExists) { existingFiles.add(filePath); }
+                else { existingFiles.delete(filePath); }
+            } else if (plan.kind === 'unresolved') {
+                snapshots.delete(filePath);
+                modes.delete(filePath);
+                existingFiles.delete(filePath);
+                opaque.delete(filePath);
+                unresolved.set(filePath, plan.reason);
+            } else {
+                opaque.set(filePath, {
+                    reason: plan.state.reason,
+                    size: plan.state.size,
+                    mtime: plan.state.mtime,
+                    fingerprint: plan.state.fingerprint
+                });
+                snapshots.delete(filePath);
+                modes.delete(filePath);
+                existingFiles.delete(filePath);
+                unresolved.delete(filePath);
+            }
+        }
+
+        state.fileSnapshots = [...snapshots].sort(([left], [right]) => left.localeCompare(right));
+        state.fileModes = [...modes].filter(([filePath]) => snapshots.has(filePath));
+        state.baselineExistingFiles = [...existingFiles].sort((left, right) => left.localeCompare(right));
+        state.unresolvedBaselineFiles = [...unresolved].sort(([left], [right]) => left.localeCompare(right));
+        state.opaqueBaselineFiles = [...opaque].sort(([left], [right]) => left.localeCompare(right));
+
+        if (!this.parsePersistedState(state)) {
+            throw new Error(
+                'Restored additions would exceed Session V4 schema/count limits; rebuild or narrow the monitoring scope before retrying.'
+            );
+        }
+        if (Buffer.byteLength(JSON.stringify(state), 'utf8') > this.maxPersistedBytes) {
+            throw new Error(
+                'Restored additions would exceed persisted byte capacity; rebuild or narrow the monitoring scope before retrying.'
+            );
+        }
+    }
+
+    private planScannedBaseline(
+        filePath: string,
+        state: CurrentFileState,
+        scope: 'workspace' | 'repository'
+    ): CandidateBaselinePlan {
+        const phase = scope === 'repository' ? 'repository baseline rebuild' : 'baseline scan';
+        if (this.hasScanUncertainty(filePath)) {
+            return { kind: 'unresolved', reason: 'File changed during ' + phase + '; before-image is unknown' };
+        }
+        if (state.kind === 'text') {
+            return { kind: 'text', content: state.content, mode: state.mode, baselineExists: true };
+        }
+        if (this.isStableUnsupportedState(state)) {
+            if (this.hasDirtyDocument(filePath)) {
+                return {
+                    kind: 'unresolved',
+                    reason: 'Unsupported file has unsaved editor changes; save or discard them before clearing the baseline'
+                };
+            }
+            return { kind: 'opaque', state };
+        }
+        return {
+            kind: 'unresolved',
+            reason: state.kind === 'unavailable'
+                ? state.reason
+                : 'File disappeared during ' + phase + '; before-image is unknown'
+        };
+    }
+
+    private serializedArrayAppendBytes(entryCount: number, value: unknown): number {
+        const serialized = JSON.stringify(value);
+        if (serialized === undefined) {
+            throw new Error('Monitoring scope candidate persistence value could not be serialized');
+        }
+        return Buffer.byteLength(serialized, 'utf8') + (entryCount > 0 ? 1 : 0);
+    }
+
+    private serializedArrayRemovalBytes(entryCount: number, value: unknown): number {
+        const serialized = JSON.stringify(value);
+        if (serialized === undefined) {
+            throw new Error('Monitoring scope candidate persistence value could not be serialized');
+        }
+        return Buffer.byteLength(serialized, 'utf8') + (entryCount > 1 ? 1 : 0);
+    }
+
+    private synchronizeCandidateUnresolvedBudget(budget: CandidatePersistenceBudget): void {
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+        const source = this.unresolvedBaselineFiles;
+        const revision = source instanceof UnresolvedBaselineMap ? source.revision : undefined;
+        if (source === budget.observedUnresolvedMap && revision !== undefined &&
+            revision === budget.observedUnresolvedRevision) { return; }
+        const fail = (message: string): never => {
+            budget.failedReason = message;
+            throw new Error(message);
+        };
+        let count = budget.unresolvedBaselineFiles;
+        let delta = 0;
+        const updates = new Map<string, string | undefined>();
+        for (const [filePath, previous] of budget.observedUnresolvedBaselineFiles) {
+            const next = source.get(filePath);
+            if (next === previous) { continue; }
+            if (budget.accountedUnresolvedBaselineFiles.get(filePath) !== previous) {
+                fail('Unresolved evidence changed while a replacement baseline was reserved; retry preparation');
+            }
+            if (next === undefined) {
+                delta -= this.serializedArrayRemovalBytes(count, [filePath, previous]);
+                count--;
+            } else {
+                delta += Buffer.byteLength(JSON.stringify([filePath, next]), 'utf8') -
+                    Buffer.byteLength(JSON.stringify([filePath, previous]), 'utf8');
+            }
+            updates.set(filePath, next);
+        }
+        for (const [filePath, reason] of source) {
+            if (budget.observedUnresolvedBaselineFiles.has(filePath)) { continue; }
+            if (budget.accountedUnresolvedBaselineFiles.has(filePath)) {
+                fail('New unresolved evidence conflicts with a reserved baseline; retry preparation');
+            }
+            delta += this.serializedArrayAppendBytes(count, [filePath, reason]);
+            count++;
+            updates.set(filePath, reason);
+        }
+        if (count > this.maxPersistedSnapshots) {
+            fail('Monitoring scope unresolved snapshot capacity exceeded by concurrent evidence; narrow the scope before retrying');
+        }
+        if (delta > budget.remainingBytes) {
+            fail('Monitoring scope persisted byte capacity exceeded by concurrent evidence; narrow the scope before retrying');
+        }
+        budget.remainingBytes -= delta;
+        budget.unresolvedBaselineFiles = count;
+        for (const [filePath, reason] of updates) {
+            if (reason === undefined) { budget.accountedUnresolvedBaselineFiles.delete(filePath); }
+            else { budget.accountedUnresolvedBaselineFiles.set(filePath, reason); }
+        }
+        budget.observedUnresolvedBaselineFiles = new Map(source);
+        budget.observedUnresolvedMap = source;
+        budget.observedUnresolvedRevision = revision;
+    }
+
+    private noteCandidateBudgetPublication(
+        filePath: string,
+        budget: CandidatePersistenceBudget,
+        beforeReason: string | undefined,
+        beforeRevision: number | undefined
+    ): void {
+        const actual = this.unresolvedBaselineFiles.get(filePath);
+        if (actual !== budget.accountedUnresolvedBaselineFiles.get(filePath)) {
+            budget.failedReason = 'Baseline classification changed during synchronous publication; retry preparation';
+            throw new Error(budget.failedReason);
+        }
+        if (actual === undefined) { budget.observedUnresolvedBaselineFiles.delete(filePath); }
+        else { budget.observedUnresolvedBaselineFiles.set(filePath, actual); }
+        const source = this.unresolvedBaselineFiles;
+        const revision = source instanceof UnresolvedBaselineMap ? source.revision : undefined;
+        // Synchronous event subscribers may mutate another path. A revision
+        // other than this publication's own change forces reconciliation next time.
+        const ownChanges = actual === beforeReason ? 0 : 1;
+        budget.observedUnresolvedMap = source;
+        budget.observedUnresolvedRevision = beforeRevision !== undefined &&
+            revision === beforeRevision + ownChanges ? revision : undefined;
+    }
+
+    private consumeCandidatePersistenceBudget(
+        filePath: string,
+        plan: CandidateBaselinePlan,
+        budget: CandidatePersistenceBudget
+    ): void {
+        const fail = (message: string): never => {
+            budget.failedReason = budget.failedReason ?? message;
+            throw new Error(budget.failedReason);
+        };
+        if (budget.failedReason) { throw new Error(budget.failedReason); }
+        this.synchronizeCandidateUnresolvedBudget(budget);
+        filePath = this.canonicalTrackingPath(filePath);
+        const existingUnresolvedReason = budget.accountedUnresolvedBaselineFiles.get(filePath);
+        const replacingUnresolved = existingUnresolvedReason !== undefined;
+        let addedBytes = 0;
+        let nextMode: number | undefined;
+        let addsExistingPath = false;
+
+        if (replacingUnresolved && plan.kind !== 'unresolved') {
+            addedBytes -= this.serializedArrayRemovalBytes(
+                budget.unresolvedBaselineFiles,
+                [filePath, existingUnresolvedReason]
+            );
+        }
+
+        if (plan.kind === 'text') {
+            if (budget.fileSnapshots >= this.maxPersistedSnapshots) {
+                fail(
+                    'Monitoring scope text snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.fileSnapshots,
+                [filePath, plan.content]
+            );
+            nextMode = plan.mode ?? this.fileModes.get(filePath);
+            if (nextMode !== undefined && !this.fileSnapshots.has(filePath)) {
+                addedBytes += this.serializedArrayAppendBytes(
+                    budget.fileModes,
+                    [filePath, nextMode]
+                );
+            }
+            addsExistingPath = plan.baselineExists && !this.baselineExistingFiles.has(filePath);
+            if (addsExistingPath) {
+                addedBytes += this.serializedArrayAppendBytes(
+                    budget.baselineExistingFiles,
+                    filePath
+                );
+            }
+        } else if (plan.kind === 'opaque') {
+            if (budget.opaqueBaselineFiles >= this.maxPersistedSnapshots) {
+                fail(
+                    'Monitoring scope opaque snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.opaqueBaselineFiles,
+                [filePath, {
+                    reason: plan.state.reason,
+                    size: plan.state.size,
+                    mtime: plan.state.mtime,
+                    fingerprint: plan.state.fingerprint
+                }]
+            );
+        } else if (replacingUnresolved) {
+            const previousBytes = Buffer.byteLength(
+                JSON.stringify([filePath, existingUnresolvedReason]),
+                'utf8'
+            );
+            const nextBytes = Buffer.byteLength(
+                JSON.stringify([filePath, plan.reason]),
+                'utf8'
+            );
+            addedBytes += nextBytes - previousBytes;
+        } else {
+            if (budget.unresolvedBaselineFiles >= this.maxPersistedSnapshots) {
+                fail(
+                    'Monitoring scope unresolved snapshot capacity would exceed ' +
+                    this.maxPersistedSnapshots +
+                    ' entries; add explicit exclusions before retrying.'
+                );
+            }
+            addedBytes += this.serializedArrayAppendBytes(
+                budget.unresolvedBaselineFiles,
+                [filePath, plan.reason]
+            );
+        }
+
+        if (addedBytes > budget.remainingBytes) {
+            fail(
+                'Monitoring scope persisted byte capacity would exceed ' +
+                this.maxPersistedBytes +
+                ' bytes; add explicit exclusions before retrying.'
+            );
+        }
+
+        budget.remainingBytes -= addedBytes;
+        if (replacingUnresolved && plan.kind !== 'unresolved') {
+            budget.unresolvedBaselineFiles--;
+        }
+        if (plan.kind === 'text') {
+            budget.fileSnapshots++;
+            if (nextMode !== undefined && !this.fileSnapshots.has(filePath)) { budget.fileModes++; }
+            if (addsExistingPath) { budget.baselineExistingFiles++; }
+        } else if (plan.kind === 'opaque') {
+            budget.opaqueBaselineFiles++;
+        } else if (!replacingUnresolved) {
+            budget.unresolvedBaselineFiles++;
+        }
+        if (plan.kind === 'unresolved') {
+            budget.accountedUnresolvedBaselineFiles.set(filePath, plan.reason);
+        } else {
+            budget.accountedUnresolvedBaselineFiles.delete(filePath);
+        }
+    }
+
+    private async captureConfiguredExpansionBaselines(
+        scope: CanonicalMonitoringScope,
+        epoch: number,
+        preparationStillCurrent: () => boolean,
+        identityEvidence?: PathIdentityWorkBudget
+    ): Promise<number> {
+        let captured = 0;
+        const durableResourcePaths = new Set([
+            ...this.fileSnapshots.keys(),
+            ...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys()
+        ]);
+        const capacityExemptPaths = new Set([
+            ...durableResourcePaths,
+            ...this.trackedChanges.keys()
+        ]);
+        const projectedScanCoverage =
+            !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+                ? undefined
+                : this.ignoreFingerprint;
+        const persistenceBudget = this.createCandidatePersistenceBudget(projectedScanCoverage);
+        const preparationBudget = identityEvidence ?? {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        if (!identityEvidence) {
+            preparationBudget.remainingEntries = this.maxScopePreflightEntries;
+            preparationBudget.exhausted = false;
+        }
+        const files = await this.enumerateConfiguredCandidateFiles(
+            scope,
+            epoch,
+            undefined,
+            {
+                remaining: this.remainingCandidatePersistenceSlots(),
+                exemptPaths: capacityExemptPaths,
+                countedCandidates: new Set<string>()
+            },
+            preparationBudget,
+            preparationStillCurrent,
+            { identityBudget: preparationBudget }
+        );
+        if (!this.isCurrentEpoch(epoch)) { return captured; }
+        if (!preparationStillCurrent()) {
+            throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+        }
+        const candidatePaths = [...new Set(files.map(filePath =>
+            this.canonicalTrackingPath(filePath, false, preparationBudget)
+        ))]
+            .filter(filePath =>
+                !durableResourcePaths.has(filePath) &&
+                !this.trackedChanges.has(filePath) &&
+                !this.isPathIgnored(vscode.Uri.file(filePath), false, false, false, preparationBudget)
+            );
+        for (let filePath of candidatePaths) {
+            if (!this.isCurrentEpoch(epoch)) { return captured; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
+            filePath = this.canonicalTrackingPath(filePath, false, preparationBudget);
+            if (this.hasCapturedBaseline(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) ||
+                this.trackedChanges.has(filePath) ||
+                this.isPathIgnored(vscode.Uri.file(filePath), false, false, false, preparationBudget)) { continue; }
+            const targetError = this.validateSnapshotTarget(filePath, preparationBudget);
+            if (targetError) { continue; }
+            const state = await this.readCurrentFileState(filePath);
+            if (!this.isCurrentEpoch(epoch)) { return captured; }
+            if (!preparationStillCurrent()) {
+                throw new Error('Monitoring scope preparation was invalidated by concurrent workspace activity');
+            }
+            if (this.hasCapturedBaseline(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) ||
+                this.trackedChanges.has(filePath) ||
+                this.isPathIgnored(vscode.Uri.file(filePath), false, false, false)) { continue; }
+            if (this.recordScannedBaseline(filePath, state, 'workspace', persistenceBudget)) { captured++; }
+        }
+        if (scope.mode === 'rules') {
+            captured += await this.captureConfiguredIncludeBaselines(
+                scope,
+                epoch,
+                preparationStillCurrent,
+                {
+                    persistence: persistenceBudget,
+                    traversal: preparationBudget,
+                    missingOnly: true
+                }
+            );
+        }
+        this.validateCandidatePersistenceProjection(persistenceBudget);
         return captured;
     }
 
@@ -2777,9 +4207,6 @@ export class DiffTracker {
         if (!requestStillCurrent()) {
             return empty('conflict', 'Monitoring scope request changed before preparation started.');
         }
-        if (scope.mode === 'wholeWorkspace') {
-            return empty('requiresS4', 'Whole Workspace preparation and coverage belong to S4-W.');
-        }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) {
             return empty('conflict', identityIssue);
@@ -2787,19 +4214,50 @@ export class DiffTracker {
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
             return empty('conflict', 'Requested scope roots do not match the current local workspace identity.');
         }
-        const watcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
-        if (watcherExcludedInclude) {
-            return empty('requiresS4',
-                `Explicit include ${watcherExcludedInclude} intersects files.watcherExclude and requires S4-W supplemental observation coverage.`);
-        }
-        if (this.effectiveMonitoringScope.kind === 'configured') {
-            const expansion = detectScopeExpansion(this.effectiveMonitoringScope, scope);
-            if (expansion.reasons.some(reason =>
-                reason.startsWith('New workspace root:') ||
-                reason.startsWith('Explicit exclude removed or changed:') ||
-                reason.startsWith('Whole Workspace mode'))) {
-                return empty('requiresS4', 'This scope expansion requires broader bounded preparation in S4-W.');
+        const preparationIdentityEvidence: PathIdentityWorkBudget = {
+            remainingEntries: this.maxScopePreflightEntries
+        };
+        const watcherCoverageRevision = this.watcherCoverageRevision;
+        const expansion = this.effectiveMonitoringScope.kind === 'configured'
+            ? detectScopeExpansion(this.effectiveMonitoringScope, scope)
+            : undefined;
+        // Migration is a scope transition too. Broad migration/expansion must
+        // cross bounded preflight before any later qualification shortcut can
+        // reject the request. The preflight's physical identity evidence is then
+        // reused by supplemental watcher qualification and candidate capture.
+        const legacyMigration = this.effectiveMonitoringScope.kind === 'legacyV3';
+        const needsBroadCapture = scope.mode === 'wholeWorkspace' || expansion?.expands === true;
+        const needsBroadPreparation = legacyMigration || needsBroadCapture;
+        if (needsBroadPreparation) {
+            const preflight = await this.preflightConfiguredMonitoringScope(
+                scope,
+                requestStillCurrent,
+                preparationIdentityEvidence
+            );
+            if (preflight.status !== 'ready') {
+                return empty(preflight.status === 'conflict' ? 'conflict' : 'failed',
+                    preflight.reason ?? 'Monitoring scope bounded preflight failed.');
             }
+            if (preflight.unreadableDirectoryCount > 0) {
+                return empty('failed',
+                    `Monitoring scope preflight could not enumerate ${preflight.unreadableDirectoryCount} director${preflight.unreadableDirectoryCount === 1 ? 'y' : 'ies'}; the previous effective scope remains active.`);
+            }
+        }
+        if (this.watcherCoverageRevision !== watcherCoverageRevision) {
+            return empty('conflict',
+                'Watcher coverage policy changed during monitoring-scope preparation; retry the current request.');
+        }
+        const supplementalCoverageIssue = this.configuredScopeNeedsSupplementalCoverage(
+            scope,
+            preparationIdentityEvidence
+        );
+        if (preparationIdentityEvidence.exhausted) {
+            return empty('failed',
+                'Monitoring scope preparation path-identity work budget exceeded before scope qualification completed.');
+        }
+        if (supplementalCoverageIssue) {
+            return empty('requiresS4',
+                `Monitoring scope requires S4-B supplemental observation coverage at ${supplementalCoverageIssue}.`);
         }
         const rootRemovalReconciliation = this.canReconcileRemovedWorkspaceRoots(scope);
         const preflightEpoch = this.sessionEpoch;
@@ -2807,12 +4265,20 @@ export class DiffTracker {
             return empty('conflict', 'Monitoring scope preparation could not drain file events observed under the current effective scope; retry after file activity settles.');
         }
         const approvedDiscardRevision = discardExplicitlyExcludedReviews
-            ? expectedAffectedReviewRevision ?? this.getExplicitlyExcludedReviewRevision(scope) : undefined;
+            ? expectedAffectedReviewRevision ??
+                this.getExplicitlyExcludedReviewRevision(scope, preparationIdentityEvidence)
+            : undefined;
         let approvedReviewsDiscarded = false;
         const discardApprovalStillCurrent = (): boolean => !discardExplicitlyExcludedReviews ||
             (approvedReviewsDiscarded
-                ? this.getExplicitlyExcludedPendingReviewPaths(scope).length === 0
-                : this.getExplicitlyExcludedReviewRevision(scope) === approvedDiscardRevision);
+                ? this.getExplicitlyExcludedPendingReviewPaths(
+                    scope,
+                    preparationIdentityEvidence
+                ).length === 0
+                : this.getExplicitlyExcludedReviewRevision(
+                    scope,
+                    preparationIdentityEvidence
+                ) === approvedDiscardRevision);
         if (!discardApprovalStillCurrent()) {
             return empty('conflict', 'Affected review changed after discard approval; confirm the current review set again.');
         }
@@ -2825,7 +4291,7 @@ export class DiffTracker {
             fileSnapshots: new Map(this.fileSnapshots),
             fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             postBaselineUnknownFiles: new Set(this.postBaselineUnknownFiles),
             trackedChanges: new Map(this.trackedChanges),
@@ -2852,7 +4318,7 @@ export class DiffTracker {
             this.fileSnapshots = new Map(previous.fileSnapshots);
             this.fileModes = new Map(previous.fileModes);
             this.baselineExistingFiles = new Set(previous.baselineExistingFiles);
-            this.unresolvedBaselineFiles = new Map(previous.unresolvedBaselineFiles);
+            this.unresolvedBaselineFiles = new UnresolvedBaselineMap(previous.unresolvedBaselineFiles);
             this.opaqueBaselineFiles = new Map(previous.opaqueBaselineFiles);
             this.postBaselineUnknownFiles = new Set(previous.postBaselineUnknownFiles);
             this.trackedChanges = new Map(previous.trackedChanges);
@@ -2880,12 +4346,21 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        // The candidate matcher refresh below is allowed to establish one new
+        // policy generation for the requested scope. Once that refresh
+        // completes, every acquisition and durable barrier must stay on that
+        // exact ignore-policy generation. A live Rules-policy refresh that
+        // publishes during broad capture therefore invalidates the transaction.
+        let preparedIgnorePolicyRevision: number | undefined;
         const scopeContextStillCurrent = (): boolean =>
             this.isCurrentEpoch(epoch) &&
             requestStillCurrent() &&
             (!this.workspaceContextChanged || rootRemovalReconciliation) &&
             !this.recoveryBlocked &&
-            !this.explicitIncludeNeedsSupplementalCoverage(scope) &&
+            this.watcherCoverageRevision === watcherCoverageRevision &&
+            (preparedIgnorePolicyRevision === undefined ||
+                this.ignorePolicyRevision === preparedIgnorePolicyRevision) &&
+            !preparationIdentityEvidence.exhausted &&
             discardApprovalStillCurrent() &&
             (transaction.observedEvents?.size ?? 0) === 0 &&
             (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
@@ -2905,14 +4380,27 @@ export class DiffTracker {
             for (const filePath of this.trackedChanges.keys()) { this.retainedReviewPaths.add(filePath); }
             this.scanCoverage = undefined;
             this.ignoreResultCache.clear();
-            await this.refreshIgnoreMatchers();
+            await this.refreshIgnoreMatchers(preparationIdentityEvidence);
+            // A superseding refresh that happened before candidate acquisition
+            // is safe because capture has not started yet and refreshIgnoreMatchers
+            // follows the newest queued refresh. From this point forward, freeze
+            // the generation used by the scan.
+            preparedIgnorePolicyRevision = this.ignorePolicyRevision;
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }
 
-            const explicitlyExcludedReviews = new Set(this.getExplicitlyExcludedPendingReviewPaths(scope));
+            const explicitlyExcludedReviews = new Set(
+                this.getExplicitlyExcludedPendingReviewPaths(scope, preparationIdentityEvidence)
+            );
             for (const filePath of [...this.trackedChanges.keys()]) {
-                const ignored = this.isPathIgnored(vscode.Uri.file(filePath), false, false);
+                const ignored = this.isPathIgnored(
+                    vscode.Uri.file(filePath),
+                    false,
+                    false,
+                    false,
+                    preparationIdentityEvidence
+                );
                 if (!ignored) {
                     this.retainedReviewPaths.delete(filePath);
                     continue;
@@ -2948,18 +4436,35 @@ export class DiffTracker {
 
             // Apply is not Start: stopped sessions must not acquire new
             // before-images or enumerate newly included resource contents.
+            // A first Rules migration establishes only its explicit targets.
+            // Treating every untracked ordinary file as a new baseline here
+            // would silently accept unrelated post-scan creations.
             result.capturedBaselines = this.isRecording
-                ? await this.captureConfiguredIncludeBaselines(scope, epoch) : 0;
-            const lateWatcherExcludedInclude = this.explicitIncludeNeedsSupplementalCoverage(scope);
-            if (lateWatcherExcludedInclude) {
-                requiresS4Reason =
-                    `Explicit include ${lateWatcherExcludedInclude} now intersects files.watcherExclude and requires S4-W supplemental observation coverage.`;
-                throw new Error(requiresS4Reason);
+                ? needsBroadCapture
+                    ? await this.captureConfiguredExpansionBaselines(
+                        scope,
+                        epoch,
+                        scopeContextStillCurrent,
+                        preparationIdentityEvidence
+                    )
+                    : await this.captureConfiguredIncludeBaselines(
+                        scope,
+                        epoch,
+                        scopeContextStillCurrent,
+                        undefined,
+                        preparationIdentityEvidence
+                    )
+                : 0;
+            if (this.watcherCoverageRevision !== watcherCoverageRevision) {
+                throw new Error(
+                    'Watcher coverage policy changed during monitoring-scope preparation; retry the current request.'
+                );
             }
             if (!scopeContextStillCurrent()) {
                 throw new Error('Monitoring scope or workspace context changed during preparation');
             }
-            this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged
+            this.scanCoverage = !this.isRecording || this.baselineBuilding || !this.snapshotInitialized || this.workspaceContextChanged ||
+                (legacyMigration && scope.mode === 'rules')
                 ? undefined
                 : this.ignoreFingerprint;
             if (!await this.flushPersistState(false, transaction, true)) {
@@ -2984,6 +4489,18 @@ export class DiffTracker {
             try { await this.refreshIgnoreMatchers(); } catch { /* retain previous memory and report failure below */ }
             for (const event of observed.values()) {
                 if (!this.isCurrentEpoch(epoch)) { break; }
+                let directory = false;
+                if (event.kind !== 'delete') {
+                    try { directory = fs.lstatSync(event.uri.fsPath).isDirectory(); } catch { directory = false; }
+                } else {
+                    directory = this.hasHistoricalDirectoryProvenance(event.uri.fsPath);
+                }
+                const candidateMonitored = this.configuredScopeMonitorsPath(scope, event.uri, directory);
+                const ignoredByRestoredScope = this.isPathIgnored(event.uri, directory, false, false);
+                if (candidateMonitored && ignoredByRestoredScope) {
+                    this.preserveRejectedScopePreparationEvent(event);
+                    continue;
+                }
                 if (event.kind === 'delete') { await this.onExternalFileDeleted(event.uri); }
                 else if (event.kind === 'create' || event.firstKind === 'create') { await this.onExternalFileCreated(event.uri); }
                 else { this.pendingExternalChanges.add(event.uri.fsPath); }
@@ -3289,19 +4806,61 @@ export class DiffTracker {
         });
     }
 
-    private async refreshIgnoreMatchers(): Promise<void> {
-        let latest = this.loadIgnoreMatchers(++this.ignoreRefreshVersion);
+    private refreshIgnoreMatchersAfterLivePolicyChange(): void {
+        const epoch = this.sessionEpoch;
+        void this.refreshIgnoreMatchers().catch(error => {
+            // Invalidation means this refresh no longer owns policy publication
+            // (for example, an enclosing scope transaction was superseded).
+            // That path must roll back through its own transaction, not pause an
+            // otherwise-valid committed recording session.
+            if (error instanceof IgnoreDiscoveryError && error.limit === 'invalidated') {
+                return;
+            }
+            // A stopped session will revalidate policy before the next Start.
+            // Whole Workspace does not use ordinary ignore policy for membership.
+            if (!this.isCurrentEpoch(epoch) || !this.isRecording ||
+                !this.ordinaryIgnorePolicyAffectsCoverage()) {
+                return;
+            }
+            void this.pauseRecordingForUnpersistableCoverage(
+                'Monitoring policy refresh could not complete within bounded preparation; recording is paused until the baseline is rebuilt.',
+                error
+            );
+        });
+    }
+
+    private async refreshIgnoreMatchers(identityEvidence?: PathIdentityWorkBudget): Promise<void> {
+        let latest = this.loadIgnoreMatchers(++this.ignoreRefreshVersion, identityEvidence);
         this.ignoreRefreshPromise = latest;
         while (true) {
-            await latest;
+            try {
+                await latest;
+            } catch (error) {
+                // A superseded bounded refresh must not fail a caller after a
+                // newer policy refresh has become authoritative.
+                if (latest !== this.ignoreRefreshPromise) {
+                    latest = this.ignoreRefreshPromise;
+                    continue;
+                }
+                throw error;
+            }
             if (latest === this.ignoreRefreshPromise) { return; }
             latest = this.ignoreRefreshPromise;
         }
     }
 
-    private async loadIgnoreMatchers(version: number): Promise<void> {
+    private async loadIgnoreMatchers(
+        version: number,
+        identityEvidence?: PathIdentityWorkBudget
+    ): Promise<void> {
         const epoch = this.sessionEpoch;
         const matchers = new Map<string, Ignore>();
+        const transaction = this.baselineTransaction;
+        const discoveryBudget = this.effectiveMonitoringScope.kind === 'configured'
+            ? this.createIgnoreDiscoveryBudget(() => this.isCurrentEpoch(epoch) &&
+                version === this.ignoreRefreshVersion && this.baselineTransaction === transaction &&
+                (!transaction?.valid || transaction.valid()), identityEvidence)
+            : undefined;
         // Matching semantics are part of scan provenance: older implementations
         // may have excluded a different set even with identical rule text.
         const evidence: string[] = ['ignore-semantics-v2'];
@@ -3313,7 +4872,14 @@ export class DiffTracker {
                 .map(([rootUri, patterns]) => [rootUri, [...patterns]] as [string, string[]]))
             : new Map<string, string[]>();
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const matcher = await this.buildIgnoreMatcher(folder, evidence, nextLegacyPolicy);
+            let matcher: Ignore;
+            try {
+                matcher = await this.buildIgnoreMatcher(folder, evidence, nextLegacyPolicy,
+                    undefined, true, discoveryBudget);
+            } catch (error) {
+                if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
+                throw error;
+            }
             if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             matchers.set(folder.uri.fsPath, matcher);
         }
@@ -3326,6 +4892,7 @@ export class DiffTracker {
         if (legacyPolicyChanged) { this.schedulePersistState(); }
         const fingerprint = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
         const changed = fingerprint !== this.ignoreFingerprint;
+        if (changed) { this.ignorePolicyRevision++; }
         this.ignoreFingerprint = fingerprint;
         if (this.scanCoverage && this.scanCoverage !== fingerprint) {
             this.scanCoverage = undefined;
@@ -3350,7 +4917,10 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch) || version !== this.ignoreRefreshVersion) { return; }
             }
         }
-        if (!this.isRecording || (!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
+        // A scope/baseline transaction owns discovery and durable publication.
+        // Recursive restore discovery here can await the enclosing transaction's
+        // persistence barrier and deadlock Apply before its capture phase.
+        if (this.baselineTransaction || !this.isRecording || (!changed && this.pendingImportedDirectoryReconciliation.size === 0) || previousMatchers.size === 0 ||
             this.restoringEpoch !== undefined || this.baselineBuilding || !this.snapshotInitialized) { return; }
         const restored = [...this.pendingImportedDirectoryReconciliation];
         const restoredMarkers = new Set(restored.filter(directory =>
@@ -3392,7 +4962,16 @@ export class DiffTracker {
         ];
     }
 
-    private async findScopeFilesUnderDirectory(rootPath: string): Promise<vscode.Uri[]> {
+    private async findScopeFilesUnderDirectory(
+        rootPath: string,
+        wholeWorkspacePreparationBudget?: { remainingEntries: number },
+        wholeWorkspaceCapacityGuard?: CandidateCapacityGuard,
+        traversalOptions: {
+            seedOverlappingWorkspaceRoots?: boolean;
+            skipTraversalPath?: (targetPath: string) => boolean;
+            identityBudget?: PathIdentityWorkBudget;
+        } = {}
+    ): Promise<vscode.Uri[]> {
         const candidates = new Map<string, vscode.Uri>();
         const normalizedRootPath = path.resolve(rootPath);
         const workspaceRoot = this.getSupportedWorkspaceFolders()
@@ -3410,10 +4989,46 @@ export class DiffTracker {
             }
         };
 
-        add(await vscode.workspace.findFiles(
-            new vscode.RelativePattern(patternBase, '**/*'),
-            new vscode.RelativePattern(patternBase, '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
-        ));
+        const wholeWorkspaceDiscovery = this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace';
+        if (wholeWorkspaceDiscovery) {
+            // VS Code findFiles/search indexing can lag resources created while
+            // recording is stopped and can inherit host search exclusions. Whole
+            // Workspace rebuilds therefore use the same direct filesystem scope
+            // enumeration as transactional expansion preparation.
+            const localCapacityGuard = wholeWorkspaceCapacityGuard ?? (() => {
+                const durableResourcePaths = new Set([
+                    ...this.fileSnapshots.keys(),
+                    ...this.unresolvedBaselineFiles.keys(),
+                    ...this.opaqueBaselineFiles.keys()
+                ]);
+                return {
+                    remaining: this.remainingCandidatePersistenceSlots(),
+                    exemptPaths: new Set([
+                        ...durableResourcePaths,
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                } satisfies CandidateCapacityGuard;
+            })();
+            const files = await this.enumerateConfiguredCandidateFiles(
+                this.effectiveMonitoringScope as CanonicalMonitoringScope,
+                this.sessionEpoch,
+                rootPath,
+                localCapacityGuard,
+                wholeWorkspacePreparationBudget ?? { remainingEntries: this.maxScopePreflightEntries },
+                undefined,
+                traversalOptions
+            );
+            add(files.map(filePath => vscode.Uri.file(filePath)));
+            return [...candidates.values()];
+        } else {
+            add(await vscode.workspace.findFiles(
+                new vscode.RelativePattern(patternBase, '**/*'),
+                new vscode.RelativePattern(patternBase,
+                    '**/{node_modules,.git,out,dist,build,coverage,tmp,.difftracker-restore-*}/**')
+            ));
+        }
 
         if (this.effectiveMonitoringScope.kind === 'configured') {
             const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
@@ -3455,22 +5070,109 @@ export class DiffTracker {
             .map(([pattern]) => pattern);
     }
 
-    private expandSimpleBraceGlob(pattern: string): string[] {
-        const match = pattern.match(/\{([^{}]+)\}/);
-        if (!match) { return [pattern]; }
-        const alternatives = match[1].split(',').map(value => value.trim()).filter(Boolean);
-        if (alternatives.length === 0) { return [pattern]; }
-        return alternatives.flatMap(value =>
-            this.expandSimpleBraceGlob(pattern.slice(0, match.index!) + value + pattern.slice(match.index! + match[0].length)));
+    private readonly maxWatcherExcludeVariants = 256;
+
+    private expandSimpleBraceGlob(pattern: string, limit = this.maxWatcherExcludeVariants): string[] | undefined {
+        const completed: string[] = [];
+        const pending = [pattern];
+        while (pending.length > 0) {
+            const current = pending.pop()!;
+            const match = current.match(/\{([^{}]+)\}/);
+            if (!match) {
+                if (completed.length >= limit) { return undefined; }
+                completed.push(current);
+                continue;
+            }
+            // Glob alternatives are literal text: whitespace and empty branches
+            // affect the watched resource set and must not be normalized away.
+            const alternatives = match[1].split(',');
+            if (alternatives.length === 0) {
+                if (completed.length >= limit) { return undefined; }
+                completed.push(current);
+                continue;
+            }
+            // Every pending branch produces at least one completed variant.
+            // Refuse the Cartesian product before it can exceed the retained cap.
+            if (completed.length + pending.length + alternatives.length > limit) {
+                return undefined;
+            }
+            for (const value of alternatives) {
+                pending.push(
+                    current.slice(0, match.index!) + value + current.slice(match.index! + match[0].length)
+                );
+            }
+        }
+        return completed;
     }
 
-    private watcherPatternOnlyTargetsHardBoundary(pattern: string): boolean {
-        const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').split('/');
-        // An exact .git path segment is unmonitorable regardless of whether the
-        // leaf is a file or directory. Restore-prefixed names are different:
-        // only restore-prefixed directories are hard boundaries, while an
-        // ordinary file such as ".difftracker-restore-notes" is monitorable.
-        return segments.some(segment => segment === '.git');
+    private getExpandedVsCodeWatcherExcludePatterns(resource: vscode.Uri): string[] | undefined {
+        const expanded: string[] = [];
+        for (const pattern of this.getVsCodeWatcherExcludePatterns(resource)) {
+            const variants = this.expandSimpleBraceGlob(
+                pattern,
+                this.maxWatcherExcludeVariants - expanded.length
+            );
+            if (!variants) { return undefined; }
+            expanded.push(...variants);
+            if (expanded.length > this.maxWatcherExcludeVariants) { return undefined; }
+        }
+        return expanded;
+    }
+
+    private watcherPatternOnlyTargetsHardBoundary(
+        pattern: string,
+        identity: WorkspaceRootIdentity,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean {
+        const segments = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')
+            .split('/').filter(Boolean);
+        return segments.some((segment, index) => {
+            // Only ancestor segments are known directories. A leaf with the
+            // restore prefix can still be an ordinary, monitorable file.
+            const directory = index < segments.length - 1;
+            if (isHardUnmonitorableRelativePath(segment, true, directory)) { return true; }
+            if (!isHardUnmonitorableRelativePath(segment, false, directory)) { return false; }
+            if (typeof identity.caseSensitive !== 'boolean') { return false; }
+
+            const parents = segments.slice(0, index);
+            // A root's case flag cannot prove lookup semantics under every
+            // wildcard-selected parent (a child may be a sensitive directory or
+            // mount). Keep that unproved blind spot for supplemental coverage.
+            if (parents.some(part => /[*?\[\]{}]/.test(part))) { return false; }
+            try {
+                const root = new URL(identity.uri);
+                if (root.protocol !== 'file:') { return false; }
+                const rootPath = fileURLToPath(root);
+                const parentIdentity = resolveRelativePathIdentity(
+                    rootPath,
+                    parents.join('/'),
+                    identity.caseSensitive,
+                    identityBudget
+                );
+                if (parentIdentity.unavailable || parentIdentity.verifiedPrefixLength !== parents.length) {
+                    return false;
+                }
+                if (!/[*?\[\]{}]/.test(segment)) {
+                    const prefix = [...parents, segment].join('/');
+                    const target = resolveRelativePathIdentity(
+                        rootPath,
+                        prefix,
+                        identity.caseSensitive,
+                        identityBudget
+                    );
+                    if (!target.unavailable && target.verifiedPrefixLength === parents.length + 1) {
+                        return isHardUnmonitorableRelativePath(prefix, identity, directory, identityBudget);
+                    }
+                }
+                // For a missing name or restore-prefix glob, prove ASCII case
+                // behavior at this exact existing parent. Never infer it from
+                // the root flag or Unicode string folding.
+                const parent = path.join(rootPath, ...parentIdentity.resolvedRelativePath.split('/').filter(Boolean));
+                return cachedExclusionDirectoryCaseSensitivity(parent, identityBudget) === false;
+            } catch {
+                return false;
+            }
+        });
     }
 
     private watcherGlobSegmentMatches(patternSegment: string, value: string, caseSensitive: boolean): boolean {
@@ -3502,10 +5204,30 @@ export class DiffTracker {
         }
     }
 
+    private watcherTargetParentCaseSensitivity(
+        identity: WorkspaceRootIdentity,
+        targetSegments: readonly string[],
+        targetIndex: number,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean | undefined {
+        if (targetIndex === 0) { return identity.caseSensitive; }
+        try {
+            const root = new URL(identity.uri);
+            if (root.protocol !== 'file:') { return undefined; }
+            return cachedExclusionDirectoryCaseSensitivity(
+                path.join(fileURLToPath(root), ...targetSegments.slice(0, targetIndex)),
+                identityBudget
+            );
+        } catch {
+            return undefined;
+        }
+    }
+
     private watcherPatternMatchesPath(
         pattern: string,
         relativePath: string,
-        caseSensitive: boolean
+        identity: WorkspaceRootIdentity,
+        identityBudget?: PathIdentityWorkBudget
     ): boolean {
         const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const target = relativePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
@@ -3523,15 +5245,22 @@ export class DiffTracker {
             if (patternIndex === patternSegments.length) {
                 result = targetIndex === targetSegments.length;
             } else if (patternSegments[patternIndex] === '**') {
-                result = visit(patternIndex + 1, targetIndex) ||
-                    (targetIndex < targetSegments.length && visit(patternIndex, targetIndex + 1));
+                result = patternIndex === patternSegments.length - 1
+                    ? targetIndex < targetSegments.length
+                    : visit(patternIndex + 1, targetIndex) ||
+                        (targetIndex < targetSegments.length && visit(patternIndex, targetIndex + 1));
             } else if (targetIndex === targetSegments.length) {
                 result = false;
             } else {
+                const parentSensitive = this.watcherTargetParentCaseSensitivity(
+                    identity, targetSegments, targetIndex, identityBudget
+                );
+                // Unknown parent semantics cannot prove disjointness. Case-
+                // insensitive matching is the conservative superset.
                 result = this.watcherGlobSegmentMatches(
                     patternSegments[patternIndex],
                     targetSegments[targetIndex],
-                    caseSensitive
+                    parentSensitive === true
                 ) && visit(patternIndex + 1, targetIndex + 1);
             }
             memo.set(key, result);
@@ -3543,9 +5272,9 @@ export class DiffTracker {
     private watcherPatternMayMatchWithinInclude(
         pattern: string,
         includePath: string,
-        caseSensitive: boolean
+        identity: WorkspaceRootIdentity,
+        identityBudget?: PathIdentityWorkBudget
     ): boolean {
-        if (this.watcherPatternOnlyTargetsHardBoundary(pattern)) { return false; }
         const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const include = includePath.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
         const patternSegments = normalized.split('/').filter(Boolean);
@@ -3568,10 +5297,13 @@ export class DiffTracker {
             } else if (patternSegments[patternIndex] === '**') {
                 result = visit(patternIndex + 1, includeIndex) || visit(patternIndex, includeIndex + 1);
             } else {
+                const parentSensitive = this.watcherTargetParentCaseSensitivity(
+                    identity, includeSegments, includeIndex, identityBudget
+                );
                 result = this.watcherGlobSegmentMatches(
                     patternSegments[patternIndex],
                     includeSegments[includeIndex],
-                    caseSensitive
+                    parentSensitive === true
                 ) && visit(patternIndex + 1, includeIndex + 1);
             }
             memo.set(key, result);
@@ -3580,7 +5312,10 @@ export class DiffTracker {
         return visit(0, 0);
     }
 
-    private explicitIncludeNeedsSupplementalCoverage(scope: CanonicalMonitoringScope): string | undefined {
+    private explicitIncludeNeedsSupplementalCoverage(
+        scope: CanonicalMonitoringScope,
+        identityBudget: PathIdentityWorkBudget
+    ): string | undefined {
         const foldersByName = new Map(this.getSupportedWorkspaceFolders().map(folder => [folder.name, folder] as const));
         for (const rule of scope.includes) {
             const folders = rule.scope === 'folder'
@@ -3589,15 +5324,49 @@ export class DiffTracker {
             for (const folder of folders) {
                 const identity = this.workspaceRootIdentityForFolder(folder);
                 if (typeof identity.caseSensitive !== 'boolean') { return `${folder.name}:unverified-path-identity`; }
-                const patterns = this.getVsCodeWatcherExcludePatterns(folder.uri)
-                    .flatMap(pattern => this.expandSimpleBraceGlob(pattern));
+                const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+                const directDisposition = evaluateConfiguredScope(
+                    scope, identity, rel, false, false, identityBudget
+                );
+                if (identityBudget.exhausted) { return `${folder.name}:path-identity preparation budget exceeded`; }
+                if (directDisposition.source === 'explicitExclude') {
+                    continue;
+                }
+                const descendantsExplicitlyExcluded =
+                    configuredScopeExplicitlyExcludesSubtree(scope, identity, rel, identityBudget);
+                if (identityBudget.exhausted) {
+                    return `${folder.name}:path-identity preparation budget exceeded`;
+                }
+                const expandedPatterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
+                if (!expandedPatterns) {
+                    return `${folder.name}:${rule.path}:files.watcherExclude expansion exceeds safe bound`;
+                }
+                // Direct target, ancestor and descendant checks must share
+                // the same root-aware hard-boundary classification.
+                const patterns = expandedPatterns.filter(pattern =>
+                    !this.watcherPatternOnlyTargetsHardBoundary(pattern, identity, identityBudget));
+                if (identityBudget.exhausted) {
+                    return `${folder.name}:path-identity preparation budget exceeded`;
+                }
                 if (patterns.length === 0) { continue; }
 
                 const matcher = ignore({ ignorecase: !identity.caseSensitive }).add(patterns);
-                const rel = rule.path.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
-                if (matcher.ignores(rel) || patterns.some(pattern =>
-                    this.watcherPatternMatchesPath(pattern, rel, identity.caseSensitive!))) {
+                if (patterns.some(pattern =>
+                    this.watcherPatternMatchesPath(pattern, rel, identity, identityBudget))) {
                     return `${folder.name}:${rule.path}`;
+                }
+                const includeSegments = rel.split('/').filter(Boolean);
+                const includeAncestors = includeSegments.slice(0, -1)
+                    .map((_segment, index) => includeSegments.slice(0, index + 1).join('/'));
+                if (patterns.some(pattern => includeAncestors.some(ancestor =>
+                    this.watcherPatternMatchesPath(pattern, ancestor, identity, identityBudget)))) {
+                    return `${folder.name}:${rule.path}`;
+                }
+                if (descendantsExplicitlyExcluded) {
+                    // A descendant-only exclusion such as vendor/** does not
+                    // exclude a monitorable file named vendor. The direct target
+                    // was checked above; only descendant coverage can be skipped.
+                    continue;
                 }
 
                 let mayHaveDescendants = true;
@@ -3614,7 +5383,7 @@ export class DiffTracker {
                 ];
                 if (directProbes.some(probe => matcher.ignores(probe)) ||
                     patterns.some(pattern =>
-                        this.watcherPatternMayMatchWithinInclude(pattern, rel, identity.caseSensitive!))) {
+                        this.watcherPatternMayMatchWithinInclude(pattern, rel, identity, identityBudget))) {
                     return `${folder.name}:${rule.path}`;
                 }
             }
@@ -3622,10 +5391,105 @@ export class DiffTracker {
         return undefined;
     }
 
+    private watcherPatternCoveredByExplicitScopeExclusion(
+        scope: CanonicalMonitoringScope,
+        identity: WorkspaceRootIdentity,
+        pattern: string,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean {
+        const normalized = pattern.replace(/\\/g, '/')
+            .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+
+        // A universal configured exclusion is sufficient regardless of whether
+        // the host watcher blind spot has any literal prefix.
+        if (configuredScopeExplicitlyExcludesSubtree(scope, identity, '', identityBudget)) {
+            return true;
+        }
+
+        // Wildcard-prefixed watcher patterns cannot be reduced to a literal
+        // subtree witness. An identical supported structured exclusion is still
+        // a direct proof: both sides use the same segment/globstar vocabulary,
+        // and explicit exclusions have higher precedence than Whole Workspace.
+        // Do not equate directory-only structured rules (trailing slash) with
+        // watcher patterns, whose coverage helper strips that marker.
+        const comparable = (value: string): string =>
+            value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '');
+        // Only identical glob syntax is a global coverage proof. Neither
+        // Unicode nor ASCII folding proves that every literal component resolves
+        // equivalently beneath wildcard-selected parents. Non-identical patterns
+        // fall through to the concrete filesystem-aware subtree proof below.
+        const watcherKey = normalized;
+        const identicalExplicitExclusion = scope.excludes.some(rule => {
+            if (rule.scope === 'folder' && rule.folder !== identity.name) { return false; }
+            if (rule.pattern.endsWith('/')) { return false; }
+            const ruleKey = comparable(rule.pattern);
+            return ruleKey === watcherKey;
+        });
+        if (identicalExplicitExclusion) {
+            return true;
+        }
+
+        const segments = normalized.split('/').filter(Boolean);
+        const literalPrefix: string[] = [];
+        for (const segment of segments) {
+            if (segment === '**' || /[*?\[\]{}]/.test(segment)) { break; }
+            literalPrefix.push(segment);
+        }
+        if (literalPrefix.length === 0) { return false; }
+        const prefix = literalPrefix.join('/');
+        if (!configuredScopeExplicitlyExcludesSubtree(scope, identity, prefix, identityBudget)) {
+            return false;
+        }
+        if (literalPrefix.length === segments.length) {
+            const directTarget = evaluateConfiguredScope(
+                scope, identity, prefix, false, false, identityBudget
+            );
+            if (directTarget.source !== 'explicitExclude') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private configuredScopeNeedsSupplementalCoverage(
+        scope: CanonicalMonitoringScope,
+        providedIdentityBudget?: PathIdentityWorkBudget
+    ): string | undefined {
+        const identityBudget: PathIdentityWorkBudget = providedIdentityBudget ?? {
+            remainingEntries: this.maxPathIdentityPreparationEntries
+        };
+        const includeIssue = this.explicitIncludeNeedsSupplementalCoverage(scope, identityBudget);
+        if (includeIssue) { return includeIssue; }
+        if (scope.mode !== 'wholeWorkspace') { return undefined; }
+
+        for (const folder of this.getSupportedWorkspaceFolders()) {
+            const identity = this.workspaceRootIdentityForFolder(folder);
+            if (typeof identity.caseSensitive !== 'boolean') {
+                return `${folder.name}:unverified-path-identity`;
+            }
+            const expandedPatterns = this.getExpandedVsCodeWatcherExcludePatterns(folder.uri);
+            if (!expandedPatterns) {
+                return `${folder.name}:files.watcherExclude expansion exceeds safe bound`;
+            }
+            const patterns = expandedPatterns
+                .filter(pattern => !this.watcherPatternOnlyTargetsHardBoundary(pattern, identity, identityBudget))
+                .filter(pattern => !this.watcherPatternCoveredByExplicitScopeExclusion(
+                    scope, identity, pattern, identityBudget
+                ));
+            if (identityBudget.exhausted) {
+                return `${folder.name}:path-identity preparation budget exceeded`;
+            }
+            if (patterns.length > 0) {
+                return `${folder.name}:Whole Workspace intersects files.watcherExclude (${patterns[0]})`;
+            }
+        }
+        return undefined;
+    }
+
     private invalidateConfiguredScopeForWatcherCoverage(): void {
         const committedScope = this.getEffectiveMonitoringScope();
-        if (committedScope.kind !== 'configured' || committedScope.mode !== 'rules') { return; }
-        const issue = this.explicitIncludeNeedsSupplementalCoverage(committedScope);
+        if (committedScope.kind !== 'configured') { return; }
+        const issue = this.configuredScopeNeedsSupplementalCoverage(committedScope);
         if (!issue) { return; }
 
         const alreadyPaused = !this.isRecording && this.baselineBuilding && !this.snapshotInitialized;
@@ -3643,7 +5507,7 @@ export class DiffTracker {
 
         if (!alreadyPaused) {
             void vscode.window.showWarningMessage(
-                `Code Diff Tracker: Effective include ${issue} now intersects files.watcherExclude. Review is paused; narrow the scope or restore watcher coverage, then rebuild the baseline.`
+                `Code Diff Tracker: Effective monitoring scope now requires supplemental coverage at ${issue}. Review is paused; narrow the scope or restore watcher coverage, then rebuild the baseline.`
             );
         }
     }
@@ -3794,16 +5658,27 @@ export class DiffTracker {
     private async buildIgnoreMatcher(
         folder: vscode.WorkspaceFolder,
         evidence: string[],
-        legacyPolicyCandidate?: Map<string, string[]>
+        legacyPolicyCandidate?: Map<string, string[]>,
+        scopeOverride?: CanonicalMonitoringScope,
+        includeLegacyWatchExclude = true,
+        discoveryBudget?: IgnoreDiscoveryBudget
     ): Promise<Ignore> {
         const epoch = this.sessionEpoch;
         for (let attempt = 0; ; attempt++) {
             const candidateEvidence: string[] = [];
             try {
-                const matcher = await this.readIgnoreMatcher(folder, candidateEvidence, legacyPolicyCandidate);
+                const matcher = await this.readIgnoreMatcher(
+                    folder,
+                    candidateEvidence,
+                    legacyPolicyCandidate,
+                    scopeOverride,
+                    includeLegacyWatchExclude,
+                    discoveryBudget
+                );
                 evidence.push(...candidateEvidence);
                 return matcher;
             } catch (error) {
+                if (error instanceof IgnoreDiscoveryError) { throw error; }
                 // Atomic replacement/deletion and transient provider errors can
                 // race discovery. Retry the whole candidate, never skip a rule
                 // or publish evidence from a partially read set of files.
@@ -3817,21 +5692,45 @@ export class DiffTracker {
     private async readIgnoreMatcher(
         folder: vscode.WorkspaceFolder,
         evidence: string[],
-        legacyPolicyCandidate?: Map<string, string[]>
+        legacyPolicyCandidate?: Map<string, string[]>,
+        scopeOverride?: CanonicalMonitoringScope,
+        includeLegacyWatchExclude = true,
+        discoveryBudget?: IgnoreDiscoveryBudget
     ): Promise<Ignore> {
         const ig = ignore();
-        const watchExcludes = this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate);
+        const configured = scopeOverride ?? (this.effectiveMonitoringScope.kind === 'configured'
+            ? this.effectiveMonitoringScope as CanonicalMonitoringScope : undefined);
+        const watchExcludes = includeLegacyWatchExclude
+            ? this.getWatchExcludePatterns(folder.uri, legacyPolicyCandidate)
+            : [];
         const basePatterns = [
             ...this.getDefaultExcludePatterns(),
             ...this.getVsCodeExcludePatterns(folder.uri),
             ...watchExcludes
         ];
         ig.add(basePatterns);
-        evidence.push(folder.uri.fsPath, JSON.stringify(basePatterns));
-        // Include resource-scoped settings that may influence VS Code discovery.
         const scoped = vscode.workspace.getConfiguration(undefined, folder.uri);
-        evidence.push(JSON.stringify(['files.exclude', 'files.watcherExclude', 'search.exclude']
-            .map(key => scoped.get(key, {}))));
+        if (configured?.mode === 'wholeWorkspace') {
+            // Whole Workspace membership ignores ordinary files.exclude and
+            // search.exclude policy. Keep only watcher coverage policy in the
+            // scan fingerprint so unrelated UI/search settings cannot retire a
+            // still-valid coverage proof.
+            evidence.push(folder.uri.fsPath, JSON.stringify({
+                wholeWorkspace: true,
+                watcherExclude: scoped.get('files.watcherExclude', {})
+            }));
+        } else {
+            evidence.push(folder.uri.fsPath, JSON.stringify(basePatterns));
+            // Include resource-scoped settings that may influence discovery.
+            evidence.push(JSON.stringify(['files.exclude', 'files.watcherExclude', 'search.exclude']
+                .map(key => scoped.get(key, {}))));
+        }
+
+        if (configured) {
+            const epoch = this.sessionEpoch;
+            return this.readConfiguredIgnoreMatcher(folder, ig, evidence, configured,
+                discoveryBudget ?? this.createIgnoreDiscoveryBudget(() => this.isCurrentEpoch(epoch)));
+        }
 
         // Repository-local excludes have lower priority than .gitignore files.
         const infoExcludePath = path.join(folder.uri.fsPath, '.git', 'info', 'exclude');
@@ -3849,7 +5748,7 @@ export class DiffTracker {
             // skipped when its whole containing subtree is also excluded; if
             // only the metadata file is excluded, treating its policy as empty
             // could expose files that its rules would otherwise protect.
-            const disposition = this.excludedIgnoreFileDisposition(uri);
+            const disposition = this.excludedIgnoreFileDisposition(uri, scopeOverride);
             if (disposition === 'skip') { continue; }
             if (disposition === 'block') {
                 throw new Error(
@@ -3868,11 +5767,15 @@ export class DiffTracker {
         return ig;
     }
 
-    private excludedIgnoreFileDisposition(uri: vscode.Uri): 'read' | 'skip' | 'block' {
+    private excludedIgnoreFileDisposition(
+        uri: vscode.Uri,
+        scopeOverride?: CanonicalMonitoringScope,
+        identityBudget?: PathIdentityWorkBudget
+    ): 'read' | 'skip' | 'block' {
         if (uri.scheme !== 'file') { return 'block'; }
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         if (!folder || folder.uri.scheme !== 'file') { return 'block'; }
-        const scope = this.pendingMonitoringScope ??
+        const scope = scopeOverride ?? this.pendingMonitoringScope ??
             (this.effectiveMonitoringScope.kind === 'configured'
                 ? this.effectiveMonitoringScope as CanonicalMonitoringScope
                 : undefined);
@@ -3880,15 +5783,245 @@ export class DiffTracker {
 
         const rootIdentity = this.workspaceRootIdentityForFolder(folder);
         const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath));
-        const fileDecision = evaluateConfiguredScope(scope, rootIdentity, relative, false, false);
+        const fileDecision = evaluateConfiguredScope(
+            scope, rootIdentity, relative, false, false, identityBudget
+        );
         if (fileDecision.source !== 'explicitExclude') { return 'read'; }
+        if (scope.mode === 'wholeWorkspace') {
+            // Whole Workspace membership ignores ordinary .gitignore policy.
+            // An explicitly excluded policy file can therefore be skipped
+            // without creating a coverage hole in its monitored parent.
+            return 'skip';
+        }
 
         const relativeDir = path.posix.dirname(relative);
         return configuredScopeExplicitlyExcludesSubtree(
             scope,
             rootIdentity,
-            relativeDir === '.' ? '' : relativeDir
+            relativeDir === '.' ? '' : relativeDir,
+            identityBudget
         ) ? 'skip' : 'block';
+    }
+
+    private createIgnoreDiscoveryBudget(
+        stillCurrent: () => boolean,
+        identityEvidence?: PathIdentityWorkBudget
+    ): IgnoreDiscoveryBudget {
+        return {
+            remainingEntries: this.maxScopePreflightEntries,
+            identityBudget: identityEvidence ?? {
+                remainingEntries: this.maxScopePreflightEntries
+            },
+            remainingBytes: this.maxPersistedBytes,
+            seenEntries: new Set<string>(),
+            policyBytes: new Map<string, number>(),
+            stillCurrent
+        };
+    }
+
+    private checkIgnoreDiscovery(budget: IgnoreDiscoveryBudget): void {
+        if (budget.identityBudget.exhausted) {
+            throw new IgnoreDiscoveryError(
+                'entries',
+                'Monitoring scope preparation path-identity work budget exceeded'
+            );
+        }
+        if (!budget.stillCurrent()) {
+            throw new IgnoreDiscoveryError('invalidated', 'Monitoring scope ignore-policy preparation was invalidated');
+        }
+    }
+
+    private consumeIgnoreDiscoveryEntry(budget: IgnoreDiscoveryBudget, targetPath: string): void {
+        this.checkIgnoreDiscovery(budget);
+        const key = path.resolve(targetPath);
+        if (budget.seenEntries.has(key)) { return; }
+        if (budget.remainingEntries <= 0) {
+            throw new IgnoreDiscoveryError('entries',
+                'Monitoring scope preparation work budget would exceed ' +
+                this.maxScopePreflightEntries + ' inspected directory entries during ignore-policy discovery');
+        }
+        budget.remainingEntries--;
+        budget.seenEntries.add(key);
+    }
+
+    private async readBudgetedIgnoreFile(
+        uri: vscode.Uri,
+        rootPath: string,
+        budget: IgnoreDiscoveryBudget
+    ): Promise<string> {
+        this.checkIgnoreDiscovery(budget);
+        // Local file scope only. Do not follow an internal metadata symlink.
+        for (let current = uri.fsPath; path.resolve(current) !== path.resolve(rootPath); current = path.dirname(current)) {
+            if (fs.lstatSync(current).isSymbolicLink()) { throw new Error('Symbolic link ignore policy cannot establish scope coverage'); }
+            if (path.dirname(current) === current) { throw new Error('Ignore policy escaped its workspace root'); }
+        }
+        const key = path.resolve(uri.fsPath);
+        const previousBytes = budget.policyBytes.get(key) ?? 0;
+        const allowance = Math.min(5 * 1024 * 1024, budget.remainingBytes + previousBytes);
+        const handle = await fs.promises.open(uri.fsPath, 'r');
+        try {
+            this.checkIgnoreDiscovery(budget);
+            const before = await handle.stat();
+            if (!before.isFile() || before.size > allowance) {
+                throw new IgnoreDiscoveryError('bytes', 'Monitoring scope ignore-policy byte budget exceeded before reading ' + uri.fsPath);
+            }
+            const chunks: Buffer[] = [];
+            let length = 0;
+            while (true) {
+                this.checkIgnoreDiscovery(budget);
+                const chunk = Buffer.alloc(Math.min(64 * 1024, allowance - length + 1));
+                const read = await handle.read(chunk, 0, chunk.length, null);
+                this.checkIgnoreDiscovery(budget);
+                if (read.bytesRead === 0) { break; }
+                length += read.bytesRead;
+                if (length > allowance) {
+                    throw new IgnoreDiscoveryError('bytes', 'Monitoring scope ignore-policy byte budget exceeded while reading ' + uri.fsPath);
+                }
+                chunks.push(chunk.subarray(0, read.bytesRead));
+            }
+            const after = await handle.stat();
+            const current = fs.lstatSync(uri.fsPath);
+            if (before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
+                current.isSymbolicLink() || current.ino !== after.ino || current.dev !== after.dev ||
+                current.size !== after.size || current.mtimeMs !== after.mtimeMs) {
+                throw new Error('Ignore policy changed during bounded read; retry discovery');
+            }
+            budget.remainingBytes += previousBytes - length;
+            budget.policyBytes.set(key, length);
+            return new TextDecoder('utf-8').decode(Buffer.concat(chunks, length));
+        } finally { await handle.close(); }
+    }
+
+    private async readConfiguredIgnoreMatcher(
+        folder: vscode.WorkspaceFolder,
+        matcher: Ignore,
+        evidence: string[],
+        scope: CanonicalMonitoringScope,
+        budget: IgnoreDiscoveryBudget
+    ): Promise<Ignore> {
+        const rootPath = path.resolve(folder.uri.fsPath);
+        const identity = this.workspaceRootIdentityForFolder(folder);
+        this.checkIgnoreDiscovery(budget);
+        if (configuredScopeExplicitlyExcludesSubtree(
+            scope, identity, '', budget.identityBudget
+        )) {
+            this.checkIgnoreDiscovery(budget);
+            return matcher;
+        }
+        this.checkIgnoreDiscovery(budget);
+        if (scope.mode === 'wholeWorkspace') {
+            // Whole Workspace membership is defined by explicit DiffTracker
+            // exclusions plus hard boundaries, not ordinary Git ignore policy.
+            // Skip both .gitignore and .git/info/exclude discovery entirely so
+            // irrelevant policy metadata cannot narrow or block preparation.
+            return matcher;
+        }
+        const info = path.join(rootPath, '.git', 'info', 'exclude');
+        let infoStat: fs.Stats | undefined;
+        try { infoStat = fs.lstatSync(info); }
+        catch (error) {
+            if (!this.isFileNotFound(error)) { throw error; }
+        }
+        if (infoStat) {
+            const text = await this.readBudgetedIgnoreFile(vscode.Uri.file(info), rootPath, budget);
+            this.addGitignorePatterns(matcher, text, '');
+            evidence.push('.git/info/exclude', text);
+        }
+        const policies: Array<[string, string]> = [];
+        const pending = [rootPath];
+        while (pending.length > 0) {
+            this.checkIgnoreDiscovery(budget);
+            const directory = pending.pop()!;
+            if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
+            const relative = this.toPosixPath(path.relative(rootPath, directory));
+            if (configuredScopeExplicitlyExcludesSubtree(
+                scope, identity, relative, budget.identityBudget
+            ) || relative && isHardUnmonitorableRelativePath(
+                relative, identity, true, budget.identityBudget
+            )) {
+                this.checkIgnoreDiscovery(budget);
+                continue;
+            }
+            this.checkIgnoreDiscovery(budget);
+            if (relative && !evaluateConfiguredScope(
+                scope,
+                identity,
+                relative,
+                matcher.ignores(relative + '/'),
+                true,
+                budget.identityBudget
+            ).monitored) {
+                this.checkIgnoreDiscovery(budget);
+                continue;
+            }
+            this.checkIgnoreDiscovery(budget);
+
+            const policyPath = path.join(directory, '.gitignore');
+            let policyStat: fs.Stats | undefined;
+            try { policyStat = fs.lstatSync(policyPath); }
+            catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
+            if (policyStat?.isFile() || policyStat?.isSymbolicLink()) {
+                const uri = vscode.Uri.file(policyPath);
+                const disposition = this.excludedIgnoreFileDisposition(
+                    uri, scope, budget.identityBudget
+                );
+                this.checkIgnoreDiscovery(budget);
+                if (disposition === 'block') {
+                    throw new Error('Explicitly excluded .gitignore cannot be ignored while its parent subtree remains monitored; nested ignore policy is unavailable');
+                }
+                if (disposition === 'read') {
+                    this.consumeIgnoreDiscoveryEntry(budget, policyPath);
+                    const text = await this.readBudgetedIgnoreFile(uri, rootPath, budget);
+                    this.addGitignorePatterns(matcher, text, relative ? relative + '/' : '');
+                    policies.push([this.toPosixPath(path.relative(rootPath, policyPath)), text]);
+                }
+            }
+            let handle: fs.Dir | undefined;
+            try {
+                handle = await fs.promises.opendir(directory);
+                this.checkIgnoreDiscovery(budget);
+                while (true) {
+                    const entry = handle.readSync();
+                    if (!entry) { break; }
+                    const child = path.join(directory, entry.name);
+                    this.consumeIgnoreDiscoveryEntry(budget, child);
+                    const kind = this.classifyDirectoryEntry(directory, entry);
+                    if (kind !== 'directory' || !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
+                    this.notePhysicalIdentityPath(budget.identityBudget, child);
+                    const childRelative = this.toPosixPath(path.relative(rootPath, child));
+                    if (isHardUnmonitorableRelativePath(
+                        childRelative, identity, true, budget.identityBudget
+                    ) || configuredScopeExplicitlyExcludesSubtree(
+                        scope, identity, childRelative, budget.identityBudget
+                    )) {
+                        this.checkIgnoreDiscovery(budget);
+                        continue;
+                    }
+                    this.checkIgnoreDiscovery(budget);
+                    if (evaluateConfiguredScope(
+                        scope,
+                        identity,
+                        childRelative,
+                        matcher.ignores(childRelative + '/'),
+                        true,
+                        budget.identityBudget
+                    ).monitored) {
+                        this.checkIgnoreDiscovery(budget);
+                        pending.push(child);
+                    } else {
+                        this.checkIgnoreDiscovery(budget);
+                    }
+                }
+            } catch (error) {
+                if (error instanceof IgnoreDiscoveryError) { throw error; }
+                if (this.isFileNotFound(error)) { continue; }
+                if (!budget.onUnreadableDirectory) { throw error; }
+                budget.onUnreadableDirectory(directory, error);
+            } finally { if (handle) { handle.closeSync(); } }
+        }
+        policies.sort(([left], [right]) => left.localeCompare(right));
+        for (const [relative, text] of policies) { evidence.push(relative, text); }
+        return matcher;
     }
 
     private async getGitignoreFiles(folder: vscode.WorkspaceFolder): Promise<vscode.Uri[]> {
@@ -3975,7 +6108,13 @@ export class DiffTracker {
         return { ignored: ordinaryIgnored, reason: ordinaryIgnored ? 'Matched legacy ignore rules' : 'Not ignored' };
     }
 
-    private isPathIgnored(uri: vscode.Uri, directory = false, respectRetainedReview = true, respectPendingScope = true): boolean {
+    private isPathIgnored(
+        uri: vscode.Uri,
+        directory = false,
+        respectRetainedReview = true,
+        respectPendingScope = true,
+        identityBudget?: PathIdentityWorkBudget
+    ): boolean {
         if (uri.scheme !== 'file') { return true; }
         // Lookup cost depends on path depth, not the number of recent recoveries.
         for (let current = uri.fsPath; ; current = path.dirname(current)) {
@@ -3991,17 +6130,22 @@ export class DiffTracker {
         if (typeof rootIdentity.caseSensitive !== 'boolean') { return true; }
         let hardBoundaryDirectory = directory;
         if (!hardBoundaryDirectory &&
-            !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, false) &&
-            isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, true)) {
+            !isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, false, identityBudget) &&
+            isHardUnmonitorableRelativePath(hardBoundaryPath, rootIdentity, true, identityBudget)) {
             try { hardBoundaryDirectory = fs.lstatSync(uri.fsPath).isDirectory(); }
             catch (error) { if (!this.isFileNotFound(error)) { return true; } }
         }
         if (isHardUnmonitorableRelativePath(
             hardBoundaryPath,
             rootIdentity,
-            hardBoundaryDirectory
-        )) { return true; }
-        if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory)) { return true; }
+            hardBoundaryDirectory,
+            identityBudget
+        )) {
+            this.assertPathIdentityBudget(identityBudget);
+            return true;
+        }
+        this.assertPathIdentityBudget(identityBudget);
+        if (respectPendingScope && this.pendingScopeExplicitlyExcludes(uri, directory, identityBudget)) { return true; }
 
         // Retained Review is outside the current target scope but remains
         // minimally observable until its pending review is resolved.
@@ -4029,9 +6173,11 @@ export class DiffTracker {
                 this.workspaceRootIdentityForFolder(folder),
                 relPath,
                 ordinaryIgnored,
-                directory
+                directory,
+                identityBudget
             ).monitored
             : ordinaryIgnored;
+        this.assertPathIdentityBudget(identityBudget);
         this.setIgnoreResultCache(cacheKey, ignored);
         return ignored;
     }
@@ -4090,6 +6236,38 @@ export class DiffTracker {
         if (removedFiles.length > 0) { this.emitTrackChangesEvent({ removedFiles }); }
     }
 
+    private startupCreatePredatesWatchBoundary(
+        event: StartupEvent,
+        boundaryMs: number | undefined,
+        boundaryMonotonicNs: bigint | undefined
+    ): boolean {
+        if (boundaryMs === undefined || boundaryMonotonicNs === undefined ||
+            event.firstKind !== 'create' || event.kind !== 'create' ||
+            event.uri.scheme !== 'file') { return false; }
+
+        const nowWallMs = Date.now();
+        const elapsedMonotonicMs = Number(process.hrtime.bigint() - boundaryMonotonicNs) / 1_000_000;
+        const elapsedWallMs = nowWallMs - boundaryMs;
+        if (!Number.isFinite(elapsedMonotonicMs) || !Number.isFinite(elapsedWallMs) ||
+            elapsedMonotonicMs < 0 || elapsedWallMs < 0 ||
+            Math.abs(elapsedWallMs - elapsedMonotonicMs) > this.startupTimestampSafetyMarginMs) {
+            // Wall-clock jumps make file timestamps incomparable with the
+            // activation boundary. Preserve uncertainty instead of guessing.
+            return false;
+        }
+
+        try {
+            const stat = fs.statSync(event.uri.fsPath);
+            const latestSafeTimestamp = boundaryMs - this.startupTimestampSafetyMarginMs;
+            const timestamps = [stat.birthtimeMs, stat.mtimeMs, stat.ctimeMs];
+            return timestamps.every(value =>
+                Number.isFinite(value) && value > 0 && value < latestSafeTimestamp
+            );
+        } catch {
+            return false;
+        }
+    }
+
     private async initializeWorkspaceSnapshots(transaction?: BaselineTransaction): Promise<void> {
         const epoch = this.sessionEpoch;
         const folders = this.getSupportedWorkspaceFolders();
@@ -4100,6 +6278,12 @@ export class DiffTracker {
 
         const scanFingerprint = this.ignoreFingerprint;
         const scanIgnoreVersion = this.ignoreRefreshVersion;
+        const wholeWorkspacePreparationBudget =
+            this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace'
+                ? { remainingEntries: this.maxScopePreflightEntries }
+                : undefined;
+        let wholeWorkspacePersistenceBudget: CandidatePersistenceBudget | undefined;
         if (this.initialIgnoreEpoch === epoch) {
             const classified = new Map<string, { event: StartupEvent; state: 'ignored' | 'directory' | 'missing' | 'other' }>();
             // Keep each path's first event across I/O rounds. An event arriving
@@ -4124,10 +6308,26 @@ export class DiffTracker {
                     classified.set(uri.fsPath, { event, state });
                 }
             }
+            const initialWatchBoundaryMs = this.initialWatchBoundaryMs;
+            const initialWatchBoundaryMonotonicNs = this.initialWatchBoundaryMonotonicNs;
             this.initialIgnoreEpoch = undefined;
+            this.initialWatchBoundaryMs = undefined;
+            this.initialWatchBoundaryMonotonicNs = undefined;
             this.initialIgnoreEvents.clear();
             for (const [filePath, { event, state }] of classified) {
                 if (state === 'ignored') { continue; }
+                if ((state === 'other' || state === 'directory') &&
+                    this.startupCreatePredatesWatchBoundary(
+                        event,
+                        initialWatchBoundaryMs,
+                        initialWatchBoundaryMonotonicNs
+                    )) {
+                    // Some watcher backends report an existing path as "create"
+                    // when a new watcher starts. Only a single create whose
+                    // birth/content metadata is strictly older than the watcher
+                    // activation boundary can be discarded as stale.
+                    continue;
+                }
                 // Even a transient parent must not cause surviving children or
                 // pre-existing open documents to be accepted as a fresh baseline.
                 this.scanUncertainFiles.add(filePath);
@@ -4141,9 +6341,41 @@ export class DiffTracker {
                 this.pendingExternalChanges.add(filePath);
             }
             // Unchanged editors may be ahead of disk. Changed paths stay unknown.
-            vscode.workspace.textDocuments.forEach(doc => {
-                if (!transientPaths.has(doc.uri.fsPath)) { this.ensureSnapshotForDocument(doc, true); }
-            });
+            // Whole Workspace must create the durable budget before copying any
+            // editor contents into the baseline so open documents cannot bypass
+            // the same incremental byte/category limits as filesystem candidates.
+            if (wholeWorkspacePreparationBudget) {
+                wholeWorkspacePersistenceBudget =
+                    this.createCandidatePersistenceBudget(scanFingerprint);
+            }
+            for (const doc of vscode.workspace.textDocuments) {
+                if (!transientPaths.has(doc.uri.fsPath)) {
+                    this.ensureSnapshotForDocument(doc, true, wholeWorkspacePersistenceBudget);
+                }
+            }
+            if (wholeWorkspacePersistenceBudget) {
+                // Unsupported/uncertain document handling can add unresolved
+                // evidence without going through the text capture branch.
+                this.synchronizeCandidateUnresolvedBudget(wholeWorkspacePersistenceBudget);
+            }
+        }
+
+        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
+            wholeWorkspacePreparationBudget
+                ? {
+                    remaining: this.remainingCandidatePersistenceSlots(),
+                    exemptPaths: new Set([
+                        ...this.fileSnapshots.keys(),
+                        ...this.unresolvedBaselineFiles.keys(),
+                        ...this.opaqueBaselineFiles.keys(),
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                }
+                : undefined;
+        if (wholeWorkspacePreparationBudget && !wholeWorkspacePersistenceBudget) {
+            wholeWorkspacePersistenceBudget =
+                this.createCandidatePersistenceBudget(scanFingerprint);
         }
 
         for (const folder of folders) {
@@ -4151,14 +6383,20 @@ export class DiffTracker {
                 return;
             }
 
-            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
+            const files = await this.findScopeFilesUnderDirectory(
+                folder.uri.fsPath,
+                wholeWorkspacePreparationBudget,
+                wholeWorkspaceCapacityGuard
+            );
             if (!this.isCurrentEpoch(epoch)) { return; }
 
             const candidates = files.filter(uri => {
-                if (this.isPathIgnored(uri)) {
+                const filePath = this.canonicalTrackingPath(uri.fsPath);
+                if (this.isPathIgnored(uri) || this.pendingScopeExplicitlyExcludes(uri)) {
                     return false;
                 }
-                return !this.fileSnapshots.has(uri.fsPath);
+                return !this.fileSnapshots.has(filePath) &&
+                    !this.opaqueBaselineFiles.has(filePath);
             });
 
             const batchSize = 50;
@@ -4174,13 +6412,26 @@ export class DiffTracker {
                     if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
                         return;
                     }
-                    if (this.fileSnapshots.has(uri.fsPath)) {
+                    const filePath = this.canonicalTrackingPath(uri.fsPath);
+                    if (this.fileSnapshots.has(filePath) ||
+                        this.opaqueBaselineFiles.has(filePath)) {
                         return;
                     }
                     const state = await this.readFileSnapshot(uri);
                     if (!this.isCurrentEpoch(epoch)) { return; }
                     if (state.kind === 'missing' && transientPaths.has(uri.fsPath)) { return; }
-                    this.recordScannedBaseline(uri.fsPath, state, 'workspace');
+
+                    // Eligibility can change while readFileSnapshot awaits:
+                    // startup evidence may become durable or a pending/effective
+                    // exclusion may remove the path. Charge only a baseline that
+                    // recordScannedBaseline can actually publish synchronously.
+                    if (this.pendingScopeExplicitlyExcludes(uri) ||
+                        this.isPathIgnored(uri) ||
+                        this.fileSnapshots.has(filePath) ||
+                        this.opaqueBaselineFiles.has(filePath)) {
+                        return;
+                    }
+                    this.recordScannedBaseline(filePath, state, 'workspace', wholeWorkspacePersistenceBudget);
                 });
 
                 if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
@@ -4192,11 +6443,21 @@ export class DiffTracker {
             }
         }
 
+        if (wholeWorkspacePersistenceBudget) {
+            // One final event-loop yield follows the last candidate batch. Any
+            // watcher/editor evidence that arrived in that window must join the
+            // same durable budget before the baseline can cross the Ready barrier.
+            this.synchronizeCandidateUnresolvedBudget(wholeWorkspacePersistenceBudget);
+        }
         this.scanCoverage = scanIgnoreVersion === this.ignoreRefreshVersion ? scanFingerprint : undefined;
-        await this.completeBaseline(epoch, transaction);
+        await this.completeBaseline(epoch, transaction, wholeWorkspacePersistenceBudget);
     }
 
-    private async completeBaseline(epoch: number, transaction?: BaselineTransaction): Promise<boolean> {
+    private async completeBaseline(
+        epoch: number,
+        transaction?: BaselineTransaction,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): Promise<boolean> {
         ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
@@ -4207,10 +6468,21 @@ export class DiffTracker {
             this.persistTimer = undefined;
         }
         let version: number;
+        let evidenceChangedDuringFlush: boolean;
         do {
             version = this.baselineCompletionVersion;
+            // Pending-event processing can mutate several persisted evidence
+            // categories. Validate the exact Ready payload immediately before
+            // writing, then compare the whole projection after the awaited write.
+            const projectionBefore = persistenceBudget
+                ? this.validateCandidatePersistenceProjection(persistenceBudget)
+                : undefined;
             if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) { return false; }
-        } while (version !== this.baselineCompletionVersion);
+            const projectionAfter = persistenceBudget
+                ? this.validateCandidatePersistenceProjection(persistenceBudget)
+                : undefined;
+            evidenceChangedDuringFlush = projectionBefore !== projectionAfter;
+        } while (version !== this.baselineCompletionVersion || evidenceChangedDuringFlush);
         if (transaction?.valid && !transaction.valid()) { return false; }
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
@@ -4406,30 +6678,33 @@ export class DiffTracker {
             document.uri.scheme === 'file' && this.canonicalTrackingPath(document.uri.fsPath) === filePath && document.isDirty);
     }
 
-    private recordScannedBaseline(filePath: string, state: CurrentFileState, scope: 'workspace' | 'repository'): void {
+    private recordScannedBaseline(
+        filePath: string,
+        state: CurrentFileState,
+        scope: 'workspace' | 'repository',
+        budget?: CandidatePersistenceBudget
+    ): boolean {
         filePath = this.canonicalTrackingPath(filePath);
-        if (this.pendingScopeExplicitlyExcludes(vscode.Uri.file(filePath))) { return; }
-        // Recheck after the scanner's await. An editor may have captured a valid
-        // before-image in the meantime; neither scanner may overwrite it.
-        if (this.hasCapturedBaseline(filePath) || this.isPathIgnored(vscode.Uri.file(filePath))) { return; }
-        const phase = scope === 'repository' ? 'repository baseline rebuild' : 'baseline scan';
-        if (this.hasScanUncertainty(filePath)) {
-            this.recordUnresolvedBaseline(filePath, `File changed during ${phase}; before-image is unknown`);
-            return;
-        }
-        if (state.kind === 'text') {
+        const uri = vscode.Uri.file(filePath);
+        if (this.pendingScopeExplicitlyExcludes(uri) || this.hasCapturedBaseline(filePath) ||
+            this.isPathIgnored(uri)) { return false; }
+        const plan = this.planScannedBaseline(filePath, state, scope);
+        if (budget) { this.consumeCandidatePersistenceBudget(filePath, plan, budget); }
+        const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+        const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+            ? this.unresolvedBaselineFiles.revision : undefined;
+        if (plan.kind === 'text') {
             this.unresolvedBaselineFiles.delete(filePath);
-            this.fileSnapshots.set(filePath, state.content);
-            if (state.mode !== undefined) { this.fileModes.set(filePath, state.mode); }
+            this.fileSnapshots.set(filePath, plan.content);
+            if (plan.mode !== undefined) { this.fileModes.set(filePath, plan.mode); }
             this.baselineExistingFiles.add(filePath);
-            return;
+        } else if (plan.kind === 'opaque') {
+            this.recordOpaqueBaseline(filePath, plan.state);
+        } else {
+            this.recordUnresolvedBaseline(filePath, plan.reason);
         }
-        if (this.isStableUnsupportedState(state)) {
-            this.recordOpaqueBaseline(filePath, state);
-            return;
-        }
-        this.recordUnresolvedBaseline(filePath, state.kind === 'unavailable'
-            ? state.reason : `File disappeared during ${phase}; before-image is unknown`);
+        if (budget) { this.noteCandidateBudgetPublication(filePath, budget, beforeReason, beforeRevision); }
+        return true;
     }
 
     private recordOpaqueBaseline(filePath: string, state: Extract<CurrentFileState, { kind: 'unavailable' }>): void {
@@ -4519,15 +6794,60 @@ export class DiffTracker {
 
     private async discoverRestoredFiles(epoch: number): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
+        const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
+            this.effectiveMonitoringScope.mode === 'wholeWorkspace';
+        const wholeWorkspacePreparationBudget = wholeWorkspace
+            ? { remainingEntries: this.maxScopePreflightEntries }
+            : undefined;
+        const durableResourcePaths = wholeWorkspace ? new Set([
+            ...this.fileSnapshots.keys(),
+            ...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys()
+        ]) : undefined;
+        const persistenceBudget = wholeWorkspace
+            ? this.createCandidatePersistenceBudget()
+            : undefined;
+        const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
+            wholeWorkspace && durableResourcePaths
+                ? {
+                    remaining: this.remainingCandidatePersistenceSlots(),
+                    exemptPaths: new Set([
+                        ...durableResourcePaths,
+                        ...this.trackedChanges.keys()
+                    ]),
+                    countedCandidates: new Set<string>()
+                }
+                : undefined;
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = await this.findScopeFilesUnderDirectory(folder.uri.fsPath);
+            const files = await this.findScopeFilesUnderDirectory(
+                folder.uri.fsPath,
+                wholeWorkspacePreparationBudget,
+                wholeWorkspaceCapacityGuard
+            );
             if (!this.isCurrentEpoch(epoch)) { return; }
             for (const uri of files) { candidates.set(uri.fsPath, uri); }
         }
         for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.scheme === 'file') { candidates.set(doc.uri.fsPath, doc.uri); }
+            if (doc.uri.scheme !== 'file' || this.isPathIgnored(doc.uri)) { continue; }
+            const canonical = this.canonicalTrackingPath(doc.uri.fsPath);
+            const canonicalUri = vscode.Uri.file(canonical);
+            if (this.isPathIgnored(canonicalUri)) { continue; }
+            if (wholeWorkspaceCapacityGuard &&
+                !wholeWorkspaceCapacityGuard.exemptPaths.has(canonical) &&
+                !this.trackedChanges.has(canonical) &&
+                !wholeWorkspaceCapacityGuard.countedCandidates.has(canonical)) {
+                if (wholeWorkspaceCapacityGuard.remaining <= 0) {
+                    throw new Error(
+                        'Monitoring scope snapshot capacity would exceed the remaining per-category persistence slots; add explicit exclusions before retrying.'
+                    );
+                }
+                wholeWorkspaceCapacityGuard.countedCandidates.add(canonical);
+                wholeWorkspaceCapacityGuard.remaining--;
+            }
+            candidates.set(canonical, canonicalUri);
         }
-        let added = false;
+
+        const plannedAdditions: Array<{ filePath: string; plan: CandidateBaselinePlan }> = [];
         for (const uri of candidates.values()) {
             if (!this.isCurrentEpoch(epoch)) { return; }
             const filePath = uri.fsPath;
@@ -4537,16 +6857,65 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch)) { return; }
             if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath)) { continue; }
             const observedCreation = this.hasObservedCreation(filePath);
-            if (observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)) {
-                this.fileSnapshots.set(filePath, '');
-                this.baselineExistingFiles.delete(filePath);
-            } else {
-                this.recordUnresolvedBaseline(filePath, 'Prior scan coverage is unknown or ignore rules changed; before-image is unknown');
+            const plan: CandidateBaselinePlan =
+                observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)
+                    ? { kind: 'text', content: '', baselineExists: false }
+                    : {
+                        kind: 'unresolved',
+                        reason: 'Prior scan coverage is unknown or ignore rules changed; before-image is unknown'
+                    };
+            if (persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(filePath, plan, persistenceBudget);
             }
-            added = true;
+            plannedAdditions.push({ filePath, plan });
         }
-        if (added && !await this.flushPendingPersistence()) {
+
+        const publishableAdditions = plannedAdditions.filter(({ filePath }) => {
+            const uri = vscode.Uri.file(filePath);
+            return !this.isPathIgnored(uri) &&
+                !this.fileSnapshots.has(filePath) &&
+                !this.unresolvedBaselineFiles.has(filePath) &&
+                !this.opaqueBaselineFiles.has(filePath);
+        });
+        if (persistenceBudget) {
+            this.validateCandidatePersistenceProjection(persistenceBudget);
+        }
+        this.validateRestoreAdditionsProjection(publishableAdditions);
+
+        const unresolvedReviews: Array<{ filePath: string; reason: string }> = [];
+        for (const { filePath, plan } of publishableAdditions) {
+            const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+            const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                ? this.unresolvedBaselineFiles.revision : undefined;
+            if (plan.kind === 'text') {
+                this.fileSnapshots.set(filePath, plan.content);
+                this.fileModes.delete(filePath);
+                this.baselineExistingFiles.delete(filePath);
+            } else if (plan.kind === 'unresolved') {
+                this.opaqueBaselineFiles.delete(filePath);
+                this.postBaselineUnknownFiles.delete(filePath);
+                this.unresolvedBaselineFiles.set(filePath, plan.reason);
+                unresolvedReviews.push({ filePath, reason: plan.reason });
+            } else {
+                throw new Error('Unexpected opaque restore candidate');
+            }
+            if (persistenceBudget) {
+                this.noteCandidateBudgetPublication(
+                    filePath,
+                    persistenceBudget,
+                    beforeReason,
+                    beforeRevision
+                );
+            }
+        }
+        if (persistenceBudget) {
+            this.validateCandidatePersistenceProjection(persistenceBudget);
+        }
+        if (publishableAdditions.length > 0 && !await this.flushPendingPersistence()) {
             throw new Error('Restored additions could not be persisted');
+        }
+        for (const { filePath, reason } of unresolvedReviews) {
+            this.markFileUnavailable(filePath, reason);
         }
     }
 
@@ -4695,13 +7064,20 @@ export class DiffTracker {
         worker: (item: T) => Promise<void>
     ): Promise<void> {
         let index = 0;
+        let failed = false;
+        let failure: unknown;
         const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (index < items.length) {
+            while (!failed && index < items.length) {
                 const current = items[index++];
-                await worker(current);
+                try { await worker(current); }
+                catch (error) {
+                    if (!failed) { failure = error; }
+                    failed = true;
+                }
             }
         });
         await Promise.all(workers);
+        if (failed) { throw failure; }
     }
 
     private async yieldToEventLoop(): Promise<void> {
@@ -4828,7 +7204,14 @@ export class DiffTracker {
         this.ensureSnapshotForDocument(doc);
     }
 
-    private async markCreatedDirectoryUnavailable(filePath: string, reason: string, duringScan: boolean, epoch: number, refreshVersion?: number): Promise<void> {
+    private async markCreatedDirectoryUnavailable(
+        filePath: string,
+        reason: string,
+        duringScan: boolean,
+        epoch: number,
+        refreshVersion?: number,
+        schedule = true
+    ): Promise<void> {
         const isCurrent = () => this.isCurrentEpoch(epoch) && (refreshVersion === undefined || refreshVersion === this.ignoreRefreshVersion);
         if (!isCurrent()) { return; }
         const historicalFileEvidence = this.baselineExistingFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath);
@@ -4853,8 +7236,123 @@ export class DiffTracker {
         this.setSubtreeCoverageGap(
             filePath,
             duringScan ? 'directory-scan-coverage-gap' : 'directory-runtime-coverage-gap',
-            reason
+            reason,
+            schedule
         );
+    }
+
+    private captureImportedDirectoryRollbackState(root: string): ImportedDirectoryRollbackState {
+        const resolvedRoot = path.resolve(root);
+        const ownsPath = (targetPath: string): boolean =>
+            path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot);
+        const scopedMap = <T>(source: Map<string, T>, clone: (value: T) => T = value => value): Map<string, T> =>
+            new Map([...source].filter(([targetPath]) => ownsPath(targetPath))
+                .map(([targetPath, value]) => [targetPath, clone(value)]));
+        const scopedSet = (source: Set<string>): Set<string> =>
+            new Set([...source].filter(targetPath => ownsPath(targetPath)));
+
+        return {
+            fileSnapshots: scopedMap(this.fileSnapshots),
+            fileModes: scopedMap(this.fileModes),
+            baselineExistingFiles: scopedSet(this.baselineExistingFiles),
+            unresolvedBaselineFiles: scopedMap(this.unresolvedBaselineFiles),
+            opaqueBaselineFiles: scopedMap(this.opaqueBaselineFiles, value => ({ ...value })),
+            trackedChanges: scopedMap(this.trackedChanges, value => ({
+                ...value,
+                changes: value.changes.map(change => ({ ...change })),
+                timestamp: new Date(value.timestamp)
+            })),
+            lineChanges: scopedMap(this.lineChanges, value => value.map(change => ({ ...change }))),
+            inlineViews: scopedMap(this.inlineViews, value => ({
+                ...value,
+                lineTypes: [...value.lineTypes]
+            })),
+            postBaselineUnknownFiles: scopedSet(this.postBaselineUnknownFiles),
+            retainedReviewPaths: scopedSet(this.retainedReviewPaths),
+            coverageGaps: scopedMap(this.coverageGaps, value => ({
+                file: value.file ? { ...value.file } : undefined,
+                subtree: value.subtree ? { ...value.subtree } : undefined
+            })),
+            pendingReconciliation: scopedSet(this.pendingImportedDirectoryReconciliation),
+            // releaseScopeBaselineData() can remove an absence sentinel's Undo
+            // item. Preserve only records that touch this subtree so unrelated
+            // concurrent history remains outside this local rollback.
+            revertHistory: this.revertHistory
+                .map(record => ({
+                    ...record,
+                    items: record.items.filter(item => ownsPath(item.filePath)).map(item => ({
+                        ...item,
+                        before: { ...item.before },
+                        after: { ...item.after }
+                    }))
+                }))
+                .filter(record => record.items.length > 0)
+        };
+    }
+
+    private restoreImportedDirectoryRollbackState(
+        root: string,
+        previous: ImportedDirectoryRollbackState
+    ): void {
+        const resolvedRoot = path.resolve(root);
+        const ownsPath = (targetPath: string): boolean =>
+            path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot);
+        const restoreMap = <T>(target: Map<string, T>, snapshot: Map<string, T>): void => {
+            for (const targetPath of [...target.keys()]) {
+                if (ownsPath(targetPath)) { target.delete(targetPath); }
+            }
+            for (const [targetPath, value] of snapshot) { target.set(targetPath, value); }
+        };
+        const restoreSet = (target: Set<string>, snapshot: Set<string>): void => {
+            for (const targetPath of [...target]) {
+                if (ownsPath(targetPath)) { target.delete(targetPath); }
+            }
+            for (const targetPath of snapshot) { target.add(targetPath); }
+        };
+
+        restoreMap(this.fileSnapshots, previous.fileSnapshots);
+        restoreMap(this.fileModes, previous.fileModes);
+        restoreSet(this.baselineExistingFiles, previous.baselineExistingFiles);
+        restoreMap(this.unresolvedBaselineFiles, previous.unresolvedBaselineFiles);
+        restoreMap(this.opaqueBaselineFiles, previous.opaqueBaselineFiles);
+        restoreMap(this.trackedChanges, previous.trackedChanges);
+        restoreMap(this.lineChanges, previous.lineChanges);
+        restoreMap(this.inlineViews, previous.inlineViews);
+        restoreSet(this.postBaselineUnknownFiles, previous.postBaselineUnknownFiles);
+        restoreSet(this.retainedReviewPaths, previous.retainedReviewPaths);
+        restoreMap(this.coverageGaps, previous.coverageGaps);
+        restoreSet(this.pendingImportedDirectoryReconciliation, previous.pendingReconciliation);
+
+        const retainedHistory = this.revertHistory
+            .map(record => ({ ...record, items: record.items.filter(item => !ownsPath(item.filePath)) }))
+            .filter(record => record.items.length > 0);
+        const byId = new Map(retainedHistory.map(record => [record.id, record]));
+        for (const record of previous.revertHistory) {
+            const current = byId.get(record.id);
+            if (current) {
+                current.items.push(...record.items.map(item => ({
+                    ...item,
+                    before: { ...item.before },
+                    after: { ...item.after }
+                })));
+            } else {
+                const restored = {
+                    ...record,
+                    items: record.items.map(item => ({
+                        ...item,
+                        before: { ...item.before },
+                        after: { ...item.after }
+                    }))
+                };
+                retainedHistory.push(restored);
+                byId.set(restored.id, restored);
+            }
+        }
+        this.revertHistory = retainedHistory;
+        this.resetChangeBlocksCaches();
+        this.trackedChangesVersion++;
+        this.trackedChangesCacheVersion = -1;
+        this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
     }
 
     private clearAbsentDirectorySentinel(filePath: string): boolean {
@@ -4876,7 +7374,11 @@ export class DiffTracker {
         return true;
     }
 
-    private async onExternalFileCreated(uri: vscode.Uri, duringScan = false): Promise<void> {
+    private async onExternalFileCreated(
+        uri: vscode.Uri,
+        duringScan = false,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
         if (!this.isRecording || !this.externalWatcherEnabled) {
@@ -4911,6 +7413,44 @@ export class DiffTracker {
             const directory = await this.isUntrackedDirectory(uri);
             if (!creationIsCurrent()) { return; }
             if (directory) {
+                const watcherFailureReason =
+                    'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
+                const scanFailureReason =
+                    'Created directory could not be scanned; rebuild the baseline after resolving the read failure';
+                let childPersistenceBudget!: CandidatePersistenceBudget;
+                try {
+                    childPersistenceBudget = this.createCandidatePersistenceBudget();
+                    // A failed populated-directory import must always leave a
+                    // durable subtree obligation. Reserve the worst-case watcher
+                    // failure evidence before mutating any child baseline so a
+                    // later capacity rejection cannot strand partial children
+                    // without a persistable warning.
+                    this.reserveCandidateCoverageGap(
+                        filePath,
+                        {
+                            targetKind: 'subtree',
+                            reasonCode: scanEvent
+                                ? 'directory-scan-coverage-gap'
+                                : 'directory-runtime-coverage-gap',
+                            reason: watcherFailureReason
+                        },
+                        childPersistenceBudget
+                    );
+                } catch (error) {
+                    await this.pauseRecordingForUnpersistableCoverage(
+                        'Created directory could not reserve durable coverage evidence; recording is paused until the baseline is rebuilt.',
+                        error
+                    );
+                    return;
+                }
+                // Initial baseline construction already has its enclosing
+                // baseline transaction. Runtime populated-directory imports need
+                // their own subtree-scoped rollback so durable failure cannot
+                // strand newly accepted child baselines in memory.
+                const importRollback = scanEvent
+                    ? undefined
+                    : this.captureImportedDirectoryRollbackState(filePath);
+
                 // A missing explicit include is represented by an absent-file
                 // sentinel. Once that path is known to be a directory the
                 // sentinel must not survive persistence: directories are not
@@ -4925,23 +7465,81 @@ export class DiffTracker {
                 }
                 // Native watchers may report only the parent when a populated
                 // directory appears; its nested .gitignore events are not guaranteed.
+                let failureReason = scanFailureReason;
                 try {
                     await this.refreshIgnoreMatchers();
                     if (!creationIsCurrent()) { return; }
+                    const importedPreparationBudget = { remainingEntries: this.maxScopePreflightEntries };
                     let watchFailed = false;
-                    try { await this.watchImportedTree(filePath, epoch); }
-                    catch { watchFailed = true; }
+                    try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget); }
+                    catch {
+                        watchFailed = true;
+                        failureReason = watcherFailureReason;
+                    }
                     if (!creationIsCurrent()) { return; }
-                    const children = await this.findScopeFilesUnderDirectory(filePath);
+                    const durablePaths = new Set([
+                        ...this.fileSnapshots.keys(),
+                        ...this.unresolvedBaselineFiles.keys(),
+                        ...this.opaqueBaselineFiles.keys(),
+                        ...this.trackedChanges.keys()
+                    ]);
+                    const childCapacityGuard: CandidateCapacityGuard = {
+                        remaining: Math.max(
+                            0,
+                            this.maxPersistedSnapshots -
+                                (scanEvent ? this.unresolvedBaselineFiles.size : this.fileSnapshots.size)
+                        ),
+                        exemptPaths: durablePaths,
+                        countedCandidates: new Set<string>()
+                    };
+                    const children = await this.findScopeFilesUnderDirectory(
+                        filePath,
+                        importedPreparationBudget,
+                        childCapacityGuard
+                    );
                     if (!creationIsCurrent()) { return; }
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
-                            await this.onExternalFileCreated(child, scanEvent);
+                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
+                        }
+                    }
+                    let watcherFailureProjected = false;
+                    if (watchFailed && !scanEvent && creationIsCurrent()) {
+                        // Runtime child baselines and their missing-watcher
+                        // obligation are one durable publication. Normalize any
+                        // stale file-level uncertainty into subtree evidence now,
+                        // but suppress a separate persistence schedule: the final
+                        // projection/flush below owns the whole publication.
+                        await this.markCreatedDirectoryUnavailable(
+                            filePath,
+                            watcherFailureReason,
+                            false,
+                            epoch,
+                            undefined,
+                            false
+                        );
+                        watcherFailureProjected = true;
+                    }
+                    if (!scanEvent && creationIsCurrent()) {
+                        // Child publications share one incremental budget. Persist
+                        // once after the bounded parent scan so both child baselines
+                        // and any required watcher-failure gap cross the same
+                        // projection and durable write barrier.
+                        this.validateCandidatePersistenceProjection(childPersistenceBudget);
+                        if (!await this.flushPendingPersistence()) {
+                            throw new Error('Created directory baseline changes could not be persisted');
                         }
                     }
                     if (watchFailed && creationIsCurrent()) {
-                        await this.markCreatedDirectoryUnavailable(filePath, 'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit', scanEvent, epoch);
+                        if (!watcherFailureProjected) {
+                            await this.markCreatedDirectoryUnavailable(
+                                filePath,
+                                watcherFailureReason,
+                                scanEvent,
+                                epoch
+                            );
+                        }
                     } else if (creationIsCurrent()) {
                         // A successful watch plus the completed bounded scan above
                         // satisfies an existing diagnostic; watcher installation
@@ -4951,23 +7549,63 @@ export class DiffTracker {
                     }
                 } catch {
                     if (creationIsCurrent()) {
-                        await this.markCreatedDirectoryUnavailable(filePath, 'Created directory could not be scanned; rebuild the baseline after resolving the read failure', scanEvent, epoch);
+                        if (importRollback) {
+                            this.restoreImportedDirectoryRollbackState(filePath, importRollback);
+                        }
+                        await this.markCreatedDirectoryUnavailable(filePath, failureReason, scanEvent, epoch);
+                        if (importRollback) {
+                            // A failed flush can occur after the target file was
+                            // replaced but before the backup/commit barrier. Push
+                            // the rolled-back state plus its coverage obligation
+                            // through the durable writer immediately. If storage
+                            // is still unavailable, the existing failure marker /
+                            // backup recovery path remains authoritative.
+                            await this.flushPendingPersistence();
+                        }
                     }
                 }
                 return;
             }
             if (scanEvent) {
-                this.recordUnresolvedBaseline(filePath, 'File appeared during baseline scan; before-image is unknown');
+                const reason = 'File appeared during baseline scan; before-image is unknown';
+                const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+                const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                    ? this.unresolvedBaselineFiles.revision : undefined;
+                if (persistenceBudget) {
+                    this.consumeCandidatePersistenceBudget(
+                        filePath,
+                        { kind: 'unresolved', reason },
+                        persistenceBudget
+                    );
+                }
+                this.recordUnresolvedBaseline(filePath, reason);
+                if (persistenceBudget) {
+                    this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
+                }
                 return;
             }
             const state = await this.readFileSnapshot(uri);
             if (!creationIsCurrent()) { return; }
             if (!this.fileSnapshots.has(filePath) && !this.opaqueBaselineFiles.has(filePath) &&
                 (!this.unresolvedBaselineFiles.has(filePath) || this.postBaselineUnknownFiles.has(filePath))) {
+                const beforeReason = this.unresolvedBaselineFiles.get(filePath);
+                const beforeRevision = this.unresolvedBaselineFiles instanceof UnresolvedBaselineMap
+                    ? this.unresolvedBaselineFiles.revision : undefined;
+                if (persistenceBudget) {
+                    this.consumeCandidatePersistenceBudget(
+                        filePath,
+                        { kind: 'text', content: '', baselineExists: false },
+                        persistenceBudget
+                    );
+                }
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
-                if (!await this.completeBaseline(epoch)) { return; }
+                if (persistenceBudget) {
+                    this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
+                } else if (!await this.completeBaseline(epoch)) {
+                    return;
+                }
             }
             if (this.reconcileOpaqueBaseline(filePath, state)) {
                 return;
@@ -5212,12 +7850,15 @@ export class DiffTracker {
         return this.validateSnapshotTarget(filePath);
     }
 
-    private validateSnapshotTarget(filePath: string): string | undefined {
+    private validateSnapshotTarget(
+        filePath: string,
+        identityBudget?: PathIdentityWorkBudget
+    ): string | undefined {
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
         if (this.disposed || this.workspaceContextChanged) { return 'Session is closed or workspace membership changed; review is paused'; }
         const gitPauseReason = this.getGitPauseReason(filePath);
         if (gitPauseReason) { return gitPauseReason; }
-        return this.validateResourceTarget(filePath);
+        return this.validateResourceTarget(filePath, identityBudget);
     }
 
     private pathBelongsToRoot(filePath: string, root: string): boolean {
@@ -5377,7 +8018,7 @@ export class DiffTracker {
             lineChanges: new Map(this.lineChanges),
             inlineViews: new Map(this.inlineViews),
             revertHistory: [...this.revertHistory],
-            unresolvedBaselineFiles: new Map(this.unresolvedBaselineFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles),
             baselineGitContexts: new Map(this.baselineGitContexts),
             pausedGitRepositories: new Map(this.pausedGitRepositories),
@@ -5473,21 +8114,50 @@ export class DiffTracker {
                 this.markLineChangesUpdated(filePath);
             }
 
-            const files = await this.findScopeFilesUnderDirectory(repoRoot);
-            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
-            await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
-                const state = await this.readFileSnapshot(uri);
-                if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
-                this.recordScannedBaseline(uri.fsPath, state, 'repository');
-            });
-
-            if (!contextStillCurrent()) { throw new Error('Git context changed during baseline rebuild'); }
+            // Repository rebuild permanently drops recovery history owned by the
+            // repository. Remove those items before projecting durable capacity
+            // so obsolete history cannot consume replacement-baseline bytes.
             this.revertHistory = this.revertHistory.map(record => ({
                 ...record,
                 items: record.items.filter(item => !ownsPath(item.filePath))
             })).filter(record => record.items.length > 0);
+
+            const projectedScanCoverage =
+                previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            const repositoryPersistenceBudget =
+                this.createCandidatePersistenceBudget(projectedScanCoverage);
+
+            const normalizedRepoRoot = path.resolve(repoRoot);
+            const nestedRepositoryRootSet = new Set(
+                this.getRepositoryRoots()
+                    .map(root => path.resolve(root))
+                    .filter(root => root !== normalizedRepoRoot && this.pathBelongsToRoot(root, normalizedRepoRoot))
+            );
+            const files = await this.findScopeFilesUnderDirectory(
+                repoRoot,
+                undefined,
+                undefined,
+                {
+                    seedOverlappingWorkspaceRoots: true,
+                    identityBudget: { remainingEntries: this.maxPathIdentityPreparationEntries },
+                    skipTraversalPath: targetPath => {
+                        for (let current = path.resolve(targetPath); ; current = path.dirname(current)) {
+                            if (nestedRepositoryRootSet.has(current)) { return true; }
+                            if (current === normalizedRepoRoot || path.dirname(current) === current) { return false; }
+                        }
+                    }
+                }
+            );
+            if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+            await this.runWithConcurrency(files.filter(uri => uri.scheme === 'file' && ownsPath(uri.fsPath) && !this.isPathIgnored(uri)), 8, async uri => {
+                const state = await this.readFileSnapshot(uri);
+                if (!this.isCurrentEpoch(epoch)) { throw new Error('Session changed during repository baseline rebuild'); }
+                this.recordScannedBaseline(uri.fsPath, state, 'repository', repositoryPersistenceBudget);
+            });
+
+            if (!contextStillCurrent()) { throw new Error('Git context changed during baseline rebuild'); }
             this.baselineGitContexts.set(repoRoot, { ...context });
-            this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
+            this.scanCoverage = projectedScanCoverage;
             this.resetChangeBlocksCaches();
             this.snapshotInitialized = true;
             await this.processPendingExternalChanges();
@@ -5523,7 +8193,10 @@ export class DiffTracker {
         }
     }
 
-    private validateResourceTarget(filePath: string): string | undefined {
+    private validateResourceTarget(
+        filePath: string,
+        identityBudget?: PathIdentityWorkBudget
+    ): string | undefined {
         if (this.disposed) { return 'Session is closed; resource access is blocked'; }
         const uri = vscode.Uri.file(filePath);
         const folder = vscode.workspace.getWorkspaceFolder(uri);
@@ -5548,10 +8221,13 @@ export class DiffTracker {
         if (isHardUnmonitorableRelativePath(
             relativePath,
             rootIdentity,
-            targetIsDirectory
+            targetIsDirectory,
+            identityBudget
         )) {
+            this.assertPathIdentityBudget(identityBudget);
             return 'Resource is inside a DiffTracker hard-excluded internal path; action blocked';
         }
+        this.assertPathIdentityBudget(identityBudget);
         try {
             const realRoot = fs.realpathSync(folder.uri.fsPath);
             // Reject aliases even when they stay inside the workspace. Checking
@@ -7240,7 +9916,11 @@ export class DiffTracker {
         }
     }
 
-    private ensureSnapshotForDocument(doc: vscode.TextDocument, useDocumentContent = false): void {
+    private ensureSnapshotForDocument(
+        doc: vscode.TextDocument,
+        useDocumentContent = false,
+        persistenceBudget?: CandidatePersistenceBudget
+    ): void {
         if (!this.isRecording || this.initialIgnoreEpoch === this.sessionEpoch || this.restoringEpoch !== undefined) {
             return;
         }
@@ -7294,14 +9974,33 @@ export class DiffTracker {
                 this.markFileUnavailable(filePath, 'Baseline is unsupported or exceeds the 5 MiB limit');
                 return;
             }
+            const mode = stat.mode & 0o777;
+            if (!this.snapshotInitialized && persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(
+                    filePath,
+                    { kind: 'text', content, mode, baselineExists: true },
+                    persistenceBudget
+                );
+            }
             this.fileSnapshots.set(filePath, this.snapshotInitialized ? '' : content);
-            this.fileModes.set(filePath, stat.mode & 0o777);
+            this.fileModes.set(filePath, mode);
             if (!this.snapshotInitialized) { this.baselineExistingFiles.add(filePath); }
             else { this.updateTrackedDiff(filePath, content); }
         } catch (error) {
+            // Persistence capacity is a preparation failure, not a file-read
+            // failure. Do not translate a sealed budget into unresolved review
+            // evidence or continue capturing later open documents.
+            if (persistenceBudget?.failedReason) { throw error; }
             if (!this.isFileNotFound(error)) {
                 this.markFileUnavailable(filePath, 'Baseline cannot be read or decoded');
                 return;
+            }
+            if (!this.snapshotInitialized && persistenceBudget) {
+                this.consumeCandidatePersistenceBudget(
+                    filePath,
+                    { kind: 'text', content: '', baselineExists: false },
+                    persistenceBudget
+                );
             }
             this.fileSnapshots.set(filePath, '');
             this.baselineExistingFiles.delete(filePath);

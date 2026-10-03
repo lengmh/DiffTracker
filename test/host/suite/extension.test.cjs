@@ -178,16 +178,107 @@ module.exports = async function runExtensionHostScenario() {
         await scopeConfig.update('watchInclude', stableIncludes, vscode.ConfigurationTarget.Workspace);
         console.log('PASS HOST-S3 stale scope approval cannot authorize a newer revision');
 
-        // Whole Workspace is a valid request in S3 but cannot become effective
-        // until S4-W can atomically establish preparation and observation coverage.
+        // S4-A: when host watcher exclusions are explicitly disabled for the
+        // fixture, Whole Workspace can publish transactionally. Recording Apply
+        // baselines current resources immediately; stopped Apply publishes only
+        // the scope, and the next Start rebuilds under that effective scope.
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        const mergedWatcherExclude = filesConfig.get('watcherExclude', {});
+        const coverageSafeWatcherExclude = Object.fromEntries(
+            Object.keys(mergedWatcherExclude).map(pattern => [pattern, false])
+        );
+        await filesConfig.update('watcherExclude', coverageSafeWatcherExclude,
+            vscode.ConfigurationTarget.Workspace);
+        const secondRootFilesConfig = vscode.workspace.getConfiguration('files', vscode.Uri.file(secondRoot));
+        const previousSecondRootWatcherExclude =
+            secondRootFilesConfig.inspect('watcherExclude')?.workspaceFolderValue;
+        const mergedSecondRootWatcherExclude = secondRootFilesConfig.get('watcherExclude', {});
+        const coverageSafeSecondRootWatcherExclude = Object.fromEntries(
+            Object.keys(mergedSecondRootWatcherExclude).map(pattern => [pattern, false])
+        );
+        await secondRootFilesConfig.update('watcherExclude', coverageSafeSecondRootWatcherExclude,
+            vscode.ConfigurationTarget.WorkspaceFolder);
+        // Updating a WorkspaceFolder setting writes secondRoot/.vscode/settings.json,
+        // which is itself a monitored workspace resource. Let that real watcher
+        // event settle before opening the scope transaction; late events must
+        // continue to invalidate preparation rather than being ignored.
+        await delay(500);
+        await scopeConfig.update('watchInclude', [], vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchExclude', [], vscode.ConfigurationTarget.Workspace);
+
+        // Existing-before-Start but ordinary-policy-ignored is the precise
+        // expansion fixture: Rules must not baseline it, while Whole Workspace
+        // must adopt its current contents as the candidate before-image.
+        const recordingWholePath = path.join(workspacePath, 'node_modules', 's4-recording-whole.txt');
+        const recordingWholeTrackedPath = vscode.Uri.file(recordingWholePath).fsPath;
+        fs.mkdirSync(path.dirname(recordingWholePath), { recursive: true });
+        fs.writeFileSync(recordingWholePath, 'recording whole baseline\n');
+
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
+            'Rules recording must restart after fixture watcher exclusions are made coverage-safe');
+        await until('Rules baseline before recording Whole Workspace Apply',
+            async () => (await state()).baselineState === 'ready');
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', recordingWholeTrackedPath),
+            undefined,
+            'Rules baseline must not include the ordinary-policy-ignored expansion fixture'
+        );
+
         await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
-        const wholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+        const recordingWholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true
         });
-        assert.equal(wholeApply.status, 'requiresS4', JSON.stringify(wholeApply));
-        assert.equal((await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')).effective.mode, 'rules');
+        assert.equal(recordingWholeApply.status, 'applied', JSON.stringify(recordingWholeApply));
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', recordingWholeTrackedPath),
+            'recording whole baseline\n'
+        );
+        assert.equal((await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')).effective.mode,
+            'wholeWorkspace');
+        console.log('PASS HOST-S4A recording Whole Workspace apply captures candidate baseline');
+
         await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
-        console.log('PASS HOST-S3 Whole Workspace request stays pending until S4-W coverage exists');
+        const rulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(rulesApply.status, 'applied', JSON.stringify(rulesApply));
+
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        const stoppedWholePath = path.join(workspacePath, 's4-stopped-whole.txt');
+        const stoppedWholeTrackedPath = vscode.Uri.file(stoppedWholePath).fsPath;
+        fs.writeFileSync(stoppedWholePath, 'stopped whole baseline\n');
+        await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
+        const stoppedWholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(stoppedWholeApply.status, 'applied', JSON.stringify(stoppedWholeApply));
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', stoppedWholeTrackedPath),
+            undefined,
+            'stopped scope Apply must not acquire a new before-image'
+        );
+        // Stable Linux watchers can emit an existing path as a create when the
+        // new watcher starts. The product only treats that as stale when the
+        // filesystem timestamps predate activation by the full safety margin.
+        await delay(2100);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true);
+        await until('Whole Workspace baseline after stopped Apply', async () => (await state()).baselineState === 'ready');
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', stoppedWholeTrackedPath),
+            'stopped whole baseline\n'
+        );
+        console.log('PASS HOST-S4A stopped Whole Workspace apply defers baseline acquisition until Start');
+
+        await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
+        const restoreRulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(restoreRulesApply.status, 'applied', JSON.stringify(restoreRulesApply));
+        await vscode.commands.executeCommand('diffTracker.stopRecording');
+        await secondRootFilesConfig.update('watcherExclude', previousSecondRootWatcherExclude,
+            vscode.ConfigurationTarget.WorkspaceFolder);
+        await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true);
+        await until('Rules baseline after restoring watcher fixture',
+            async () => (await state()).baselineState === 'ready');
 
         // A directly edited explicit exclusion is only a requested scope until
         // Apply. Pause new reads for the affected path, and if the request is
@@ -212,7 +303,10 @@ module.exports = async function runExtensionHostScenario() {
         const pausedReview = await pending('existing.txt');
         assert.equal(pausedReview?.reviewKind, 'unknown',
             'pending explicit exclusion must preserve the prior baseline as unverified review');
-        assert.match(pausedReview?.unavailableReason ?? '', /pending explicit exclusion|paused.*exclusion/i);
+        assert.match(
+            pausedReview?.unavailableReason ?? '',
+            /pending explicit exclusion|paused.*exclusion|explicit exclusion awaited confirmation/i
+        );
         assert.equal((await state()).reviewTokens.some(token => token.filePath === uri('existing.txt').fsPath), false,
             'unverified pending-exclusion review must not expose a text action token');
 

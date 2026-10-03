@@ -3,7 +3,16 @@ import { fileURLToPath } from 'url';
 import * as path from 'path';
 import * as fs from 'fs';
 import ignore from 'ignore';
-import { asciiCaseFold, detectLocalPathCaseSensitivity, resolveRelativePathIdentity } from './utils/pathIdentity';
+import {
+    asciiCaseFold,
+    createPathIdentityRuntimeContext,
+    detectLocalPathCaseSensitivity,
+    PathIdentityRuntimeContext,
+    PathIdentityWorkBudget,
+    RelativePathIdentity,
+    sameExistingDirectoryEntry,
+    resolveRelativePathIdentity
+} from './utils/pathIdentity';
 
 export type MonitoringScopeMode = 'rules' | 'wholeWorkspace';
 export type MonitoringRuleScope = 'all' | 'folder';
@@ -486,27 +495,103 @@ function localRootPath(root: WorkspaceRootIdentity): string | undefined {
     }
 }
 
-function relativeIdentity(root: WorkspaceRootIdentity, value: string): string {
+function normalizeRelativeParts(value: string): string[] {
+    return value.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '')
+        .split('/').filter(Boolean);
+}
+
+function runtimeBoundedExistingIdentity(
+    value: RelativePathIdentity | undefined,
+    componentCount: number
+): boolean {
+    return value?.runtimeFallbackExhausted === true &&
+        value.lookupVerifiedPrefixLength >= componentCount;
+}
+
+function identityUnavailableForSafety(
+    value: RelativePathIdentity | undefined,
+    componentCount: number
+): boolean {
+    return !!value?.unavailable && !runtimeBoundedExistingIdentity(value, componentCount);
+}
+
+/**
+ * Compare two same-depth literal relative paths without treating root case
+ * semantics as proof for descendant directories. Normal physical identity wins.
+ * If runtime spelling recovery hit its bounded cap, only an existing lookup plus
+ * a filesystem-proven insensitive parent may bridge an ASCII-case difference.
+ */
+function sameRelativeFilesystemIdentity(
+    root: WorkspaceRootIdentity,
+    leftValue: string,
+    rightValue: string,
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
+): boolean {
+    const leftRequested = normalizeRelativeParts(leftValue);
+    const rightRequested = normalizeRelativeParts(rightValue);
+    if (leftRequested.length !== rightRequested.length) { return false; }
+    if (leftRequested.every((part, index) => part === rightRequested[index])) { return true; }
+
     const rootPath = localRootPath(root);
-    return rootPath
-        ? resolveRelativePathIdentity(rootPath, value, false).identity
-        : value;
+    if (!rootPath || typeof root.caseSensitive !== 'boolean') { return false; }
+    const leftRelative = leftRequested.join('/');
+    const rightRelative = rightRequested.join('/');
+    const left = resolveRelativePathIdentity(rootPath, leftRelative, root.caseSensitive, workBudget, runtimeContext);
+    const right = resolveRelativePathIdentity(rootPath, rightRelative, root.caseSensitive, workBudget, runtimeContext);
+    const leftResolved = normalizeRelativeParts(left.resolvedRelativePath);
+    const rightResolved = normalizeRelativeParts(right.resolvedRelativePath);
+
+    for (let index = 0; index < leftRequested.length; index++) {
+        if (leftResolved[index] === rightResolved[index]) { continue; }
+
+        // Physical spelling is still unresolved. Never use generic Unicode
+        // folding, missing lookup, symlink uncertainty, or preparation-budget
+        // exhaustion as alias proof.
+        if (asciiCaseFold(leftRequested[index]) !== asciiCaseFold(rightRequested[index]) ||
+            left.lookupVerifiedPrefixLength <= index ||
+            right.lookupVerifiedPrefixLength <= index ||
+            (left.runtimeFallbackExhausted !== true && right.runtimeFallbackExhausted !== true)) {
+            return false;
+        }
+
+        const parentSensitive = index === 0
+            ? root.caseSensitive
+            : cachedExclusionDirectoryCaseSensitivity(
+                path.join(rootPath, ...rightRequested.slice(0, index)),
+                workBudget
+            );
+        if (parentSensitive !== false) { return false; }
+    }
+    return true;
 }
 
 function includeCoversRelativePath(
     includePath: string,
     relativePath: string,
     directory: boolean,
-    root: WorkspaceRootIdentity
+    root: WorkspaceRootIdentity,
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
-    const includeParts = relativeIdentity(root, includePath).split('/').filter(Boolean);
-    const targetParts = relativeIdentity(root, relativePath.replace(/\/$/, '')).split('/').filter(Boolean);
-    if (targetParts.length >= includeParts.length &&
-        includeParts.every((part, index) => targetParts[index] === part)) {
-        return true;
+    const includeParts = normalizeRelativeParts(includePath);
+    const targetParts = normalizeRelativeParts(relativePath);
+    if (targetParts.length >= includeParts.length) {
+        return sameRelativeFilesystemIdentity(
+            root,
+            includeParts.join('/'),
+            targetParts.slice(0, includeParts.length).join('/'),
+            workBudget,
+            runtimeContext
+        );
     }
-    return directory && targetParts.length < includeParts.length &&
-        targetParts.every((part, index) => includeParts[index] === part);
+    return directory && sameRelativeFilesystemIdentity(
+        root,
+        targetParts.join('/'),
+        includeParts.slice(0, targetParts.length).join('/'),
+        workBudget,
+        runtimeContext
+    );
 }
 
 function explicitPatternForIgnore(pattern: string): string {
@@ -522,10 +607,17 @@ function explicitPatternForIgnore(pattern: string): string {
 export function isHardUnmonitorableRelativePath(
     relativePath: string,
     identity: boolean | WorkspaceRootIdentity = true,
-    leafIsDirectory = false
+    leafIsDirectory = false,
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const rootPath = typeof identity === 'boolean' ? undefined : localRootPath(identity);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const rootCaseSensitive = typeof identity === 'boolean'
+        ? identity
+        : identity.caseSensitive ?? false;
+    const resolved = rootPath
+        ? resolveRelativePathIdentity(rootPath, relativePath, rootCaseSensitive, workBudget, runtimeContext)
+        : undefined;
     const parts = (resolved?.resolvedRelativePath ?? relativePath)
         .replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/$/, '').split('/').filter(Boolean);
     return parts.some((part, index) => {
@@ -538,12 +630,35 @@ export function isHardUnmonitorableRelativePath(
             return typeof identity === 'boolean' ? !identity : true;
         }
         // Missing/unreadable reserved spellings are conservative boundaries.
-        if (index >= resolved.verifiedPrefixLength) { return true; }
+        // Runtime spelling-scan exhaustion is different: when lookup already
+        // proved the target prefix exists, continue to the canonical spelling
+        // check instead of treating bounded recovery as identity failure.
+        const targetPrefixLookupVerified =
+            runtimeBoundedExistingIdentity(resolved, parts.length) &&
+            resolved.lookupVerifiedPrefixLength > index;
+        if (index >= resolved.verifiedPrefixLength && !targetPrefixLookupVerified) { return true; }
         const prefix = parts.slice(0, index);
+        const targetPrefix = [...prefix, part].join('/');
         const reservedSpelling = folded === '.git' ? '.git' : '.difftracker-restore-' + part.slice('.difftracker-restore-'.length);
-        const canonical = resolveRelativePathIdentity(rootPath, [...prefix, reservedSpelling].join('/'), true);
-        return canonical.unavailable || (canonical.verifiedPrefixLength === index + 1 &&
-            canonical.identity === [...prefix, part].join('/'));
+        const canonicalPrefix = [...prefix, reservedSpelling].join('/');
+        const canonical = resolveRelativePathIdentity(
+            rootPath,
+            canonicalPrefix,
+            rootCaseSensitive,
+            workBudget,
+            runtimeContext
+        );
+        if (identityUnavailableForSafety(canonical, index + 1)) { return true; }
+        if (canonical.verifiedPrefixLength === index + 1 &&
+            canonical.identity === targetPrefix) { return true; }
+        return runtimeBoundedExistingIdentity(canonical, index + 1) &&
+            sameRelativeFilesystemIdentity(
+                identity as WorkspaceRootIdentity,
+                targetPrefix,
+                canonicalPrefix,
+                workBudget,
+                runtimeContext
+            );
     });
 }
 
@@ -569,7 +684,10 @@ function exclusionDirectorySignature(directory: string): string | undefined {
     }
 }
 
-function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | undefined {
+export function cachedExclusionDirectoryCaseSensitivity(
+    directory: string,
+    workBudget?: PathIdentityWorkBudget
+): boolean | undefined {
     const key = path.resolve(directory);
     const before = exclusionDirectorySignature(directory);
     if (before !== undefined) {
@@ -578,7 +696,7 @@ function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | u
         if (cached) { exclusionDirectoryCaseCache.delete(key); }
     }
 
-    const value = detectLocalPathCaseSensitivity(directory);
+    const value = detectLocalPathCaseSensitivity(directory, process.platform, workBudget);
     if (value === undefined || before === undefined) { return value; }
     const after = exclusionDirectorySignature(directory);
     if (after === before) {
@@ -589,12 +707,19 @@ function cachedExclusionDirectoryCaseSensitivity(directory: string): boolean | u
 }
 
 function explicitExcludeMatches(
-    pattern: string, relativePath: string, directory: boolean, root: WorkspaceRootIdentity
+    pattern: string,
+    relativePath: string,
+    directory: boolean,
+    root: WorkspaceRootIdentity,
+    workBudget?: PathIdentityWorkBudget,
+    runtimeContext?: PathIdentityRuntimeContext
 ): boolean {
     const body = pattern.replace(/^\//, '').replace(/\/$/, '');
     const components = body.split('/');
     const rootPath = localRootPath(root);
-    const resolved = rootPath ? resolveRelativePathIdentity(rootPath, relativePath, true) : undefined;
+    const resolved = rootPath
+        ? resolveRelativePathIdentity(rootPath, relativePath, root.caseSensitive ?? false, workBudget, runtimeContext)
+        : undefined;
     const target = (resolved?.resolvedRelativePath ?? relativePath).replace(/\/$/, '').split('/').filter(Boolean);
     const directoryOnly = pattern.endsWith('/');
     const anchored = pattern.startsWith('/') || body.includes('/');
@@ -606,14 +731,39 @@ function explicitExcludeMatches(
         const literal = literalPatternComponent(component);
         if (literal !== undefined && exact.ignores(literal)) {
             if (!rootPath) { return false; }
-            const requested = resolveRelativePathIdentity(rootPath, [...target.slice(0, index), literal].join('/'), true);
+            const requested = resolveRelativePathIdentity(
+                rootPath,
+                [...target.slice(0, index), literal].join('/'),
+                root.caseSensitive ?? false,
+                workBudget,
+                runtimeContext
+            );
             // Unreadable/ambiguous identity must not turn an exclusion into
-            // permission to read. Missing paths, by contrast, remain distinct.
-            return requested.unavailable || !!resolved?.unavailable ||
-                requested.identity === target.slice(0, index + 1).join('/');
+            // permission to read. A runtime spelling cap with successful lookup
+            // is not that condition: it still has to prove this literal matches
+            // through physical/case semantics below. Missing paths remain distinct.
+            const requestedComponentCount = index + 1;
+            const targetComponentCount = target.length;
+            if (identityUnavailableForSafety(requested, requestedComponentCount) ||
+                identityUnavailableForSafety(resolved, targetComponentCount)) { return true; }
+            if (requested.identity === target.slice(0, index + 1).join('/')) { return true; }
+            // Runtime spelling recovery may be bounded while both lookups still
+            // exist. Preserve genuine aliases, but never equate hard-link names
+            // by inode or grant permission after an inaccessible proof.
+            if (!workBudget &&
+                (runtimeBoundedExistingIdentity(requested, requestedComponentCount) ||
+                    runtimeBoundedExistingIdentity(resolved, targetComponentCount)) &&
+                requested.lookupVerifiedPrefixLength >= requestedComponentCount &&
+                (resolved?.lookupVerifiedPrefixLength ?? 0) >= requestedComponentCount) {
+                return sameExistingDirectoryEntry(
+                    path.join(rootPath, ...target.slice(0, index), literal),
+                    path.join(rootPath, ...target.slice(0, index + 1))
+                ) !== false;
+            }
+            return false;
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
-        const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent) : root.caseSensitive;
+        const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent, workBudget) : root.caseSensitive;
         return sensitive !== true && ignore({ ignorecase: true })
             .add('/' + explicitPatternForIgnore(component)).ignores(target[index]);
     };
@@ -647,7 +797,8 @@ function explicitExcludeMatches(
 export function configuredScopeExplicitlyExcludesSubtree(
     scope: CanonicalMonitoringScope,
     rootIdentity: string | WorkspaceRootIdentity,
-    relativeDirectory: string
+    relativeDirectory: string,
+    workBudget?: PathIdentityWorkBudget
 ): boolean {
     const rel = relativeDirectory.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
     const root = typeof rootIdentity === 'string'
@@ -662,7 +813,7 @@ export function configuredScopeExplicitlyExcludesSubtree(
 
         // A rule that excludes the directory node itself necessarily makes its
         // descendants unreachable to configured-scope discovery.
-        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root)) {
+        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root, workBudget)) {
             return true;
         }
 
@@ -685,7 +836,7 @@ export function configuredScopeExplicitlyExcludesSubtree(
             continue;
         }
         if (!prefix) { continue; }
-        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root)) {
+        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root, workBudget)) {
             return true;
         }
     }
@@ -697,7 +848,8 @@ export function evaluateConfiguredScope(
     rootIdentity: string | WorkspaceRootIdentity,
     relativePath: string,
     ordinaryIgnored: boolean,
-    directory = false
+    directory = false,
+    workBudget?: PathIdentityWorkBudget
 ): ConfiguredScopeDecision {
     const rel = relativePath.replace(/^\.\//, '').replace(/^\/+/, '');
     const root = typeof rootIdentity === 'string'
@@ -708,22 +860,30 @@ export function evaluateConfiguredScope(
         return { monitored: false, source: 'identityUnknown' };
     }
     const caseSensitive = root.caseSensitive;
-    if (isHardUnmonitorableRelativePath(rel, root, directory)) {
+    // One normal runtime scope decision owns one identity allowance. Every hard
+    // boundary, exclusion, final identity gate and include in this decision
+    // reuses it. Preparation continues to use only the caller-owned workBudget.
+    const runtimeContext = workBudget ? undefined : createPathIdentityRuntimeContext();
+    if (isHardUnmonitorableRelativePath(rel, root, directory, workBudget, runtimeContext)) {
         return { monitored: false, source: 'hardBoundary' };
     }
     for (const rule of scope.excludes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (explicitExcludeMatches(rule.pattern, rel, directory, root)) {
+        if (explicitExcludeMatches(rule.pattern, rel, directory, root, workBudget, runtimeContext)) {
             return { monitored: false, source: 'explicitExclude' };
         }
     }
     const rootPath = localRootPath(root);
-    if (rootPath && resolveRelativePathIdentity(rootPath, rel, caseSensitive).unavailable) {
-        return { monitored: false, source: 'identityUnknown' };
+    if (rootPath) {
+        const resolvedIdentity = resolveRelativePathIdentity(rootPath, rel, caseSensitive, workBudget, runtimeContext);
+        const componentCount = rel.replace(/\/$/, '').split('/').filter(Boolean).length;
+        if (identityUnavailableForSafety(resolvedIdentity, componentCount)) {
+            return { monitored: false, source: 'identityUnknown' };
+        }
     }
     for (const rule of scope.includes) {
         if (!ruleAppliesToRoot(rule, rootName)) { continue; }
-        if (includeCoversRelativePath(rule.path, rel, directory, root)) {
+        if (includeCoversRelativePath(rule.path, rel, directory, root, workBudget, runtimeContext)) {
             return { monitored: true, source: 'explicitInclude' };
         }
     }
