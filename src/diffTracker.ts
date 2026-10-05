@@ -1088,6 +1088,18 @@ export class DiffTracker {
             this.initialWatchBoundaryMs = Date.now();
             this.initialWatchBoundaryMonotonicNs = process.hrtime.bigint();
             this.initialIgnoreEpoch = epoch;
+            if (startupSupplementalPlan) {
+                // Start builds a fresh baseline under the current watcher policy.
+                // Obsolete stopped owners must not consume its budget or regain
+                // live ownership before the new plan is installed. Match roots,
+                // not just contained paths, so a narrower/wider plan can reown them.
+                const desiredRoots = new Set(startupSupplementalPlan.targets);
+                for (const [directory, entry] of [...this.supplementalDirectoryWatchers]) {
+                    if (desiredRoots.has(entry.coverageRoot)) { continue; }
+                    entry.watcher.dispose();
+                    this.supplementalDirectoryWatchers.delete(directory);
+                }
+            }
             this.activateExternalWatchers(this.createExternalWatchers(epoch));
             void (async () => {
                 let supplemental: SupplementalCoverageInstall | undefined;
@@ -5854,8 +5866,14 @@ export class DiffTracker {
             includePath?: string
         ): string | undefined => {
             if (identityBudget.exhausted) { return `${folder.name}:path-identity preparation budget exceeded`; }
-            const target = this.supplementalTargetForWatcherPattern(folder, pattern) ??
-                (includePath === undefined ? undefined : this.supplementalTargetForConfiguredInclude(folder, includePath));
+            let target = this.supplementalTargetForWatcherPattern(folder, pattern);
+            if (includePath !== undefined) {
+                const included = this.supplementalTargetForConfiguredInclude(folder, includePath);
+                // Rules coverage cannot escape its existing directory include.
+                // Keep a concrete excluded subtree when it is narrower; files
+                // and absent includes cannot borrow an excluded parent witness.
+                target = included && target && this.pathBelongsToRoot(target, included) ? target : included;
+            }
             if (!target) {
                 return `${context}:unsupported files.watcherExclude supplemental pattern (${pattern}); narrow the monitored scope or use a concrete existing blind subtree`;
             }

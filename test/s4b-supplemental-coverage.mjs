@@ -33,6 +33,116 @@ export function registerS4BSupplementalCoverage(h, fixture) {
     const {test, Uri, DiffTracker, file, getTracker, setTracker, setVsCodeExcludes, nativeDirectoryWatchers,
         fireConfigurationChanged} = h;
 
+    test('S4-B P2 concrete excluded parent keeps a narrow directory include within its own budget', () => fixture(async ({tracker,dir}) => {
+        const excluded = path.join(dir, 'node_modules');
+        const included = path.join(excluded, 'included-package');
+        fs.mkdirSync(included, {recursive:true});
+        const target = path.join(included, 'tracked.txt');
+        fs.writeFileSync(target, 'before');
+        for (let index = 0; index < 4; index++) {
+            fs.mkdirSync(path.join(excluded, `sibling-${index}`));
+        }
+        tracker.maxImportedDirectoryWatchers = 1;
+        setVsCodeExcludes({'files.watcherExclude': {'node_modules/**':true}});
+        tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+        const requested = configuredScope(tracker, 'rules', [{scope:'all',path:'node_modules/included-package'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested, false, () => true)).status, 'applied');
+        assert.deepEqual([...tracker.supplementalCoverageRoots], [included]);
+        assert.deepEqual([...tracker.supplementalDirectoryWatchers.keys()], [included]);
+        assert.equal(nativeDirectoryWatchers.some(owner => path.resolve(String(owner.directory)) === excluded), false);
+        assert.equal(tracker.getSubtreeCoverageGaps().length, 0);
+        const owner = activeNativeWatcher(nativeDirectoryWatchers, included);
+        assert.ok(owner);
+        fs.writeFileSync(target, 'after');
+        owner.listener('change', 'tracked.txt');
+        await settle(tracker);
+        assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent, 'after');
+    }, 'rules'));
+
+    for (const include of ['node_modules/pkg/file.js', 'node_modules/missing']) {
+        test(`S4-B P2 concrete exclusion cannot promote unsupported include ${include}`, () => fixture(async ({tracker,dir}) => {
+            fs.mkdirSync(path.join(dir, 'node_modules', 'pkg'), {recursive:true});
+            fs.writeFileSync(path.join(dir, 'node_modules', 'pkg', 'file.js'), 'before');
+            setVsCodeExcludes({'files.watcherExclude': {'node_modules/**':true}});
+            const before = configuredScope(tracker, 'rules');
+            tracker.effectiveMonitoringScope = before;
+            const requested = configuredScope(tracker, 'rules', [{scope:'all',path:include}]);
+            assert.equal((await tracker.applyConfiguredMonitoringScope(requested, false, () => true)).status, 'requiresS4');
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision, before.scopeRevision);
+            assert.equal(nativeDirectoryWatchers.length, 0, 'an excluded parent is not an include directory witness');
+        }, 'rules'));
+    }
+
+    test('S4-B P2 broad directory include retains the narrower concrete excluded subtree', () => fixture(async ({tracker,dir}) => {
+        const included = path.join(dir, 'included');
+        const excluded = path.join(included, 'blind');
+        fs.mkdirSync(excluded, {recursive:true});
+        fs.mkdirSync(path.join(included, 'visible-sibling'));
+        fs.writeFileSync(path.join(excluded, 'tracked.txt'), 'before');
+        tracker.maxImportedDirectoryWatchers = 1;
+        setVsCodeExcludes({'files.watcherExclude': {'included/blind/**':true}});
+        tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+        const requested = configuredScope(tracker, 'rules', [{scope:'all',path:'included'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested, false, () => true)).status, 'applied');
+        assert.deepEqual([...tracker.supplementalCoverageRoots], [excluded]);
+        assert.deepEqual([...tracker.supplementalDirectoryWatchers.keys()], [excluded]);
+        assert.equal(tracker.getSubtreeCoverageGaps().length, 0);
+    }, 'rules'));
+
+    for (const [oldRoot, newRoot] of [['old', 'next'], ['old', 'old/child'], ['old/child', 'old']]) {
+        test(`S4-B P2 stopped watcher policy ${oldRoot} to ${newRoot} releases obsolete owners before Start`, () => fixture(async ({tracker,dir}) => {
+            for (const name of ['old/child', 'next/child']) {
+                fs.mkdirSync(path.join(dir, name), {recursive:true});
+            }
+            const next = path.join(dir, newRoot);
+            const changed = path.join(next, 'changed.txt');
+            const deleted = path.join(next, 'deleted.txt');
+            fs.writeFileSync(changed, 'before');
+            fs.writeFileSync(deleted, 'before-delete');
+            tracker.maxImportedDirectoryWatchers = 2;
+            setVsCodeExcludes({'files.watcherExclude': {[`${oldRoot}/**`]:true}});
+            tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+            const requested = configuredScope(tracker, 'rules', [{scope:'all',path:'next'}, {scope:'all',path:'old'}]);
+            const applied = await tracker.applyConfiguredMonitoringScope(requested, false, () => true);
+            assert.equal(applied.status, 'applied', JSON.stringify(applied));
+            const oldOwners = [...nativeDirectoryWatchers];
+            tracker.stopRecording();
+            setVsCodeExcludes({'files.watcherExclude': {[`${newRoot}/**`]:true}});
+            fireConfigurationChanged('files.watcherExclude');
+            const beforeStart = nativeDirectoryWatchers.length;
+            h.setListedFiles([Uri.file(changed), Uri.file(deleted)]);
+            tracker.startRecording();
+            await h.waitUntil(() => tracker.getBaselineState() === 'ready');
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(), [],
+                'the final target fits the shared budget: ' + JSON.stringify(tracker.getSubtreeCoverageGaps()));
+            assert.equal(nativeDirectoryWatchers.slice(beforeStart).some(owner =>
+                !tracker.pathBelongsToRoot(path.resolve(String(owner.directory)), next)), false,
+            'obsolete directories must never be rebound during Start');
+            assert.deepEqual([...tracker.supplementalCoverageRoots], [next]);
+            assert.ok([...tracker.supplementalDirectoryWatchers.values()].every(entry => entry.coverageRoot === next));
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 0,
+                'the final target fits the shared budget and must not retain an artificial capacity or ownership gap');
+            const owner = activeNativeWatcher(nativeDirectoryWatchers, next);
+            assert.ok(owner, 'current target must be watched after Start');
+            assert.ok(oldOwners.every(entry => !entry.active));
+            for (const old of oldOwners) { old.listener('change', undefined); }
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 0, 'stale callbacks cannot damage current coverage');
+            fs.writeFileSync(changed, 'after');
+            owner.listener('change', 'changed.txt');
+            const created = path.join(next, 'created.txt');
+            fs.writeFileSync(created, 'created');
+            owner.listener('rename', 'created.txt');
+            fs.unlinkSync(deleted);
+            owner.listener('rename', 'deleted.txt');
+            await settle(tracker);
+            const changes = new Map(tracker.getTrackedChanges().map(change => [change.filePath, change]));
+            assert.equal(changes.get(changed)?.currentContent, 'after');
+            assert.equal(changes.get(created)?.baselineExists, false);
+            assert.equal(changes.get(deleted)?.isDeleted, true);
+            assert.equal(await tracker.flushPendingPersistence(), true);
+        }, 'rules'));
+    }
+
     test('S4-B literal watcher blind subtree installs persistent direct coverage and observes C/M/D', () => fixture(async ({tracker,dir}) => {
         const blind = path.join(dir,'blind');
         fs.mkdirSync(blind,{recursive:true});

@@ -4965,7 +4965,7 @@ test('S4-A watcher-excluded include shadowed by explicit exclusion does not requ
         'restore must preserve exclusion precedence over the shadowed include');
 });
 
-test('S4-B Rules file include under a literal watcher blind directory installs supplemental coverage',async()=>{
+test('S4-B Rules file include under a literal watcher blind directory does not promote its parent',async()=>{
     const vendor=file('watcher-ancestor-vendor');
     const includeFile=path.join(vendor,'file.txt');
     fs.mkdirSync(vendor,{recursive:true});
@@ -4983,10 +4983,12 @@ test('S4-B Rules file include under a literal watcher blind directory installs s
         model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
     })).digest('hex');
 
+    const before=tracker.getEffectiveMonitoringScope();
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'applied',JSON.stringify(result));
-    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(vendor)));
-    assert.ok(nativeDirectoryWatchers.some(w=>w.active&&path.resolve(String(w.directory))===path.resolve(vendor)));
+    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
+    assert.equal(tracker.supplementalCoverageRoots.size,0);
+    assert.equal(nativeDirectoryWatchers.some(w=>w.active),false);
 });
 
 test('S4-A Rules include prefix still requires coverage when only descendants are excluded',async()=>{

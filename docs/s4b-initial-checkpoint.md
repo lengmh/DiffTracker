@@ -83,3 +83,24 @@ It adds no S4-C handoff or new filesystem/provider support.
 
 The existing supported-boundary limits remain in force. A visible coverage gap
 requires explicit recovery; it is not evidence that no pending change exists.
+
+## Bounded Rules-target and stopped-policy correction
+
+- Rules supplemental targets stay inside a concrete existing directory include.
+  A concrete watcher-excluded subtree remains the target when it is narrower
+  than that include. A file or absent include cannot use its excluded parent as
+  a directory witness, even when the watcher pattern has a literal prefix.
+- Start releases owners whose coverage root is absent from the current plan
+  before rebinding native callbacks. Obsolete stopped-session owners therefore
+  cannot consume the shared watcher budget or block a narrower/wider target with
+  obsolete ownership. Active-session reset/rebuild handoff and scope Apply
+  rollback keep their existing safety behavior.
+- Seven focused regressions cover narrow directory budgets, file/absent include
+  rejection, preservation of a narrower excluded subtree, and stopped-policy
+  target replacement, narrowing and widening. The latter verify C/M/D callbacks,
+  stale-owner rejection, no artificial capacity/ownership gap, and persistence.
+  Six new counterexamples fail against source head `71e2075`; all seven new
+  tests pass after the correction. An older test that expected file-to-parent
+  promotion is corrected to enforce rejection and unchanged effective scope;
+  it also fails against the old source. Full and exact-head CI results are
+  recorded in the PR.
