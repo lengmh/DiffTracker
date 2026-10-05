@@ -53,3 +53,27 @@ Extension Host tests on both systems, VS Code 1.80.2 Host on Ubuntu and the rele
 0.7.2 downgrade guard. Host tests include direct filesystem create/change/delete
 inside a watcher-excluded concrete subtree. Exact run results belong to the PR
 checkpoint; this document does not claim that every planned check has passed.
+
+## Bounded lifecycle safety follow-up
+
+The follow-up audit covers Start/Stop, baseline reset and repository rebuild,
+scope Apply/rollback, restart restoration and current-versus-stale callbacks.
+It adds no S4-C handoff or new filesystem/provider support.
+
+- Epoch handoff rebinds committed supplemental owners alongside host and imported
+  watchers. Failed reinstallation leaves a visible subtree gap.
+- Full baseline reset reinstalls the bounded target tree before scanning, and
+  only retires the exact earlier gap after a successful scan and durable save.
+- Rollback preserves errors and unnamed-event evidence from committed owners.
+  Candidate cleanup uses exact acquired owner identity, including handles that
+  failed during preparation, rather than assuming a failed handle is still live.
+- Direct callbacks verify the installed directory's device, inode and birth time.
+  Removal or same-path replacement closes the stale owner and records a durable
+  gap while preserving the review baseline. Automatic reattachment is deferred.
+- Regressions check fresh observation and safe Keep/Revert after reset/rebuild,
+  failure rollback, Stop/Start and restart failure. Real-host coverage adds direct
+  writes after each active-session handoff and directory replacement with no
+  parent workspace watcher available to conceal a dead native owner.
+
+The existing supported-boundary limits remain in force. A visible coverage gap
+requires explicit recovery; it is not evidence that no pending change exists.

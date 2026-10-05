@@ -129,7 +129,7 @@ interface SupplementalCoveragePlan {
 interface SupplementalCoverageInstall {
     desiredRoots: string[];
     successfulRoots: string[];
-    activeBefore: Set<string>;
+    acquired: Map<string, SupplementalDirectoryWatch>;
     reconciliationGaps: Map<string, CoverageGapEvidence | undefined>;
 }
 
@@ -1161,6 +1161,12 @@ export class DiffTracker {
     private async performBaselineReset(): Promise<boolean> {
         if (this.recoveryBlocked) { return false; }
         const previousEpoch = this.sessionEpoch;
+        const supplementalPlan = this.isRecording && this.effectiveMonitoringScope.kind === 'configured'
+            ? this.configuredSupplementalCoveragePlan(this.effectiveMonitoringScope) : undefined;
+        if (supplementalPlan?.issue) {
+            vscode.window.showWarningMessage(`Code Diff Tracker: Supplemental coverage cannot be rebuilt at ${supplementalPlan.issue}. Prior review is preserved.`);
+            return false;
+        }
         let watchers: vscode.FileSystemWatcher[] | undefined;
         if (this.isRecording) {
             try {
@@ -1226,6 +1232,7 @@ export class DiffTracker {
             scanCoverage: this.scanCoverage,
             retainedReviewPaths: new Set(this.retainedReviewPaths),
             coverageGaps: new Map(this.coverageGaps),
+            supplementalCoverageRoots: new Set(this.supplementalCoverageRoots),
             pendingScopeSuspendedPaths: new Set(this.pendingScopeSuspendedPaths),
             pendingExternalChanges: new Set(this.pendingExternalChanges),
             postBaselineUnknownFiles: previousPostBaselineUnknownFiles,
@@ -1256,7 +1263,7 @@ export class DiffTracker {
             this.workspaceContextChanged = previous.workspaceContextChanged;
             this.scanCoverage = previous.scanCoverage === this.ignoreFingerprint ? previous.scanCoverage : undefined;
             this.retainedReviewPaths = new Set(previous.retainedReviewPaths);
-            this.coverageGaps = new Map(previous.coverageGaps);
+            this.restoreCoverageGapsPreservingSupplemental(previous.coverageGaps, previous.supplementalCoverageRoots);
             this.pendingScopeSuspendedPaths = new Set(previous.pendingScopeSuspendedPaths);
             this.pendingExternalChanges = new Set([
                 ...previous.pendingExternalChanges,
@@ -1386,7 +1393,8 @@ export class DiffTracker {
         this.unresolvedBaselineFiles = new UnresolvedBaselineMap();
         this.opaqueBaselineFiles = new Map();
         this.retainedReviewPaths = new Set();
-        this.coverageGaps = new Map();
+        this.coverageGaps = new Map([...this.coverageGaps].filter(([, record]) =>
+            this.isSupplementalCoverageGap(record)));
         this.pendingScopeSuspendedPaths = new Set();
         this.clearTrackedChanges();
         this.lineChanges = new Map();
@@ -1400,12 +1408,24 @@ export class DiffTracker {
 
         try {
             this.initialIgnoreEpoch = epoch;
+            const supplemental = supplementalPlan
+                ? await this.installSupplementalCoverageTargets(supplementalPlan.targets, epoch, true)
+                : undefined;
+            if (!this.isCurrentEpoch(epoch)) { return false; }
             await this.initializeWorkspaceSnapshots(transaction);
             const committed = this.isCurrentEpoch(epoch) && this.baselineTransaction === transaction &&
                 this.snapshotInitialized && !this.baselineBuilding && (!transaction.valid || transaction.valid());
             if (!committed) {
                 await rollback();
                 return false;
+            }
+            if (supplemental) {
+                this.reconcileSupplementalCoverageAfterSuccessfulScan(supplemental);
+                if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) {
+                    await rollback();
+                    return false;
+                }
+                this.commitSupplementalCoverageTargets(supplemental.desiredRoots);
             }
             this.endBaselineTransaction(transaction, true);
             this.emitTrackChangesEvent({
@@ -1694,10 +1714,35 @@ export class DiffTracker {
         }
         const targetError = this.validateResourceTarget(directory);
         if (targetError) { throw new Error(targetError); }
+        const identity = fs.lstatSync(directory, { bigint: true });
+        if (!identity.isDirectory() || identity.isSymbolicLink()) {
+            throw new Error('Supplemental coverage target is not a direct directory');
+        }
+        const identityStillCurrent = (): boolean => {
+            try {
+                const current = fs.lstatSync(directory, { bigint: true });
+                return current.isDirectory() && !current.isSymbolicLink() &&
+                    current.dev === identity.dev && current.ino === identity.ino &&
+                    current.birthtimeNs === identity.birthtimeNs;
+            } catch { return false; }
+        };
         const native = fs.watch(directory, { persistent: false }, (kind, filename) => {
             const current = this.supplementalDirectoryWatchers.get(directory);
             if (!this.isCurrentEpoch(epoch) || current?.epoch !== epoch ||
                 current.watcher !== watcher || current.coverageRoot !== coverageRoot) { return; }
+            // Native watches follow directory identity, not the path string.
+            // A named self-event may arrive after deletion/replacement, when
+            // joining its filename would otherwise miss the dead owner entirely.
+            if (!identityStillCurrent()) {
+                native.close();
+                current.epoch = -1;
+                this.setSubtreeCoverageGap(
+                    coverageRoot,
+                    'supplemental-watcher-identity-gap',
+                    'A watched directory was removed or replaced; rebuild the baseline to verify the current subtree and restore direct coverage.'
+                );
+                return;
+            }
             if (!filename) {
                 this.setSubtreeCoverageGap(
                     coverageRoot,
@@ -1730,6 +1775,10 @@ export class DiffTracker {
                 epoch
             );
         });
+        if (!identityStillCurrent()) {
+            native.close();
+            throw new Error('Supplemental directory identity changed during watcher installation');
+        }
         const watcher = { dispose: () => native.close() };
         this.supplementalDirectoryWatchers.set(directory, { watcher, epoch, coverageRoot });
         native.on('error', (error: unknown) => {
@@ -1749,7 +1798,8 @@ export class DiffTracker {
         root: string,
         coverageRoot: string,
         epoch: number,
-        preparationBudget: { remainingEntries: number }
+        preparationBudget: { remainingEntries: number },
+        acquired: Map<string, SupplementalDirectoryWatch>
     ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: SupplementalDirectoryWatch; previous?: SupplementalDirectoryWatch }>();
@@ -1763,7 +1813,9 @@ export class DiffTracker {
                 if (this.validateResourceTarget(directory)) { continue; }
                 const previous = this.supplementalDirectoryWatchers.get(directory);
                 if (this.watchSupplementalDirectory(directory, coverageRoot, epoch)) {
-                    installed.set(directory, { current: this.supplementalDirectoryWatchers.get(directory)!, previous });
+                    const current = this.supplementalDirectoryWatchers.get(directory)!;
+                    installed.set(directory, { current, previous });
+                    acquired.set(directory, current);
                 }
                 let handle: fs.Dir | undefined;
                 try {
@@ -1793,6 +1845,7 @@ export class DiffTracker {
             for (const [directory, entry] of installed) {
                 if (this.supplementalDirectoryWatchers.get(directory) === entry.current) {
                     entry.current.watcher.dispose();
+                    acquired.delete(directory);
                     if (entry.previous) { this.supplementalDirectoryWatchers.set(directory, entry.previous); }
                     else { this.supplementalDirectoryWatchers.delete(directory); }
                 }
@@ -1823,11 +1876,7 @@ export class DiffTracker {
         recordFailures: boolean
     ): Promise<SupplementalCoverageInstall> {
         const desiredRoots = this.normalizeSupplementalTargets(targets);
-        const activeBefore = new Set(
-            [...this.supplementalDirectoryWatchers]
-                .filter(([, entry]) => entry.epoch === epoch)
-                .map(([directory]) => directory)
-        );
+        const acquired = new Map<string, SupplementalDirectoryWatch>();
         const successfulRoots: string[] = [];
         const reconciliationGaps = new Map<string, CoverageGapEvidence | undefined>();
         const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
@@ -1836,7 +1885,7 @@ export class DiffTracker {
             reconciliationGaps.set(root, this.coverageGaps.get(root)?.subtree);
             try {
                 if (!fs.lstatSync(root).isDirectory()) { throw new Error('Supplemental coverage target is not a directory'); }
-                await this.watchSupplementalTree(root, root, epoch, preparationBudget);
+                await this.watchSupplementalTree(root, root, epoch, preparationBudget, acquired);
                 if (!this.isCurrentEpoch(epoch)) { break; }
                 successfulRoots.push(root);
             } catch (error) {
@@ -1847,16 +1896,33 @@ export class DiffTracker {
                 }
             }
         }
-        return { desiredRoots, successfulRoots, activeBefore, reconciliationGaps };
+        return { desiredRoots, successfulRoots, acquired, reconciliationGaps };
     }
 
     private rollbackSupplementalCoverageInstall(install: SupplementalCoverageInstall | undefined, epoch: number): void {
         if (!install) { return; }
-        for (const [directory, entry] of [...this.supplementalDirectoryWatchers]) {
-            if (entry.epoch === epoch && !install.activeBefore.has(directory)) {
+        for (const [directory, entry] of install.acquired) {
+            // A native failure changes epoch to -1. Ownership, not liveness,
+            // determines what this candidate must release on rollback.
+            if (this.supplementalDirectoryWatchers.get(directory) === entry &&
+                (entry.epoch === epoch || entry.epoch === -1)) {
                 entry.watcher.dispose();
                 this.supplementalDirectoryWatchers.delete(directory);
             }
+        }
+    }
+
+    private restoreCoverageGapsPreservingSupplemental(
+        previous: Map<string, CoverageGapRecord>,
+        committedRoots: ReadonlySet<string>
+    ): void {
+        const live = [...this.coverageGaps].filter(([root, record]) =>
+            committedRoots.has(root) && this.isSupplementalCoverageGap(record));
+        this.coverageGaps = new Map(previous);
+        // Watcher failures and unnamed/directory events are live observations,
+        // not candidate baseline state. Rollback cannot undo their uncertainty.
+        for (const [root, record] of live) {
+            this.coverageGaps.set(root, { ...this.coverageGaps.get(root), subtree: record.subtree });
         }
     }
 
@@ -1905,7 +1971,7 @@ export class DiffTracker {
         };
         const native = fs.watch(directory, { persistent: false }, (kind, filename) => {
             if (!this.isCurrentEpoch(epoch) || this.importedDirectoryWatchers.get(directory)?.epoch !== epoch ||
-                this.isPathIgnored(vscode.Uri.file(directory), true)) { return; }
+                this.importedDirectoryWatchers.get(directory)?.watcher !== watcher || this.isPathIgnored(vscode.Uri.file(directory), true)) { return; }
             if (!filename) {
                 reportFailure('Directory watcher returned an unnamed event; rebuild the baseline to reconcile');
                 return;
@@ -2013,6 +2079,21 @@ export class DiffTracker {
         this.fileWatchers = watchers;
         this.externalWatcherEnabled = watchers.length > 0;
         previousWatchers.forEach(watcher => watcher.dispose());
+        // Epoch changes invalidate native callbacks too. Rebind every committed
+        // direct owner synchronously in the same handoff as the host watcher;
+        // a successful host watcher alone cannot certify an excluded subtree.
+        for (const [directory, previous] of [...this.supplementalDirectoryWatchers]) {
+            try {
+                this.watchSupplementalDirectory(directory, previous.coverageRoot, this.sessionEpoch);
+            } catch (error) {
+                previous.watcher.dispose();
+                if (this.supplementalDirectoryWatchers.get(directory) === previous) {
+                    this.supplementalDirectoryWatchers.delete(directory);
+                }
+                const evidence = this.classifySupplementalWatcherFailure(error);
+                this.setSubtreeCoverageGap(previous.coverageRoot, evidence.reasonCode, evidence.reason, false);
+            }
+        }
         for (const [directory, previous] of this.importedDirectoryWatchers) {
             try {
                 if (!fs.lstatSync(directory).isDirectory()) { this.removeImportedDirectoryWatchers(directory); continue; }
@@ -4598,6 +4679,7 @@ export class DiffTracker {
             effectiveMonitoringScope: this.getEffectiveMonitoringScope(),
             retainedReviewPaths: new Set(this.retainedReviewPaths),
             coverageGaps: new Map(this.coverageGaps),
+            supplementalCoverageRoots: new Set(this.supplementalCoverageRoots),
             fileSnapshots: new Map(this.fileSnapshots),
             fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
@@ -4624,7 +4706,7 @@ export class DiffTracker {
             this.committedScopeDuringApply = undefined;
             this.effectiveMonitoringScope = previous.effectiveMonitoringScope;
             this.retainedReviewPaths = new Set(previous.retainedReviewPaths);
-            this.coverageGaps = new Map(previous.coverageGaps);
+            this.restoreCoverageGapsPreservingSupplemental(previous.coverageGaps, previous.supplementalCoverageRoots);
             this.fileSnapshots = new Map(previous.fileSnapshots);
             this.fileModes = new Map(previous.fileModes);
             this.baselineExistingFiles = new Set(previous.baselineExistingFiles);

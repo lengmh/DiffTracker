@@ -698,6 +698,24 @@ module.exports = async function runExtensionHostScenario() {
             (await pending('dist/s4b-blind/deleted.txt'))?.isDeleted === true);
         console.log('PASS HOST-S4-B literal watcher blind subtree observes create/change/delete');
 
+        for (const operation of ['reset', 'repository rebuild', 'Stop/Start']) {
+            if (operation === 'reset') {
+                assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
+            } else if (operation === 'repository rebuild') {
+                assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
+            } else {
+                await vscode.commands.executeCommand('diffTracker.stopRecording');
+                await vscode.commands.executeCommand('diffTracker.startRecording');
+            }
+            await untilStable(`S4-B ${operation} baseline`, async () => (await state()).baselineState === 'ready');
+            const content = `s4b after ${operation}\n`;
+            fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), content);
+            await untilStable(`S4-B direct coverage after ${operation}`, async () =>
+                (await pending('dist/s4b-blind/changed.txt'))?.currentContent === content);
+            console.log(`PASS HOST-S4-B direct watcher coverage survives ${operation}`);
+        }
+
+
         await filesConfig.update('watcherExclude', previousWatcherExclude,
             vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchInclude', [privateInclude],
@@ -713,5 +731,6 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await state()).reviewTokens.length, 0);
         assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
+        await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
 };

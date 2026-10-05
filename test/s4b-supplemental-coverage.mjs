@@ -453,4 +453,228 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             fs.promises.opendir = originalOpen;
         }
     },'rules'));
+
+    async function lifecycleFixture(tracker, dir) {
+        const blind = path.join(dir, 'lifecycle-blind');
+        const child = path.join(blind, 'child');
+        fs.mkdirSync(child, { recursive: true });
+        const target = path.join(child, 'tracked.txt');
+        fs.writeFileSync(target, 'before');
+        setVsCodeExcludes({'files.watcherExclude': {'lifecycle-blind/**': true}});
+        tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+        const scope = configuredScope(tracker, 'rules', [{scope:'all', path:'lifecycle-blind'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope, false, () => true)).status, 'applied');
+        h.setListedFiles([Uri.file(target)]);
+        return {blind, child, target, scope};
+    }
+
+    for (const operation of ['reset', 'repository rebuild']) {
+        test(`S4-B lifecycle ${operation} renews direct owners and preserves safe review`, () => fixture(async ({tracker,dir}) => {
+            const {blind, child, target} = await lifecycleFixture(tracker, dir);
+            const old = activeNativeWatcher(nativeDirectoryWatchers, child);
+            let result;
+            if (operation === 'reset') {
+                result = await tracker.resetBaselineToCurrentState();
+            } else {
+                const context = {repoRoot:dir,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+                tracker.setBaselineGitContexts([context]);
+                tracker.observeGitContext(context);
+                result = await tracker.rebuildRepositoryBaseline(dir, context);
+            }
+            assert.equal(result, true);
+            const fresh = activeNativeWatcher(nativeDirectoryWatchers, child);
+            assert.ok(fresh && fresh !== old, 'the current epoch needs a newly bound native owner');
+            assert.equal(old.active, false);
+            const gaps = tracker.getSubtreeCoverageGaps();
+            old.listener('change', undefined);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(), gaps, 'late old callbacks remain rejected');
+            assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind), false);
+            fs.writeFileSync(target, 'after lifecycle');
+            fresh.listener('change', 'tracked.txt');
+            await settle(tracker);
+            assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent, 'after lifecycle', JSON.stringify(tracker.getTrackedChanges()));
+            assert.equal((await tracker.keepAllChangesInFile(target)).status, 'success');
+            fs.writeFileSync(target, 'later edit');
+            fresh.listener('change', 'tracked.txt');
+            await settle(tracker);
+            assert.equal((await tracker.revertFile(target)).status, 'success');
+            assert.equal(fs.readFileSync(target, 'utf8'), 'after lifecycle');
+        }, 'rules'));
+    }
+
+    for (const failure of ['error', 'unnamed']) {
+        test(`S4-B lifecycle failed Apply retains committed ${failure} coverage evidence`, () => fixture(async ({tracker,dir}) => {
+            const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
+            fs.writeFileSync(target, 'pending before Apply');
+            activeNativeWatcher(nativeDirectoryWatchers, child).listener('change', 'tracked.txt');
+            await settle(tracker);
+            const added = path.join(dir, 'added');
+            fs.mkdirSync(added);
+            fs.writeFileSync(path.join(added, 'new.txt'), 'new');
+            const requested = configuredScope(tracker, 'rules', [...scope.includes, {scope:'all',path:'added'}]);
+            tracker.captureConfiguredExpansionBaselines = async () => {
+                const committed = activeNativeWatcher(nativeDirectoryWatchers, child);
+                if (failure === 'error') { committed.error(Object.assign(new Error('live committed owner failed'), {code:'EIO'})); }
+                else { committed.listener('change', undefined); }
+                throw new Error('force candidate rollback');
+            };
+            const result = await tracker.applyConfiguredMonitoringScope(requested, false, () => true);
+            assert.equal(result.status, 'failed');
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision, scope.scopeRevision);
+            assert.equal(tracker.getOriginalContent(target), 'before');
+            assert.ok(tracker.getTrackedChanges().some(change => change.filePath === target));
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
+                'rollback must not erase a live committed coverage failure');
+            const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+            assert.ok(saved.coverageGaps.some(([root, value]) => root === blind && value.subtree));
+            const reviewed = tracker.getReviewToken(target);
+            assert.ok(reviewed);
+            fs.writeFileSync(target, 'unobserved later content');
+            assert.equal((await tracker.keepAllChangesInFile(target, reviewed)).status, 'conflict');
+            assert.equal((await tracker.revertFile(target, reviewed)).status, 'conflict');
+            assert.equal(fs.readFileSync(target, 'utf8'), 'unobserved later content');
+            assert.equal(tracker.getOriginalContent(target), 'before');
+        }, 'rules'));
+    }
+
+    test('S4-B lifecycle failed Apply removes failed candidate owners too', () => fixture(async ({tracker,dir}) => {
+        const {blind, scope} = await lifecycleFixture(tracker, dir);
+        const candidate = path.join(dir, 'candidate-blind');
+        fs.mkdirSync(candidate);
+        fs.writeFileSync(path.join(candidate, 'new.txt'), 'new');
+        // Keep the committed watcher requirement unchanged while preparing another target.
+        setVsCodeExcludes({'files.watcherExclude': {'lifecycle-blind/**':true,'candidate-blind/**':true}});
+        const requested = configuredScope(tracker, 'rules', [...scope.includes, {scope:'all',path:'candidate-blind'}]);
+        tracker.captureConfiguredExpansionBaselines = async () => {
+            activeNativeWatcher(nativeDirectoryWatchers, candidate).error(Object.assign(new Error('candidate failed'), {code:'EIO'}));
+            throw new Error('force candidate rollback');
+        };
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested, false, () => true)).status, 'failed');
+        assert.equal(tracker.supplementalDirectoryWatchers.has(candidate), false,
+            'failed candidate entries cannot survive rollback as future restart obligations');
+        assert.ok(activeNativeWatcher(nativeDirectoryWatchers, blind));
+        assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === candidate), false);
+    }, 'rules'));
+
+
+    for (const replacement of ['missing', 'same-path replacement']) {
+        test(`S4-B lifecycle ${replacement} invalidates the old directory inode`, () => fixture(async ({tracker,dir}) => {
+            const {blind, child, target} = await lifecycleFixture(tracker, dir);
+            const owner = activeNativeWatcher(nativeDirectoryWatchers, child);
+            fs.renameSync(child, path.join(blind, 'moved-child'));
+            if (replacement === 'same-path replacement') {
+                fs.mkdirSync(child);
+                fs.writeFileSync(target, 'replacement contents');
+            }
+            owner.listener('rename', 'child');
+            await settle(tracker);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
+                'a named directory self-event cannot certify a handle bound to the old inode');
+            assert.equal(owner.active, false);
+            assert.equal(tracker.getOriginalContent(target), 'before');
+            const before = tracker.getSubtreeCoverageGaps();
+            owner.listener('change', undefined);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(), before);
+        }, 'rules'));
+    }
+
+    test('S4-B lifecycle reset repairs directory-change coverage through a bounded full scan', () => fixture(async ({tracker,dir}) => {
+        const {blind} = await lifecycleFixture(tracker, dir);
+        const added = path.join(blind, 'added');
+        fs.mkdirSync(added);
+        const target = path.join(added, 'new.txt');
+        fs.writeFileSync(target, 'new baseline');
+        h.setListedFiles([Uri.file(path.join(blind, 'child', 'tracked.txt')), Uri.file(target)]);
+        activeNativeWatcher(nativeDirectoryWatchers, blind).listener('rename', 'added');
+        await settle(tracker);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+        assert.equal(await tracker.resetBaselineToCurrentState(), true);
+        assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind), false);
+        assert.equal(tracker.getOriginalContent(target), 'new baseline');
+        assert.equal(tracker.supplementalDirectoryWatchers.get(added)?.epoch, tracker.sessionEpoch);
+        const fresh = activeNativeWatcher(nativeDirectoryWatchers, added);
+        assert.ok(fresh);
+        fs.writeFileSync(target, 'new pending');
+        fresh.listener('change', 'new.txt');
+        await settle(tracker);
+        assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent, 'new pending');
+    }, 'rules'));
+
+    for (const rollback of [false, true]) {
+        test(`S4-B lifecycle reset retains failed handoff coverage (rollback=${rollback})`, () => fixture(async ({tracker,dir}) => {
+            const {blind, child, target} = await lifecycleFixture(tracker, dir);
+            fs.writeFileSync(target, 'pending before reset');
+            activeNativeWatcher(nativeDirectoryWatchers, child).listener('change', 'tracked.txt');
+            await settle(tracker);
+            const originalWatch = fs.watch;
+            const originalInitialize = tracker.initializeWorkspaceSnapshots;
+            fs.watch = (directory, ...args) => {
+                if (path.resolve(String(directory)) === child) { throw Object.assign(new Error('handoff capacity failure'), {code:'ENOSPC'}); }
+                return originalWatch(directory, ...args);
+            };
+            if (rollback) { tracker.initializeWorkspaceSnapshots = async () => { throw new Error('forced reset rollback'); }; }
+            try {
+                assert.equal(await tracker.resetBaselineToCurrentState(), !rollback);
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+                assert.equal(activeNativeWatcher(nativeDirectoryWatchers, child), undefined);
+                if (rollback) {
+                    assert.equal(tracker.getOriginalContent(target), 'before');
+                    assert.ok(tracker.getTrackedChanges().some(change => change.filePath === target));
+                }
+                const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+                assert.ok(saved.coverageGaps.some(([root, value]) => root === blind && value.subtree));
+            } finally {
+                fs.watch = originalWatch;
+                tracker.initializeWorkspaceSnapshots = originalInitialize;
+            }
+        }, 'rules'));
+    }
+
+
+    test('S4-B lifecycle stopped scope Apply installs no watchers until Start', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
+        const old = activeNativeWatcher(nativeDirectoryWatchers, child);
+        tracker.stopRecording();
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope, false, () => true)).status, 'applied');
+        assert.equal(nativeDirectoryWatchers.some(owner => owner.active), false);
+        const gaps = tracker.getSubtreeCoverageGaps();
+        old.listener('change', undefined);
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), gaps);
+        tracker.startRecording();
+        await h.waitUntil(() => tracker.getBaselineState() === 'ready');
+        const fresh = activeNativeWatcher(nativeDirectoryWatchers, child);
+        assert.ok(fresh && fresh !== old);
+        fs.writeFileSync(target, 'after Start');
+        fresh.listener('change', 'tracked.txt');
+        await settle(tracker);
+        assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent, 'after Start');
+        assert.ok(tracker.supplementalCoverageRoots.has(blind));
+    }, 'rules'));
+
+    test('S4-B lifecycle restart installation failure preserves pending review and a durable gap', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        fs.writeFileSync(target, 'pending across restart');
+        activeNativeWatcher(nativeDirectoryWatchers, child).listener('change', 'tracked.txt');
+        await settle(tracker);
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const storage = tracker.storageUri;
+        await tracker.dispose();
+        const originalWatch = fs.watch;
+        fs.watch = (directory, ...args) => {
+            if (path.resolve(String(directory)) === child) { throw Object.assign(new Error('restart watcher capacity failure'), {code:'ENOSPC'}); }
+            return originalWatch(directory, ...args);
+        };
+        try {
+            const restarted = new DiffTracker(storage);
+            setTracker(restarted);
+            assert.equal(await restarted.restorePersistedState(), 'restored');
+            assert.equal(restarted.getOriginalContent(target), 'before');
+            assert.ok(restarted.getTrackedChanges().some(change => change.filePath === target));
+            assert.ok(restarted.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+            assert.equal(await restarted.flushPendingPersistence(), true);
+            const saved = JSON.parse(fs.readFileSync(path.join(storage.fsPath, 'session-state.json'), 'utf8'));
+            assert.ok(saved.coverageGaps.some(([root, value]) => root === blind && value.subtree));
+        } finally { fs.watch = originalWatch; }
+    }, 'rules'));
+
 }
