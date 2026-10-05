@@ -68,6 +68,12 @@ It adds no S4-C handoff or new filesystem/provider support.
   Candidate cleanup uses exact acquired owner identity, including handles that
   failed during preparation, rather than assuming a failed handle is still live.
 - Direct callbacks verify the installed directory's device, inode and birth time.
+  Windows can omit directory self-rename callbacks, so an unref'd one-second
+  identity sweep also checks only already-owned directories. The shared cap
+  bounds a sweep to 256 metadata reads, with eight async reads in flight and no
+  overlapping sweep. Slow I/O delays the next sweep rather than adding work.
+  Stop, scope release and disposal cancel the timer; in-flight results recheck
+  exact ownership and epoch. No resource enumeration or content polling occurs.
   Removal or same-path replacement closes the stale owner and records a durable
   gap while preserving the review baseline. Automatic reattachment is deferred.
 - Regressions check fresh observation and safe Keep/Revert after reset/rebuild,

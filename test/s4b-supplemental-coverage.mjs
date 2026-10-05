@@ -677,4 +677,81 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         } finally { fs.watch = originalWatch; }
     }, 'rules'));
 
+
+    test('S4-B lifecycle silent directory replacement becomes a durable identity gap', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        const owner = activeNativeWatcher(nativeDirectoryWatchers, child);
+        fs.renameSync(child, path.join(blind, 'silent-moved-child'));
+        fs.mkdirSync(child);
+        fs.writeFileSync(target, 'silent replacement');
+        // Windows can omit native self-rename notifications entirely. Do not
+        // inject a callback or rely on an ancestor watcher in this regression.
+        await h.waitUntil(() => tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind), 2500);
+        assert.equal(owner.active, false);
+        assert.equal(tracker.getOriginalContent(target), 'before');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+        assert.ok(saved.coverageGaps.some(([root, value]) => root === blind && value.subtree?.reasonCode === 'supplemental-watcher-identity-gap'));
+    }, 'rules'));
+
+    for (const release of ['Stop', 'scope release']) {
+        test(`S4-B lifecycle identity probes stop after ${release} without stale ledger writes`, () => fixture(async ({tracker,dir}) => {
+            const {blind, child} = await lifecycleFixture(tracker, dir);
+            if (release === 'Stop') { tracker.stopRecording(); }
+            else { tracker.commitSupplementalCoverageTargets([]); }
+            const before = tracker.getSubtreeCoverageGaps();
+            fs.renameSync(child, path.join(blind, 'released-child'));
+            const originalStat = fs.promises.lstat;
+            let identityProbes = 0;
+            fs.promises.lstat = (target, options, ...args) => {
+                if (options?.bigint && (path.resolve(String(target)) === child || path.resolve(String(target)) === blind)) {
+                    identityProbes++;
+                }
+                return originalStat(target, options, ...args);
+            };
+            try {
+                await delay(1150);
+                assert.equal(identityProbes, 0, 'released owners must not retain background identity work');
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(), before);
+            } finally { fs.promises.lstat = originalStat; }
+        }, 'rules'));
+    }
+
+
+    test('S4-B lifecycle identity sweep bounds concurrency and rejects late results after Stop', () => fixture(async ({tracker,dir}) => {
+        const {blind} = await lifecycleFixture(tracker, dir);
+        for (let index = 0; index < 12; index++) {
+            const directory = path.join(blind, `probe-${index}`);
+            fs.mkdirSync(directory);
+            tracker.watchSupplementalDirectory(directory, blind, tracker.sessionEpoch);
+        }
+        const originalStat = fs.promises.lstat;
+        let release;
+        const held = new Promise(resolve => { release = resolve; });
+        let probes = 0;
+        fs.promises.lstat = async (target, options, ...args) => {
+            if (options?.bigint && String(target).startsWith(blind)) {
+                probes++;
+                await held;
+                throw Object.assign(new Error('late unavailable identity'), {code:'ENOENT'});
+            }
+            return originalStat(target, options, ...args);
+        };
+        try {
+            await h.waitUntil(() => probes === 8, 2500);
+            await delay(1100);
+            assert.equal(probes, 8, 'a slow sweep must neither exceed eight in-flight reads nor overlap the next tick');
+            tracker.stopRecording();
+            const before = tracker.getSubtreeCoverageGaps();
+            release();
+            await h.waitUntil(() => !tracker.supplementalIdentitySweepRunning, 2500);
+            assert.equal(probes, 8, 'cancelled queued owners must not begin more metadata I/O');
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(), before, 'awaited failures from an old epoch cannot publish');
+            assert.equal(tracker.supplementalIdentityTimer, undefined);
+        } finally {
+            release();
+            fs.promises.lstat = originalStat;
+        }
+    }, 'rules'));
+
 }

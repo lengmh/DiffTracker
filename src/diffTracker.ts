@@ -119,6 +119,7 @@ interface SupplementalDirectoryWatch {
     watcher: vscode.Disposable;
     epoch: number;
     coverageRoot: string;
+    identity: fs.BigIntStats;
 }
 
 interface SupplementalCoveragePlan {
@@ -636,6 +637,8 @@ export class DiffTracker {
     private fileWatchers: vscode.FileSystemWatcher[] = [];
     private importedDirectoryWatchers = new Map<string, ImportedDirectoryWatch>();
     private supplementalDirectoryWatchers = new Map<string, SupplementalDirectoryWatch>();
+    private supplementalIdentityTimer?: NodeJS.Timeout;
+    private supplementalIdentitySweepRunning = false;
     private supplementalCoverageRoots = new Set<string>();
     private pendingImportedDirectoryReconciliation = new Set<string>();
     private importedDirectoryResumePromise?: Promise<void>;
@@ -1701,6 +1704,50 @@ export class DiffTracker {
         };
     }
 
+    private supplementalIdentityMatches(current: fs.BigIntStats, identity: fs.BigIntStats): boolean {
+        return current.isDirectory() && !current.isSymbolicLink() &&
+            current.dev === identity.dev && current.ino === identity.ino &&
+            current.birthtimeNs === identity.birthtimeNs;
+    }
+
+    private invalidateSupplementalDirectoryIdentity(directory: string, entry: SupplementalDirectoryWatch): void {
+        if (!this.isCurrentEpoch(entry.epoch) || this.supplementalDirectoryWatchers.get(directory) !== entry) { return; }
+        entry.watcher.dispose();
+        this.setSubtreeCoverageGap(
+            entry.coverageRoot,
+            'supplemental-watcher-identity-gap',
+            'A watched directory was removed or replaced; rebuild the baseline to verify the current subtree and restore direct coverage.'
+        );
+    }
+
+    private startSupplementalIdentityChecks(): void {
+        if (this.supplementalIdentityTimer) { return; }
+        // Windows can omit native directory self-rename events. Probe only the
+        // already-owned identities: at most 256 metadata reads per sweep, eight
+        // in flight, no content reads, enumeration, overlapping sweep or rewatch.
+        this.supplementalIdentityTimer = setInterval(() => {
+            if (this.supplementalIdentitySweepRunning) { return; }
+            const epoch = this.sessionEpoch;
+            const owners = [...this.supplementalDirectoryWatchers].filter(([, entry]) => entry.epoch === epoch);
+            this.supplementalIdentitySweepRunning = true;
+            void this.runWithConcurrency(owners, 8, async ([directory, entry]) => {
+                if (!this.isCurrentEpoch(epoch) || entry.epoch !== epoch ||
+                    this.supplementalDirectoryWatchers.get(directory) !== entry) { return; }
+                let current: fs.BigIntStats | undefined;
+                try { current = await fs.promises.lstat(directory, { bigint: true }); }
+                catch { /* Unverifiable ownership must remain visibly uncovered. */ }
+                // Stop, handoff and scope rollback may have released this owner
+                // while metadata I/O was pending. Never publish their old result.
+                if (!this.isCurrentEpoch(epoch) || entry.epoch !== epoch ||
+                    this.supplementalDirectoryWatchers.get(directory) !== entry) { return; }
+                if (!current || !this.supplementalIdentityMatches(current, entry.identity)) {
+                    this.invalidateSupplementalDirectoryIdentity(directory, entry);
+                }
+            }).finally(() => { this.supplementalIdentitySweepRunning = false; });
+        }, 1000);
+        this.supplementalIdentityTimer.unref();
+    }
+
     private watchSupplementalDirectory(directory: string, coverageRoot: string, epoch: number): boolean {
         const previous = this.supplementalDirectoryWatchers.get(directory);
         if (previous?.epoch === epoch) {
@@ -1721,9 +1768,7 @@ export class DiffTracker {
         const identityStillCurrent = (): boolean => {
             try {
                 const current = fs.lstatSync(directory, { bigint: true });
-                return current.isDirectory() && !current.isSymbolicLink() &&
-                    current.dev === identity.dev && current.ino === identity.ino &&
-                    current.birthtimeNs === identity.birthtimeNs;
+                return this.supplementalIdentityMatches(current, identity);
             } catch { return false; }
         };
         const native = fs.watch(directory, { persistent: false }, (kind, filename) => {
@@ -1734,13 +1779,7 @@ export class DiffTracker {
             // A named self-event may arrive after deletion/replacement, when
             // joining its filename would otherwise miss the dead owner entirely.
             if (!identityStillCurrent()) {
-                native.close();
-                current.epoch = -1;
-                this.setSubtreeCoverageGap(
-                    coverageRoot,
-                    'supplemental-watcher-identity-gap',
-                    'A watched directory was removed or replaced; rebuild the baseline to verify the current subtree and restore direct coverage.'
-                );
+                this.invalidateSupplementalDirectoryIdentity(directory, current);
                 return;
             }
             if (!filename) {
@@ -1779,13 +1818,22 @@ export class DiffTracker {
             native.close();
             throw new Error('Supplemental directory identity changed during watcher installation');
         }
-        const watcher = { dispose: () => native.close() };
-        this.supplementalDirectoryWatchers.set(directory, { watcher, epoch, coverageRoot });
-        native.on('error', (error: unknown) => {
+        const watcher = { dispose: () => {
             native.close();
             const current = this.supplementalDirectoryWatchers.get(directory);
-            if (this.isCurrentEpoch(epoch) && current?.watcher === watcher && current.epoch === epoch) {
-                current.epoch = -1;
+            if (current?.watcher === watcher) { current.epoch = -1; }
+            if (![...this.supplementalDirectoryWatchers.values()].some(entry => entry.epoch === this.sessionEpoch)) {
+                if (this.supplementalIdentityTimer) { clearInterval(this.supplementalIdentityTimer); }
+                this.supplementalIdentityTimer = undefined;
+            }
+        } };
+        this.supplementalDirectoryWatchers.set(directory, { watcher, epoch, coverageRoot, identity });
+        this.startSupplementalIdentityChecks();
+        native.on('error', (error: unknown) => {
+            const current = this.supplementalDirectoryWatchers.get(directory);
+            const active = this.isCurrentEpoch(epoch) && current?.watcher === watcher && current.epoch === epoch;
+            watcher.dispose();
+            if (active) {
                 const evidence = this.classifySupplementalWatcherFailure(error);
                 this.setSubtreeCoverageGap(coverageRoot, evidence.reasonCode, evidence.reason);
             }
