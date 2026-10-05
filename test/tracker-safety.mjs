@@ -3349,7 +3349,7 @@ test('S3 scope apply rolls back when Git context pauses during include preparati
 });
 
 
-test('S3 broad include defers when watcherExclude can hide a descendant',async()=>{
+test('S4-B concrete broad include owns coverage when watcherExclude can hide a descendant',async()=>{
     const includeDir=file('scope-descendant');
     fs.mkdirSync(includeDir,{recursive:true});
     const roots=[{
@@ -3364,7 +3364,10 @@ test('S3 broad include defers when watcherExclude can hide a descendant',async()
         excludes:[],scopeRevision:'descendant-watch-gap'
     };
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(includeDir)));
+    assert.ok(nativeDirectoryWatchers.some(w=>w.active&&path.resolve(String(w.directory))===path.resolve(includeDir)),
+        'the pattern remains a coverage obligation and requires an owned direct watch');
 });
 
 
@@ -5044,7 +5047,10 @@ test('S3 restore-prefixed ordinary files are not treated as watcher hard boundar
         excludes:[],scopeRevision:'restore-prefix-watch-gap'
     };
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'requiresS4',JSON.stringify(result));
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(includeDir)));
+    assert.ok(nativeDirectoryWatchers.some(w=>w.active&&path.resolve(String(w.directory))===path.resolve(includeDir)),
+        'the pattern remains a coverage obligation and requires an owned direct watch');
 });
 
 test('S3 missing explicit include that becomes a directory drops its absent-file sentinel across restore',async()=>{

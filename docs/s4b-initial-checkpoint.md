@@ -4,7 +4,8 @@
 
 This checkpoint adds DiffTracker-owned persistent direct directory watchers for
 concrete, existing `files.watcherExclude` subtrees intersecting an explicit Rules
-include or Whole Workspace scope. It keeps the S4-A review-baseline, persistence,
+include or Whole Workspace scope. An existing explicit Rules include can also
+bound coverage for intersecting wildcard exclusions, including VS Code defaults. It keeps the S4-A review-baseline, persistence,
 path-identity and bounded-preparation contracts.
 
 - Existing directory trees receive one non-recursive direct watch per directory.
@@ -22,8 +23,10 @@ path-identity and bounded-preparation contracts.
 
 ## Explicit initial limits
 
-Patterns without a concrete existing directory prefix, missing/file-only targets,
-unverified identities and excessive pattern expansion are rejected conservatively.
+Whole Workspace patterns without a concrete existing directory prefix, Rules
+requests without a concrete existing directory witness, unverifiable identities
+and excessive pattern expansion are rejected conservatively. A file include is
+never promoted to watching its parent or the workspace root.
 A shared capacity or installation failure leaves a visible gap rather than
 claiming complete observation.
 

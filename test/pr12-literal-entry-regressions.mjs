@@ -50,7 +50,7 @@ export function registerPR12LiteralEntryRegressions(h, fixture, scopeFor) {
     }));
 
     for (const mode of ['wholeWorkspace', 'rules']) {
-        test(`PR12 CLOSURE ${mode} Apply rejects leading-space watcher blind spots`, () => fixture(async ({tracker, dir}) => {
+        test(`PR12 CLOSURE ${mode} Apply preserves leading-space watcher coverage obligations`, () => fixture(async ({tracker, dir}) => {
             const parent = path.join(dir, 'visible');
             const hidden = path.join(parent, ' .git');
             fs.mkdirSync(hidden, {recursive: true});
@@ -62,9 +62,17 @@ export function registerPR12LiteralEntryRegressions(h, fixture, scopeFor) {
             const before = tracker.getEffectiveMonitoringScope();
             setVsCodeExcludes({'files.watcherExclude': {'visible/{ .git, .difftracker-restore-x}/**': true}});
             const result = await tracker.applyConfiguredMonitoringScope(checked.scope);
-            assert.equal(result.status, 'requiresS4', JSON.stringify(result));
-            assert.deepEqual(tracker.getEffectiveMonitoringScope(), before);
-            assert.equal(tracker.fileSnapshots.has(path.join(hidden, 'live.txt')), false);
+            if (mode === 'rules') {
+                assert.equal(result.status, 'applied', JSON.stringify(result));
+                assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(parent)),
+                    'leading-space names remain coverage obligations under a bounded explicit include');
+                assert.equal(tracker.supplementalDirectoryWatchers.get(hidden)?.epoch, tracker.sessionEpoch);
+                assert.equal(tracker.getOriginalContent(path.join(hidden, 'live.txt')), 'not Git metadata');
+            } else {
+                assert.equal(result.status, 'requiresS4', JSON.stringify(result));
+                assert.deepEqual(tracker.getEffectiveMonitoringScope(), before);
+                assert.equal(tracker.fileSnapshots.has(path.join(hidden, 'live.txt')), false);
+            }
         }, mode));
     }
 

@@ -5686,13 +5686,25 @@ export class DiffTracker {
             if (segment === '**' || /[*?\[\]{}]/.test(segment)) { break; }
             literalPrefix.push(segment);
         }
-        // S4-B intentionally supports only a concrete existing blind subtree.
-        // Wildcard-root patterns and missing/file targets fail closed rather than
-        // expanding direct watches across an unbounded workspace.
+        // Whole Workspace requires a concrete existing blind subtree. Rules
+        // mode may separately use an explicit include as its bounded witness.
         if (literalPrefix.length === 0) { return undefined; }
         const target = path.join(folder.uri.fsPath, ...literalPrefix);
         try { return fs.lstatSync(target).isDirectory() ? path.resolve(target) : undefined; }
         catch { return undefined; }
+    }
+
+    private supplementalTargetForConfiguredInclude(
+        folder: vscode.WorkspaceFolder,
+        includePath: string
+    ): string | undefined {
+        const included = path.resolve(folder.uri.fsPath, ...includePath.split('/'));
+        try {
+            // A directory include supplies its own bounded subtree. A file
+            // include does not authorize promoting its parent/siblings here.
+            return fs.lstatSync(included).isDirectory() && !this.validateResourceTarget(included)
+                ? included : undefined;
+        } catch { return undefined; }
     }
 
     private configuredSupplementalCoveragePlan(
@@ -5708,10 +5720,12 @@ export class DiffTracker {
             folder: vscode.WorkspaceFolder,
             identity: WorkspaceRootIdentity,
             pattern: string,
-            context: string
+            context: string,
+            includePath?: string
         ): string | undefined => {
             if (identityBudget.exhausted) { return `${folder.name}:path-identity preparation budget exceeded`; }
-            const target = this.supplementalTargetForWatcherPattern(folder, pattern);
+            const target = this.supplementalTargetForWatcherPattern(folder, pattern) ??
+                (includePath === undefined ? undefined : this.supplementalTargetForConfiguredInclude(folder, includePath));
             if (!target) {
                 return `${context}:unsupported files.watcherExclude supplemental pattern (${pattern}); narrow the monitored scope or use a concrete existing blind subtree`;
             }
@@ -5751,7 +5765,7 @@ export class DiffTracker {
                         if (identityBudget.exhausted) {
                             return { targets: [], issue: `${folder.name}:path-identity preparation budget exceeded` };
                         }
-                        const issue = addPattern(folder, identity, pattern, `${folder.name}:${rule.path}`);
+                        const issue = addPattern(folder, identity, pattern, `${folder.name}:${rule.path}`, rule.path);
                         if (issue) { return { targets: [], issue }; }
                     }
                 }

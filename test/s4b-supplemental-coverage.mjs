@@ -69,6 +69,81 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.equal(changes.get(path.resolve(deleted))?.isDeleted,true);
     },'rules'));
 
+    test('S4-B Rules fallback for default wildcard exclusions watches only its concrete include and observes C/M/D', () => fixture(async ({tracker,dir}) => {
+        const included = path.join(dir,'concrete-include');
+        const nested = path.join(included,'node_modules','fixture-package','lib');
+        const unrelated = path.join(dir,'unrelated');
+        fs.mkdirSync(nested,{recursive:true});
+        fs.mkdirSync(unrelated,{recursive:true});
+        const changed = path.join(nested,'changed.txt');
+        const deleted = path.join(nested,'deleted.txt');
+        fs.writeFileSync(changed,'before');
+        fs.writeFileSync(deleted,'before-delete');
+        setVsCodeExcludes({'files.watcherExclude': {
+            '**/node_modules/*/**': true,
+            '**/.hg/store/**': true
+        }});
+        tracker.effectiveMonitoringScope = configuredScope(tracker,'rules');
+        const requested = configuredScope(tracker,'rules',[{scope:'all',path:'concrete-include'}]);
+
+        const result = await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+        assert.equal(result.status,'applied',JSON.stringify(result));
+        assert.deepEqual([...tracker.supplementalCoverageRoots],[path.resolve(included)],
+            'default wildcard exclusions must be covered from the explicit include, not the workspace root');
+        assert.ok(activeNativeWatcher(nativeDirectoryWatchers,included));
+        assert.equal(activeNativeWatcher(nativeDirectoryWatchers,dir),undefined);
+        assert.equal(activeNativeWatcher(nativeDirectoryWatchers,unrelated),undefined);
+        assert.equal(tracker.getOriginalContent(changed),'before');
+        assert.equal(tracker.getOriginalContent(deleted),'before-delete');
+        const watcher = activeNativeWatcher(nativeDirectoryWatchers,nested);
+        assert.ok(watcher);
+
+        fs.writeFileSync(changed,'after');
+        watcher.listener('change','changed.txt');
+        const created = path.join(nested,'created.txt');
+        fs.writeFileSync(created,'created');
+        watcher.listener('rename','created.txt');
+        fs.unlinkSync(deleted);
+        watcher.listener('rename','deleted.txt');
+        await settle(tracker);
+        const changes = new Map(tracker.getTrackedChanges().map(item=>[path.resolve(item.filePath),item]));
+        assert.equal(changes.get(path.resolve(changed))?.currentContent,'after');
+        assert.equal(changes.get(path.resolve(created))?.baselineExists,false);
+        assert.equal(changes.get(path.resolve(created))?.currentExists,true);
+        assert.equal(changes.get(path.resolve(deleted))?.isDeleted,true);
+    },'rules'));
+
+    test('S4-B Rules fallback rejects absent includes and file-parent promotion', () => fixture(async ({tracker,dir}) => {
+        const before = configuredScope(tracker,'rules');
+        tracker.effectiveMonitoringScope = before;
+        fs.writeFileSync(path.join(dir,'root.txt'),'root file');
+        fs.mkdirSync(path.join(dir,'nested'),{recursive:true});
+        fs.writeFileSync(path.join(dir,'nested','file.txt'),'nested file');
+        for (const [include,pattern] of [
+            ['missing','**/missing/**'], ['root.txt','**/*.txt'], ['nested/file.txt','**/*.txt']
+        ]) {
+            setVsCodeExcludes({'files.watcherExclude': {[pattern]:true}});
+            const requested = configuredScope(tracker,'rules',[{scope:'all',path:include}]);
+            const result = await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+            assert.equal(result.status,'requiresS4',`${include}: ${JSON.stringify(result)}`);
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,before.scopeRevision);
+            assert.equal(nativeDirectoryWatchers.some(watcher=>watcher.active),false,
+                'unsupported include fallback cannot broaden watching to a parent directory or workspace root');
+        }
+    },'rules'));
+
+    test('S4-B Rules fallback leaves Whole Workspace wildcard-root exclusions unsupported', () => fixture(async ({tracker,dir}) => {
+        fs.mkdirSync(path.join(dir,'existing-directory'),{recursive:true});
+        setVsCodeExcludes({'files.watcherExclude': {'**/node_modules/*/**':true}});
+        const before = configuredScope(tracker,'rules');
+        tracker.effectiveMonitoringScope = before;
+        const requested = configuredScope(tracker,'wholeWorkspace');
+        const result = await tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+        assert.equal(result.status,'requiresS4',JSON.stringify(result));
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,before.scopeRevision);
+        assert.equal(nativeDirectoryWatchers.some(watcher=>watcher.active),false);
+    },'rules'));
+
     test('S4-B supplemental watcher capacity failure commits a durable visible gap instead of pretending coverage', () => fixture(async ({tracker,dir}) => {
         const blind = path.join(dir,'capacity-blind');
         fs.mkdirSync(blind,{recursive:true});
