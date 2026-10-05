@@ -4660,8 +4660,8 @@ test('S4-A exact watcher prefix is not covered by a descendant-only exclusion',a
         model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
     })).digest('hex');
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'requiresS4',JSON.stringify(result));
-    assert.match(result.reason,/watcherExclude|supplemental/i);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(vendor)));
 });
 
 test('S4-A Whole Workspace discovery skips generic explicit-include findFiles fallback',async()=>{
@@ -4962,7 +4962,7 @@ test('S4-A watcher-excluded include shadowed by explicit exclusion does not requ
         'restore must preserve exclusion precedence over the shadowed include');
 });
 
-test('S4-A Rules file include requires S4-B when an ancestor directory is watcher-excluded',async()=>{
+test('S4-B Rules file include under a literal watcher blind directory installs supplemental coverage',async()=>{
     const vendor=file('watcher-ancestor-vendor');
     const includeFile=path.join(vendor,'file.txt');
     fs.mkdirSync(vendor,{recursive:true});
@@ -4981,8 +4981,9 @@ test('S4-A Rules file include requires S4-B when an ancestor directory is watche
     })).digest('hex');
 
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(result.status,'requiresS4',JSON.stringify(result));
-    assert.match(result.reason,/watcherExclude|supplemental/i);
+    assert.equal(result.status,'applied',JSON.stringify(result));
+    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(vendor)));
+    assert.ok(nativeDirectoryWatchers.some(w=>w.active&&path.resolve(String(w.directory))===path.resolve(vendor)));
 });
 
 test('S4-A Rules include prefix still requires coverage when only descendants are excluded',async()=>{
@@ -5004,9 +5005,9 @@ test('S4-A Rules include prefix still requires coverage when only descendants ar
 
     vscodeExcludes['files.watcherExclude']={[relativeVendor]:true};
     const exact=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
-    assert.equal(exact.status,'requiresS4',JSON.stringify(exact));
-    assert.match(exact.reason,/watcherExclude|supplemental/i,
-        'descendant-only exclusion must not hide a blind spot at the include prefix itself');
+    assert.equal(exact.status,'applied',JSON.stringify(exact));
+    assert.ok(tracker.supplementalCoverageRoots.has(path.resolve(vendor)),
+        'literal blind include prefix receives owned supplemental coverage');
 
     vscodeExcludes['files.watcherExclude']={[`${relativeVendor}/**`]:true};
     const descendantsOnly=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
@@ -5024,7 +5025,7 @@ test('S4-A Whole Workspace still defers host watcher blind spots to S4-B without
     };
     const result=await tracker.applyConfiguredMonitoringScope(scope,false,()=>true);
     assert.equal(result.status,'requiresS4',JSON.stringify(result));
-    assert.match(result.reason,/S4-B supplemental observation coverage/i);
+    assert.match(result.reason,/supplemental|unsupported files\.watcherExclude/i);
     assert.deepEqual(tracker.getEffectiveMonitoringScope(),before);
 });
 
@@ -5213,6 +5214,7 @@ registerPR12BoundedInvariants({
     getTracker: () => tracker, setTracker: value => { tracker=value; },
     setListedIgnores: value => { listedIgnores=value; },
     setVsCodeExcludes: value => { vscodeExcludes=value; },
+    nativeDirectoryWatchers, waitUntil,
     fireConfigurationChanged: key => configurationChanged({
         affectsConfiguration: name => name === key
     })

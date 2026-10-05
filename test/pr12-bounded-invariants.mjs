@@ -1,5 +1,6 @@
 import { registerPR12RuntimeBudgetRegressions } from './pr12-runtime-identity-budget.mjs';
 import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
+import { registerS4BSupplementalCoverage } from './s4b-supplemental-coverage.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,6 +44,7 @@ export function registerPR12BoundedInvariants(h) {
     }
     registerPR12LiteralEntryRegressions(h, fixture, scopeFor);
     registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
+    registerS4BSupplementalCoverage(h, fixture, scopeFor);
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 
@@ -1598,9 +1600,9 @@ export function registerPR12BoundedInvariants(h) {
 
     test('PR12 AUDIT Apply does not repeat supplemental identity qualification at every transaction barrier',()=>fixture(async({tracker,scope})=>{
         const requested=JSON.parse(JSON.stringify(scope));
-        const original=tracker.configuredScopeNeedsSupplementalCoverage.bind(tracker);
+        const original=tracker.configuredSupplementalCoveragePlan.bind(tracker);
         let calls=0;
-        tracker.configuredScopeNeedsSupplementalCoverage=(...args)=>{
+        tracker.configuredSupplementalCoveragePlan=(...args)=>{
             calls++;
             return original(...args);
         };
@@ -1610,7 +1612,7 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(calls,1,
                 'filesystem-aware supplemental qualification must run once; later barriers use the watcher coverage revision');
         } finally {
-            tracker.configuredScopeNeedsSupplementalCoverage=original;
+            tracker.configuredSupplementalCoveragePlan=original;
         }
     }));
 
@@ -1810,8 +1812,10 @@ export function registerPR12BoundedInvariants(h) {
             assert.equal(tracker.configuredScopeNeedsSupplementalCoverage(requested),undefined,
                 'explicit-include intersection checks must consume the same hard-boundary-filtered patterns');
             tracker.getVsCodeWatcherExcludePatterns=()=>['visible/.DIFFTRACKER-RESTORE-*'];
-            assert.ok(tracker.configuredScopeNeedsSupplementalCoverage(requested),
-                'ordinary restore-prefixed files remain a coverage obligation in Rules mode');
+            const plan=tracker.configuredSupplementalCoveragePlan(requested);
+            assert.equal(plan.issue,undefined);
+            assert.deepEqual(plan.targets,[path.resolve(visible)],
+                'ordinary restore-prefixed files still require owned supplemental coverage in Rules mode');
         });
     },'rules'));
 
