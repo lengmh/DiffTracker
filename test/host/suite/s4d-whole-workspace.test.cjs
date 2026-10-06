@@ -103,7 +103,13 @@ module.exports = async function prepareWholeWorkspaceProof({
             // rescan, reopen, mode switch or synthetic event may deliver them.
             const observed = await untilStable('S4-D Whole Workspace text/opaque create/modify/delete across three path classes', async () => {
                 const current = await state();
-                assertMode(current, 'wholeWorkspace');
+                assert.equal(current.isRecording, true);
+                assert.equal(current.effectiveMonitoringScope.mode, 'wholeWorkspace');
+                // New-file absence provenance passes through completeBaseline(),
+                // which reports building while it durably publishes the evidence.
+                // Keep the original bounded wait and require stable Ready at the
+                // result, rather than failing on an intermediate publication.
+                if (current.baselineState !== 'ready') { return undefined; }
                 const changes = new Map(current.trackedChanges.map(change => [change.filePath, change]));
                 return fixtures.every(fixture => {
                     const change = changes.get(fixture.filePath);
@@ -116,6 +122,7 @@ module.exports = async function prepareWholeWorkspaceProof({
                             current.opaqueReviewTokens.some(token => token.filePath === fixture.filePath);
                 }) ? current : undefined;
             });
+            assertMode(observed, 'wholeWorkspace');
             for (const fixture of fixtures) {
                 const change = observed.trackedChanges.find(item => item.filePath === fixture.filePath);
                 const existed = fixture.operation !== 'create';

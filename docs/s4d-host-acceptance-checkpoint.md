@@ -60,6 +60,12 @@ PR #17 最终 head `538ff742667da2b5fa718ee50029d428361141a8` 的 [Verification 
 
 独立 Recheck 入口是仍需处理的发布契约差距。此 checkpoint 不等于所有已接受 ADR、S5 或 0.8.0 RC 门槛已通过。若要延期或改变该契约，应作明确决策，不能仅以测试文档删除承诺。
 
+## 本批首次 CI 记录
+
+[PR #18 Verification #531](https://github.com/lengmh/DiffTracker/actions/runs/37494791633) 的首个提交 `2ef0c065` 未通过真实 Host。Stable Windows/Ubuntu 在新 Whole Workspace 轮询中遇到 `building`，测试错误地要求每次采样立即为 `ready`。生产创建事件会在持久化已知不存在证据时短暂进入 `building`；修正只将 Ready 放入原有有界稳定等待的成功条件，录制状态、Whole Workspace 范围、最终 Ready 和全部 18 项结果断言保持不变。没有增加时间上限或重试。
+
+同轮 Ubuntu 1.80.2 在执行新增场景前，旧 S4-B 范围准备返回 workspace/Git context 冲突。通用错误信息不足以确定具体触发条件；保留该失败，不把它归为已证实的生产缺陷或已通过验收。后续确切 head 必须重新通过完整矩阵。
+
 ## 验证与结束条件
 
 - 本地运行 `npm run lint`、`npm test`、`npm run test:performance`，并对新增 Host 脚本做语法检查。
