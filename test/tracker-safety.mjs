@@ -5218,7 +5218,7 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
 });
 
 registerPR12BoundedInvariants({
-    test, vscode, Uri, DiffTracker, file, document,
+    test, vscode, Uri, DiffTracker, file, document, pause,
     getTracker: () => tracker, setTracker: value => { tracker=value; },
     setListedFiles: value => { listedFiles=value; },
     setListedIgnores: value => { listedIgnores=value; },
@@ -5237,7 +5237,7 @@ registerStateSchemaCompatibility({
 });
 
 registerPR11ReviewRegressions({
-    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document,
+    test, root, Uri, DiffTracker, file, pending, pause, waitUntil, vscode, document, nativeDirectoryWatchers,
     getTracker: () => tracker, setTracker: value => { tracker = value; },
     setListedFiles: value => { listedFiles = value; },
     setListedIgnores: value => { listedIgnores = value; },

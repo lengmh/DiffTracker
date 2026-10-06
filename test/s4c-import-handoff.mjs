@@ -1,9 +1,11 @@
+import { registerS4CStaleHandoff } from './s4c-stale-handoff.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 export function registerS4CImportHandoff(h, fixture) {
+    registerS4CStaleHandoff(h, fixture);
     const {test, Uri, DiffTracker, nativeDirectoryWatchers, waitUntil, setTracker} = h;
     test('S4-C imported directory releases the bridge only after persistent coverage and captures post-Keep edits', () => fixture(async ({tracker,dir}) => {
         const imported = path.join(dir, 'imported');
@@ -421,6 +423,45 @@ export function registerS4CImportHandoff(h, fixture) {
         'serialization must preserve durable identity obligations without consulting current directory entries');
     }));
 
+    for (const lifecycle of ['live', 'reload']) test(`S4-C explicit exclusion without discard preserves imported review and ownership ${lifecycle}`, () => fixture(async ({tracker,dir}) => {
+        const imported = path.join(dir, 'unapproved-exclusion');
+        fs.mkdirSync(imported);
+        const target = path.join(imported, 'pending.txt');
+        fs.writeFileSync(target, 'pending import');
+        await tracker.onExternalFileCreated(Uri.file(imported));
+        const previous = tracker.getEffectiveMonitoringScope();
+        const owner = nativeDirectoryWatchers.find(item => item.active && item.directory === imported);
+        assert.ok(owner);
+        const requested = validateAndCanonicalizeScope({mode:'wholeWorkspace', includes:[],
+            excludes:[{scope:'all',pattern:'unapproved-exclusion'}]}, tracker.currentWorkspaceRootIdentities());
+        assert.equal(requested.ok, true);
+        const result = await tracker.applyConfiguredMonitoringScope(requested.scope, false, () => true);
+        assert.equal(result.status, 'conflict', JSON.stringify(result));
+        assert.match(result.reason, /discard.*confirm|confirm.*discard/i);
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(), previous);
+        assert.equal(owner.active, true, 'refusal must preserve the exact committed owner');
+        assert.equal(tracker.getOriginalContent(target), '');
+        assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent, 'pending import');
+        assert.equal(fs.readFileSync(target, 'utf8'), 'pending import');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const storage = tracker.storageUri;
+        const saved = JSON.parse(fs.readFileSync(path.join(storage.fsPath, 'session-state.json'), 'utf8'));
+        assert.equal(saved.coverageGaps.find(([root]) => root === imported)?.[1].importedCoverageRequired, true);
+        if (lifecycle === 'reload') {
+            await tracker.dispose();
+            tracker = new DiffTracker(storage); setTracker(tracker);
+            assert.equal(await tracker.restorePersistedState(), 'restored');
+            assert.deepEqual(tracker.getEffectiveMonitoringScope(), previous);
+        }
+        const activeOwner = [...nativeDirectoryWatchers].reverse().find(item => item.active && item.directory === imported);
+        assert.ok(activeOwner);
+        fs.writeFileSync(target, 'edit after refused exclusion');
+        if (!process.env.DT_REAL_DIRECTORY_WATCH) activeOwner.listener('change', 'pending.txt');
+        await waitUntil(() => tracker.getTrackedChanges().some(change =>
+            change.filePath === target && change.currentContent === 'edit after refused exclusion'));
+        assert.equal(tracker.getOriginalContent(target), '');
+    }));
+
     test('S4-C a committed explicit scope exclusion retires the imported obligation durably', () => fixture(async ({tracker,dir}) => {
         const imported = path.join(dir, 'retired-import');
         fs.mkdirSync(imported);
@@ -435,6 +476,73 @@ export function registerS4CImportHandoff(h, fixture) {
         const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
         assert.equal(saved.coverageGaps.some(([root]) => root === imported), false);
         assert.equal(nativeDirectoryWatchers.some(owner => owner.active && owner.directory === imported), false);
+    }));
+
+    test('S4-C revision-bound discard retires imported review and ownership durably', () => fixture(async ({tracker,dir}) => {
+        const imported = path.join(dir, 'approved-discard');
+        fs.mkdirSync(imported);
+        const target = path.join(imported, 'pending.txt');
+        fs.writeFileSync(target, 'discarded review stays on disk');
+        await tracker.onExternalFileCreated(Uri.file(imported));
+        const owner = nativeDirectoryWatchers.find(item => item.active && item.directory === imported);
+        const requested = validateAndCanonicalizeScope({mode:'wholeWorkspace', includes:[],
+            excludes:[{scope:'all',pattern:'approved-discard'}]}, tracker.currentWorkspaceRootIdentities());
+        const revision = tracker.getExplicitlyExcludedReviewRevision(requested.scope);
+        const result = await tracker.applyConfiguredMonitoringScope(requested.scope, true, () => true, revision);
+        assert.equal(result.status, 'applied', JSON.stringify(result));
+        assert.equal(result.discardedReviews, 1);
+        assert.equal(result.retainedReviews, 0);
+        assert.equal(owner.active, false);
+        assert.equal(tracker.getOriginalContent(target), undefined);
+        assert.equal(tracker.getTrackedChanges().some(change => change.filePath === target), false);
+        assert.equal(fs.readFileSync(target, 'utf8'), 'discarded review stays on disk');
+        const storage = tracker.storageUri;
+        const saved = JSON.parse(fs.readFileSync(path.join(storage.fsPath, 'session-state.json'), 'utf8'));
+        assert.equal(saved.coverageGaps.some(([root]) => root === imported), false);
+        await tracker.dispose();
+        tracker = new DiffTracker(storage); setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision, requested.scope.scopeRevision);
+        assert.equal(tracker.getTrackedChanges().some(change => change.filePath === target), false);
+        assert.equal(nativeDirectoryWatchers.some(item => item.active && item.directory === imported), false);
+    }));
+
+    for (const barrier of ['preparation', 'durable-copy']) test(`S4-C excluded review arriving during ${barrier} refuses publication and preserves exact imported owner`, () => fixture(async ({tracker,dir}) => {
+        const imported = path.join(dir, 'late-exclusion-event');
+        fs.mkdirSync(imported);
+        const target = path.join(imported, 'accepted.txt');
+        fs.writeFileSync(target, 'accepted before Apply');
+        await tracker.onExternalFileCreated(Uri.file(imported));
+        assert.equal((await tracker.keepAllChangesInFile(target)).status, 'success');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const previous = tracker.getEffectiveMonitoringScope();
+        const owner = nativeDirectoryWatchers.find(item => item.active && item.directory === imported);
+        const requested = validateAndCanonicalizeScope({mode:'wholeWorkspace', includes:[],
+            excludes:[{scope:'all',pattern:'late-exclusion-event'}]}, tracker.currentWorkspaceRootIdentities());
+        const gate = h.pause(path.join(tracker.storageUri.fsPath,
+            barrier === 'preparation' ? 'session-state.tmp.json' : 'session-state.json'),
+        barrier === 'preparation' ? 'write' : 'copy');
+        const applying = tracker.applyConfiguredMonitoringScope(requested.scope, false, () => true);
+        try {
+            const reached = await Promise.race([gate.entered.then(() => 'barrier'), applying.then(result => result)]);
+            assert.equal(reached, 'barrier', JSON.stringify(reached));
+            fs.writeFileSync(target, 'change observed during Apply');
+            await tracker.onExternalFileChanged(Uri.file(target));
+        } finally { gate.release(); }
+        const result = await applying;
+        assert.notEqual(result.status, 'applied', JSON.stringify(result));
+        assert.deepEqual(tracker.getEffectiveMonitoringScope(), previous);
+        assert.equal(owner.active, true, 'rollback preserves the same committed owner');
+        assert.equal(tracker.getOriginalContent(target), 'accepted before Apply');
+        assert.equal(tracker.getTrackedChanges().find(change => change.filePath === target)?.currentContent,
+            'change observed during Apply');
+        const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+        assert.equal(saved.effectiveMonitoringScope.scopeRevision, previous.scopeRevision);
+        assert.equal(saved.coverageGaps.find(([root]) => root === imported)?.[1].importedCoverageRequired, true);
+        fs.writeFileSync(target, 'later native-only edit');
+        if (!process.env.DT_REAL_DIRECTORY_WATCH) owner.listener('change', 'accepted.txt');
+        await waitUntil(() => tracker.getTrackedChanges().some(change =>
+            change.filePath === target && change.currentContent === 'later native-only edit'));
     }));
 
     test('S4-C stopped restore and explicit contraction cannot resurrect a retired restart obligation', () => fixture(async ({tracker,dir}) => {

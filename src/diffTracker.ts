@@ -122,6 +122,7 @@ interface SupplementalDirectoryWatch {
     coverageRoot: string;
     identity: fs.BigIntStats;
     eventRevision?: number;
+    preparationClaim?: symbol;
 }
 
 interface ImportedCoverageHandoff {
@@ -1811,8 +1812,19 @@ export class DiffTracker {
         const coverageRoot = [...this.supplementalCoverageRoots].find(target =>
             this.pathBelongsToRoot(root, target) && this.workspaceFolderOwnsTraversalPath(folder, target)) ?? root;
         const acquired = new Map<string, SupplementalDirectoryWatch>();
-        await this.watchSupplementalTree(root, coverageRoot, epoch, budget, acquired);
-        if (!contextCurrent()) { throw new Error('Imported coverage preparation was superseded'); }
+        const claim = Symbol();
+        await this.watchSupplementalTree(root, coverageRoot, epoch, budget, acquired, claim, contextCurrent);
+        if (!contextCurrent()) {
+            for (const [directory, entry] of acquired) {
+                if (this.supplementalDirectoryWatchers.get(directory) === entry &&
+                    (entry.epoch === epoch || entry.epoch === -1) && entry.preparationClaim === claim &&
+                    !this.supplementalCoverageRoots.has(entry.coverageRoot)) {
+                    entry.watcher.dispose();
+                    this.supplementalDirectoryWatchers.delete(directory);
+                }
+            }
+            throw new Error('Imported coverage preparation was superseded');
+        }
         this.supplementalCoverageRoots.add(coverageRoot);
         const owners = new Map([...this.supplementalDirectoryWatchers].filter(([directory, entry]) =>
             owns(directory) && entry.coverageRoot === coverageRoot));
@@ -2025,12 +2037,15 @@ export class DiffTracker {
         coverageRoot: string,
         epoch: number,
         preparationBudget: { remainingEntries: number },
-        acquired: Map<string, SupplementalDirectoryWatch>
+        acquired: Map<string, SupplementalDirectoryWatch>,
+        claim = Symbol(),
+        preparationCurrent: () => boolean = () => true
     ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: SupplementalDirectoryWatch; previous?: SupplementalDirectoryWatch }>();
         try {
             while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
+                if (!preparationCurrent()) { throw new Error('Supplemental coverage preparation was superseded'); }
                 const directory = pending.pop()!;
                 // Supplemental coverage exists specifically because host/ordinary
                 // watcher policy can hide this path. Do not use membership ignore
@@ -2038,15 +2053,21 @@ export class DiffTracker {
                 // remain unwatchable.
                 if (this.validateResourceTarget(directory)) { continue; }
                 const previous = this.supplementalDirectoryWatchers.get(directory);
-                if (this.watchSupplementalDirectory(directory, coverageRoot, epoch)) {
-                    const current = this.supplementalDirectoryWatchers.get(directory)!;
-                    installed.set(directory, { current, previous });
+                const added = this.watchSupplementalDirectory(directory, coverageRoot, epoch);
+                const current = this.supplementalDirectoryWatchers.get(directory)!;
+                if (added || !this.supplementalCoverageRoots.has(coverageRoot)) {
+                    installed.set(directory, { current, previous: added ? previous : undefined });
                     acquired.set(directory, current);
                 }
+                // Reuse transfers both the claim and cleanup responsibility;
+                // older work cannot revoke an owner now needed by this attempt.
+                current.preparationClaim = claim;
                 let handle: fs.Dir | undefined;
                 try {
                     handle = await fs.promises.opendir(directory);
-                    if (!this.isCurrentEpoch(epoch)) { throw new Error('Supplemental coverage preparation was superseded'); }
+                    if (!this.isCurrentEpoch(epoch) || !preparationCurrent()) {
+                        throw new Error('Supplemental coverage preparation was superseded');
+                    }
                     while (true) {
                         const entry = handle.readSync();
                         if (!entry) { break; }
@@ -2069,7 +2090,9 @@ export class DiffTracker {
             }
         } catch (error) {
             for (const [directory, entry] of installed) {
-                if (this.supplementalDirectoryWatchers.get(directory) === entry.current) {
+                if (this.supplementalDirectoryWatchers.get(directory) === entry.current &&
+                    entry.current.preparationClaim === claim &&
+                    !this.supplementalCoverageRoots.has(entry.current.coverageRoot)) {
                     entry.current.watcher.dispose();
                     acquired.delete(directory);
                     if (entry.previous) { this.supplementalDirectoryWatchers.set(directory, entry.previous); }
@@ -4933,8 +4956,11 @@ export class DiffTracker {
                 this.getExplicitlyExcludedReviewRevision(scope, preparationIdentityEvidence)
             : undefined;
         let approvedReviewsDiscarded = false;
-        const discardApprovalStillCurrent = (): boolean => !discardExplicitlyExcludedReviews ||
-            (approvedReviewsDiscarded
+        // Explicit exclusion may never publish retained review without discard
+        // consent. Draining can discover reviews after the controller precheck;
+        // the same invariant must also hold at every durable transaction barrier.
+        const discardApprovalStillCurrent = (): boolean =>
+            (!discardExplicitlyExcludedReviews || approvedReviewsDiscarded
                 ? this.getExplicitlyExcludedPendingReviewPaths(
                     scope,
                     preparationIdentityEvidence
@@ -4944,7 +4970,9 @@ export class DiffTracker {
                     preparationIdentityEvidence
                 ) === approvedDiscardRevision);
         if (!discardApprovalStillCurrent()) {
-            return empty('conflict', 'Affected review changed after discard approval; confirm the current review set again.');
+            return empty('conflict', discardExplicitlyExcludedReviews
+                ? 'Affected review changed after discard approval; confirm the current review set again.'
+                : 'Explicit exclusions affect pending review; confirm discard of the current review set before applying.');
         }
 
         const epoch = this.sessionEpoch;

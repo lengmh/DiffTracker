@@ -1343,12 +1343,79 @@ export function registerPR11ReviewRegressions(h) {
             t.onDocumentChanged({document:doc,contentChanges:[{text:'changed'}]});
             assert.equal(t.documentChangeTimers.has(p),true);
         }
+        const previous=t.getEffectiveMonitoringScope();
         const requested=scope([], [{scope:'all',pattern:relative(p)}]);
         const result=await t.applyConfiguredMonitoringScope(requested);
-        assert.equal(result.status,'applied',JSON.stringify(result));
-        assert.ok(pending(p),'event observed under the old scope must remain reviewable');
-        assert.ok(t.getRetainedReviewPaths().includes(p));
-        assert.equal(result.retainedReviews,1);
+        assert.equal(result.status,'conflict',JSON.stringify(result));
+        assert.match(result.reason,/confirm.*discard/i);
+        assert.equal(t.externalChangeTimers.has(p),false);
+        assert.equal(t.documentChangeTimers.has(p),false);
+        assert.equal(pending(p)?.currentContent,'changed','the drained event must remain reviewable');
+        assert.equal(t.getOriginalContent(p),'baseline');
+        assert.deepEqual(t.getEffectiveMonitoringScope(),previous);
+        assert.equal(result.retainedReviews,0,'refused Apply cannot report a published retained review');
+        assert.deepEqual(t.getExplicitlyExcludedPendingReviewPaths(requested),[p],
+            'the discovered review now requires fresh discard confirmation');
+    });
+
+    for (const known of [false, true]) test(`PR17 controller refuses unapproved imported-root exclusion after queued child (known=${known})`,async()=>{
+        const t=h.getTracker(),dir=file('controller-import');
+        fs.mkdirSync(dir);
+        t.effectiveMonitoringScope={kind:'configured',...scope()};
+        const p=path.join(dir,'child.txt');
+        if(known) fs.writeFileSync(p,'accepted child');
+        await t.onExternalFileCreated(Uri.file(dir));
+        if(known) assert.equal((await t.keepAllChangesInFile(p)).status,'success');
+        const owner=h.nativeDirectoryWatchers.find(item=>item.active&&item.directory===dir);
+        assert.ok(owner);
+        fs.writeFileSync(p,'queued child change');
+        await t.onExternalFileChanged(Uri.file(p));
+        assert.equal(t.externalChangeTimers.has(p),true);
+        const previous=t.getEffectiveMonitoringScope();
+        const excludes=[{scope:'all',pattern:relative(dir)}],oldConfig=vscode.workspace.getConfiguration;
+        vscode.workspace.getConfiguration=(section,resource)=>{
+            const old=oldConfig(section,resource);
+            return {...old,inspect:key=>key==='watchExclude'?{workspaceValue:excludes}:undefined};
+        };
+        const state=new Map(),controller=h.createScopeController({workspaceState:{
+            get:key=>state.get(key),update:async(k,v)=>state.set(k,v)
+        }});
+        try{
+            if(!known) assert.deepEqual(t.getExplicitlyExcludedPendingReviewPaths(controller.getRequestedScope().scope),[],
+                'the controller precheck cannot yet see a newly queued child');
+            const first=await controller.applyPendingScope();
+            assert.equal(first.status,known?'needsDiscardConfirmation':'conflict',JSON.stringify(first));
+            assert.deepEqual(t.getEffectiveMonitoringScope(),previous);
+            assert.equal(owner.active,true,'unapproved exclusion must keep its exact direct owner');
+            assert.ok(pending(p),'the pending event must remain visible as review evidence');
+            if(!known) assert.match(pending(p).unavailableReason,/observed.*scope|scope.*observed/i);
+            assert.equal(fs.readFileSync(p,'utf8'),'queued child change');
+            const confirmation=await controller.applyPendingScope();
+            assert.equal(confirmation.status,'needsDiscardConfirmation');
+            assert.deepEqual(confirmation.affectedReviewPaths,[p]);
+            let applied=await controller.applyPendingScope({
+                discardExplicitlyExcludedReviews:true,
+                expectedScopeRevision:confirmation.scopeRevision,
+                expectedAffectedReviewRevision:confirmation.affectedReviewRevision
+            });
+            if(known){
+                assert.equal(applied.status,'conflict','draining a queued event invalidates earlier discard approval');
+                assert.equal(owner.active,true);
+                const refreshed=await controller.applyPendingScope();
+                assert.equal(refreshed.status,'needsDiscardConfirmation');
+                assert.notEqual(refreshed.affectedReviewRevision,confirmation.affectedReviewRevision);
+                applied=await controller.applyPendingScope({
+                    discardExplicitlyExcludedReviews:true,
+                    expectedScopeRevision:refreshed.scopeRevision,
+                    expectedAffectedReviewRevision:refreshed.affectedReviewRevision
+                });
+            }
+            assert.equal(applied.status,'applied',JSON.stringify(applied));
+            assert.equal(owner.active,false,'the owner retires only after revision-bound discard');
+            assert.equal(pending(p),undefined);
+            assert.equal(t.getOriginalContent(p),undefined);
+            assert.equal(fs.readFileSync(p,'utf8'),'queued child change');
+        }finally{controller.dispose();vscode.workspace.getConfiguration=oldConfig;}
     });
 
     test('PR11 event arriving during scope transaction aborts publication and replays under committed scope',async()=>{
