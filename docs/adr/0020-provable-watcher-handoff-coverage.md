@@ -14,3 +14,9 @@ S4 不把“创建新的 VS Code `FileSystemWatcher` 对象”、重复提交相
 - **Supplemental watcher**：有效监控范围为了覆盖宿主默认监听盲区而持续持有的、由 DiffTracker 明确拥有的补充监听。只要该盲区仍存在，它可以长期存活，不以“active watcher = 0”为成功条件。
 
 容量和诊断分别统计临时 bridge 与持续 supplemental watcher，同时受统一总资源预算约束。不能通过重新分类绕过总上限。Stop/dispose 必须释放两类 watcher；覆盖失败必须保留 coverage gap 或 unavailable 证据，不能因为扫描成功或 watcher 对象创建成功就报告完整覆盖。
+
+## S4-C 的有限实现
+
+典型 ready configured scope 使用独立的 native watcher 与 bridge 重叠，在有界子树核对、持久化及最终 owner/identity 核验后释放确切 bridge 实例。重启义务沿用 V4 subtree uncertainty 格式，保存时不重新推断目录身份；当前 runtime 的覆盖正常结论不跨进程继承。pending-scope 控制证据必须保留，不能为编码接管义务而覆盖。
+
+不安全的运行中 ownership 重叠继续拒绝并保留缺口，必要时先处理待审，再 Stop → Start 重建。支持范围、回归及历史开发版兼容限制见 [S4-C checkpoint](../s4c-handoff-checkpoint.md)。
