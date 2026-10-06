@@ -1,5 +1,5 @@
-// One configured-scope import in the real Extension Host. The parent-create
-// boundary is delivered once; every edit after Keep must arrive via fs.watch.
+// Configured-scope import and pending-scope restart in the real Extension Host.
+// Directory event boundaries are explicit; later file edits arrive via fs.watch.
 // No workspace FileSystemWatcher can mask a missing persistent direct owner.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -27,7 +27,7 @@ module.exports = async function s4cHandoffHost(workspace) {
     const nested = path.join(root, 'deep');
     const directories = [root, nested];
     const files = [path.join(root, 'readme.txt'), path.join(nested, 'tracked.txt')];
-    const tracker = new DiffTracker(vscode.Uri.file(storage));
+    let tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
     const handles = [];
     // Observe only resource lifetimes. Forward the production callback unchanged
@@ -115,6 +115,40 @@ module.exports = async function s4cHandoffHost(workspace) {
         assert.equal(saved.version, 4);
         assert.equal(new Map(saved.coverageGaps).get(root)?.subtree?.reasonCode,
             'imported-coverage-restart-required', 'saved review must not claim that an OS handle survives restart');
+        assert.equal(new Map(saved.coverageGaps).get(root)?.importedCoverageRequired, true);
+
+        const pending = validateAndCanonicalizeScope({
+            mode: 'rules', includes: [{ scope: 'all', path: 's4c-import-owner' }],
+            excludes: [{ scope: 'all', pattern: 's4c-import-owner' }]
+        }, tracker.currentWorkspaceRootIdentities());
+        assert.equal(pending.ok, true);
+        tracker.setPendingMonitoringScope(pending.scope);
+        await tracker.onExternalFileCreated(vscode.Uri.file(root));
+        await tracker.dispose();
+        await until('old session owners to close before restore', () => handles.every(handle => handle.closed));
+        tracker = new DiffTracker(vscode.Uri.file(storage));
+        tracker.setPendingMonitoringScope(pending.scope);
+        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.ok(tracker.supplementalDirectoryWatchers.get(root)?.epoch === tracker.sessionEpoch,
+            'pending control must not hide the imported persistent owner during restore');
+        tracker.setPendingMonitoringScope(undefined);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === root));
+        assert.equal(await tracker.resetBaselineToCurrentState(), true);
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+        // Restore/Reset exercise their normal host-watch setup. Close only those
+        // general watches before the proof edit so they cannot mask owner loss.
+        tracker.fileWatchers.forEach(watcher => watcher.dispose());
+        tracker.fileWatchers = [];
+        await delay(250);
+        for (const filePath of files) { fs.writeFileSync(filePath, 'native edit after pending restart and Reset\n'); }
+        await until('restored owners to observe edits after pending restart and Reset', () =>
+            files.every(filePath => tracker.getTrackedChanges().some(change =>
+                change.filePath === filePath && change.currentContent === 'native edit after pending restart and Reset\n')));
+        for (const filePath of files) {
+            assert.equal(tracker.getOriginalContent(filePath), 'native edit after Keep\n');
+            assert.equal(tracker.getTrackedChanges().find(change => change.filePath === filePath)?.unavailableReason, undefined);
+        }
+        assert.equal(tracker.fileWatchers.length, 0);
 
         tracker.stopRecording();
         await until('Stop to release every imported native handle', () => handles.every(handle => handle.closed));
@@ -126,7 +160,7 @@ module.exports = async function s4cHandoffHost(workspace) {
         assert.equal(stopped.isRecording, false);
         assert.equal(new Map(stopped.coverageGaps).get(root)?.subtree?.reasonCode,
             'imported-coverage-restart-required');
-        console.log('PASS HOST-S4-C populated import hands off to independent native owners; Keep, later edits, restart evidence and Stop remain safe');
+        console.log('PASS HOST-S4-C populated import, Keep, pending restart, Reset, later native-only edits and Stop remain safe');
     } finally {
         fs.watch = nativeWatch;
         await tracker.dispose();

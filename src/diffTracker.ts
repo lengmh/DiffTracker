@@ -257,6 +257,11 @@ interface CoverageGapRecord {
     subtree?: CoverageGapEvidence;
 }
 
+interface PersistedCoverageGapRecord extends CoverageGapRecord {
+    /** Durable ownership obligation, independent of control/health diagnostics. */
+    importedCoverageRequired?: true;
+}
+
 export interface SubtreeCoverageDiagnostic {
     targetPath: string;
     reasonCode: string;
@@ -273,7 +278,7 @@ interface PersistedTrackerState {
     workspaceRoots: string[];
     effectiveMonitoringScope: EffectiveMonitoringScope;
     retainedReviewPaths: string[];
-    coverageGaps: Array<[string, CoverageGapRecord]>;
+    coverageGaps: Array<[string, PersistedCoverageGapRecord]>;
     legacyWatchExcludeByRoot: Array<[string, string[]]>;
     fileSnapshots: Array<[string, string]>;
     fileModes: Array<[string, number]>;
@@ -878,7 +883,8 @@ export class DiffTracker {
         );
         this.effectiveMonitoringScope = state.effectiveMonitoringScope;
         this.importedCoverageObligations = new Set(state.coverageGaps
-            .filter(([, record]) => record.subtree?.reasonCode === this.importedCoverageRestartCode)
+            .filter(([, record]) => record.importedCoverageRequired === true ||
+                record.subtree?.reasonCode === this.importedCoverageRestartCode)
             .map(([root]) => root));
         const configuredScopeNeedsReconciliation = state.effectiveMonitoringScope.kind === 'configured'
             ? (() => {
@@ -899,7 +905,10 @@ export class DiffTracker {
             configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
-        this.coverageGaps = new Map(state.coverageGaps);
+        // Runtime diagnostics never own this serialized marker. Scope retirement
+        // and rollback use the independent Set, not stale flags in gap records.
+        this.coverageGaps = new Map(state.coverageGaps.map(([root, record]) =>
+            [root, { file: record.file, subtree: record.subtree }]));
         this.restorePendingScopeSuspendedPathsFromCoverageGaps();
         this.committedLegacyWatchExcludeByRoot = new Map(
             state.legacyWatchExcludeByRoot.map(([rootUri, patterns]) => [rootUri, [...patterns]])
@@ -1427,6 +1436,7 @@ export class DiffTracker {
         this.importedCoverageObligations = new Set(supplementalPlan?.importedTargets ??
             [...this.importedCoverageObligations].filter(root => this.sessionWorkspaceRoots.some(workspaceRoot =>
                 this.pathBelongsToRoot(root, workspaceRoot))));
+        this.clearRetiredImportedRestartGaps(previous.importedCoverageObligations);
         this.clearExternalChangeTimers();
         this.clearDocumentChangeTimers();
         this.pendingWriteFiles.clear();
@@ -1734,21 +1744,40 @@ export class DiffTracker {
         });
     }
 
-    private persistedCoverageGaps(): Map<string, CoverageGapRecord> {
-        const gaps = new Map(this.coverageGaps);
-        for (const root of this.importedCoverageObligations) {
-            const record = gaps.get(root);
-            // Pending-scope codes reconstruct suspended observations. Preserve
-            // them verbatim and conservatively retain their visible gap on reload.
-            if (record?.subtree?.reasonCode.startsWith('pending-scope-')) { continue; }
-            gaps.set(root, { ...record, subtree: {
+    private persistedCoverageGap(
+        record: CoverageGapRecord | undefined,
+        importedCoverageRequired: boolean
+    ): PersistedCoverageGapRecord {
+        if (!importedCoverageRequired) { return { ...record }; }
+        return { ...record, importedCoverageRequired: true, subtree:
+            record?.subtree?.reasonCode.startsWith('pending-scope-') ? record.subtree : {
                 targetKind: 'subtree',
                 reasonCode: this.importedCoverageRestartCode,
                 reason: record?.subtree?.reason ??
                     'Imported-directory observation must be independently restored and reconciled before this subtree is trusted.'
-            } });
+            }
+        };
+    }
+
+    private persistedCoverageGaps(): Map<string, PersistedCoverageGapRecord> {
+        const gaps = new Map<string, PersistedCoverageGapRecord>(this.coverageGaps);
+        for (const root of this.importedCoverageObligations) {
+            // A pending scope and an imported owner are independent facts. Both
+            // must survive even while one diagnostic occupies the subtree slot.
+            gaps.set(root, this.persistedCoverageGap(gaps.get(root), true));
         }
         return gaps;
+    }
+
+    private clearRetiredImportedRestartGaps(previous: ReadonlySet<string>): void {
+        for (const root of previous) {
+            if (!this.importedCoverageObligations.has(root) &&
+                this.coverageGaps.get(root)?.subtree?.reasonCode === this.importedCoverageRestartCode) {
+                // This diagnostic encodes only the retired owner. Keeping it
+                // would let the legacy reason-code reader resurrect the owner.
+                this.clearCoverageGap(root, 'subtree', false);
+            }
+        }
     }
 
     private async prepareImportedCoverageHandoff(
@@ -2125,7 +2154,8 @@ export class DiffTracker {
         committedRoots: ReadonlySet<string>
     ): void {
         const live = [...this.coverageGaps].filter(([root, record]) =>
-            this.isSupplementalCoverageGap(record) && [...committedRoots].some(committed => {
+            (this.isSupplementalCoverageGap(record) || record.subtree?.reasonCode.startsWith('pending-scope-')) &&
+            [...committedRoots].some(committed => {
                 const folder = this.owningWorkspaceFolderForTraversal(committed);
                 return folder && this.pathBelongsToRoot(root, committed) &&
                     this.workspaceFolderOwnsTraversalPath(folder, root);
@@ -3129,7 +3159,7 @@ export class DiffTracker {
             }
             return { targetKind: expectedKind, reasonCode: value.reasonCode, reason: value.reason };
         };
-        const coverageGaps: Array<[string, CoverageGapRecord]> = [];
+        const coverageGaps: Array<[string, PersistedCoverageGapRecord]> = [];
         const gapPaths = new Set<string>();
         for (const entry of rawCoverageGaps) {
             if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
@@ -3137,7 +3167,7 @@ export class DiffTracker {
             if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) || gapPaths.has(filePath)) {
                 return undefined;
             }
-            let record: CoverageGapRecord | undefined;
+            let record: PersistedCoverageGapRecord | undefined;
             if (typeof rawRecord === 'string') {
                 if (rawRecord.length === 0 || rawRecord.length > 1000) { return undefined; }
                 record = {
@@ -3162,6 +3192,12 @@ export class DiffTracker {
                 record = { file: fileEvidence, subtree: subtreeEvidence };
             }
             if (!record) { return undefined; }
+            const importedCoverageRequired = typeof rawRecord === 'object' && rawRecord !== null
+                ? (rawRecord as { importedCoverageRequired?: unknown }).importedCoverageRequired : undefined;
+            if (importedCoverageRequired !== undefined) {
+                if (importedCoverageRequired !== true || !record.subtree) { return undefined; }
+                record.importedCoverageRequired = true;
+            }
             gapPaths.add(filePath);
             coverageGaps.push([filePath, record]);
         }
@@ -3408,6 +3444,14 @@ export class DiffTracker {
     ): void {
         const key = path.resolve(directory);
         const previous = this.coverageGaps.get(key)?.subtree;
+        if (previous?.reasonCode.startsWith('pending-scope-') && !reasonCode.startsWith('pending-scope-')) {
+            // Deferred event/delete codes reconstruct directory suspension after
+            // restart. A native failure must not replace that control state or
+            // let a successful owner reinstall erase an unscanned pending tree.
+            // Keep only the latest bounded health detail, not a growing history.
+            reasonCode = previous.reasonCode;
+            reason = `Pending scope reconciliation remains required. ${reason}`.slice(0, 1000);
+        }
         this.setCoverageGap(directory, { targetKind: 'subtree', reasonCode, reason }, schedule);
         if (!previous || previous.reasonCode !== reasonCode || previous.reason !== reason) {
             this.emitTrackChangesEvent({ fullRefresh: true });
@@ -4327,7 +4371,8 @@ export class DiffTracker {
     private reserveCandidateCoverageGap(
         targetPath: string,
         evidence: CoverageGapEvidence,
-        budget: CandidatePersistenceBudget
+        budget: CandidatePersistenceBudget,
+        mayRequireImportedCoverage = false
     ): void {
         const fail = (message: string): never => {
             budget.failedReason = budget.failedReason ?? message;
@@ -4339,9 +4384,13 @@ export class DiffTracker {
             ? this.canonicalTrackingPath(targetPath)
             : path.resolve(targetPath);
         const previous = this.persistedCoverageGaps().get(key);
-        const next: CoverageGapRecord = evidence.targetKind === 'file'
+        const nextEvidence: CoverageGapRecord = evidence.targetKind === 'file'
             ? { ...previous, file: evidence }
             : { ...previous, subtree: evidence };
+        // Reserve the actual serialized descriptor before installing an owner
+        // or publishing child baselines, including its independent marker bytes.
+        const next = this.persistedCoverageGap(nextEvidence,
+            mayRequireImportedCoverage || this.importedCoverageObligations.has(key));
         let addedBytes: number;
         if (previous) {
             addedBytes =
@@ -4995,6 +5044,7 @@ export class DiffTracker {
         try {
             this.effectiveMonitoringScope = { kind: 'configured', ...(JSON.parse(JSON.stringify(scope)) as CanonicalMonitoringScope) };
             this.importedCoverageObligations = new Set(supplementalCoveragePlan.importedTargets);
+            this.clearRetiredImportedRestartGaps(previous.importedCoverageObligations);
             // Protect all pending reviews from matcher pruning until each path is
             // classified against the candidate scope.
             for (const filePath of this.trackedChanges.keys()) { this.retainedReviewPaths.add(filePath); }
@@ -8150,7 +8200,8 @@ export class DiffTracker {
                                 : 'directory-runtime-coverage-gap',
                             reason: watcherFailureReason
                         },
-                        childPersistenceBudget
+                        childPersistenceBudget,
+                        !scanEvent && this.effectiveMonitoringScope.kind === 'configured'
                     );
                 } catch (error) {
                     await this.pauseRecordingForUnpersistableCoverage(

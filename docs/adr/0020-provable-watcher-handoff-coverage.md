@@ -17,6 +17,8 @@ S4 不把“创建新的 VS Code `FileSystemWatcher` 对象”、重复提交相
 
 ## S4-C 的有限实现
 
-典型 ready configured scope 使用独立的 native watcher 与 bridge 重叠，在有界子树核对、持久化及最终 owner/identity 核验后释放确切 bridge 实例。重启义务沿用 V4 subtree uncertainty 格式，保存时不重新推断目录身份；当前 runtime 的覆盖正常结论不跨进程继承。pending-scope 控制证据必须保留，不能为编码接管义务而覆盖。
+典型 ready configured scope 使用独立的 native watcher 与 bridge 重叠，在有界子树核对、持久化及最终 owner/identity 核验后释放确切 bridge 实例。重启义务在 V4 coverage-gap 记录中以独立、经过校验的 `importedCoverageRequired: true` 标记保存，不再依赖唯一的 subtree reason code。保存时不重新推断目录身份；当前 runtime 的覆盖正常结论不跨进程继承。标记必须进入既有条目和字节预算，并在子基线发布前预留。
+
+pending-scope 控制证据必须同时保留，不能被接管义务或 native health 诊断覆盖。恢复 owner 不等于核对了 pending 期间跳过的子树；完整核对后才能清除相应未核验证据，导入覆盖义务则仅在已提交的范围退役时删除。
 
 不安全的运行中 ownership 重叠继续拒绝并保留缺口，必要时先处理待审，再 Stop → Start 重建。支持范围、回归及历史开发版兼容限制见 [S4-C checkpoint](../s4c-handoff-checkpoint.md)。
