@@ -60,11 +60,17 @@ PR #17 最终 head `538ff742667da2b5fa718ee50029d428361141a8` 的 [Verification 
 
 独立 Recheck 入口是仍需处理的发布契约差距。此 checkpoint 不等于所有已接受 ADR、S5 或 0.8.0 RC 门槛已通过。若要延期或改变该契约，应作明确决策，不能仅以测试文档删除承诺。
 
-## 本批首次 CI 记录
+## 本批 CI 与夹具修正记录
 
 [PR #18 Verification #531](https://github.com/lengmh/DiffTracker/actions/runs/37494791633) 的首个提交 `2ef0c065` 未通过真实 Host。Stable Windows/Ubuntu 在新 Whole Workspace 轮询中遇到 `building`，测试错误地要求每次采样立即为 `ready`。生产创建事件会在持久化已知不存在证据时短暂进入 `building`；修正只将 Ready 放入原有有界稳定等待的成功条件，录制状态、Whole Workspace 范围、最终 Ready 和全部 18 项结果断言保持不变。没有增加时间上限或重试。
 
 同轮 Ubuntu 1.80.2 在执行新增场景前，旧 S4-B 范围准备返回 workspace/Git context 冲突。通用错误信息不足以确定具体触发条件；保留该失败，不把它归为已证实的生产缺陷或已通过验收。后续确切 head 必须重新通过完整矩阵。
+
+修正后的 `fef31abc` 在 [Verification #532](https://github.com/lengmh/DiffTracker/actions/runs/37496024763) 中通过全部三个真实 Host：Windows/Ubuntu Stable 均为 1.140.0，最低版本为 Ubuntu 1.80.2。三个日志均包含 Whole Workspace 18 项、安装拒绝、核对期间事件、拒绝排除后续编辑，以及第二 Host 进程恢复的成功记录。旧 1.80.2 范围准备场景也通过；未为其增加推测性的延时或重试。
+
+#531 与 #532 的 Windows Quality 都在同两例 PR11 stopped Apply 的固定 1,000 ms Ready 等待处超时，均为 1006/1008；因此 #532 整体仍未通过，VSIX 被跳过。进一步测量确认该测试使用整个历史夹具工作区进行真实 ignore-policy 发现：全套后段包含约 1,600 个目录，单独筛选两例时仅需数次目录读取。给每次真实 `opendir` 增加 1 ms 的诊断运行中，两例在 1 秒时仍处于策略发现，约 2.14 / 2.22 秒后正确完成基线，并无产品错误。该诊断观察窗口只存在于临时探测中。
+
+修正仅为这两例配置独立工作区，保留 stopped Apply、持久化恢复、Start 的完整流程、原 1 秒等待及全部业务断言；还原临时工作区 API，存储保持在被观察工作区之外。不修改全局等待条件、生产扫描或资源上限，也不通过原样反复重跑换取绿色。最终 PR head 仍须通过完整 CI。
 
 ## 验证与结束条件
 
