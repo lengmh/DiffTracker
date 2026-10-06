@@ -213,6 +213,9 @@ module.exports = async function runExtensionHostScenario() {
         const recordingWholeTrackedPath = vscode.Uri.file(recordingWholePath).fsPath;
         fs.mkdirSync(path.dirname(recordingWholePath), { recursive: true });
         fs.writeFileSync(recordingWholePath, 'recording whole baseline\n');
+        const wholeWorkspaceProof = await require('./s4d-whole-workspace.test.cjs')({
+            workspacePath, secondRoot, primaryFolder, state, untilStable, delay
+        });
 
         await delay(250);
         assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
@@ -224,6 +227,7 @@ module.exports = async function runExtensionHostScenario() {
             undefined,
             'Rules baseline must not include the ordinary-policy-ignored expansion fixture'
         );
+        await wholeWorkspaceProof.assertRulesBaseline();
 
         await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
         const recordingWholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
@@ -237,6 +241,7 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')).effective.mode,
             'wholeWorkspace');
         console.log('PASS HOST-S4A recording Whole Workspace apply captures candidate baseline');
+        await wholeWorkspaceProof.assertObservedChanges();
 
         await scopeConfig.update('monitoringScope', 'rules', vscode.ConfigurationTarget.Workspace);
         const rulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
@@ -272,6 +277,7 @@ module.exports = async function runExtensionHostScenario() {
         const restoreRulesApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
         assert.equal(restoreRulesApply.status, 'applied', JSON.stringify(restoreRulesApply));
         await vscode.commands.executeCommand('diffTracker.stopRecording');
+        await wholeWorkspaceProof.restoreWatcherExclude();
         await secondRootFilesConfig.update('watcherExclude', previousSecondRootWatcherExclude,
             vscode.ConfigurationTarget.WorkspaceFolder);
         await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
@@ -733,6 +739,7 @@ module.exports = async function runExtensionHostScenario() {
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
         await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./s4c-handoff.test.cjs')(workspacePath);
+        await require('./s4d-handoff-refusal.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
         await require('./nested-workspace-coverage.test.cjs')(secondRoot);
 };
