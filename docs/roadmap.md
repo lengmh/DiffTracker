@@ -2,7 +2,7 @@
 
 > Product boundaries and roadmap — local change visibility first; binary backup is optional, not a prerequisite.
 >
-> 更新日期：2026-09-20。本文是产品规划，不是已交付功能列表或发布日期承诺。
+> 更新日期：2026-10-06（北京时间）。本文是产品规划，不是已交付功能列表或发布日期承诺。
 > **0.8.x 是当前核心目标，可以作为长期维护的完整产品。0.9.x 及以后仅保留为待重新决策的候选方向。**
 
 ## 1. 产品愿景
@@ -29,20 +29,26 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 
 “0.9.x”是保留讨论的路线标签，不是排期。未启动的候选项可以推迟、取消或转为独立扩展。本文不修改扩展版本号，也不意味着已有功能获得更强的安全保证。
 
-### 2.1 0.8.x 实施检查点（2026-09-20）
+### 2.1 0.8.x 实施检查点（2026-10-06）
 
-当前主线已完成：
+按 2026-10-04 优化口径同步：主要 Windows/Linux 本地场景可靠可用，能力不足时保留证据并明确拒绝、显示缺口或暂停；不以穷举边界或清空历史讨论作为完成条件。
+
+当前核对主线为 `06273337a05f67127a8018ef52614547c9d289c5`，阶段状态如下：
 
 - **S0 / PR #7**：冻结 Native Review 稳定 API adapter 契约、virtual URI 安全边界和 watcher/W1 capability contract。
 - **S1 / PR #8**：完成 opaque / unknown 只读 review visibility。
 - **S2 / PR #9**：完成 Acknowledge、mixed actions、计数和 Clear Diffs 事务语义。
-- **S3**：下一实现阶段，负责 monitoring scope、Workspace Trust、Scope Revision / Policy Fingerprint / Coverage Generation、Session V4 与 Rules 模式。
-- **S4**：分为两个独立子轨：S4-W 负责 Whole Workspace、supplemental coverage、coverage reconciliation 与 W1 watcher handoff/reclaim；S4-N 负责 production Native Review stable-API adapter 的正式实现，以及 Quick Diff / Multi Diff / stale-view / mapping-boundary 的真实 Host 验证。
-- **S5**：汇总跨平台、最低版本、迁移、性能和 VSIX 的 0.8.0 RC 验收，并依据 S4-N 证据明确决定是否切换默认文本审阅界面。
+- **S3 / PR #11**：已合并 monitoring scope、Workspace Trust、Scope Revision / Policy Fingerprint / Coverage Generation、Session V4、Rules 模式与 Scope Manager。
+- **S4-A / [PR #12](https://github.com/lengmh/DiffTracker/pull/12)**：已合并 Whole Workspace、有界准备、失败回滚及 recording/stopped 语义。
+- **S4-B / [PR #13](https://github.com/lengmh/DiffTracker/pull/13)、[PR #14](https://github.com/lengmh/DiffTracker/pull/14)**：有限支持范围内的 persistent supplemental coverage 已完成并合并；包含生命周期、Rules 目标和嵌套工作区 ownership 修复。未能可靠覆盖的组合仍明确拒绝或保留缺口。
+- **S4-C**：下一实现批次，处理典型 imported bridge 的核对、接管与临时资源回收。
+- **S4-D**：阶段验收待完成；已有 S4-A/B 和嵌套工作区的真实 Host 证据可复用，S4-C 用户链路仍需补齐。
+- **S5**：production Native Review 稳定 API 薄适配与真实入口验收、默认入口决策，以及 0.8.0 RC 的迁移、性能、文档和 VSIX 验收均待推进。
+- **S6**：只按实际反馈维护，不预置新的功能大包，也不是 0.8.0 完成门。
 
 Native Review 不成为第二套状态源；DiffTracker 后端继续管理 baseline、session、review token、stale protection、Keep/Revert/Acknowledge、恢复、Git context、scope 和 coverage。任意 block 内部分行 Keep/Revert 不属于 0.8.0 完成门。
 
-详见 [`0.8-revised-execution-route.md`](./0.8-revised-execution-route.md)。
+旧 S4-W/S4-N 分轨已由 S4-A/B/C/D 与 S5 的分工替代，不叠加旧门槛。PR 合并与版本发布分开：0.8.0 尚未进入发布决策，仓库版本仍为 `0.7.2`。阶段证据和下一批范围统一维护在 [`0.8-revised-execution-route.md`](./0.8-revised-execution-route.md)。
 
 ## 3. 现有基础：保留什么，不顺手重写什么
 
@@ -52,7 +58,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 当前实现有单个受支持文本文件 5 MiB、快照条目数 10,000、单份序列化 session 状态 50 MiB、Revert 历史最多 10 条等限制。50 MiB 不是包含备份、归档和临时文件后的整个目录总占用承诺；当前也没有按天清理的通用保留策略。未来调整这些限制，需要独立验证，而不是在功能扩展时直接放大。
 
-当前已经完成 0.8.x 的前半段审阅能力：S1 将待审资源统一投影为 `text`、`opaque` 和 `unknown`，为稳定的不支持文本资源提供用户可见的只读文件级记录；S2 已实现绑定可靠 identity 的 Acknowledge、混合 Accept/Revert、统一结果计数以及 Clear Diffs 的事务化语义。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。尚未完成的核心工作是 S3 的监控范围/Session V4 和 S4 的 whole-workspace/真实监听覆盖。
+当前已合并 S1/S2 的文件级审阅与确认能力、S3 的监控范围/Session V4、S4-A 的 Whole Workspace 有界准备，以及 S4-B 的有限补充监听。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。尚未完成的核心工作是 S4-C 的典型 bridge 核对/接管/回收、S4-D 的集中 Host 验收和 S5 的 Native Review 薄适配及 RC 验收。
 
 0.8.x 不重写已经验证的文本 Diff、块级 Keep/Revert 和安全恢复算法。应在其外围分离“文件记录”与“可执行能力”，并继续遵守过期审阅拒绝、未保存缓冲区保护、Git 上下文隔离和持久化失败保护。
 
@@ -144,7 +150,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 ## 5. 0.8.x 验收与开发约束
 
-0.8.0 首发重点是可见性、范围控制、确认语义和状态安全；活动提示等体验增强可以留在 0.8.x。是否完成以验收结果为准，不以新增格式数量为准。
+0.8.0 首发重点是可见性、范围控制、确认语义和状态安全；活动提示等体验增强可以按真实需求另行决定。以下场景按优化执行路线的有限支持范围验证，复用有效证据，不扩展为所有平台、文件系统和异常组合的穷举矩阵。支持场景的实质安全问题必须修复或可靠阻断；范围外情况的拒绝必须有实际保护和代表性验证，不能只靠文档声明。
 
 | 验收场景 | 必须满足的结果 |
 | --- | --- |
@@ -163,7 +169,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 实现只增加当前需求所需的记录分类、能力判断、监听和持久化支持。不预先建设备份引擎，不为候选功能重写成熟的文本路径，也不以增加 `kind` 字段为由展开整个仓库重构。
 
-建议按“记录模型与迁移 → 检测和范围 → 确认及 UI → 回归和资源验证”拆分审查。实现前再细化技术任务与预算；本文本身不构成启动实现或发布的指令。
+按当前 S4-C → S4-D → S5 路线拆分后续批次，不重开已完成阶段。每批明确支持场景、安全退出和结束条件；本文本身不构成启动实现或发布的指令。
 
 ## 6. 0.9.x 及以后的候选路线（未立项）
 
