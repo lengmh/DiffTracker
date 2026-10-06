@@ -43,7 +43,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 - **S4-B / [PR #13](https://github.com/lengmh/DiffTracker/pull/13)、[PR #14](https://github.com/lengmh/DiffTracker/pull/14)**：有限支持范围内的 persistent supplemental coverage 已完成并合并；包含生命周期、Rules 目标和嵌套工作区 ownership 修复。未能可靠覆盖的组合仍明确拒绝或保留缺口。
 - **S4-C**：下一实现批次，处理典型 imported bridge 的核对、接管与临时资源回收。
 - **S4-D**：阶段验收待完成；已有 S4-A/B 和嵌套工作区的真实 Host 证据可复用，S4-C 用户链路仍需补齐。
-- **S5**：production Native Review 稳定 API 薄适配与真实入口验收、默认入口决策，以及 0.8.0 RC 的迁移、性能、文档和 VSIX 验收均待推进。
+- **S5**：依照 [ADR-0019 的 2026-10-06 时序修订](./adr/0019-native-review-as-stable-api-adapter.md#2026-10-06-时序修订)，在 S5 内完成 production Native Review 稳定 API 薄适配与真实入口验证，通过后再进行默认入口决策和 0.8.0 RC 的迁移、性能、文档及 VSIX 验收；以上工作均待推进。
 - **S6**：只按实际反馈维护，不预置新的功能大包，也不是 0.8.0 完成门。
 
 Native Review 不成为第二套状态源；DiffTracker 后端继续管理 baseline、session、review token、stale protection、Keep/Revert/Acknowledge、恢复、Git context、scope 和 coverage。任意 block 内部分行 Keep/Revert 不属于 0.8.0 完成门。
