@@ -42,8 +42,14 @@ module.exports = async function s4cHandoffHost(workspace) {
         return watcher;
     };
     try {
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workspace));
+        assert.ok(folder, 'the imported tree must have an actual workspace owner');
+        // This scenario imports into one folder. An all-roots include would
+        // also request an absent tree in the Host suite's second workspace,
+        // whose ordinary watcher exclusions correctly make restore fail closed.
+        const include = { scope: 'folder', folder: folder.name, path: 's4c-import-owner' };
         const requested = validateAndCanonicalizeScope({
-            mode: 'rules', includes: [{ scope: 'all', path: 's4c-import-owner' }], excludes: []
+            mode: 'rules', includes: [include], excludes: []
         }, tracker.currentWorkspaceRootIdentities());
         assert.equal(requested.ok, true);
         tracker.effectiveMonitoringScope = { kind: 'configured', ...requested.scope };
@@ -118,8 +124,8 @@ module.exports = async function s4cHandoffHost(workspace) {
         assert.equal(new Map(saved.coverageGaps).get(root)?.importedCoverageRequired, true);
 
         const pending = validateAndCanonicalizeScope({
-            mode: 'rules', includes: [{ scope: 'all', path: 's4c-import-owner' }],
-            excludes: [{ scope: 'all', pattern: 's4c-import-owner' }]
+            mode: 'rules', includes: [include],
+            excludes: [{ scope: 'folder', folder: folder.name, pattern: 's4c-import-owner' }]
         }, tracker.currentWorkspaceRootIdentities());
         assert.equal(pending.ok, true);
         tracker.setPendingMonitoringScope(pending.scope);
@@ -128,7 +134,7 @@ module.exports = async function s4cHandoffHost(workspace) {
         await until('old session owners to close before restore', () => handles.every(handle => handle.closed));
         tracker = new DiffTracker(vscode.Uri.file(storage));
         tracker.setPendingMonitoringScope(pending.scope);
-        assert.equal(await tracker.restorePersistedState(), 'restored');
+        assert.equal(await tracker.restorePersistedState(), 'restored', tracker.getPersistenceIssue());
         assert.ok(tracker.supplementalDirectoryWatchers.get(root)?.epoch === tracker.sessionEpoch,
             'pending control must not hide the imported persistent owner during restore');
         tracker.setPendingMonitoringScope(undefined);
