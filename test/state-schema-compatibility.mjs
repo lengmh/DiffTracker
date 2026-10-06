@@ -36,6 +36,39 @@ export function registerStateSchemaCompatibility(harness) {
         };
     }
 
+    test('SCHEMA-V4 imported ownership marker round-trips independently of pending control', () => {
+        const { state } = fixture();
+        const directory = file('schema-import-owner');
+        const subtree = {targetKind:'subtree', reasonCode:'pending-scope-deferred-delete',
+            reason:'Pending directory deletion requires reconciliation'};
+        state.coverageGaps = [[directory, {subtree, importedCoverageRequired:true}]];
+        const parsed = getTracker().parsePersistedState(state);
+        assert.ok(parsed);
+        assert.equal(parsed.version, 4);
+        assert.equal(parsed.coverageGaps[0][1].importedCoverageRequired, true);
+        assert.deepEqual(parsed.coverageGaps[0][1].subtree, subtree);
+        state.coverageGaps = [[directory, {...subtree, importedCoverageRequired:true}]];
+        const direct = getTracker().parsePersistedState(state);
+        assert.equal(direct.coverageGaps[0][1].importedCoverageRequired, true,
+            'the accepted direct-evidence form must not silently strip ownership either');
+    });
+
+    for (const marker of [false, null, 0, 'true', {}, []]) {
+        test(`SCHEMA-V4 rejects malformed imported ownership marker ${JSON.stringify(marker)}`, () => {
+            const { state } = fixture();
+            state.coverageGaps = [[file('bad-owner'), {importedCoverageRequired:marker,
+                subtree:{targetKind:'subtree', reasonCode:'pending-scope-gap', reason:'Pending subtree'}}]];
+            assert.equal(getTracker().parsePersistedState(state), undefined);
+        });
+    }
+
+    test('SCHEMA-V4 rejects an imported ownership marker without subtree evidence', () => {
+        const { state } = fixture();
+        state.coverageGaps = [[file('bad-owner-kind'), {importedCoverageRequired:true,
+            file:{targetKind:'file', reasonCode:'pending-scope-gap', reason:'Pending file'}}]];
+        assert.equal(getTracker().parsePersistedState(state), undefined);
+    });
+
     if (process.env.DT_EXPECT_LEGACY_REJECTION === '1') {
         for (const layout of ['primary', 'both', 'backup', 'interrupted-upgrade']) {
             test(`SCHEMA-DOWNGRADE released 0.7.2 preserves ${layout} V3 state`, async () => {

@@ -1,6 +1,7 @@
 import { registerPR12RuntimeBudgetRegressions } from './pr12-runtime-identity-budget.mjs';
 import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
 import { registerS4BSupplementalCoverage } from './s4b-supplemental-coverage.mjs';
+import { registerS4CImportHandoff } from './s4c-import-handoff.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -45,6 +46,7 @@ export function registerPR12BoundedInvariants(h) {
     registerPR12LiteralEntryRegressions(h, fixture, scopeFor);
     registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
     registerS4BSupplementalCoverage(h, fixture, scopeFor);
+    registerS4CImportHandoff(h, fixture);
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 

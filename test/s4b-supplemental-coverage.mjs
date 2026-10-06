@@ -581,7 +581,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
                 if (work) {
                     await entered;
                 } else {
-                    assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===path.resolve(blind)),
+                    assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===path.resolve(child)),
                         'deferring runtime installation must leave explicit persistent-coverage uncertainty');
                 }
                 if (interruption==='stop') { tracker.stopRecording(); }
@@ -680,7 +680,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         }, 'rules'));
     }
 
-    for (const failure of ['error', 'unnamed']) {
+    for (const failure of ['error', 'unnamed', 'directory']) {
         test(`S4-B lifecycle failed Apply retains committed ${failure} coverage evidence`, () => fixture(async ({tracker,dir}) => {
             const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
             fs.writeFileSync(target, 'pending before Apply');
@@ -690,9 +690,15 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             fs.mkdirSync(added);
             fs.writeFileSync(path.join(added, 'new.txt'), 'new');
             const requested = configuredScope(tracker, 'rules', [...scope.includes, {scope:'all',path:'added'}]);
+            const gapTarget = failure === 'directory' ? path.join(child, 'arrived') : blind;
             tracker.captureConfiguredExpansionBaselines = async () => {
                 const committed = activeNativeWatcher(nativeDirectoryWatchers, child);
                 if (failure === 'error') { committed.error(Object.assign(new Error('live committed owner failed'), {code:'EIO'})); }
+                else if (failure === 'directory') {
+                    fs.mkdirSync(gapTarget);
+                    fs.writeFileSync(path.join(gapTarget, 'unobserved.txt'), 'imported during rejected Apply');
+                    committed.listener('change', 'arrived');
+                }
                 else { committed.listener('change', undefined); }
                 throw new Error('force candidate rollback');
             };
@@ -701,10 +707,10 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision, scope.scopeRevision);
             assert.equal(tracker.getOriginalContent(target), 'before');
             assert.ok(tracker.getTrackedChanges().some(change => change.filePath === target));
-            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === gapTarget),
                 'rollback must not erase a live committed coverage failure');
             const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
-            assert.ok(saved.coverageGaps.some(([root, value]) => root === blind && value.subtree));
+            assert.ok(saved.coverageGaps.some(([root, value]) => root === gapTarget && value.subtree));
             const reviewed = tracker.getReviewToken(target);
             assert.ok(reviewed);
             fs.writeFileSync(target, 'unobserved later content');
@@ -763,11 +769,14 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         const target = path.join(added, 'new.txt');
         fs.writeFileSync(target, 'new baseline');
         h.setListedFiles([Uri.file(path.join(blind, 'child', 'tracked.txt')), Uri.file(target)]);
+        const dispatch = tracker.dispatchExternalEvent;
+        tracker.dispatchExternalEvent = () => {};
         activeNativeWatcher(nativeDirectoryWatchers, blind).listener('rename', 'added');
+        tracker.dispatchExternalEvent = dispatch;
         await settle(tracker);
-        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === added));
         assert.equal(await tracker.resetBaselineToCurrentState(), true);
-        assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind), false);
+        assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === added), false);
         assert.equal(tracker.getOriginalContent(target), 'new baseline');
         assert.equal(tracker.supplementalDirectoryWatchers.get(added)?.epoch, tracker.sessionEpoch);
         const fresh = activeNativeWatcher(nativeDirectoryWatchers, added);

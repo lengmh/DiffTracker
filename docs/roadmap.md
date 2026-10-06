@@ -33,7 +33,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 
 按 2026-10-04 优化口径同步：主要 Windows/Linux 本地场景可靠可用，能力不足时保留证据并明确拒绝、显示缺口或暂停；不以穷举边界或清空历史讨论作为完成条件。
 
-当前核对主线为 `06273337a05f67127a8018ef52614547c9d289c5`，阶段状态如下：
+当前核对主线为 `6d3f92694261d33eb51894cbdd1c1f232aec15d7`，阶段状态如下：
 
 - **S0 / PR #7**：冻结 Native Review 稳定 API adapter 契约、virtual URI 安全边界和 watcher/W1 capability contract。
 - **S1 / PR #8**：完成 opaque / unknown 只读 review visibility。
@@ -41,7 +41,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 - **S3 / PR #11**：已合并 monitoring scope、Workspace Trust、Scope Revision / Policy Fingerprint / Coverage Generation、Session V4、Rules 模式与 Scope Manager。
 - **S4-A / [PR #12](https://github.com/lengmh/DiffTracker/pull/12)**：已合并 Whole Workspace、有界准备、失败回滚及 recording/stopped 语义。
 - **S4-B / [PR #13](https://github.com/lengmh/DiffTracker/pull/13)、[PR #14](https://github.com/lengmh/DiffTracker/pull/14)**：有限支持范围内的 persistent supplemental coverage 已完成并合并；包含生命周期、Rules 目标和嵌套工作区 ownership 修复。未能可靠覆盖的组合仍明确拒绝或保留缺口。
-- **S4-C**：下一实现批次，处理典型 imported bridge 的核对、接管与临时资源回收。
+- **S4-C**：本批提交典型 imported bridge 的有界核对、独立接管、临时资源回收及 V4 重启义务；见 [checkpoint](./s4c-handoff-checkpoint.md)。最终 head 的 CI、审查及合并状态以 PR 为准。
 - **S4-D**：阶段验收待完成；已有 S4-A/B 和嵌套工作区的真实 Host 证据可复用，S4-C 用户链路仍需补齐。
 - **S5**：依照 [ADR-0019 的 2026-10-06 时序修订](./adr/0019-native-review-as-stable-api-adapter.md#2026-10-06-时序修订)，在 S5 内完成 production Native Review 稳定 API 薄适配与真实入口验证，通过后再进行默认入口决策和 0.8.0 RC 的迁移、性能、文档及 VSIX 验收；以上工作均待推进。
 - **S6**：只按实际反馈维护，不预置新的功能大包，也不是 0.8.0 完成门。
@@ -58,7 +58,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 当前实现有单个受支持文本文件 5 MiB、快照条目数 10,000、单份序列化 session 状态 50 MiB、Revert 历史最多 10 条等限制。50 MiB 不是包含备份、归档和临时文件后的整个目录总占用承诺；当前也没有按天清理的通用保留策略。未来调整这些限制，需要独立验证，而不是在功能扩展时直接放大。
 
-当前已合并 S1/S2 的文件级审阅与确认能力、S3 的监控范围/Session V4、S4-A 的 Whole Workspace 有界准备，以及 S4-B 的有限补充监听。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。尚未完成的核心工作是 S4-C 的典型 bridge 核对/接管/回收、S4-D 的集中 Host 验收和 S5 的 Native Review 薄适配及 RC 验收。
+当前已合并 S1/S2 的文件级审阅与确认能力、S3 的监控范围/Session V4、S4-A 的 Whole Workspace 有界准备，以及 S4-B 的有限补充监听。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。S4-C 本批实现的验收与合并单独核对，随后仍有 S4-D 的集中 Host 验收和 S5 的 Native Review 薄适配及 RC 验收。
 
 0.8.x 不重写已经验证的文本 Diff、块级 Keep/Revert 和安全恢复算法。应在其外围分离“文件记录”与“可执行能力”，并继续遵守过期审阅拒绝、未保存缓冲区保护、Git 上下文隔离和持久化失败保护。
 
