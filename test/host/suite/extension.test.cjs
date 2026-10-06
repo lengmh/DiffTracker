@@ -103,8 +103,8 @@ module.exports = async function runExtensionHostScenario() {
         );
         console.log('PASS HOST-S3 explicit include baselines resources hidden by ordinary exclusions');
 
-        // S3 can baseline an ordinary ignored subtree, but it must not publish
-        // an include whose future events are suppressed by files.watcherExclude.
+        // Unsupported watcher coverage still fails closed. S4-B may establish
+        // direct coverage when an explicit directory include supplies a bound.
         const filesConfig = vscode.workspace.getConfiguration('files');
         const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
 
@@ -149,12 +149,12 @@ module.exports = async function runExtensionHostScenario() {
         const descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true
         });
-        assert.equal(descendantWatcherApply.status, 'requiresS4', JSON.stringify(descendantWatcherApply));
+        assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify(descendantWatcherApply));
 
         await scopeConfig.update('watchInclude', [privateInclude],
             vscode.ConfigurationTarget.Workspace);
         await filesConfig.update('watcherExclude', previousWatcherExclude, vscode.ConfigurationTarget.Workspace);
-        console.log('PASS HOST-S3 watcher-excluded explicit include remains pending for S4-W');
+        console.log('PASS HOST-S4-B missing includes fail closed and concrete directory includes bound wildcard coverage');
 
         // Confirmation must be bound to the exact scope revision shown to the
         // user. A settings edit while the modal is open invalidates that approval.
@@ -662,6 +662,66 @@ module.exports = async function runExtensionHostScenario() {
         assert.ok(pausedRepository?.repoRoot, 'paused repository root is exposed for explicit recovery');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
         await until('Git baseline rebuild', async () => (await state()).gitPauses.length === 0 && (await state()).reviewTokens.length === 0);
+        // S4-B: a concrete watcher-excluded subtree gets DiffTracker-owned
+        // persistent supplemental coverage. Use direct filesystem writes so this
+        // proves coverage rather than relying on VS Code's suppressed workspace watcher.
+        const s4bBlindDir = path.join(workspacePath, 'dist', 's4b-blind');
+        fs.mkdirSync(s4bBlindDir, { recursive: true });
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), 's4b changed baseline\n');
+        fs.writeFileSync(path.join(s4bBlindDir, 'deleted.txt'), 's4b deleted baseline\n');
+        await filesConfig.update('watcherExclude', { 'dist/s4b-blind/**': true },
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [
+            privateInclude,
+            { scope: 'folder', folder: primaryFolder.name, path: 'dist/s4b-blind' }
+        ], vscode.ConfigurationTarget.Workspace);
+        await untilStable('S4-B baseline ready before scope Apply', async () => (await state()).baselineState === 'ready');
+        const s4bApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+            grantConsent: true
+        });
+        assert.equal(s4bApply.status, 'applied', JSON.stringify(s4bApply));
+        assert.equal(
+            await vscode.commands.executeCommand('diffTracker._testOriginalContent', uri('dist/s4b-blind/changed.txt').fsPath),
+            's4b changed baseline\n'
+        );
+
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), 's4b changed after\n');
+        fs.writeFileSync(path.join(s4bBlindDir, 'created.txt'), 's4b created after\n');
+        fs.unlinkSync(path.join(s4bBlindDir, 'deleted.txt'));
+        await untilStable('S4-B watcher-excluded changed file', async () =>
+            (await pending('dist/s4b-blind/changed.txt'))?.currentContent === 's4b changed after\n');
+        await untilStable('S4-B watcher-excluded created file', async () => {
+            const change = await pending('dist/s4b-blind/created.txt');
+            return change?.baselineExists === false && change.currentExists === true ? change : undefined;
+        });
+        await untilStable('S4-B watcher-excluded deleted file', async () =>
+            (await pending('dist/s4b-blind/deleted.txt'))?.isDeleted === true);
+        console.log('PASS HOST-S4-B literal watcher blind subtree observes create/change/delete');
+
+        for (const operation of ['reset', 'repository rebuild', 'Stop/Start']) {
+            if (operation === 'reset') {
+                assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
+            } else if (operation === 'repository rebuild') {
+                assert.equal(await vscode.commands.executeCommand('diffTracker._testRebuildGitBaseline', pausedRepository.repoRoot), true);
+            } else {
+                await vscode.commands.executeCommand('diffTracker.stopRecording');
+                await vscode.commands.executeCommand('diffTracker.startRecording');
+            }
+            await untilStable(`S4-B ${operation} baseline`, async () => (await state()).baselineState === 'ready');
+            const content = `s4b after ${operation}\n`;
+            fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), content);
+            await untilStable(`S4-B direct coverage after ${operation}`, async () =>
+                (await pending('dist/s4b-blind/changed.txt'))?.currentContent === content);
+            console.log(`PASS HOST-S4-B direct watcher coverage survives ${operation}`);
+        }
+
+
+        await filesConfig.update('watcherExclude', previousWatcherExclude,
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [privateInclude],
+            vscode.ConfigurationTarget.Workspace);
+        await delay(250);
+
         await write('batch-a.txt', 'stopped clear preserves disk\n');
         await untilStable('stopped clear pending', () => pending('batch-a.txt'));
         await vscode.commands.executeCommand('diffTracker.stopRecording');
@@ -671,5 +731,6 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await state()).reviewTokens.length, 0);
         assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
+        await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
 };
