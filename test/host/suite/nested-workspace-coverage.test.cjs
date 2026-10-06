@@ -16,6 +16,17 @@ async function until(description, predicate) {
     }
 }
 
+async function afterEvent(description, event, matches, update) {
+    let delivered = false;
+    const subscription = event(value => { if (matches(value)) { delivered = true; } });
+    try {
+        await update();
+        await until(description, () => delivered);
+    } finally {
+        subscription.dispose();
+    }
+}
+
 module.exports = async function nestedWorkspaceCoverageHost(outerPath) {
     const outer = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(outerPath));
     assert.ok(outer, 'outer workspace folder must be registered');
@@ -35,19 +46,27 @@ module.exports = async function nestedWorkspaceCoverageHost(outerPath) {
         fs.mkdirSync(path.join(nested, '.vscode'));
         fs.writeFileSync(outerFile, 'outer baseline\n');
         fs.writeFileSync(nestedFile, 'nested baseline\n');
-        fs.writeFileSync(path.join(nested, '.vscode', 'settings.json'), JSON.stringify({
-            'files.watcherExclude': { 'src/**': true }
-        }));
-        await filesConfig.update('watcherExclude', { ...previousExcludes, 'vendor/**': true },
-            vscode.ConfigurationTarget.WorkspaceFolder);
-        assert.equal(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length, 0, {
-            uri: vscode.Uri.file(nested), name: 'nested-supplemental-package'
-        }), true);
-        await until('nested workspace registration', () =>
-            vscode.workspace.getWorkspaceFolder(vscode.Uri.file(src))?.uri.fsPath === nested);
+        // Wait for notification delivery, not only updated folder lookup: a
+        // later event would stop a new tracker and invalidate its install epoch.
+        await afterEvent('nested workspace registration event', vscode.workspace.onDidChangeWorkspaceFolders,
+            event => event.added.some(folder => folder.uri.fsPath === nested), () => {
+                assert.equal(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length, 0, {
+                    uri: vscode.Uri.file(nested), name: 'nested-supplemental-package'
+                }), true);
+            });
         const nestedFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(src));
-        await until('nested watcher exclusion', () =>
-            vscode.workspace.getConfiguration('files', nestedFolder.uri).get('watcherExclude', {})['src/**']);
+        assert.equal(nestedFolder?.uri.fsPath, nested);
+        // Apply each folder policy only after registration, and wait for the
+        // actual configuration notification before constructing the tracker.
+        for (const [folder, pattern] of [[outer, 'vendor/**'], [nestedFolder, 'src/**']]) {
+            const config = vscode.workspace.getConfiguration('files', folder.uri);
+            const previous = config.inspect('watcherExclude')?.workspaceFolderValue;
+            await afterEvent(`${folder.name} watcher exclusion event`, vscode.workspace.onDidChangeConfiguration,
+                event => event.affectsConfiguration('files.watcherExclude', folder.uri), () =>
+                    config.update('watcherExclude', { ...previous, [pattern]: true },
+                        vscode.ConfigurationTarget.WorkspaceFolder));
+            assert.equal(vscode.workspace.getConfiguration('files', folder.uri).get('watcherExclude', {})[pattern], true);
+        }
 
         // Keep independent host watchers as a negative control. The production
         // tracker below owns only native direct watchers, so these cannot mask
@@ -78,9 +97,12 @@ module.exports = async function nestedWorkspaceCoverageHost(outerPath) {
         assert.equal(plan.issue, undefined);
         assert.deepEqual(plan.targets, [vendor, src],
             'outer containment must not remove a target owned by the nested workspace');
-        const install = await tracker.installSupplementalCoverageTargets(plan.targets, tracker.sessionEpoch, true);
+        const installEpoch = tracker.sessionEpoch;
+        const install = await tracker.installSupplementalCoverageTargets(plan.targets, installEpoch, true);
+        assert.equal(tracker.sessionEpoch, installEpoch, 'fixture events must settle before watcher installation');
+        assert.equal(tracker.isRecording, true, 'fixture setup must not pause the new tracker');
         tracker.commitSupplementalCoverageTargets(plan.targets);
-        assert.deepEqual(install.successfulRoots, [vendor, src]);
+        assert.deepEqual(install.successfulRoots, [vendor, src], JSON.stringify(tracker.getSubtreeCoverageGaps()));
         assert.deepEqual([...tracker.supplementalCoverageRoots], [vendor, src]);
         assert.deepEqual([...tracker.supplementalDirectoryWatchers.keys()], [vendor, src],
             'outer traversal stops at the nested workspace root and cannot watch its src directory');
@@ -111,12 +133,13 @@ module.exports = async function nestedWorkspaceCoverageHost(outerPath) {
         if (tracker) { await tracker.dispose(); }
         const folder = vscode.workspace.workspaceFolders.find(item => item.uri.fsPath === nested);
         if (folder) {
-            assert.equal(vscode.workspace.updateWorkspaceFolders(folder.index, 1), true);
-            await until('nested workspace removal', () =>
-                !vscode.workspace.workspaceFolders.some(item => item.uri.fsPath === nested));
+            await afterEvent('nested workspace removal event', vscode.workspace.onDidChangeWorkspaceFolders,
+                event => event.removed.some(item => item.uri.fsPath === nested), () => {
+                    assert.equal(vscode.workspace.updateWorkspaceFolders(folder.index, 1), true);
+                });
         }
         await filesConfig.update('watcherExclude', previousExcludes, vscode.ConfigurationTarget.WorkspaceFolder);
-        fs.rmSync(vendor, { recursive: true, force: true });
-        fs.rmSync(storage, { recursive: true, force: true });
+        await fs.promises.rm(vendor, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        await fs.promises.rm(storage, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     }
 };
