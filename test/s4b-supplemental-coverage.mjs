@@ -33,6 +33,74 @@ export function registerS4BSupplementalCoverage(h, fixture) {
     const {test, Uri, DiffTracker, file, getTracker, setTracker, setVsCodeExcludes, nativeDirectoryWatchers,
         fireConfigurationChanged} = h;
 
+    for (const mode of ['rules', 'wholeWorkspace']) test(`S4-B nested workspace ${mode} retains independent observation and review baselines`, () => fixture(async ({tracker,dir,folder}) => {
+        const outer = path.join(dir, 'vendor');
+        const nestedRoot = path.join(outer, 'pkg');
+        const inner = path.join(nestedRoot, 'src');
+        fs.mkdirSync(inner, {recursive:true});
+        const outerFile = path.join(outer, 'outer.txt');
+        const innerFile = path.join(inner, 'inner.txt');
+        fs.writeFileSync(outerFile, 'outer before');
+        fs.writeFileSync(innerFile, 'inner before');
+        const nested = {uri:Uri.file(nestedRoot), name:'nested'};
+        const {vscode} = h;
+        const previousGet = vscode.workspace.getWorkspaceFolder;
+        const previousConfig = vscode.workspace.getConfiguration;
+        let innerExcludes = {'src/**':true};
+        vscode.workspace.workspaceFolders = [folder, nested];
+        vscode.workspace.getWorkspaceFolder = uri =>
+            tracker.pathBelongsToRoot(uri.fsPath, nestedRoot) ? nested : previousGet(uri);
+        vscode.workspace.getConfiguration = (section, resource) => {
+            const config = previousConfig(section, resource);
+            return {...config, get:(key, fallback) => key === 'files.watcherExclude'
+                ? resource && tracker.pathBelongsToRoot(resource.fsPath, nestedRoot)
+                    ? innerExcludes : {'vendor/**':true}
+                : config.get(key, fallback)};
+        };
+        try {
+            tracker.sessionWorkspaceRoots = tracker.getWorkspaceRoots();
+            tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+            tracker.maxImportedDirectoryWatchers = 2;
+            const requested = configuredScope(tracker, mode, [
+                {scope:'folder', folder:nested.name, path:'src'},
+                {scope:'folder', folder:folder.name, path:'vendor'}
+            ]);
+            const result = await tracker.applyConfiguredMonitoringScope(requested, false, () => true);
+            assert.equal(result.status, 'applied', JSON.stringify(result));
+            assert.equal(tracker.getOriginalContent(innerFile), 'inner before');
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 0);
+            fs.writeFileSync(outerFile, 'outer after');
+            fs.writeFileSync(innerFile, 'inner after');
+            // No host event is supplied: each non-recursive native owner can
+            // report only its direct child, never an inner workspace descendant.
+            activeNativeWatcher(nativeDirectoryWatchers, outer)?.listener('change', 'outer.txt');
+            activeNativeWatcher(nativeDirectoryWatchers, inner)?.listener('change', 'inner.txt');
+            await settle(tracker);
+            const changes = new Map(tracker.getTrackedChanges().map(change => [change.filePath, change]));
+            assert.equal(changes.get(innerFile)?.currentContent, 'inner after',
+                'a ready baseline must not silently miss the nested host-excluded edit');
+            assert.equal(changes.get(outerFile)?.currentContent, 'outer after');
+            assert.equal(tracker.getOriginalContent(innerFile), 'inner before');
+            assert.equal(tracker.getOriginalContent(outerFile), 'outer before');
+            assert.deepEqual([...tracker.supplementalCoverageRoots], [outer, inner]);
+            assert.equal(tracker.supplementalDirectoryWatchers.has(nestedRoot), false,
+                'outer traversal still stops at the nested workspace root');
+
+            innerExcludes = {};
+            fireConfigurationChanged('files.watcherExclude');
+            assert.deepEqual([...tracker.supplementalCoverageRoots], [outer]);
+            assert.equal(activeNativeWatcher(nativeDirectoryWatchers, inner), undefined,
+                'removing inner coverage must release its owner even while the outer target remains');
+            assert.equal(tracker.supplementalDirectoryWatchers.has(inner), false);
+            assert.ok(activeNativeWatcher(nativeDirectoryWatchers, outer));
+            assert.equal(tracker.getOriginalContent(innerFile), 'inner before');
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 0);
+        } finally {
+            vscode.workspace.getConfiguration = previousConfig;
+            vscode.workspace.getWorkspaceFolder = previousGet;
+        }
+    }, 'rules'));
+
     test('S4-B P2 concrete excluded parent keeps a narrow directory include within its own budget', () => fixture(async ({tracker,dir}) => {
         const excluded = path.join(dir, 'node_modules');
         const included = path.join(excluded, 'included-package');

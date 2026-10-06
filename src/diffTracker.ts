@@ -1924,7 +1924,11 @@ export class DiffTracker {
             .sort((left, right) => left.length - right.length || left.localeCompare(right));
         const result: string[] = [];
         for (const target of ordered) {
-            if (result.some(existing => this.pathBelongsToRoot(target, existing))) { continue; }
+            // Direct traversal stops at nested workspace roots. An ancestor
+            // owned by another folder cannot cover this target's descendants.
+            const owner = this.owningWorkspaceFolderForTraversal(target);
+            if (owner && result.some(existing => this.pathBelongsToRoot(target, existing) &&
+                this.workspaceFolderOwnsTraversalPath(owner, existing))) { continue; }
             result.push(target);
         }
         return result;
@@ -1990,7 +1994,9 @@ export class DiffTracker {
         const desired = this.normalizeSupplementalTargets(targets);
         this.supplementalCoverageRoots = new Set(desired);
         for (const [directory, entry] of [...this.supplementalDirectoryWatchers]) {
-            if (desired.some(root => this.pathBelongsToRoot(directory, root))) { continue; }
+            // Physical containment by another workspace's target does not
+            // retain an owner whose own coverage obligation was removed.
+            if (this.supplementalCoverageRoots.has(entry.coverageRoot)) { continue; }
             entry.watcher.dispose();
             this.supplementalDirectoryWatchers.delete(directory);
         }

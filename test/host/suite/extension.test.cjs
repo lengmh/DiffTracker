@@ -733,4 +733,5 @@ module.exports = async function runExtensionHostScenario() {
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
         await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
+        await require('./nested-workspace-coverage.test.cjs')(secondRoot);
 };
