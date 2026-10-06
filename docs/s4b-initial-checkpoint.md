@@ -104,3 +104,23 @@ requires explicit recovery; it is not evidence that no pending change exists.
   promotion is corrected to enforce rejection and unchanged effective scope;
   it also fails against the old source. Full and exact-head CI results are
   recorded in the PR.
+
+## Nested workspace target ownership correction
+
+- An ancestor supplemental target only replaces a descendant target when both
+  belong to the same deepest workspace folder. Traversal still stops at nested
+  workspace roots; an outer `vendor` target cannot replace a nested folder's
+  `src` target at `vendor/pkg/src`.
+- Committing a narrower target set releases watches by their exact coverage-root
+  ownership. A retained outer target cannot keep obsolete inner-folder owners
+  alive or charge them against the shared direct-watcher budget.
+- Focused Rules and Whole Workspace regressions exercise independent external
+  edits, unchanged review baselines, the two-owner capacity bound, and retirement
+  of only the inner owner after its watcher exclusion is removed. The missed-edit
+  counterexample fails on merged source `4ea552b7`; the obsolete-owner check also
+  fails with only the deduplication correction applied.
+- The existing real-host suite adds nested workspace registration, folder-scoped
+  watcher exclusions, native external edits, and persisted baseline checks. Its
+  Linux/Windows and VS Code-version results belong to the exact-head PR checks.
+  This correction does not add ownership handoff, reconciliation or provider
+  support beyond the existing S4-B checkpoint.
