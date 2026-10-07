@@ -102,3 +102,9 @@
 [Verification #547](https://github.com/lengmh/DiffTracker/actions/runs/37605238014) 再次通过实际安装五阶段及两个 Ubuntu Host。Windows 已通过全部 Native、S4-D、Recheck 和主 Host suite，随后在 restart.prepare 的单次目录 rename 上收到 `EPERM`，尚未进入导入 handoff 或恢复断言。该日志不识别锁持有者，不能归因于某个扩展或后端。审查确认 main DiffTracker 当时已停止；测试原先在 workspace 内临时构建源目录，仍可能被 workbench/Git/系统观察。
 
 对应的 S4-C handoff 与 S4-D restart 两处夹具改在 workspace 的同文件系统相邻目录暂存，并在真实 Host 中断言该源不属于任何 workspace、设备一致。实际只做一次 rename，保留后续 owner、Keep、待审、持久化、进程重启和清理断言；不加重试或延长时限。S4-B 专门测试已监听目录替换的 in-workspace rename 不变。这是测试源隔离，不是已查明某个锁所有者或生产缺陷的声明。
+
+## 独立同夹具诊断
+
+[两版本 Ubuntu 诊断](https://github.com/lengmh/DiffTracker/actions/runs/37608195149) 使用独立分支 `e02d1939a1616cad88e8cca841efcc5fc5ea4b2e`，在同一源码/夹具上分别固定 VS Code 1.140.0 和 1.141.0。两个 job 均通过全部 18 项 S4-D 观察、完整 main suite 和跨进程 restart。该轮未重现 #548 的超时，不能据此证明版本回归、事件丢失，或声称某个根因已被修复；也不代替 PR 的完整实际 Stable gate。
+
+保留的失败遥测仅记录原有观察轮次的最后状态、前置基线、18 个逐项期望/实际条件、文本长度/指纹、opaque 身份、token 是否存在和不相关待审摘要。仅在失败后读取这 18 个已知小文件的有界磁盘证据，并重抛同一个原始错误。Ready、18 项谓词、30 秒期限、750 ms 稳定要求以及所有后续断言不变；不重试观察、不调用 Recheck/Clear、不补事件，不添加后端 hook。若完整 gate 再次失败，应以具体逐文件证据决定后续最小修正。
