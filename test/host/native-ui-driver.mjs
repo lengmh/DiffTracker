@@ -401,12 +401,22 @@ export async function runNativeUiDriver(portText, operation, argument) {
                 const state = await inspect('context');
                 return state.contextActionPoint ? state : undefined;
             });
-            await click(before.contextActionPoint);
+            // VS Code menu.ts installs its mouseup activation handler 100 ms
+            // after render to reject accidental clicks. A visible menu is not
+            // immediately actionable. Honor that source-defined guard once,
+            // then revalidate; never activate again after an uncertain click.
+            // https://github.com/microsoft/vscode/blob/1.80.2/src/vs/base/browser/ui/menu/menu.ts#L462-L507
+            await delay(150);
+            const ready = await inspect('context');
+            if (!ready.contextActionPoint || JSON.stringify(ready.contextMenus) !== JSON.stringify(before.contextMenus)) {
+                throw new Error('The Native Review menu changed during its activation guard');
+            }
+            await click(ready.contextActionPoint);
             const after = await until('the actual editor context menu to close', async () => {
                 const state = await inspect('state');
                 return state.contextMenus.length === 0 ? state : undefined;
             });
-            return { operation, clicked: true, action: argument, before, after };
+            return { operation, clicked: true, action: argument, before: ready, after };
         }
         if (operation === 'pick-native-file') {
             const picker = await until('the Native Review file picker', async () => {

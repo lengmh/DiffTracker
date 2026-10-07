@@ -62,3 +62,11 @@ VS Code 1.80 Linux 默认的原生标题栏会选择 OS context menu，CDP 无�
 进一步核对 VS Code 源码后，测试修正点击目标和 DOM 探测范围：inline Diff 会在 modified 编辑器的 view-zone 内展示不可编辑的 original 删除文本，不能把这些装饰文字当作 current 编辑器的输入区域。目标现在必须属于该 modified 编辑器自己的主 view-lines，并排除 view-zone 和嵌套编辑器。菜单查询、焦点观察和 hit testing 同时检查开放的 shadow root，避免把已渲染在 shadow root 中的菜单误判为不存在。另加最多 60 条被动输入诊断；不改变焦点、选区、事件默认行为或产品状态。
 
 合成 DOM 测试分别验证装饰文字排除、shadow 菜单发现与深层 hit testing；实际验收仍保留一次物理点击、Shift+F10、公开 URI/token 和 baseline 结果断言。下一提交的 CI 结果独立核对，不追溯覆盖前两轮失败。
+
+`4b0fbfd` 的 [Verification #539](https://github.com/lengmh/DiffTracker/actions/runs/37576837828) 已在 Windows/Ubuntu Stable 通过真实两文件 Multi Diff 焦点切换，但三个 Host 仍在后续菜单阶段失败。Stable 的菜单存在却没有 Native Review 动作；最低版本已找到并点击动作，但菜单未激活关闭。两组 Quality 与降级检查通过，VSIX 仍跳过。
+
+Stable 的缺失动作通过最小生产修正处理：Multi Diff 子编辑器的菜单上下文不可靠地提供普通编辑器的 `resourceScheme`。现在只将 active editor 是否为 current snapshot 投影到菜单可见性键，初始化、切换和释放时同步；所有动作仍独立核验点击 URI、实际 active document、文本、原 token 与完整块，不能用可见性键授权写入。红绿回归覆盖 current → baseline/file/undefined、释放以及菜单可见时的错误资源拒绝，专项为 31/31。
+
+测试同时遵守 VS Code 菜单的 100 ms 初始激活保护：首次发现后等待一次 150 ms，再核验同一启用动作并只点击一次，保留关闭与 baseline 断言。Native 验收改用独立的临时 Host 进程/user-data；还原并校验测试文件与配置后退出，再运行原 prepare → restore 双进程。这样不再在本轮保存事件仍可能排队时，立即重建下轮基线。原 90/150/45 秒验收限制保持不变，文件还原失败仍使测试失败，后端的未知 before-image 保护没有改动。
+
+此轮生产可见性修正后的本地完整聚合为 tracker 1063/1063，编译、lint、性能与 VSIX 均通过；31 项 Native 回归还验证了释放时清理可见性键，故意移除该清理会使回归失败。菜单激活保护依据 [VS Code 1.80 menu.ts](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/base/browser/ui/menu/menu.ts#L462-L542)。两个 Stable 菜单的缺失与 [Multi Diff context scope](https://github.com/microsoft/vscode/blob/main/src/vs/editor/browser/widget/multiDiffEditor/multiDiffEditorWidgetImpl.ts#L208-L225) 一致，但不把推断出的具体旧 key 值当作已直接观测的事实。

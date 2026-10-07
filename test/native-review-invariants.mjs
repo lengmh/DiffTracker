@@ -12,7 +12,7 @@ export function registerNativeReviewInvariants(h) {
             configuration: vscode.workspace.getConfiguration,
             configEvent: vscode.workspace.onDidChangeConfiguration,
             uriWith: Uri.prototype.with, uriString: Uri.prototype.toString };
-        const commands = new Map(), providers = new Map(), calls = [], sources = [];
+        const commands = new Map(), providers = new Map(), calls = [], sources = [], activeListeners = new Set();
         Uri.prototype.with = function(change) { return Object.assign(new Uri(this.fsPath), this, change); };
         Uri.prototype.toString = function() { return `${this.scheme}://${this.fsPath}${this.query ? `?${this.query}` : ''}`; };
         vscode.commands = {
@@ -29,6 +29,9 @@ export function registerNativeReviewInvariants(h) {
         } };
         vscode.window.showInformationMessage = async () => undefined;
         vscode.window.visibleTextEditors = [];
+        vscode.window.onDidChangeActiveTextEditor = listener => {
+            activeListeners.add(listener); return { dispose() { activeListeners.delete(listener); } };
+        };
         vscode.window.showQuickPick = async items => items[0];
         vscode.workspace.registerTextDocumentContentProvider = (scheme, provider) => {
             providers.set(scheme, provider); return { dispose() { providers.delete(scheme); } };
@@ -52,6 +55,7 @@ export function registerNativeReviewInvariants(h) {
             Uri.prototype.with = old.uriWith; Uri.prototype.toString = old.uriString;
         }
         return { commands, providers, calls, sources, restore,
+            activate(editor) { vscode.window.activeTextEditor = editor; for (const listener of activeListeners) { listener(editor); } },
             run: (command, ...args) => vscode.commands.executeCommand(`diffTracker.nativeReview.${command}`, ...args),
             read: uri => providers.get(uri.scheme).provideTextDocumentContent(uri),
             focus(uri, text = providers.get(uri.scheme).provideTextDocumentContent(uri)) {
@@ -59,6 +63,7 @@ export function registerNativeReviewInvariants(h) {
                     lineCount: text.split('\n').length,
                     lineAt: line => ({ text: text.split('\n')[line].replace(/\r$/, '') }) };
                 vscode.window.activeTextEditor = { document, selections: [] };
+                for (const listener of activeListeners) { listener(vscode.window.activeTextEditor); }
                 return vscode.window.activeTextEditor;
             } };
     }
@@ -266,7 +271,7 @@ export function registerNativeReviewInvariants(h) {
             const command = `diffTracker.nativeReview.${suffix}`;
             assert.ok(manifest.contributes.commands.some(item => item.command === command));
             assert.ok(menus['editor/context'].some(item => item.command === command &&
-                item.when.includes('resourceScheme == diff-tracker-review-current')));
+                item.when === 'diffTracker.nativeReviewContext'));
             assert.ok(menus.commandPalette.some(item => item.command === command && item.when === 'false'));
             assert.equal(Object.entries(menus).some(([menu, items]) => !['editor/context', 'commandPalette'].includes(menu) &&
                 items.some(item => item.command === command)), false, 'no ambiguous title/header write action');
@@ -399,5 +404,25 @@ export function registerNativeReviewInvariants(h) {
             vscode.OverviewRulerLane = old.lane; vscode.TabInputTextDiff = old.tabType;
             ui.restore();
         }
+    });
+
+    test('NATIVE menu visibility follows active snapshot capability without authorizing a wrong resource', async () => {
+        const p = file('native-menu-context.txt'); seed(p, 'old', 'new'); await scan(p);
+        const ui = host();
+        const visible = () => ui.calls.filter(call => call[0] === 'setContext' &&
+            call[1] === 'diffTracker.nativeReviewContext').at(-1)?.[2];
+        try {
+            assert.equal(visible(), false);
+            await ui.run('openFile', p); const [, base, current] = ui.calls.at(-1);
+            ui.focus(current); assert.equal(visible(), true);
+            assert.equal((await ui.run('keepFile', Uri.file(p))).status, 'conflict');
+            assert.equal(h.getTracker().getOriginalContent(p), 'old');
+            ui.focus(base); assert.equal(visible(), false);
+            ui.focus(Uri.file(p), 'new'); assert.equal(visible(), false);
+            ui.focus(current); assert.equal(visible(), true);
+            ui.activate(undefined); assert.equal(visible(), false);
+            ui.focus(current); assert.equal(visible(), true, 'dispose must clear a currently visible capability');
+        } finally { ui.restore(); }
+        assert.equal(visible(), false, 'disposing clears the capability projection');
     });
 }

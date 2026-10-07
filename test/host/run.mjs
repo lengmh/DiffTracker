@@ -15,6 +15,7 @@ const secondRoot = path.join(tempRoot, 'second root');
 const workspaceFile = path.join(tempRoot, 'host.code-workspace');
 const restartStorage = path.join(tempRoot, 's4d-restart-storage');
 const userDataPath = path.join(tempRoot, 'user-data');
+const nativeUserDataPath = path.join(tempRoot, 'native-user-data');
 const git = (...args) => execFileSync('git', args, {
     cwd: workspacePath,
     encoding: 'utf8',
@@ -36,8 +37,8 @@ try {
     // VS Code 1.80 on Linux otherwise uses an OS-native context menu, which
     // cannot be inspected through the renderer. Select the real workbench's
     // custom menu at startup (these application settings require a restart).
-    mkdirSync(path.join(userDataPath, 'User'), { recursive: true });
-    writeFileSync(path.join(userDataPath, 'User', 'settings.json'), JSON.stringify({
+    mkdirSync(path.join(nativeUserDataPath, 'User'), { recursive: true });
+    writeFileSync(path.join(nativeUserDataPath, 'User', 'settings.json'), JSON.stringify({
         'window.titleBarStyle': 'custom',
         'window.menuStyle': 'custom'
     }));
@@ -112,12 +113,25 @@ try {
             '--skip-release-notes'
         ]
     };
+    // Native acceptance owns a distinct temporary session. Its cleanup restores
+    // file bytes but must not rebuild through still-queued save/watcher events.
+    // Await process exit before the original fresh prepare/restore pair starts.
+    await runTests({
+        ...hostOptions,
+        launchArgs: hostOptions.launchArgs.map(argument => argument.startsWith('--user-data-dir=')
+            ? `--user-data-dir=${nativeUserDataPath}` : argument),
+        extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'native' }
+    });
+    assert.equal(readFileSync(path.join(workspacePath, 'native-a.txt'), 'utf8'),
+        'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n');
+    assert.equal(readFileSync(path.join(workspacePath, 'native-b.txt'), 'utf8'),
+        'b header\nbeta value=old\nb footer\n');
     await runTests({
         ...hostOptions,
         extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'prepare' }
     });
 
-    // runTests resolves only after the first VS Code process exits. Keep the
+    // runTests resolves only after the prepare VS Code process exits. Keep the
     // same workspace, user-data, extensions and dedicated session storage, and
     // make the offline edit here rather than from either Extension Host.
     const manifestPath = path.join(restartStorage, 'restart-fixture.json');

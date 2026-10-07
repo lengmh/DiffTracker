@@ -28,11 +28,21 @@ export class NativeReviewAdapter implements vscode.Disposable, vscode.TextDocume
             vscode.commands.registerCommand('diffTracker.nativeReview.revertFile', (context?: unknown) => this.applyFile('revert', context)),
             vscode.commands.registerCommand('diffTracker.nativeReview.keepSelectedBlock', (context?: unknown) => this.applyBlock('keep', context)),
             vscode.commands.registerCommand('diffTracker.nativeReview.revertSelectedBlock', (context?: unknown) => this.applyBlock('revert', context)),
+            vscode.window.onDidChangeActiveTextEditor(editor => this.publishMenuContext(editor)),
             vscode.workspace.onDidChangeConfiguration(event => {
                 if (event.affectsConfiguration('diffTracker.nativeQuickDiff')) { this.configureQuickDiff(); }
             })
         );
+        this.publishMenuContext(vscode.window.activeTextEditor);
         this.configureQuickDiff();
+    }
+
+    private publishMenuContext(editor: vscode.TextEditor | undefined): void {
+        // Multi Diff's menu scope does not reliably publish resourceScheme for
+        // its focused child. This is visibility only; handlers still require
+        // the clicked URI, active document, immutable content and backend token.
+        void vscode.commands.executeCommand('setContext', 'diffTracker.nativeReviewContext',
+            editor?.document.uri.scheme === CURRENT_SCHEME);
     }
 
     private configureQuickDiff(): void {
@@ -190,6 +200,7 @@ export class NativeReviewAdapter implements vscode.Disposable, vscode.TextDocume
     }
 
     public dispose(): void {
+        this.publishMenuContext(undefined);
         this.sourceControl?.dispose();
         this.sourceControl = undefined;
         while (this.disposables.length) { this.disposables.pop()?.dispose(); }

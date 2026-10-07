@@ -554,22 +554,22 @@
       "editor/context": [
         {
           "command": "diffTracker.nativeReview.keepSelectedBlock",
-          "when": "resourceScheme == diff-tracker-review-current",
+          "when": "diffTracker.nativeReviewContext",
           "group": "diffTracker@1"
         },
         {
           "command": "diffTracker.nativeReview.revertSelectedBlock",
-          "when": "resourceScheme == diff-tracker-review-current",
+          "when": "diffTracker.nativeReviewContext",
           "group": "diffTracker@2"
         },
         {
           "command": "diffTracker.nativeReview.keepFile",
-          "when": "resourceScheme == diff-tracker-review-current",
+          "when": "diffTracker.nativeReviewContext",
           "group": "diffTracker@3"
         },
         {
           "command": "diffTracker.nativeReview.revertFile",
-          "when": "resourceScheme == diff-tracker-review-current",
+          "when": "diffTracker.nativeReviewContext",
           "group": "diffTracker@4"
         }
       ],
