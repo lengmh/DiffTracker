@@ -41,7 +41,7 @@
 
 结果需写明文件构成、工作量、平台、Host/Node 版本、测量区间和指标口径，区别 baseline scan、准备、burst 收敛、watcher 峰值与进程 RSS。单次样本不构成普遍性能保证或新容量承诺；不提高既有限制，也不将不同预算合并成一个文件数。原有纯文本 performance fixture 继续保留，新夹具不能替代完整聚合回归。
 
-### 本地实测（2026-10-07）
+### 初始本地实测（2026-10-07，加入 Recheck 前）
 
 [`test/performance-mixed.mjs`](../test/performance-mixed.mjs) 已完成五次本地成功运行，且独立审查未发现 P0/P1/P2 问题。环境为 Linux x64、Node.js 24.19.0；使用生产 tracker/scope 公共 API、真实本地文件和 Session V4 持久化，以及真实 OS `fs.watch`。VS Code 配置、发现和宿主 watcher 回调位于 stub 边界，因此这不是 Extension Host 性能或全平台验收。
 
@@ -66,9 +66,9 @@
 | --- | --- | --- |
 | 设置与原有 adapter 的源码回归 | 本地完整聚合已通过：tracker 1070（Native Review 38）、review UI 39、Git adapter 31、真实临时 Git 仓库 9 | 最终候选确切提交的 CI 仍待核对 |
 | 设置改动独立审查 | 未发现独立 P0/P1/P2 问题；最终候选审查另行核对 | 对应审查范围与提交 |
-| 三组真实开发 Host 的新增设置入口 | 待结果 | Windows/Ubuntu Stable、Ubuntu 1.80.2 日志 |
-| 实际安装、同 ID 升级、recording/stopped 激活恢复 | 待结果 | 发布资产与候选身份、真实旧 session、分阶段日志 |
-| 候选 opaque 跨 Host 恢复 | 待结果，独立于旧版迁移 | 候选基线/身份、重启前后状态 |
+| 三组真实开发 Host 的新增设置入口 | #545/#546 三组均通过全部 13 条 Native 检查；不等于完整 Host suite 全部通过 | Windows/Ubuntu Stable、Ubuntu 1.80.2 日志；后续范围失败见下文 |
+| 实际安装、同 ID 升级、recording/stopped 激活恢复 | #546 Ubuntu Stable 五阶段通过 | 官方资产身份、实际 V3→V4、同一存储路径及原文本 before-image；[安装证据](https://github.com/lengmh/DiffTracker/actions/runs/37603115636/artifacts/11473398391) |
+| 候选 opaque 跨 Host 恢复 | #546 通过，独立于旧版迁移 | 候选基线/身份及待审跨 recording/stopped 激活保留 |
 | 混合预检、burst、watcher 峰值、RSS | 五次本地样本通过；独立审查未发现 P0/P1/P2 问题 | 第 4 节的真实文件/API stub 边界、构成、正确性和测量口径；最终 CI 待核对 |
 | 编译、lint、完整聚合与 VSIX | 本地编译、lint、聚合与包装通过；最终候选 CI 待核对 | 完整日志、产物内容和来源；降级保护独立核对 |
 | 最终 CI、PR 状态与发布决策 | 待核对；未发布 | 确切 head/run，审查、合并和发布分别陈述 |
@@ -82,3 +82,19 @@
 [Verification #545](https://github.com/lengmh/DiffTracker/actions/runs/37602431751) 已启动实际 job：三组 Native Review 均通过新增常规设置入口以及全部 13 条 Native 检查，但 Windows 后续既有 S4-D cleanup 的零待审稳定等待超时，不能将整个 Windows Host 记为通过。下一次运行仅增加该失败点的被动状态诊断，保留原断言、时限和错误，不重试 Clear，也不改写未知状态。
 
 同轮安装 job 已完成候选首装的产品激活和文本/opaque 实际观察，但首个进程退出后，配置字节不变断言发现 VS Code 把测试配置 `extensions.autoUpdate: false` 迁移为 `off`。该行为与 [VS Code 官方迁移验证](https://github.com/microsoft/vscode/issues/321146) 一致。测试配置改用当前 Stable 的 `off` 枚举；全局规则和整个配置文件的严格不变断言仍保留。此时升级、后续激活恢复和最终包装尚未通过。
+
+## 安装验收与后续范围诊断
+
+[Verification #546](https://github.com/lengmh/DiffTracker/actions/runs/37603115636) 的 [Installed RC job](https://github.com/lengmh/DiffTracker/actions/runs/37603115636/job/112732034403) 已通过五个真实进程阶段：候选首装、recording 恢复、stopped 恢复、官方 `0.7.2` 准备及同 ID 升级。逐阶段记录安装路径、版本、`productionActivation: true` 与 VS Code 1.140.0；原 session 实为 V3，升级后同一扩展存储下为 V4，旧文本 before-image 和有序 legacy 规则保持不变。候选 opaque 恢复与旧版迁移仍分别陈述。产物校验与源码 `0.7.2` 未修改证据均已核对。
+
+该轮 Windows 与最低版本完整 Host 通过，Ubuntu Stable 在首次 recording Whole Workspace Apply 时因 concurrent workspace activity 安全拒绝而失败；尚无证据确定触发事件。原 Windows post-Clear 超时本轮未复现。下一检查仅隔离 Native 专用 opaque 文件（在 Git 基线之后创建、退出 Native Host 并核验还原后移除），并在 Apply 失败时记录前后公开状态；保留全部范围断言和时限，不重试 Apply/Clear、不压制未知状态、不修改后端保护。此隔离不是已经证明的范围失败根因修复。
+
+#545/#546 的 Windows 混合测量均在 burst 后通过 32 个精确待审结果、22 text/10 opaque 与 token 断言，再因四个现有目录的 supplemental coverage gap 未满足零缺口断言而失败。目录分别对应 pkg-4/5 替换、pkg-6 创建与 pkg-7 删除；这是原生父目录通知触发的既有保守保护。后续测量将保留并核验这些证据，单独测量一次显式有界 Recheck，只有原 before-image/待审未变且覆盖恢复后才继续 Mixed Accept；不删除该保护或把任意 gap 当作通过。
+
+### 单次 Recheck 的测量契约
+
+混合夹具保留原有 `node_modules/**` watcher exclusion、9 个 native owner 及全部文件操作。burst 后只允许同时满足三个条件的目录诊断：原因严格为 `supplemental-watcher-directory-change-gap`、路径属于本轮改变成员的 package 目录、并且测试在原生回调边界实际观察到该目录事件。逐条核验持久化证据，其他路径、原因或文件级 gap 仍失败。随后在每个平台调用一次公共 Recheck，不循环重试；要求覆盖归零、全部 32 项审阅的内容/存在性/指纹及持久化 baseline 不变，再进行 Mixed Accept。Recheck 对新建 opaque 资源可刷新说明文字并保守更新其 token；其他 token 必须保持一致，接受前必须重新取得有效 token。
+
+修正后的一个真实 Linux native 样本为预检 38.4 ms、准备 547.3 ms、burst 核验 192.1 ms、Recheck 426.1 ms、Mixed Accept 372.1 ms。真实 native 峰值仍为 9，替换期间 VS Code API stub 峰值为 2；Stop/dispose 后均为 0。整进程 RSS 采样峰值为 227.4 MiB（增量 137.7 MiB）。这些是加入 Recheck 后的独立样本，不能与上一节未包含该阶段的范围混为同一测量区间。
+
+另外通过 API 回调形状复现 Windows 的四个目录事件：旧断言失败；新夹具保留四个精确 gap，经一次 Recheck 清除并保持审阅和 baseline，随后处理 22 text/10 opaque。该注入仅是本地契约回归，输出明确标注注入数量；它不代替实际 Windows CI。

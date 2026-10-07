@@ -231,9 +231,33 @@ module.exports = async function runExtensionHostScenario() {
         await wholeWorkspaceProof.assertRulesBaseline();
 
         await scopeConfig.update('monitoringScope', 'wholeWorkspace', vscode.ConfigurationTarget.Workspace);
+        let beforeWholeApply, beforeWholeApplyError;
+        try { beforeWholeApply = await state(); }
+        catch (error) { beforeWholeApplyError = String(error); }
         const recordingWholeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
             grantConsent: true
         });
+        if (recordingWholeApply.status !== 'applied') {
+            try {
+                const summarize = current => current && ({
+                    isRecording: current.isRecording, baselineState: current.baselineState,
+                    policyFingerprint: current.policyFingerprint, coverageGeneration: current.coverageGeneration,
+                    effectiveMonitoringScope: current.effectiveMonitoringScope, gitPauses: current.gitPauses,
+                    unknownReviewPaths: current.unknownReviewPaths, retainedReviewPaths: current.retainedReviewPaths,
+                    coverageGaps: current.coverageGaps, subtreeCoverageGaps: current.subtreeCoverageGaps,
+                    trackedChanges: current.trackedChanges.map(change => ({
+                        filePath: change.filePath, reviewKind: change.reviewKind,
+                        reviewReason: change.reviewReason, unavailableReason: change.unavailableReason,
+                        baselineExists: change.baselineExists, currentExists: change.currentExists
+                    }))
+                });
+                console.error('S4 recording Whole Workspace Apply rejected:', JSON.stringify({
+                    result: recordingWholeApply, before: summarize(beforeWholeApply), beforeDiagnosticError: beforeWholeApplyError,
+                    after: summarize(await state()),
+                    scopeStatus: await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus')
+                }));
+            } catch (error) { console.error('S4 Apply diagnostic failed:', error); }
+        }
         assert.equal(recordingWholeApply.status, 'applied', JSON.stringify(recordingWholeApply));
         assert.equal(
             await vscode.commands.executeCommand('diffTracker._testOriginalContent', recordingWholeTrackedPath),

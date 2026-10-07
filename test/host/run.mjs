@@ -51,7 +51,6 @@ try {
         ['batch-a.txt', 'batch a\n'],
         ['batch-b.txt', 'batch b\n'],
         ['native-a.txt', 'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n'],
-        ['native-opaque.bin', Buffer.from([0, 1, 2, 3])],
         ['native-b.txt', 'b header\nbeta value=old\nb footer\n'],
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
@@ -86,6 +85,11 @@ try {
     git('config', 'core.autocrlf', 'false');
     git('add', '.');
     git('commit', '-m', 'host baseline');
+
+    // This resource belongs only to Native fallback acceptance, not to the
+    // shared Git baseline or the later scope/recovery fixtures.
+    const nativeOpaquePath = path.join(workspacePath, 'native-opaque.bin');
+    writeFileSync(nativeOpaquePath, Buffer.from([0, 1, 2, 3]));
 
     // Test-only renderer access for actual Quick Diff menu clicks and Multi
     // Diff child focus. The helper runs with this Node, not the old Host's Node.
@@ -127,6 +131,9 @@ try {
         'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n');
     assert.equal(readFileSync(path.join(workspacePath, 'native-b.txt'), 'utf8'),
         'b header\nbeta value=old\nb footer\n');
+    assert.deepEqual(readFileSync(nativeOpaquePath), Buffer.from([0, 1, 2, 3]));
+    rmSync(nativeOpaquePath);
+    assert.equal(existsSync(nativeOpaquePath), false, 'Native-only opaque fixture must not enter the main Host');
     await runTests({
         ...hostOptions,
         extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'prepare' }

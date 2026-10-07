@@ -76,6 +76,7 @@ const configuration = new Map();
 const configurationChanged = new Emitter();
 const hostWatchers = new Set();
 const nativeWatchers = new Map();
+const burstDirectoryNotifications = new Set();
 const watcherMetrics = { apiBoundaryPeak: 0, realNativePeak: 0, realNativeEvents: 0, injectedHostEvents: 0 };
 const warnings = [];
 let phase = 'setup';
@@ -92,6 +93,15 @@ const nativeWatch = fs.watch;
 fs.watch = (directory, options, listener) => {
     const watcher = nativeWatch(directory, options, (...args) => {
         watcherMetrics.realNativeEvents++;
+        // Some native backends notify a parent about child-directory metadata
+        // when entries inside that child are created, removed or replaced.
+        // Record the boundary evidence without changing the production event.
+        if (phase === 'burst' && args[1]) {
+            const target = path.resolve(String(directory), args[1].toString());
+            try {
+                if (fs.lstatSync(target).isDirectory()) { burstDirectoryNotifications.add(target); }
+            } catch { /* A removed file is not a directory-identity witness. */ }
+        }
         listener(...args);
     });
     nativeWatchers.set(watcher, path.resolve(String(directory)));
@@ -259,12 +269,14 @@ try {
 
     const expected = new Map();
     const temporaryPaths = [];
+    const membershipChangedDirectories = new Set();
     const burstOperations = { changed: 0, created: 0, deleted: 0, tempRenameReplacements: 0 };
     function change(relative, content, kind = 'text', replace = false) {
         const filePath = path.join(root, relative);
         const bytes = Buffer.from(content);
         const beforeFile = manifest.get(filePath);
         expected.set(filePath, { before: beforeFile, after: describe(bytes, kind) });
+        if (replace || !beforeFile) { membershipChangedDirectories.add(path.dirname(filePath)); }
         if (replace) {
             const temporary = `${filePath}.saving`;
             temporaryPaths.push(temporary);
@@ -280,6 +292,7 @@ try {
     function remove(relative) {
         const filePath = path.join(root, relative);
         expected.set(filePath, { before: manifest.get(filePath), after: undefined });
+        membershipChangedDirectories.add(path.dirname(filePath));
         fs.unlinkSync(filePath);
         emitHost('delete', filePath);
         burstOperations.deleted++;
@@ -326,7 +339,16 @@ try {
     assert.equal(tracker.getReviewTokens().length, pendingText);
     assert.equal(tracker.getOpaqueReviewTokens().length, pendingOpaque);
     assert.deepEqual(tracker.getUnknownReviewPaths(), []);
-    assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+    const burstCoverageGaps = tracker.getSubtreeCoverageGaps();
+    assert.equal(tracker.getCoverageGaps().length, burstCoverageGaps.length, 'no file-level gap is allowed');
+    for (const gap of burstCoverageGaps) {
+        assert.equal(gap.reasonCode, 'supplemental-watcher-directory-change-gap');
+        assert.equal(path.dirname(gap.targetPath), path.join(root, 'node_modules'), 'only direct package directories qualify');
+        assert.ok(membershipChangedDirectories.has(gap.targetPath), 'gap must belong to a membership-mutated directory');
+        assert.ok(burstDirectoryNotifications.has(gap.targetPath), 'gap must have an observed directory-target callback');
+    }
+    assert.deepEqual(new Set(burstCoverageGaps.map(gap => gap.targetPath)), burstDirectoryNotifications,
+        'every observed directory notification must retain its precise coverage evidence');
     for (const temporary of temporaryPaths) {
         assert.equal(fs.existsSync(temporary), false);
         assert.equal(tracker.getTrackedChange(temporary), undefined);
@@ -340,6 +362,74 @@ try {
     }
     assert.ok(watcherMetrics.realNativeEvents > 0);
     assert.ok(watcherMetrics.realNativePeak <= budgets.sharedDirectWatchers);
+
+    // Pending file identity and complete subtree coverage are different claims.
+    // Keep the original broad watcher exclusion and preserve any precise parent
+    // directory diagnostics before one explicit public Recheck. Do not retry a
+    // failed/limited recheck or use Start/Reset to accept these pending changes.
+    markPhase('coverageRecheck');
+    assert.equal(await tracker.flushPendingPersistence(), true);
+    const beforeRecheckSession = readSession();
+    const persistedBurstGaps = new Map(beforeRecheckSession.coverageGaps);
+    assert.deepEqual(new Set(persistedBurstGaps.keys()), new Set(burstCoverageGaps.map(gap => gap.targetPath)));
+    for (const gap of burstCoverageGaps) {
+        const evidence = persistedBurstGaps.get(gap.targetPath);
+        assert.equal(evidence.file, undefined);
+        assert.deepEqual(evidence.subtree, {
+            targetKind: 'subtree', reasonCode: gap.reasonCode, reason: gap.reason
+        });
+    }
+    const beforeTextTokens = tracker.getReviewTokens();
+    const beforeOpaqueTokens = tracker.getOpaqueReviewTokens();
+    const semanticReview = ({ timestamp: _timestamp, reviewReason: _reason, ...change }) => change;
+    const recheckStart = performance.now();
+    const rechecked = await controller.recheckObservationCoverage();
+    const coverageRecheckMilliseconds = elapsed(recheckStart);
+    assert.equal(rechecked.status, 'rechecked', JSON.stringify(rechecked));
+    assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision, requested.scopeRevision);
+    assert.equal(tracker.getIsRecording(), true);
+    assert.equal(tracker.getBaselineState(), 'ready');
+    assert.deepEqual(tracker.getCoverageGaps(), []);
+    assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+    const afterRecheck = new Map(tracker.getTrackedChanges().map(change => [change.filePath, change]));
+    assert.deepEqual(new Set(afterRecheck.keys()), new Set(expected.keys()));
+    let refreshedOpaqueCreationTokens = 0;
+    for (const change of pending) {
+        const current = afterRecheck.get(change.filePath);
+        assert.deepEqual(semanticReview(current), semanticReview(change), 'Recheck must preserve each pending identity');
+        if (current.reviewReason !== change.reviewReason) {
+            // Creation is still pending with an absent baseline. A subsequent
+            // read can refresh its explanation and conservatively invalidate
+            // that opaque token; no content/identity evidence may change.
+            assert.equal(change.reviewKind, 'opaque');
+            assert.equal(change.baselineExists, false);
+            assert.equal(change.reviewReason, 'Read-only unsupported file was created after the baseline');
+            assert.equal(current.reviewReason, 'Read-only unsupported file changed after creation');
+        }
+    }
+    for (const token of beforeTextTokens) { assert.deepEqual(tracker.getReviewToken(token.filePath), token); }
+    for (const token of beforeOpaqueTokens) {
+        const current = tracker.getOpaqueReviewToken(token.filePath);
+        assert.ok(current, 'each opaque identity must remain reviewable after Recheck');
+        const previousReview = pending.find(change => change.filePath === token.filePath);
+        if (manifest.has(token.filePath) || previousReview.reviewReason === afterRecheck.get(token.filePath).reviewReason) {
+            assert.deepEqual(current, token);
+        } else {
+            assert.equal(previousReview.baselineExists, false);
+            assert.notEqual(current.reviewRevision, token.reviewRevision);
+            assert.deepEqual({ ...current, reviewRevision: token.reviewRevision }, token);
+            refreshedOpaqueCreationTokens++;
+        }
+    }
+    const afterRecheckSession = readSession();
+    for (const key of ['fileSnapshots', 'opaqueBaselineFiles', 'unresolvedBaselineFiles', 'baselineExistingFiles']) {
+        assert.deepEqual(afterRecheckSession[key], beforeRecheckSession[key], `Recheck must preserve ${key}`);
+    }
+    assert.deepEqual(afterRecheckSession.coverageGaps, []);
+    for (const [filePath, file] of expected) {
+        if (file.after) { assert.equal(hash(fs.readFileSync(filePath)), file.after.fingerprint); }
+        else { assert.equal(fs.existsSync(filePath), false); }
+    }
 
     markPhase('mixedAccept');
     const acceptStart = performance.now();
@@ -405,6 +495,7 @@ try {
             trackerAndScope: 'production public APIs; real local files and Session V4 persistence',
             vscode: 'stub configuration/discovery/host watcher callbacks; not Extension Host evidence',
             nativeWatchers: 'real OS fs.watch callbacks and close events',
+            coverageRecheck: 'one explicit public Recheck after the burst; precise observed directory gaps persist first',
             failureProbe: 'one injected ENOSPC at native watcher API boundary; no real OS quota exhaustion',
             measurement: 'one warm filesystem run; new latency/RSS figures are descriptive, without performance gates'
         },
@@ -419,6 +510,10 @@ try {
         burst: { writeMilliseconds: burstWriteMilliseconds,
             firstWriteToVerifiedPendingMilliseconds: burstToVerifiedPendingMilliseconds,
             textPending: pendingText, opaquePending: pendingOpaque, unknownPending: 0, extraPending: 0 },
+        coverageRecheck: { milliseconds: coverageRecheckMilliseconds, status: rechecked.status,
+            before: burstCoverageGaps.map(gap => ({ path: path.relative(root, gap.targetPath).split(path.sep).join('/'),
+                reasonCode: gap.reasonCode })), afterGapCount: 0, preservedPending: expected.size,
+            refreshedOpaqueCreationTokens },
         mixedAccept: { milliseconds: mixedAcceptMilliseconds, accepted: accepted.accepted,
             acknowledged: accepted.acknowledged, stillPending: 0, acceptedSessionBytes },
         watchers: { ...watcherMetrics, afterStop, afterDispose: { apiBoundary: 0, realNative: 0 },
