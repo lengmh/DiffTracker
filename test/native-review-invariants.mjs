@@ -256,8 +256,11 @@ export function registerNativeReviewInvariants(h) {
         const token = h.getTracker().getReviewToken(p), ui = host(true);
         try {
             await withLookups([[alias, p]], [], async () => {
-                assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias)).scheme,
-                    'diff-tracker-original');
+                const original = ui.sources[0].quickDiffProvider.provideOriginalResource(
+                    Uri.file(alias).with({ query: 'ignored-query', fragment: 'ignored-fragment' }));
+                assert.equal(original.scheme, 'diff-tracker-original');
+                assert.equal(original.fsPath, p);
+                assert.equal(original.query, ''); assert.equal(original.fragment, '');
                 assert.equal((await ui.run('openFromQuickDiff', Uri.file(alias))).mode, 'single-diff');
                 const [, base, current] = ui.calls.at(-1);
                 assert.deepEqual(JSON.parse(current.query), token);
@@ -274,6 +277,44 @@ export function registerNativeReviewInvariants(h) {
             });
         } finally { ui.restore(); }
     });
+
+    for (const baseline of ['initial baseline', '']) {
+        test(`NATIVE Quick Diff baseline URI receives incremental Keep refreshes after opening an unchanged case alias (empty=${baseline === ''})`, async () => {
+            const dir = file('native-baseline-refresh'); fs.mkdirSync(dir);
+            const p = path.join(dir, 'asset.txt'), alias = path.join(dir, 'ASSET.TXT');
+            seed(p, baseline); await scan(p);
+            const ui = host(true), original = h.createOriginalProvider();
+            const refreshes = [], events = [];
+            let cachedText, originalUri;
+            const changed = original.onDidChange(uri => {
+                refreshes.push(uri.toString());
+                if (uri.toString() === originalUri?.toString()) { cachedText = original.provideTextDocumentContent(uri); }
+            });
+            const tracked = h.getTracker().onDidTrackChanges(event => events.push(event));
+            try {
+                await withLookups([[alias, p]], [], async () => {
+                    assert.equal(h.getTracker().getReviewToken(alias), undefined, 'open before any pending review exists');
+                    originalUri = ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias));
+                    cachedText = original.provideTextDocumentContent(originalUri);
+                    assert.equal(cachedText, baseline);
+                    for (const next of ['first accepted edit', 'second accepted edit']) {
+                        fs.writeFileSync(p, next); await scan(p);
+                        await ui.run('openFile', Uri.file(alias));
+                        const current = ui.calls.at(-1)[2]; ui.focus(current);
+                        refreshes.length = 0; events.length = 0;
+                        assert.equal((await ui.run('keepFile', current)).status, 'success');
+                        assert.equal(events.some(event => event.fullRefresh), false, 'exercise incremental invalidation only');
+                        assert.ok(events.some(event => event.baselineChanged && event.removedFiles.includes(p)));
+                        assert.ok(refreshes.includes(originalUri.toString()), 'the originally opened document must be invalidated');
+                        assert.equal(cachedText, next, 'the open Quick Diff baseline updates without reopening');
+                        assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias)).toString(),
+                            originalUri.toString(), 'unchanged and pending states retain one baseline document identity');
+                        assert.equal(h.getTracker().getReviewToken(alias), undefined);
+                    }
+                });
+            } finally { changed.dispose(); tracked.dispose(); original.dispose(); ui.restore(); }
+        });
+    }
 
     test('NATIVE missing case variant cannot inherit a distinct read-only review', async () => {
         const dir = file('native-missing-variant'); fs.mkdirSync(dir);
@@ -305,7 +346,9 @@ export function registerNativeReviewInvariants(h) {
         try {
             const provider = ui.sources[0].quickDiffProvider;
             assert.equal(provider.provideOriginalResource(Uri.file(opaque)), undefined);
-            assert.equal(provider.provideOriginalResource(Uri.file(text)).scheme, 'diff-tracker-original');
+            const original = provider.provideOriginalResource(Uri.file(text));
+            assert.equal(original.scheme, 'diff-tracker-original');
+            assert.equal(original.fsPath, text);
             assert.equal((await ui.run('openFile', text)).mode, 'single-diff');
             const [, base, current] = ui.calls.at(-1);
             assert.equal(current.fsPath, text);

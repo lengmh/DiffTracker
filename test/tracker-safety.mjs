@@ -5266,6 +5266,11 @@ registerNativeReviewInvariants({
         try { const { NativeReviewAdapter } = require('../out/nativeReviewAdapter.js'); return new NativeReviewAdapter(tracker, result => result); }
         finally { Module._load = originalLoad; }
     },
+    createOriginalProvider: () => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try { const { OriginalContentProvider } = require('../out/originalContentProvider.js'); return new OriginalContentProvider(tracker); }
+        finally { Module._load = originalLoad; }
+    },
     createPresentation: () => {
         Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
         try {

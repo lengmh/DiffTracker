@@ -55,10 +55,13 @@ export class NativeReviewAdapter implements vscode.Disposable, vscode.TextDocume
     }
 
     public provideOriginalResource(uri: vscode.Uri): vscode.Uri | undefined {
-        if (uri.scheme !== 'file' || this.tracker.getOriginalContent(uri.fsPath) === undefined) { return undefined; }
-        const pending = this.tracker.getTrackedChange(uri.fsPath);
-        if (pending && !this.tracker.getReviewToken(uri.fsPath)) { return undefined; }
-        return uri.with({ scheme: 'diff-tracker-original', query: '', fragment: '' });
+        if (uri.scheme !== 'file') { return undefined; }
+        const filePath = this.tracker.getOriginalFilePath(uri.fsPath);
+        if (!filePath) { return undefined; }
+        const pending = this.tracker.getTrackedChange(filePath);
+        if (pending && !this.tracker.getReviewToken(filePath)) { return undefined; }
+        // Match incremental baseline notifications even before a change exists.
+        return vscode.Uri.file(filePath).with({ scheme: 'diff-tracker-original', query: '', fragment: '' });
     }
 
     private snapshotUri(token: ReviewToken, scheme: string): vscode.Uri {

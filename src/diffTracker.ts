@@ -10202,6 +10202,11 @@ export class DiffTracker {
         return this.fileSnapshots.get(filePath);
     }
 
+    public getOriginalFilePath(filePath: string): string | undefined {
+        filePath = this.canonicalTrackingPath(filePath);
+        return this.fileSnapshots.has(filePath) ? filePath : undefined;
+    }
+
     public getInlineContent(filePath: string): string | undefined {
         filePath = this.canonicalTrackingPath(filePath);
         const view = this.ensureInlineView(filePath);
