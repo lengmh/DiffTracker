@@ -98,3 +98,7 @@
 修正后的一个真实 Linux native 样本为预检 38.4 ms、准备 547.3 ms、burst 核验 192.1 ms、Recheck 426.1 ms、Mixed Accept 372.1 ms。真实 native 峰值仍为 9，替换期间 VS Code API stub 峰值为 2；Stop/dispose 后均为 0。整进程 RSS 采样峰值为 227.4 MiB（增量 137.7 MiB）。这些是加入 Recheck 后的独立样本，不能与上一节未包含该阶段的范围混为同一测量区间。
 
 另外通过 API 回调形状复现 Windows 的四个目录事件：旧断言失败；新夹具保留四个精确 gap，经一次 Recheck 清除并保持审阅和 baseline，随后处理 22 text/10 opaque。该注入仅是本地契约回归，输出明确标注注入数量；它不代替实际 Windows CI。
+
+[Verification #547](https://github.com/lengmh/DiffTracker/actions/runs/37605238014) 再次通过实际安装五阶段及两个 Ubuntu Host。Windows 已通过全部 Native、S4-D、Recheck 和主 Host suite，随后在 restart.prepare 的单次目录 rename 上收到 `EPERM`，尚未进入导入 handoff 或恢复断言。该日志不识别锁持有者，不能归因于某个扩展或后端。审查确认 main DiffTracker 当时已停止；测试原先在 workspace 内临时构建源目录，仍可能被 workbench/Git/系统观察。
+
+对应的 S4-C handoff 与 S4-D restart 两处夹具改在 workspace 的同文件系统相邻目录暂存，并在真实 Host 中断言该源不属于任何 workspace、设备一致。实际只做一次 rename，保留后续 owner、Keep、待审、持久化、进程重启和清理断言；不加重试或延长时限。S4-B 专门测试已监听目录替换的 in-workspace rename 不变。这是测试源隔离，不是已查明某个锁所有者或生产缺陷的声明。

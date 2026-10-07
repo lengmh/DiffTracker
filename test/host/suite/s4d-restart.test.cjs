@@ -110,12 +110,17 @@ exports.prepare = async () => {
     assert.equal(fs.existsSync(f.root), false, 'restart target must begin absent');
     assert.equal(fs.existsSync(f.storage), false, 'restart storage must be fresh');
     fs.mkdirSync(f.storage, { recursive: true });
-    const source = fs.mkdtempSync(path.join(f.workspace, 's4d-restart-source-'));
+    // Stage outside every workspace to avoid exposing preparation to workspace-
+    // scoped observers, then perform one real move into the destination.
+    const source = fs.mkdtempSync(path.join(path.dirname(f.workspace), 's4d-restart-source-'));
     let prepared = false;
     await observeNativeHandles(f.directories, async handles => {
         const tracker = new DiffTracker(vscode.Uri.file(f.storage));
         let disposed = false;
         try {
+            assert.equal(vscode.workspace.getWorkspaceFolder(vscode.Uri.file(source)), undefined);
+            assert.equal(fs.statSync(source).dev, fs.statSync(f.workspace).dev,
+                'staging must remain on the destination filesystem');
             const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(f.workspace));
             assert.ok(folder, 'restart fixture must have an actual primary workspace owner');
             // A folder-scoped include avoids imposing coverage for an absent
