@@ -12,6 +12,11 @@ import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, conf
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
+export interface ObservationCoverageRecheckResult {
+    status: 'rechecked' | 'limited' | 'conflict' | 'failed';
+    reason?: string;
+}
+
 export interface FileDiff {
     sourceNote?: string;
     filePath: string;
@@ -391,6 +396,9 @@ export class DiffTracker {
     private fileModes = new Map<string, number>();
     private baselineTransaction?: BaselineTransaction;
     private restoringEpoch?: number;
+    private coverageRecheckEpoch?: number;
+    private coverageRecheckOverflow = false;
+    private activeScopeApplications = 0;
     private initialIgnoreEpoch?: number;
     private initialWatchBoundaryMs?: number;
     private initialWatchBoundaryMonotonicNs?: bigint;
@@ -1054,6 +1062,183 @@ export class DiffTracker {
         );
     }
 
+    public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        const epoch = this.sessionEpoch;
+        if (this.coverageRecheckEpoch !== undefined) {
+            return Promise.resolve({ status: 'conflict', reason: 'Observation coverage is already being rechecked.' });
+        }
+        // Claim before queueing: a concurrent Apply must not stage another scope.
+        this.coverageRecheckEpoch = epoch;
+        return this.queueRecoveryAction(async () => {
+            const completion: { failureReason?: string } = {};
+            try {
+                const result = await this.performObservationCoverageRecheck(epoch, completion);
+                // Our own safe pause advances epoch too. Keep its failure local
+                // to this invocation rather than inspecting a newer session.
+                if (completion.failureReason) { return { status: 'failed', reason: completion.failureReason }; }
+                return this.isCurrentEpoch(epoch) && this.persistenceFailed
+                    ? { status: 'failed', reason: this.persistenceIssue } : result;
+            } catch (error) {
+                return { status: 'failed', reason: `Observation coverage recheck did not complete: ${String(error)}` };
+            }
+            finally {
+                if (this.coverageRecheckEpoch === epoch) { this.coverageRecheckEpoch = undefined; }
+            }
+        });
+    }
+
+    private async performObservationCoverageRecheck(
+        epoch: number,
+        completion: { failureReason?: string }
+    ): Promise<ObservationCoverageRecheckResult> {
+        const conflict = (reason: string): ObservationCoverageRecheckResult => ({ status: 'conflict', reason });
+        if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
+            this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
+            this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
+            this.pausedGitRepositories.size > 0 || this.workspaceContextChanged || this.pendingMonitoringScope ||
+            this.effectiveMonitoringScope.kind !== 'configured') {
+            return conflict('Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.');
+        }
+        if (vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty)) {
+            return conflict('Save or discard unsaved editor changes before rechecking observation coverage.');
+        }
+        const scope = this.effectiveMonitoringScope;
+        const watcherRevision = this.watcherCoverageRevision;
+        const ignoreVersion = this.ignoreRefreshVersion;
+        const policyRevision = this.ignorePolicyRevision;
+        const current = () => this.isCurrentEpoch(epoch) && this.isRecording &&
+            this.coverageRecheckEpoch === epoch && this.activeScopeApplications === 0 &&
+            this.effectiveMonitoringScope === scope && !this.pendingMonitoringScope &&
+            !this.workspaceContextChanged && !this.gitContextPending && this.pausedGitRepositories.size === 0 &&
+            this.watcherCoverageRevision === watcherRevision && this.ignoreRefreshVersion === ignoreVersion &&
+            this.ignorePolicyRevision === policyRevision;
+        if (!await this.drainDeferredScopeApplyEvents(epoch) || !current()) {
+            return conflict('Workspace activity or scope changed before Recheck could begin; retry after it settles.');
+        }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) { return conflict(identityIssue); }
+        const plan = this.configuredSupplementalCoveragePlan(scope);
+        if (plan.issue) { return conflict(`Observation coverage cannot be safely reinstalled at ${plan.issue}. Existing review is preserved.`); }
+
+        // Persist uncertainty first. Never replace another root-level control
+        // obligation, and reserve all markers before publishing any of them.
+        const markers = new Map<string, CoverageGapEvidence>();
+        const budget = this.createCandidatePersistenceBudget();
+        try {
+            for (const root of this.sessionWorkspaceRoots) {
+                const previous = this.coverageGaps.get(root)?.subtree;
+                if (previous) {
+                    if (previous.reasonCode === 'coverage-recheck-incomplete') { markers.set(root, previous); }
+                    continue;
+                }
+                const evidence: CoverageGapEvidence = { targetKind: 'subtree', reasonCode: 'coverage-recheck-incomplete',
+                    reason: 'Observation coverage recheck has not completed; original baselines and pending review are preserved.' };
+                this.reserveCandidateCoverageGap(root, evidence, budget);
+                markers.set(root, evidence);
+            }
+        } catch (error) {
+            return { status: 'failed', reason: `Recheck cannot reserve durable coverage evidence: ${String(error)}` };
+        }
+        for (const [root, evidence] of markers) {
+            if (!this.coverageGaps.get(root)?.subtree) {
+                this.setCoverageGap(root, evidence, false);
+            }
+        }
+        this.restoringEpoch = epoch;
+        this.coverageRecheckOverflow = false;
+        this.emitTrackChangesEvent({ fullRefresh: true });
+        try {
+            const initialSaved = await this.flushPendingPersistence();
+            // False also means the writer was superseded by Stop/Start or
+            // disposal. Old work must never pause the newer recording session.
+            if (!this.isCurrentEpoch(epoch)) { return conflict('Observation coverage recheck was cancelled by a recording lifecycle change.'); }
+            if (!initialSaved) {
+                await this.pauseRecordingForUnpersistableCoverage('Observation coverage recheck could not save its uncertainty; recording is paused with original review preserved.');
+                return { status: 'failed', reason: this.persistenceIssue };
+            }
+            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            this.activateExternalWatchers(this.createExternalWatchers(epoch));
+            const generation = this.coverageGeneration;
+            const install = await this.installSupplementalCoverageTargets(plan.targets, epoch, true, current);
+            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            this.commitSupplementalCoverageTargets(plan.targets);
+            const owners = new Map([...this.supplementalDirectoryWatchers].map(([directory, owner]) =>
+                [directory, { owner, revision: owner.eventRevision ?? 0 }]));
+            const ownerCoverageCurrent = () => current() && this.coverageGeneration === generation &&
+                !this.coverageRecheckOverflow && this.restoreEvents.size === 0 &&
+                this.supplementalDirectoryWatchers.size === owners.size &&
+                [...owners].every(([directory, { owner, revision }]) => {
+                    if (this.supplementalDirectoryWatchers.get(directory) !== owner || owner.epoch !== epoch ||
+                        (owner.eventRevision ?? 0) !== revision) { return false; }
+                    try { return this.supplementalIdentityMatches(fs.lstatSync(directory, { bigint: true }), owner.identity); }
+                    catch { return false; }
+                });
+            await this.discoverRestoredFiles(epoch, current);
+            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            for (const filePath of new Set([
+                ...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys(), ...this.unresolvedBaselineFiles.keys()
+            ])) {
+                if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+                await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath), current);
+            }
+            if (!ownerCoverageCurrent()) {
+                return { status: 'limited', reason: 'Files, settings or watcher ownership changed during Recheck. Coverage remains unverified; retry after activity settles.' };
+            }
+
+            // Only retirement is transactional. Discovery must not run inside
+            // this transaction: its bounded additions have their own save barrier.
+            const removed = new Map<string, CoverageGapEvidence>();
+            const transaction = this.beginBaselineTransaction(() => {
+                for (const [target, evidence] of removed) {
+                    if (!this.coverageGaps.get(target)?.subtree) { this.setCoverageGap(target, evidence, false); }
+                }
+            });
+            transaction.valid = ownerCoverageCurrent;
+            let committed = false;
+            try {
+                const before = new Map([...this.coverageGaps].map(([target, record]) => [target, record.subtree]));
+                this.reconcileSupplementalCoverageAfterSuccessfulScan(install);
+                // A failed installation is a valid limited result, never a
+                // reason to erase its more specific diagnostic.
+                for (const [target, evidence] of markers) {
+                    if (this.coverageGaps.get(target)?.subtree === evidence) { this.clearCoverageGap(target, 'subtree', false); }
+                }
+                for (const [target, evidence] of before) {
+                    if (evidence && !this.coverageGaps.get(target)?.subtree) { removed.set(target, evidence); }
+                }
+                committed = await this.flushPersistState(false, transaction) && ownerCoverageCurrent();
+                this.endBaselineTransaction(transaction, committed);
+                if (!committed) { return { status: 'failed', reason: 'Coverage certification could not be saved or became stale; original review and unverified coverage are retained.' }; }
+            } finally {
+                if (this.baselineTransaction === transaction) { this.endBaselineTransaction(transaction, false); }
+            }
+            return this.getCoverageGaps().length > 0 || this.getSubtreeCoverageGaps().length > 0
+                ? { status: 'limited', reason: 'Recheck completed against the original baselines, but some coverage remains unverified. See Monitoring Scope diagnostics.' }
+                : { status: 'rechecked' };
+        } catch (error) {
+            return { status: 'failed', reason: `Observation coverage remains unverified: ${String(error)}` };
+        } finally {
+            if (this.isCurrentEpoch(epoch)) {
+                this.restoringEpoch = undefined;
+                // One bounded replay only. A busy workspace is a visible limited
+                // result, not an unbounded rescan/retry loop.
+                const events = [...this.restoreEvents.values()];
+                this.restoreEvents.clear();
+                for (const { uri, kind } of events) {
+                    if (!this.isCurrentEpoch(epoch)) { break; }
+                    if (kind === 'create') { await this.onExternalFileCreated(uri); }
+                    else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
+                    else { await this.readFileAndUpdate(uri.fsPath, uri); }
+                }
+                if (this.isCurrentEpoch(epoch) && !await this.flushPendingPersistence() && this.isCurrentEpoch(epoch)) {
+                    completion.failureReason = 'Observation coverage recheck results could not be saved; recording is paused with original review preserved.';
+                    await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
+                }
+                if (this.isCurrentEpoch(epoch)) { this.emitTrackChangesEvent({ fullRefresh: true }); }
+            }
+        }
+    }
+
     public startRecording() {
         if (this.disposed || this.recoveryBlocked) { return; }
         const identityIssue = this.getPathIdentityIssue();
@@ -1594,6 +1779,7 @@ export class DiffTracker {
             this.refreshIgnoreMatchersAfterLivePolicyChange();
         }
         if (this.restoringEpoch === epoch) {
+            if (this.deferCoverageRecheckEvent(uri, kind)) { return; }
             // A change does not invalidate the evidence that a path
             // was created. Delete replaces it; a later create starts
             // a new incarnation and establishes absence again.
@@ -1606,6 +1792,17 @@ export class DiffTracker {
         if (kind === 'create') { void this.onExternalFileCreated(uri); }
         else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
         else { void this.onExternalFileChanged(uri); }
+    }
+
+    private deferCoverageRecheckEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
+        if (this.coverageRecheckEpoch !== this.sessionEpoch || this.restoringEpoch !== this.sessionEpoch) { return false; }
+        if (!this.restoreEvents.has(uri.fsPath) && this.restoreEvents.size >= this.maxScopePreflightEntries) {
+            this.coverageRecheckOverflow = true;
+            return true;
+        }
+        const previous = this.restoreEvents.get(uri.fsPath);
+        if (kind !== 'change' || previous?.kind !== 'create') { this.restoreEvents.set(uri.fsPath, { uri, kind }); }
+        return true;
     }
 
     private readonly maxImportedDirectoryWatchers = 256;
@@ -2126,7 +2323,8 @@ export class DiffTracker {
     private async installSupplementalCoverageTargets(
         targets: readonly string[],
         epoch: number,
-        recordFailures: boolean
+        recordFailures: boolean,
+        preparationCurrent: () => boolean = () => true
     ): Promise<SupplementalCoverageInstall> {
         const desiredRoots = this.normalizeSupplementalTargets(targets);
         const acquired = new Map<string, SupplementalDirectoryWatch>();
@@ -2134,7 +2332,7 @@ export class DiffTracker {
         const reconciliationGaps = new Map<string, CoverageGapEvidence | undefined>();
         const preparationBudget = { remainingEntries: this.maxScopePreflightEntries };
         for (const root of desiredRoots) {
-            if (!this.isCurrentEpoch(epoch)) { break; }
+            if (!this.isCurrentEpoch(epoch) || !preparationCurrent()) { break; }
             reconciliationGaps.set(root, this.coverageGaps.get(root)?.subtree);
             const folder = this.owningWorkspaceFolderForTraversal(root);
             for (const [target, record] of this.coverageGaps) {
@@ -2145,8 +2343,8 @@ export class DiffTracker {
             }
             try {
                 if (!fs.lstatSync(root).isDirectory()) { throw new Error('Supplemental coverage target is not a directory'); }
-                await this.watchSupplementalTree(root, root, epoch, preparationBudget, acquired);
-                if (!this.isCurrentEpoch(epoch)) { break; }
+                await this.watchSupplementalTree(root, root, epoch, preparationBudget, acquired, Symbol(), preparationCurrent);
+                if (!this.isCurrentEpoch(epoch) || !preparationCurrent()) { break; }
                 successfulRoots.push(root);
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch)) { break; }
@@ -3187,7 +3385,7 @@ export class DiffTracker {
         for (const entry of rawCoverageGaps) {
             if (!Array.isArray(entry) || entry.length !== 2) { return undefined; }
             const [filePath, rawRecord] = entry;
-            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !isWithinRoot(filePath) || gapPaths.has(filePath)) {
+            if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || gapPaths.has(filePath)) {
                 return undefined;
             }
             let record: PersistedCoverageGapRecord | undefined;
@@ -3221,6 +3419,13 @@ export class DiffTracker {
                 if (importedCoverageRequired !== true || !record.subtree) { return undefined; }
                 record.importedCoverageRequired = true;
             }
+            // A whole-scope Recheck sentinel describes subtree uncertainty,
+            // never a root file or imported-directory ownership. Keep every
+            // other persisted path subject to the strict descendant boundary.
+            const rootRecheckMarker = candidate.version === 4 && effectiveMonitoringScope.kind === 'configured' &&
+                normalizedRoots.includes(filePath) && !record.file && !record.importedCoverageRequired &&
+                record.subtree?.reasonCode === 'coverage-recheck-incomplete';
+            if (!isWithinRoot(filePath) && !rootRecheckMarker) { return undefined; }
             gapPaths.add(filePath);
             coverageGaps.push([filePath, record]);
         }
@@ -4877,6 +5082,23 @@ export class DiffTracker {
         requestStillCurrent: () => boolean = () => true,
         expectedAffectedReviewRevision?: string
     ): Promise<MonitoringScopeApplyResult> {
+        if (this.coverageRecheckEpoch !== undefined) {
+            return { status: 'conflict', reason: 'Observation coverage is being rechecked; retry scope preparation after it finishes.',
+                retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0 };
+        }
+        this.activeScopeApplications++;
+        try {
+            return await this.performConfiguredMonitoringScopeApply(scope, discardExplicitlyExcludedReviews,
+                requestStillCurrent, expectedAffectedReviewRevision);
+        } finally { this.activeScopeApplications--; }
+    }
+
+    private async performConfiguredMonitoringScopeApply(
+        scope: CanonicalMonitoringScope,
+        discardExplicitlyExcludedReviews = false,
+        requestStillCurrent: () => boolean = () => true,
+        expectedAffectedReviewRevision?: string
+    ): Promise<MonitoringScopeApplyResult> {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
         });
@@ -5339,6 +5561,7 @@ export class DiffTracker {
     }
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
+        if (this.deferCoverageRecheckEvent(doc.uri, 'change')) { return; }
         if (this.isRecording && !this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath))) {
             this.processDocumentChange(doc);
         }
@@ -7586,23 +7809,23 @@ export class DiffTracker {
         }
     }
 
-    private async discoverRestoredFiles(epoch: number): Promise<void> {
+    private async discoverRestoredFiles(epoch: number, recheckCurrent?: () => boolean): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
         const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
             this.effectiveMonitoringScope.mode === 'wholeWorkspace';
-        const wholeWorkspacePreparationBudget = wholeWorkspace
+        const wholeWorkspacePreparationBudget = wholeWorkspace || recheckCurrent
             ? { remainingEntries: this.maxScopePreflightEntries }
             : undefined;
-        const durableResourcePaths = wholeWorkspace ? new Set([
+        const durableResourcePaths = wholeWorkspace || recheckCurrent ? new Set([
             ...this.fileSnapshots.keys(),
             ...this.unresolvedBaselineFiles.keys(),
             ...this.opaqueBaselineFiles.keys()
         ]) : undefined;
-        const persistenceBudget = wholeWorkspace
+        const persistenceBudget = wholeWorkspace || recheckCurrent
             ? this.createCandidatePersistenceBudget()
             : undefined;
         const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
-            wholeWorkspace && durableResourcePaths
+            (wholeWorkspace || recheckCurrent) && durableResourcePaths
                 ? {
                     remaining: this.remainingCandidatePersistenceSlots(),
                     exemptPaths: new Set([
@@ -7613,12 +7836,17 @@ export class DiffTracker {
                 }
                 : undefined;
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = await this.findScopeFilesUnderDirectory(
+            const files = recheckCurrent
+                ? (await this.enumerateConfiguredCandidateFiles(
+                    this.effectiveMonitoringScope as CanonicalMonitoringScope, epoch, folder.uri.fsPath,
+                    wholeWorkspaceCapacityGuard, wholeWorkspacePreparationBudget, recheckCurrent
+                )).map(filePath => vscode.Uri.file(this.canonicalTrackingPath(filePath)))
+                : await this.findScopeFilesUnderDirectory(
                 folder.uri.fsPath,
                 wholeWorkspacePreparationBudget,
                 wholeWorkspaceCapacityGuard
             );
-            if (!this.isCurrentEpoch(epoch)) { return; }
+            if (!this.isCurrentEpoch(epoch) || (recheckCurrent && !recheckCurrent())) { return; }
             for (const uri of files) { candidates.set(uri.fsPath, uri); }
         }
         for (const doc of vscode.workspace.textDocuments) {
@@ -7671,6 +7899,7 @@ export class DiffTracker {
                 !this.unresolvedBaselineFiles.has(filePath) &&
                 !this.opaqueBaselineFiles.has(filePath);
         });
+        if (!this.isCurrentEpoch(epoch) || (recheckCurrent && !recheckCurrent())) { return; }
         if (persistenceBudget) {
             this.validateCandidatePersistenceProjection(persistenceBudget);
         }
@@ -7708,6 +7937,7 @@ export class DiffTracker {
         if (publishableAdditions.length > 0 && !await this.flushPendingPersistence()) {
             throw new Error('Restored additions could not be persisted');
         }
+        if (recheckCurrent && (!this.isCurrentEpoch(epoch) || !recheckCurrent())) { return; }
         for (const { filePath, reason } of unresolvedReviews) {
             this.markFileUnavailable(filePath, reason);
         }
@@ -8183,6 +8413,8 @@ export class DiffTracker {
             return;
         }
 
+        if (this.deferCoverageRecheckEvent(uri, 'create')) { return; }
+
         if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
         const filePath = uri.fsPath;
         this.recordBaselineTransactionEvent(uri, 'create');
@@ -8563,7 +8795,7 @@ export class DiffTracker {
         }
     }
 
-    private async readFileAndUpdate(filePath: string, uri: vscode.Uri): Promise<void> {
+    private async readFileAndUpdate(filePath: string, uri: vscode.Uri, operationCurrent?: () => boolean): Promise<void> {
         filePath = this.canonicalTrackingPath(filePath);
         if (uri.scheme === 'file') { uri = vscode.Uri.file(filePath); }
         const epoch = this.sessionEpoch;
@@ -8575,7 +8807,7 @@ export class DiffTracker {
         }
         if (this.isPathIgnored(uri)) { return; }
         const state = await this.readFileSnapshot(uri);
-        if (!this.isCurrentEpoch(epoch) || this.isPathIgnored(uri)) { return; }
+        if (!this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
         // A watcher read can finish after native Undo or another buffer edit.
         // Its disk snapshot must not erase the newer unsaved review.
         const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath);
@@ -10626,6 +10858,7 @@ export class DiffTracker {
         const uri = doc.uri.scheme === 'file' ? vscode.Uri.file(this.canonicalTrackingPath(doc.uri.fsPath)) : doc.uri;
         if (this.retainCoverageGapReview(filePath)) { return; }
         if (this.restoringEpoch === epoch) {
+            if (this.deferCoverageRecheckEvent(uri, 'change')) { return; }
             if (this.restoreEvents.get(filePath)?.kind !== 'create') {
                 this.restoreEvents.set(filePath, { uri, kind: 'change' });
             }
@@ -10686,6 +10919,7 @@ export class DiffTracker {
     }
 
     private processDocumentChange(doc: vscode.TextDocument): void {
+        if (this.deferCoverageRecheckEvent(doc.uri, 'change')) { return; }
         if (!this.isRecording) {
             return;
         }

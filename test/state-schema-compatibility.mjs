@@ -36,6 +36,38 @@ export function registerStateSchemaCompatibility(harness) {
         };
     }
 
+    test('SCHEMA-DOWNGRADE root Recheck sentinel preserves state when the reader predates it', async () => {
+        const { state, target } = fixture();
+        const requested = validateAndCanonicalizeScope({ mode: 'rules', includes: [], excludes: [] },
+            state.effectiveMonitoringScope.roots);
+        assert.equal(requested.ok, true);
+        state.effectiveMonitoringScope = { kind: 'configured', ...requested.scope };
+        state.coverageGaps = [[root, { subtree: { targetKind: 'subtree',
+            reasonCode: 'coverage-recheck-incomplete', reason: 'Observation recheck incomplete' } }]];
+        const tracker = getTracker();
+        if (process.env.DT_EXPECT_LEGACY_REJECTION !== '1' && process.env.DT_EXPECT_RECHECK_PREDECESSOR_REJECTION !== '1') {
+            assert.ok(tracker.parsePersistedState(state));
+            return;
+        }
+        assert.equal(tracker.parsePersistedState(state), undefined);
+        const storage = file('recheck-downgrade-storage');
+        fs.mkdirSync(storage);
+        tracker.storageUri = Uri.file(storage);
+        for (const name of ['session-state.json', 'session-state.last-good.json']) {
+            fs.writeFileSync(path.join(storage, name), JSON.stringify(state));
+        }
+        const before = new Map(fs.readdirSync(storage).map(name => [name, fs.readFileSync(path.join(storage, name))]));
+        const bytes = fs.readFileSync(target);
+        assert.equal(await tracker.restorePersistedState(), 'blocked');
+        tracker.startRecording();
+        assert.equal(tracker.getIsRecording(), false);
+        assert.equal(await tracker.flushPendingPersistence(), false);
+        await tracker.dispose();
+        assert.deepEqual(fs.readdirSync(storage).sort(), [...before.keys()].sort());
+        for (const [name, content] of before) { assert.deepEqual(fs.readFileSync(path.join(storage, name)), content); }
+        assert.deepEqual(fs.readFileSync(target), bytes);
+    });
+
     test('SCHEMA-V4 imported ownership marker round-trips independently of pending control', () => {
         const { state } = fixture();
         const directory = file('schema-import-owner');

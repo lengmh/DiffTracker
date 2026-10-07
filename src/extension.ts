@@ -975,6 +975,16 @@ export async function activate(context: vscode.ExtensionContext) {
             const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
             await panel.applyInteractively();
         }),
+        vscode.commands.registerCommand('diffTracker.recheckObservationCoverage', async () => {
+            const outcome = await monitoringScopeController.recheckObservationCoverage();
+            if (outcome.status === 'rechecked') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Observation coverage rechecked. Original review baselines are unchanged.');
+            } else {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`);
+            }
+            settingsTreeDataProvider.refresh();
+            return outcome;
+        }),
         vscode.commands.registerCommand('diffTracker.migrateLegacyWatchRules', async () => {
             const outcome = await monitoringScopeController.migrateLegacyWatchRules();
             if (outcome.status === 'migrated') {

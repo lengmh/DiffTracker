@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vscode = require('vscode');
@@ -675,6 +676,10 @@ module.exports = async function runExtensionHostScenario() {
         fs.mkdirSync(s4bBlindDir, { recursive: true });
         fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), 's4b changed baseline\n');
         fs.writeFileSync(path.join(s4bBlindDir, 'deleted.txt'), 's4b deleted baseline\n');
+        const recheckOpaqueBaseline = Buffer.from('\0s4b opaque baseline');
+        const recheckOpaquePending = Buffer.from('\0s4b opaque pending');
+        const fingerprint = bytes => createHash('sha256').update(bytes).digest('hex');
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.png'), recheckOpaqueBaseline);
         await filesConfig.update('watcherExclude', { 'dist/s4b-blind/**': true },
             vscode.ConfigurationTarget.Workspace);
         await scopeConfig.update('watchInclude', [
@@ -694,6 +699,7 @@ module.exports = async function runExtensionHostScenario() {
         fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), 's4b changed after\n');
         fs.writeFileSync(path.join(s4bBlindDir, 'created.txt'), 's4b created after\n');
         fs.unlinkSync(path.join(s4bBlindDir, 'deleted.txt'));
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.png'), recheckOpaquePending);
         await untilStable('S4-B watcher-excluded changed file', async () =>
             (await pending('dist/s4b-blind/changed.txt'))?.currentContent === 's4b changed after\n');
         await untilStable('S4-B watcher-excluded created file', async () => {
@@ -703,6 +709,72 @@ module.exports = async function runExtensionHostScenario() {
         await untilStable('S4-B watcher-excluded deleted file', async () =>
             (await pending('dist/s4b-blind/deleted.txt'))?.isDeleted === true);
         console.log('PASS HOST-S4-B literal watcher blind subtree observes create/change/delete');
+
+        // Exercise the public command against the active extension. Recheck
+        // must retain these existing reviews, unlike Reset or Stop/Start.
+        await untilStable('Recheck opaque pending review before command', async () => {
+            const current = await state();
+            const change = current.trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.png').fsPath);
+            return current.baselineState === 'ready' && change?.reviewKind === 'opaque' &&
+                change.baselineFingerprint === fingerprint(recheckOpaqueBaseline) &&
+                change.currentFingerprint === fingerprint(recheckOpaquePending) &&
+                current.opaqueReviewTokens.some(token => token.filePath === change.filePath);
+        });
+        const recheckPaths = ['changed.txt', 'created.txt', 'deleted.txt', 'changed.png']
+            .map(name => uri(`dist/s4b-blind/${name}`).fsPath);
+        for (const filePath of recheckPaths) {
+            assert.equal(vscode.workspace.textDocuments.some(document => document.uri.fsPath === filePath), false,
+                'Recheck fixtures must remain unopened so editor events cannot supply observation');
+        }
+        const projectPending = current => recheckPaths.map(filePath => {
+            const change = current.trackedChanges.find(item => item.filePath === filePath);
+            assert.ok(change, `${filePath}: existing review must remain pending`);
+            return {
+                filePath: change.filePath, reviewKind: change.reviewKind,
+                baselineExists: change.baselineExists, currentExists: change.currentExists,
+                isDeleted: change.isDeleted, originalContent: change.originalContent,
+                currentContent: change.currentContent, baselineFingerprint: change.baselineFingerprint,
+                currentFingerprint: change.currentFingerprint, baselineSize: change.baselineSize,
+                currentSize: change.currentSize
+            };
+        });
+        const beforeRecheck = await state();
+        const pendingBeforeRecheck = projectPending(beforeRecheck);
+        const rechecked = await vscode.commands.executeCommand('diffTracker.recheckObservationCoverage');
+        assert.equal(rechecked?.status, 'rechecked', JSON.stringify(rechecked));
+        const afterRecheck = await state();
+        assert.equal(afterRecheck.isRecording, true, 'Recheck must leave recording active');
+        assert.equal(afterRecheck.recordingContext, true, 'Recheck must retain the recording command context');
+        assert.equal(afterRecheck.baselineState, 'ready');
+        assert.deepEqual(afterRecheck.effectiveMonitoringScope, beforeRecheck.effectiveMonitoringScope,
+            'Recheck must preserve the effective monitoring scope');
+        assert.deepEqual(projectPending(afterRecheck), pendingBeforeRecheck,
+            'Recheck must preserve text create/change/delete and opaque pending identities');
+        assert.equal(await vscode.commands.executeCommand('diffTracker._testOriginalContent',
+            uri('dist/s4b-blind/changed.txt').fsPath), 's4b changed baseline\n',
+            'Recheck must preserve the original baseline instead of accepting the current text');
+        assert.ok(afterRecheck.reviewTokens.some(token => token.filePath === uri('dist/s4b-blind/changed.txt').fsPath));
+        assert.ok(afterRecheck.opaqueReviewTokens.some(token => token.filePath === uri('dist/s4b-blind/changed.png').fsPath));
+
+        // These native writes are the only follow-up stimulus: no reset, scope
+        // Apply, document open, direct callback or second Recheck may supply it.
+        const recheckOpaqueLater = Buffer.from('\0s4b opaque native edit after Recheck');
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.txt'), 's4b native edit after Recheck\n');
+        fs.writeFileSync(path.join(s4bBlindDir, 'changed.png'), recheckOpaqueLater);
+        const afterRecheckEdit = await untilStable('Recheck coverage observes later native text and opaque edits', async () => {
+            const current = await state();
+            const textChange = current.trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.txt').fsPath);
+            const opaqueChange = current.trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.png').fsPath);
+            return current.isRecording && current.baselineState === 'ready' &&
+                textChange?.currentContent === 's4b native edit after Recheck\n' &&
+                !textChange.unavailableReason && opaqueChange?.currentFingerprint === fingerprint(recheckOpaqueLater) &&
+                !opaqueChange.unavailableReason ? current : undefined;
+        });
+        assert.equal(afterRecheckEdit.trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.txt').fsPath)
+            .originalContent, 's4b changed baseline\n');
+        assert.equal(afterRecheckEdit.trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.png').fsPath)
+            .baselineFingerprint, fingerprint(recheckOpaqueBaseline));
+        console.log('PASS HOST-RECHECK public command preserves baseline and pending text/opaque reviews, then observes native edits');
 
         for (const operation of ['reset', 'repository rebuild', 'Stop/Start']) {
             if (operation === 'reset') {
