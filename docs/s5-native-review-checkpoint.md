@@ -56,3 +56,9 @@
 VS Code 1.80 Linux 默认的原生标题栏会选择 OS context menu，CDP 无法检查该菜单。测试启动前仅在一次性 user-data 设置中选择 custom title/menu style，仍点击真实 editor/context 菜单并由 VS Code 传入 URI。此证据不等于 OS 原生菜单自动化覆盖。依据：[1.80 窗口设置](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/platform/window/common/window.ts#L142-L165)、[ContextMenuService](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/contextmenu/electron-sandbox/contextmenuService.ts#L50-L57)。
 
 不增加重试或时间上限，不修改生产行为；修正后的真实 Host 结果仍须单独核对。
+
+`fd5c502` 的 [Verification #538](https://github.com/lengmh/DiffTracker/actions/runs/37575709688) 再次未通过 Host。新的公开 URI 断言证明 Stable 的点击没有切换到目标文件；1.80 的原始错误已保留，表现为菜单探测超时。两组 Quality 和降级保护通过，VSIX 因 Host 失败跳过，不能将这一轮记为验收成功。
+
+进一步核对 VS Code 源码后，测试修正点击目标和 DOM 探测范围：inline Diff 会在 modified 编辑器的 view-zone 内展示不可编辑的 original 删除文本，不能把这些装饰文字当作 current 编辑器的输入区域。目标现在必须属于该 modified 编辑器自己的主 view-lines，并排除 view-zone 和嵌套编辑器。菜单查询、焦点观察和 hit testing 同时检查开放的 shadow root，避免把已渲染在 shadow root 中的菜单误判为不存在。另加最多 60 条被动输入诊断；不改变焦点、选区、事件默认行为或产品状态。
+
+合成 DOM 测试分别验证装饰文字排除、shadow 菜单发现与深层 hit testing；实际验收仍保留一次物理点击、Shift+F10、公开 URI/token 和 baseline 结果断言。下一提交的 CI 结果独立核对，不追溯覆盖前两轮失败。

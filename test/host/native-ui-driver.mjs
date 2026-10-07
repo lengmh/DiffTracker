@@ -17,9 +17,75 @@ const NATIVE_ACTIONS = new Set([
 ]);
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+// Observation only: no event cancellation, focus, selection or application
+// command changes. Bounded evidence distinguishes delivered input from a
+// renderer acknowledgement when an actual native acceptance assertion fails.
+function installInputProbe() {
+    globalThis.__diffTrackerNativeInputProbe?.dispose();
+    const events = [], disposables = [];
+    const describe = element => element?.nodeType === 1 ? {
+        tag: element.tagName, className: String(element.className).slice(0, 180),
+        role: element.getAttribute('role'), aria: element.getAttribute('aria-label')?.slice(0, 160)
+    } : { node: element?.nodeName };
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click',
+        'keydown', 'keyup', 'contextmenu', 'focusin', 'focusout']) {
+        for (const capture of [true, false]) {
+            const listener = event => {
+                if (events.length >= 60) { return; }
+                const entry = {
+                    type, phase: capture ? 'capture' : 'bubble', trusted: event.isTrusted,
+                    target: describe(event.target), path: event.composedPath().slice(0, 6).map(describe),
+                    button: event.button, buttons: event.buttons, pointerType: event.pointerType,
+                    key: event.key, code: event.code, keyCode: event.keyCode,
+                    shift: event.shiftKey, ctrl: event.ctrlKey, alt: event.altKey, meta: event.metaKey,
+                    defaultPrevented: event.defaultPrevented
+                };
+                events.push(entry);
+                queueMicrotask(() => {
+                    entry.finalDefaultPrevented = event.defaultPrevented;
+                    entry.activeAfter = describe(document.activeElement);
+                });
+            };
+            window.addEventListener(type, listener, { capture, passive: true });
+            disposables.push(() => window.removeEventListener(type, listener, capture));
+        }
+    }
+    globalThis.__diffTrackerNativeInputProbe = { events, dispose() { disposables.forEach(dispose => dispose()); } };
+    return true;
+}
+
 // Kept self-contained because this function executes in the real workbench DOM.
 // Coordinates are accepted only when hit testing confirms the visible element.
 function inspectWorkbench(request) {
+    const searchRootCache = new Map();
+    const searchRoots = root => {
+        if (searchRootCache.has(root)) { return searchRootCache.get(root); }
+        const roots = [root];
+        if (root.shadowRoot) { roots.push(...searchRoots(root.shadowRoot)); }
+        for (const element of root.querySelectorAll('*')) {
+            if (element.shadowRoot) { roots.push(...searchRoots(element.shadowRoot)); }
+        }
+        searchRootCache.set(root, roots);
+        return roots;
+    };
+    const composedClosest = (element, selector) => {
+        for (let current = element; current;) {
+            const found = current.closest?.(selector);
+            if (found) { return found; }
+            current = current.getRootNode?.().host;
+        }
+        return undefined;
+    };
+    const ancestry = element => {
+        const result = [];
+        for (let current = element; current && result.length < 8;) {
+            result.push(`${current.tagName}.${String(current.className).slice(0, 160)}`);
+            current = current.parentElement || current.getRootNode?.().host;
+        }
+        return result;
+    };
+    let activeElement = document.activeElement;
+    while (activeElement?.shadowRoot?.activeElement) { activeElement = activeElement.shadowRoot.activeElement; }
     const visible = element => {
         const bounds = element.getBoundingClientRect();
         const style = getComputedStyle(element);
@@ -27,14 +93,20 @@ function inspectWorkbench(request) {
             style.display !== 'none' && bounds.right > 0 && bounds.bottom > 0 &&
             bounds.left < innerWidth && bounds.top < innerHeight;
     };
-    const all = (selector, root = document) => [...root.querySelectorAll(selector)];
+    const all = (selector, root = document) => [...new Set(searchRoots(root)
+        .flatMap(searchRoot => [...searchRoot.querySelectorAll(selector)]))];
     const point = element => {
         if (!element || !visible(element)) { return undefined; }
         const box = element.getBoundingClientRect();
         const left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
         const top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
         const x = (left + right) / 2, y = (top + bottom) / 2;
-        const hit = document.elementFromPoint(x, y);
+        let hit = document.elementFromPoint(x, y);
+        for (let depth = 0; hit?.shadowRoot && depth < 8; depth++) {
+            const inner = hit.shadowRoot.elementFromPoint(x, y);
+            if (!inner || inner === hit) { break; }
+            hit = inner;
+        }
         return hit && (hit === element || element.contains(hit)) ? { x, y } : undefined;
     };
     const text = element => (element?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -76,13 +148,29 @@ function inspectWorkbench(request) {
     const result = {
         quickDiff, multiDiff, multiDiffRoots: roots.length, quickPick,
         documentHasFocus: document.hasFocus(), visibilityState: document.visibilityState,
-        activeElement: document.activeElement ? {
-            tag: document.activeElement.tagName,
-            label: label(document.activeElement).slice(0, 200),
-            inMultiDiff: !!document.activeElement.closest('.multiDiffEditor'),
-            inEditor: !!document.activeElement.closest('.monaco-editor')
+        activeElement: activeElement ? {
+            tag: activeElement.tagName,
+            className: String(activeElement.className),
+            label: label(activeElement).slice(0, 200),
+            ancestry: ancestry(activeElement),
+            inMultiDiff: !!composedClosest(activeElement, '.multiDiffEditor'),
+            inEditor: !!composedClosest(activeElement, '.monaco-editor')
         } : undefined
     };
+    if (globalThis.__diffTrackerNativeInputProbe) {
+        result.inputEvents = globalThis.__diffTrackerNativeInputProbe.events;
+        result.editorInputs = all('.monaco-editor textarea, .monaco-editor [contenteditable], ' +
+            '.monaco-editor .native-edit-context, .monaco-editor [role="textbox"]')
+            .slice(0, 12).map(element => ({
+                tag: element.tagName, className: String(element.className), role: element.getAttribute('role'),
+                contentEditable: element.getAttribute('contenteditable'), readOnly: element.getAttribute('readonly'),
+                tabIndex: element.tabIndex, focused: element === activeElement,
+                aria: element.getAttribute('aria-label')?.slice(0, 160),
+                editorClass: element.closest('.monaco-editor')?.className,
+                rect: { x: element.getBoundingClientRect().x, y: element.getBoundingClientRect().y,
+                    width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height }
+            }));
+    }
     const contextMenus = all('.monaco-menu').filter(visible);
     result.contextMenus = contextMenus.map(menu => all('.action-label', menu).filter(visible)
         .map(element => ({ label: label(element), enabled: !!enabled(element) })));
@@ -123,15 +211,27 @@ function inspectWorkbench(request) {
                 // The Host then verifies its actual URI and uses the stable
                 // TextEditor.selection API, never an injected Monaco model.
                 // Monaco's line wrapper may span far beyond its visible text.
-                // Hit a rendered text leaf, not the center of that large box.
-                const leaves = all('.view-lines .view-line span', editors[0])
+                // Inline diff also renders decorative ORIGINAL text in a view
+                // zone inside the modified editor. That is not its text input.
+                const mainLines = all('.view-lines', editors[0]).filter(element =>
+                    composedClosest(element, '.monaco-editor') === editors[0] &&
+                    !composedClosest(element, '.view-zones'));
+                const isMainText = element => mainLines.includes(composedClosest(element, '.view-lines')) &&
+                    composedClosest(element, '.monaco-editor') === editors[0] &&
+                    !composedClosest(element, '.view-zones');
+                const allLeaves = all('.view-lines .view-line span', editors[0])
                     .filter(element => !element.childElementCount && text(element) && visible(element));
+                const leaves = allLeaves.filter(isMainText);
+                result.mainTextCandidates = leaves.length;
+                result.excludedTextCandidates = allLeaves.filter(element => !isMainText(element)).slice(0, 3)
+                    .map(element => ({ text: text(element), ancestry: ancestry(element) }));
                 const target = leaves.find(element => point(element));
                 result.focusPoint = target ? point(target) : undefined;
                 result.focusTarget = target ? {
-                    text: text(target).slice(0, 160), tag: target.tagName, className: target.className
+                    text: text(target).slice(0, 160), tag: target.tagName, className: target.className,
+                    lineText: text(composedClosest(target, '.view-line')).slice(0, 200), ancestry: ancestry(target)
                 } : undefined;
-                result.modifiedFocused = editors[0].contains(document.activeElement);
+                result.modifiedFocused = composedClosest(activeElement, '.monaco-editor') === editors[0];
             }
         }
     }
@@ -259,6 +359,9 @@ export async function runNativeUiDriver(portText, operation, argument) {
             return matches[0];
         });
         cdp = await connect(validateWebSocketUrl(target.webSocketDebuggerUrl, port), deadline);
+        if (operation === 'focus-multi-diff' || operation === 'click-native-action') {
+            await cdp.send('Runtime.evaluate', { expression: `(${installInputProbe.toString()})()`, returnByValue: true });
+        }
         const inspect = async kind => {
             const response = await cdp.send('Runtime.evaluate', {
                 expression: `(${inspectWorkbench.toString()})(${JSON.stringify({
@@ -381,7 +484,15 @@ export async function runNativeUiDriver(portText, operation, argument) {
     } catch (error) {
         console.error('Native UI diagnostics:', JSON.stringify({ operation, lastDiscovery, lastState }));
         throw error;
-    } finally { cdp?.close(); }
+    } finally {
+        if (cdp) {
+            try {
+                await cdp.send('Runtime.evaluate', { expression:
+                    'globalThis.__diffTrackerNativeInputProbe?.dispose(); delete globalThis.__diffTrackerNativeInputProbe;' });
+            } catch { /* A closed or timed-out target must not mask the original failure. */ }
+            cdp.close();
+        }
+    }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -122,6 +122,13 @@ module.exports = async function nativeReviewCheckpoint() {
     const initial = await state();
     assert.equal(initial.isRecording, true);
     assert.equal(initial.trackedChanges.length, 0, 'checkpoint must run before other scenarios create reviews');
+    const windowConfig = vscode.workspace.getConfiguration('window');
+    assert.equal(windowConfig.get('titleBarStyle'), 'custom', 'disposable Host must load its custom-menu fixture');
+    if (!/^1\.80\./.test(vscode.version)) {
+        assert.equal(windowConfig.get('menuStyle'), 'custom', 'Stable must load its custom-menu fixture');
+    }
+    console.log('Native Review menu fixture:', JSON.stringify({ version: vscode.version,
+        titleBarStyle: windowConfig.get('titleBarStyle'), menuStyle: windowConfig.get('menuStyle') }));
     assert.equal(config.get('nativeQuickDiff'), false, 'native Quick Diff is opt-in');
     assert.equal(await original(A), BASE_A);
     assert.equal(await original(B), BASE_B);
@@ -359,6 +366,11 @@ module.exports = async function nativeReviewCheckpoint() {
                     reviewTokens: cleanupState.reviewTokens, coverageGaps: cleanupState.coverageGaps,
                     subtreeCoverageGaps: cleanupState.subtreeCoverageGaps,
                     unknownReviewPaths: cleanupState.unknownReviewPaths,
+                    fixtureReviews: cleanupState.trackedChanges.filter(change =>
+                        [uri(A).fsPath, uri(B).fsPath].includes(change.filePath)).map(change => ({
+                        filePath: change.filePath, kind: change.reviewKind, reason: change.reviewReason,
+                        unavailableReason: change.unavailableReason
+                    })),
                     originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null
                 }));
             } catch (diagnosticError) {
