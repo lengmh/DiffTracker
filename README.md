@@ -67,6 +67,8 @@ The project retains the MIT license and upstream attribution. The Marketplace ex
 
 **Clear Diffs** resets the baseline to the current workspace while recording. When recording is stopped, it clears the saved baseline and Undo history and remains stopped, including after reload. It does not modify workspace files or dirty buffers.
 
+**Recheck Observation Coverage** is available in the Command Palette and Settings → Tools. For an active, ready configured scope, it reinstalls failed observation coverage and performs one bounded comparison against the original review baselines. Pending text/opaque reviews and unknown before-images are preserved. It refuses while recording is stopped, scope changes or recovery are pending, or editors have unsaved changes. Activity, unsupported coverage or resource limits may leave a visible coverage gap; retry after resolving the cause. It does not accept changes, rebuild the baseline or modify workspace files. See the [bounded recovery contract](docs/recheck-observation-coverage-checkpoint.md).
+
 ## How It Works
 
 When recording starts, Code Diff Tracker:

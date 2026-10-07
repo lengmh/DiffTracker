@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { DiffTracker } from './diffTracker';
+import { DiffTracker, ObservationCoverageRecheckResult } from './diffTracker';
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
@@ -94,6 +94,15 @@ export class MonitoringScopeController implements vscode.Disposable {
 
     public dispose(): void {
         for (const disposable of this.disposables.splice(0)) { disposable.dispose(); }
+    }
+
+    public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        this.reconcileRequestedScope();
+        const requested = this.getRequestedScope();
+        if (!requested.ok) {
+            return Promise.resolve({ status: 'conflict', reason: 'Correct the invalid monitoring-scope request before rechecking observation coverage.' });
+        }
+        return this.tracker.recheckObservationCoverage();
     }
 
     public getWorkspaceRoots(): WorkspaceRootIdentity[] {

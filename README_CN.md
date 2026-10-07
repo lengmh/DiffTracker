@@ -100,6 +100,8 @@ Code Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件�
 6. 在 WebView Diff 中，可对每个变更块执行 `Undo / Keep`，或在文件级执行 `Keep All / Reject All`。
 7. `Code Diff Tracker: Clear Diffs` 在录制中会以当前工作区状态重建基线；停止录制后会清除已保存的基线和 Undo 历史，重载后仍保持停止。该命令不会修改工作区文件或未保存的缓冲区。
 
+`Code Diff Tracker: Recheck Observation Coverage` 可从命令面板或 Settings → Tools 执行。它适用于正在录制、基线已就绪的已配置范围：重装失效监听，并按原审阅基线进行一次有界核对，保留文本、不透明和未知待审状态。停止录制、存在待处理范围或恢复操作、编辑器有未保存修改时会拒绝执行。核对期间有文件活动、覆盖不受支持或资源超限时，覆盖缺口继续可见；解决原因后可重试。该命令不接受修改、不重建基线，也不写回工作区文件。限制见 [Recheck checkpoint](docs/recheck-observation-coverage-checkpoint.md)。
+
 ## 工作原理
 
 开始录制后，Code Diff Tracker 会：

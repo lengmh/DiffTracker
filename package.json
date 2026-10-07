@@ -382,6 +382,11 @@
         "category": "Code Diff Tracker"
       },
       {
+        "command": "diffTracker.recheckObservationCoverage",
+        "title": "Recheck Observation Coverage",
+        "category": "Code Diff Tracker"
+      },
+      {
         "command": "diffTracker.migrateLegacyWatchRules",
         "title": "Migrate Legacy Watch Rules",
         "category": "Code Diff Tracker"

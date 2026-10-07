@@ -135,6 +135,11 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
                         title: 'Manage Monitoring Scope'
                     },
                     'filter'
+                ),
+                new SettingActionItem(
+                    'Recheck Observation Coverage',
+                    { command: 'diffTracker.recheckObservationCoverage', title: 'Recheck Observation Coverage' },
+                    'refresh'
                 )
             ];
         }
