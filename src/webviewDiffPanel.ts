@@ -57,6 +57,13 @@ export class WebviewDiffPanel {
         this.panel = panel;
         this.extensionUri = extensionUri;
 
+        // Defaults are sampled once per panel, never over a toolbar choice on
+        // refresh, file navigation, or a later configuration change.
+        const config = vscode.workspace.getConfiguration('diffTracker');
+        this.currentStyle = config.get<string>('webviewDiffStyle', 'split') === 'unified' ? 'unified' : 'split';
+        this.currentWrap = config.get<boolean>('webviewWordWrap', false) === true;
+        this.currentExpandAll = config.get<boolean>('webviewExpandUnchanged', false) === true;
+
         // Listen for panel disposal
         this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 

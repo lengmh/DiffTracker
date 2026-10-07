@@ -14,7 +14,7 @@ const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
-    const state = { changes: change ? [change] : [], subtreeCoverageGaps: [], result: { status: 'success' }, error: undefined };
+    const state = { changes: change ? [change] : [], subtreeCoverageGaps: [], configuration: {}, updates: [], createdPanels: [], result: { status: 'success' }, error: undefined };
     const vscode = {
         Uri: {
             file: value => ({ fsPath: value }),
@@ -27,8 +27,25 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         CodeLens:class {constructor(range,command){Object.assign(this,{range,command});}},
         ThemeIcon: class { static File = 'file'; },
         ColorThemeKind: { Light: 1 },
-        window: { activeColorTheme: { kind: 1 } },
-        workspace: { textDocuments: [], workspaceFolders: [], getWorkspaceFolder: () => undefined,getConfiguration:()=>({get:(key,f)=>state.configuration?.[key]??f}),onDidChangeConfiguration:()=>({dispose(){}}) },
+        ViewColumn: { One: 1, Beside: -2 },
+        ConfigurationTarget: { Global: 1, Workspace: 2 },
+        window: {
+            activeColorTheme: { kind: 1 },
+            onDidChangeActiveColorTheme: () => ({ dispose() {} }),
+            createWebviewPanel: () => {
+                const panel = {
+                    onDidDispose: () => ({ dispose() {} }), reveal() {}, dispose() {},
+                    webview: {
+                        postMessage: value => messages.push(value),
+                        asWebviewUri: uri => uri, cspSource: 'test-source',
+                        onDidReceiveMessage: () => ({ dispose() {} })
+                    }
+                };
+                state.createdPanels.push(panel);
+                return panel;
+            }
+        },
+        workspace: { textDocuments: [], workspaceFolders: [], getWorkspaceFolder: () => undefined,getConfiguration:()=>({get:(key,f)=>state.configuration?.[key]??f,inspect:key=>({workspaceValue:state.workspaceConfiguration?.[key]}),update:async(...args)=>state.updates.push(args)}),onDidChangeConfiguration:()=>({dispose(){}}) },
         commands: { async executeCommand(...args) {
             commands.push(args);
             if (state.error) { throw state.error; }
@@ -84,7 +101,8 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         disposed:false,viewGeneration:0,seenRequests:new Set(),activeRequest:undefined,disposables:[],
         panel: { dispose(){},webview: { postMessage: value => messages.push(value), asWebviewUri: uri => uri, cspSource: 'test-source' } }
     });
-    return { panel, tracker, state, messages, commands, load };
+    return { panel, tracker, state, messages, commands, load,
+        open: (target = filePath) => load('webviewDiffPanel.ts').WebviewDiffPanel.createOrShow({ fsPath: '/extension' }, tracker, target) };
 }
 
 function runInline(html) {
@@ -93,7 +111,7 @@ function runInline(html) {
         listeners = {};
         disabled = false;
         textContent = '';
-        classList = { toggle() {} };
+        classList = { values: new Set(), toggle(name, enabled) { if (enabled) this.values.add(name); else this.values.delete(name); }, contains(name) { return this.values.has(name); } };
         set innerHTML(value) { this.html = value; this.children = []; }
         get innerHTML() { return this.html ?? ''; }
         addEventListener(event, handler) { this.listeners[event] = handler; }
@@ -392,7 +410,7 @@ function commandHarness(options={}) {
     const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],executed:[],updates:[],pickerItems:[],...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
-    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode']);
+    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode','diffTracker.selectWebviewDiffStyle']);
     function visit(node){
         if(ts.isFunctionDeclaration(node)&&['extractFilePath','extractIsDeleted','getDefaultOpenMode','isDeletedReview'].includes(node.name?.text))helpers.push(node.getText(source));
         if(ts.isCallExpression(node)&&node.expression.getText(source)==='vscode.commands.registerCommand'&&names.has(node.arguments[0]?.text))callbacks.push(`${JSON.stringify(node.arguments[0].text)}:${node.arguments[1].getText(source)}`);
@@ -401,8 +419,8 @@ function commandHarness(options={}) {
     visit(source);
     class Uri {constructor(fsPath,scheme='file'){this.fsPath=fsPath;this.scheme=scheme;}static file(p){return new Uri(p);}}
     let sandbox;
-    const vscode={Uri,ConfigurationTarget:{Global:1},ViewColumn:{One:1,Two:2},
-        workspace:{getConfiguration:()=>({get:(_key,fallback)=>state.mode??fallback,update:async(...args)=>state.updates.push(args)}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
+    const vscode={Uri,ConfigurationTarget:{Global:1,Workspace:2},ViewColumn:{One:1,Two:2},
+        workspace:{getConfiguration:()=>({get:(_key,fallback)=>state.mode??fallback,inspect:key=>({workspaceValue:state.workspaceConfiguration?.[key]}),update:async(...args)=>state.updates.push(args)}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
         window:{
             showTextDocument:async()=>{},
             showQuickPick:async items=>{state.pickerItems=items;return items.find(item=>item.value===state.chooseMode);},
@@ -427,6 +445,143 @@ function commandHarness(options={}) {
     vm.runInContext(ts.transpileModule(`${helpers.join('\n')}globalThis.callbacks={${callbacks.join(',')}};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     return {state,Uri,run:(name,...args)=>sandbox.callbacks[name](...args)};
 }
+// Exercise the real constructor and generated inline script, including the
+// one-time default boundary. No settings initializer is copied into this test.
+for (const style of ['split', 'unified']) {
+    for (const wrap of [false, true]) {
+        for (const expand of [false, true]) {
+            await test(`new WebView initializes ${style}, wrap=${wrap}, expand=${expand}`, () => {
+                const h = harness({ filePath, fileName: 'empty.m', originalContent: 'before', currentContent: 'after' });
+                h.state.configuration = { webviewDiffStyle: style, webviewWordWrap: wrap, webviewExpandUnchanged: expand };
+                const panel = h.open();
+                const ui = runInline(h.state.createdPanels[0].webview.html);
+                const options = ui.rendererOptions.at(-1);
+                assert.equal(options.diffStyle, style);
+                assert.equal(options.overflow, wrap ? 'wrap' : 'scroll');
+                assert.equal(options.expandUnchanged, expand);
+                assert.equal(ui.elements.get('btn-split').classList.contains('secondary'), style !== 'split');
+                assert.equal(ui.elements.get('btn-unified').classList.contains('secondary'), style !== 'unified');
+                assert.equal(ui.elements.get('btn-wrap').classList.contains('secondary'), !wrap);
+                assert.equal(ui.elements.get('btn-expand').classList.contains('secondary'), !expand);
+                assert.deepEqual(h.state.updates, [], 'opening a panel does not write settings');
+                panel.dispose();
+            });
+        }
+    }
+}
+await test('missing and invalid WebView defaults retain Split, Wrap off and Expand off', () => {
+    for (const configuration of [{}, { webviewDiffStyle: 'sideBySide', webviewWordWrap: 'true', webviewExpandUnchanged: 1 }]) {
+        const h = harness();
+        h.state.configuration = configuration;
+        const panel = h.open();
+        panel.sendDataUpdate();
+        const update = h.messages.at(-1);
+        assert.equal(update.style, 'split');
+        assert.equal(update.wrap, false);
+        assert.equal(update.expandAll, false);
+        panel.dispose();
+    }
+});
+await test('WebView toolbar choices survive refresh and file navigation; reopening samples new settings', async () => {
+    const change = { filePath, fileName: 'empty.m', originalContent: 'before', currentContent: 'after' };
+    const h = harness(change);
+    h.state.configuration = { webviewDiffStyle: 'unified', webviewWordWrap: true, webviewExpandUnchanged: true };
+    const panel = h.open();
+    const ui = runInline(h.state.createdPanels[0].webview.html);
+    for (const id of ['btn-split', 'btn-wrap', 'btn-expand']) {
+        ui.click(id);
+        await panel.handleMessage(ui.sent.at(-1));
+    }
+    assert.equal(ui.rendererOptions.at(-1).diffStyle, 'split');
+    assert.equal(ui.rendererOptions.at(-1).overflow, 'scroll');
+    assert.equal(ui.rendererOptions.at(-1).expandUnchanged, false);
+    const assertToolbarChoices = () => {
+        const update = h.messages.at(-1);
+        assert.equal(update.style, 'split');
+        assert.equal(update.wrap, false);
+        assert.equal(update.expandAll, false);
+        ui.receive(update);
+        assert.equal(ui.rendererOptions.at(-1).diffStyle, 'split');
+        assert.equal(ui.rendererOptions.at(-1).overflow, 'scroll');
+        assert.equal(ui.rendererOptions.at(-1).expandUnchanged, false);
+    };
+    panel.update(filePath);
+    assertToolbarChoices();
+    assert.equal(h.open(), panel, 'reveal reuses the same panel');
+    const secondPath = '/workspace/second.m';
+    h.state.changes.push({ ...change, filePath: secondPath });
+    assert.equal(h.open(secondPath), panel);
+    assertToolbarChoices();
+    h.state.configuration = { webviewDiffStyle: 'unified', webviewWordWrap: false, webviewExpandUnchanged: true };
+    panel.update(secondPath);
+    assertToolbarChoices();
+    assert.deepEqual(h.state.updates, [], 'toolbar controls never persist settings');
+    panel.dispose();
+    const reopened = h.open(secondPath);
+    assert.notEqual(reopened, panel);
+    const freshUI = runInline(h.state.createdPanels[1].webview.html);
+    assert.equal(freshUI.rendererOptions.at(-1).diffStyle, 'unified');
+    assert.equal(freshUI.rendererOptions.at(-1).overflow, 'scroll');
+    assert.equal(freshUI.rendererOptions.at(-1).expandUnchanged, true);
+    // Both directions remain interactive after using configured defaults.
+    for (const id of ['btn-split', 'btn-unified', 'btn-wrap', 'btn-wrap', 'btn-expand', 'btn-expand']) freshUI.click(id);
+    assert.equal(freshUI.rendererOptions.at(-1).diffStyle, 'unified');
+    assert.equal(freshUI.rendererOptions.at(-1).overflow, 'scroll');
+    assert.equal(freshUI.rendererOptions.at(-1).expandUnchanged, true);
+    reopened.dispose();
+});
+await test('WebView settings have matching manifest defaults and sidebar controls', async () => {
+    const properties = JSON.parse(fs.readFileSync('package.json', 'utf8')).contributes.configuration.properties;
+    assert.deepEqual(properties['diffTracker.webviewDiffStyle'].enum, ['split', 'unified']);
+    for (const [key, expected] of [['webviewDiffStyle', 'split'], ['webviewWordWrap', false], ['webviewExpandUnchanged', false]]) {
+        assert.equal(properties[`diffTracker.${key}`].default, expected);
+        assert.equal(properties[`diffTracker.${key}`].scope, 'window');
+    }
+    const h = harness();
+    const provider = new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();
+    const display = provider.getChildren().find(item => item.label === 'Display');
+    let items = provider.getChildren(display);
+    assert.equal(items.find(item => item.command?.command === 'diffTracker.selectWebviewDiffStyle').label, 'WebView default layout: Split');
+    for (const key of ['webviewWordWrap', 'webviewExpandUnchanged']) {
+        assert.equal(items.find(item => item.settingKey === key).isEnabled, false);
+        await provider.toggleSetting(key);
+        assert.deepEqual(h.state.updates.at(-1), [key, true, 1]);
+    }
+    h.state.configuration = { webviewDiffStyle: 'unified', webviewWordWrap: true, webviewExpandUnchanged: true };
+    items = provider.getChildren(display);
+    assert.equal(items.find(item => item.command?.command === 'diffTracker.selectWebviewDiffStyle').label, 'WebView default layout: Unified');
+    for (const key of ['webviewWordWrap', 'webviewExpandUnchanged']) {
+        assert.equal(items.find(item => item.settingKey === key).isEnabled, true);
+        await provider.toggleSetting(key);
+        assert.deepEqual(h.state.updates.at(-1), [key, false, 1]);
+    }
+    provider.dispose();
+});
+await test('WebView layout picker preserves selections and cancellation without changing the frontend mode', async () => {
+    for (const style of ['split', 'unified']) {
+        const h = commandHarness({ mode: style, chooseMode: style });
+        await h.run('diffTracker.selectWebviewDiffStyle');
+        assert.deepEqual(Array.from(h.state.pickerItems, item => item.value), ['split', 'unified']);
+        assert.match(h.state.pickerItems.find(item => item.value === style).label, /^\$\(check\)/);
+        assert.deepEqual(h.state.updates, [['webviewDiffStyle', style, 1]]);
+    }
+    const cancel = commandHarness();
+    await cancel.run('diffTracker.selectWebviewDiffStyle');
+    assert.deepEqual(cancel.state.updates, []);
+});
+await test('WebView sidebar changes update existing workspace overrides instead of hidden global values', async () => {
+    const h = harness();
+    h.state.configuration = { webviewWordWrap: false, webviewExpandUnchanged: true };
+    h.state.workspaceConfiguration = { ...h.state.configuration };
+    const provider = new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();
+    await provider.toggleSetting('webviewWordWrap');
+    await provider.toggleSetting('webviewExpandUnchanged');
+    assert.deepEqual(h.state.updates, [['webviewWordWrap', true, 2], ['webviewExpandUnchanged', false, 2]]);
+    provider.dispose();
+    const picker = commandHarness({ mode: 'split', chooseMode: 'unified', workspaceConfiguration: { webviewDiffStyle: 'split' } });
+    await picker.run('diffTracker.selectWebviewDiffStyle');
+    assert.deepEqual(picker.state.updates, [['webviewDiffStyle', 'unified', 2]]);
+});
 await test('settings tree shows the selected Native Review label',()=>{
     const h=harness();h.state.configuration={defaultOpenMode:'nativeReview'};
     const provider=new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();

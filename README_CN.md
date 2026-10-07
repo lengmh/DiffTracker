@@ -6,7 +6,7 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 [English](./README.md)
 
-本文描述 `0.8.0` 源码发布准备。监控范围、Native Review 和有界 RC 工作已合并；已核验的功能基线通过 [Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513)，8/8 job 成功。这不表示已创建发布 tag、GitHub release 或 Marketplace 包。证据与限制见 [RC 检查点](docs/bounded-rc-checkpoint.md)，最终发布 VSIX 仍需单独通过[发布门禁](docs/releasing.md)。
+本文描述 `0.8.1` 源码，在 `0.8.0` 基础上增加 WebView 显示默认值设置。源码版本不代表新版本已发布；最终 VSIX 的核验要求见[发布门禁](docs/releasing.md)。
 
 > 本 fork 的扩展 ID 为 `lengmh.code-diff-tracker`。安装前，请禁用或卸载上游
 > `TinyTigerPan.diff-tracker`，以及此前用于测试的 `lengmh.diff-tracker` VSIX。
@@ -186,11 +186,16 @@ npm run package
 | `diffTracker.nativeQuickDiff` | `false` | 独立启用 Quick Diff provider；其菜单打开新的 Native Review 快照 |
 | `diffTracker.monitoringScope` | `rules` | 请求 `rules` 或 `wholeWorkspace`；范围扩展需要本机确认和准备 |
 | `diffTracker.watchInclude` | `[]` | 由范围管理器编辑的结构化、字面工作区相对路径 |
+| `diffTracker.webviewDiffStyle` | `split` | 新建 WebView 面板的布局：`split` 为分栏，`unified` 为单列 |
+| `diffTracker.webviewWordWrap` | `false` | 新建 WebView 面板时是否对长行自动换行 |
+| `diffTracker.webviewExpandUnchanged` | `false` | 新建 WebView 面板时是否展开全部未改动的上下文行 |
 | `diffTracker.openWebviewBeside` | `false` | 是否将 WebView Diff 打开到旁边的编辑器分组 |
 | `diffTracker.watchExclude` | `[]` | 不支持 `!` 否定的结构化显式排除；旧字符串规则在迁移前保留兼容语义 |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
 
 显示设置位于侧边栏 **Settings**。默认打开方式可从 **Display → Default open mode**、**Select Default Open Mode** 命令或 VS Code 设置修改；监控规则由 **Manage Monitoring Scope** 管理。
+
+WebView 显示默认值也可从 **Settings → Display** 中的 **WebView default layout**、**WebView default: Wrap** 和 **WebView default: Expand** 修改。Expand 展开未改动的上下文，包括变更区块之外的行。这三个设置仅在新建面板时读取；已打开的面板在刷新、隐藏后再次显示和切换文件时保留工具栏选择。关闭 WebView 标签页后重新打开，才会应用新的默认值。工具栏操作不会回写设置，这些默认值也不影响 VS Code 原生 Diff 编辑器。
 
 ## 默认打开模式
 

@@ -2,7 +2,7 @@
   "name": "code-diff-tracker",
   "displayName": "Code Diff Tracker",
   "description": "Review, keep, and safely revert workspace file changes in real time",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publisher": "lengmh",
   "author": "TinyTigerPan (Fork from Wizyoung)",
   "license": "MIT",
@@ -122,6 +122,32 @@
           "type": "boolean",
           "default": false,
           "description": "When opening Webview diff, place it in a side editor group instead of the current one"
+        },
+        "diffTracker.webviewDiffStyle": {
+          "type": "string",
+          "enum": [
+            "split",
+            "unified"
+          ],
+          "default": "split",
+          "scope": "window",
+          "enumDescriptions": [
+            "Show original and current lines side by side.",
+            "Show original and current lines in one column."
+          ],
+          "description": "Initial layout for a new WebView diff panel. Toolbar changes stay in that panel; close and reopen it to apply a changed default."
+        },
+        "diffTracker.webviewWordWrap": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Wrap long lines in a new WebView diff panel. Toolbar changes stay in that panel; close and reopen it to apply a changed default."
+        },
+        "diffTracker.webviewExpandUnchanged": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Show all unchanged context lines in a new WebView diff panel (the Expand toolbar control). Toolbar changes stay in that panel; close and reopen it to apply a changed default."
         },
         "diffTracker.watchExclude": {
           "type": "array",
@@ -372,6 +398,11 @@
       {
         "command": "diffTracker.selectDefaultOpenMode",
         "title": "Select Default Open Mode",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.selectWebviewDiffStyle",
+        "title": "Select Default WebView Diff Layout",
         "category": "Code Diff Tracker"
       },
       {

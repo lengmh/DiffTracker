@@ -957,6 +957,26 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.selectWebviewDiffStyle', async () => {
+            const config = vscode.workspace.getConfiguration('diffTracker');
+            const current = config.get<string>('webviewDiffStyle', 'split');
+            const items = [
+                { label: 'Split', description: 'Original and current lines side by side', value: 'split' },
+                { label: 'Unified', description: 'Original and current lines in one column', value: 'unified' }
+            ];
+            const selected = await vscode.window.showQuickPick(
+                items.map(item => ({ ...item, label: item.value === current ? `$(check) ${item.label}` : item.label })),
+                { placeHolder: 'Default layout for new WebView panels (close and reopen to apply)' }
+            );
+            if (!selected) { return; }
+            const target = config.inspect('webviewDiffStyle')?.workspaceValue !== undefined
+                ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+            await config.update('webviewDiffStyle', selected.value, target);
+            settingsTreeDataProvider.refresh();
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.showWebviewDiffActive', async () => {
             const editor = vscode.window.activeTextEditor;
             if (!editor || editor.document.uri.scheme !== 'file') {

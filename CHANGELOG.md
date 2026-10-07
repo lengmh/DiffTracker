@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1
+
+- Add configurable WebView defaults for Split/Unified layout, Wrap, and Expand (all unchanged context lines) in VS Code settings and the sidebar Display group. Existing defaults remain Split, Wrap off, and Expand off.
+- Apply these defaults when a new WebView panel is created. Toolbar choices remain local to the current panel across refreshes and file switches; close and reopen to apply changed defaults.
+
 ## 0.8.0
 
 These notes accompany the `0.8.0` source release preparation; they do not announce a published tag, GitHub release or Marketplace package. The merged feature candidate passed its bounded checks; the final release VSIX must separately pass the [release gates](docs/releasing.md) before publication.

@@ -7,7 +7,8 @@ class SettingItem extends vscode.TreeItem {
     constructor(
         public readonly settingKey: string,
         public readonly label: string,
-        public readonly isEnabled: boolean
+        public readonly isEnabled: boolean,
+        tooltip?: string
     ) {
         super(label, vscode.TreeItemCollapsibleState.None);
 
@@ -20,7 +21,7 @@ class SettingItem extends vscode.TreeItem {
             title: 'Toggle Setting',
             arguments: [settingKey]
         };
-        this.tooltip = `Click to ${isEnabled ? 'disable' : 'enable'}`;
+        this.tooltip = tooltip ?? `Click to ${isEnabled ? 'disable' : 'enable'}`;
     }
 }
 
@@ -53,7 +54,7 @@ type SettingGroup = {
     id: string;
     label: string;
     icon?: string;
-    items: Array<{ key: string; label: string }>;
+    items: Array<{ key: string; label: string; defaultValue?: boolean; tooltip?: string }>;
 };
 
 /**
@@ -70,6 +71,10 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
             label: 'Display',
             items: [
                 { key: 'openWebviewBeside', label: 'Beside View' },
+                { key: 'webviewWordWrap', label: 'WebView default: Wrap', defaultValue: false,
+                    tooltip: 'Wrap long lines in new WebView panels. Close and reopen the panel to apply.' },
+                { key: 'webviewExpandUnchanged', label: 'WebView default: Expand', defaultValue: false,
+                    tooltip: 'Show all unchanged context lines in new WebView panels. Close and reopen the panel to apply.' },
                 { key: 'showDeletedLinesBadge', label: 'Deleted line badge' },
                 { key: 'showCodeLens', label: 'CodeLens actions' }
             ]
@@ -155,6 +160,7 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
                 splitOriginalWebview: 'Split: Original | Webview'
             };
             const modeLabel = modeLabelMap[defaultOpenMode] ?? 'Webview';
+            const diffStyleLabel = config.get<string>('webviewDiffStyle', 'split') === 'unified' ? 'Unified' : 'Split';
 
             return [
                 new SettingActionItem(
@@ -165,16 +171,21 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
                     },
                     'preview'
                 ),
+                new SettingActionItem(
+                    `WebView default layout: ${diffStyleLabel}`,
+                    { command: 'diffTracker.selectWebviewDiffStyle', title: 'Select Default WebView Diff Layout' },
+                    'split-horizontal'
+                ),
                 ...group.items.map(setting => {
-                    const value = config.get<boolean>(setting.key, true);
-                    return new SettingItem(setting.key, setting.label, value);
+                    const value = config.get<boolean>(setting.key, setting.defaultValue ?? true);
+                    return new SettingItem(setting.key, setting.label, value, setting.tooltip);
                 })
             ];
         }
 
         return group.items.map(setting => {
-            const value = config.get<boolean>(setting.key, true);
-            return new SettingItem(setting.key, setting.label, value);
+            const value = config.get<boolean>(setting.key, setting.defaultValue ?? true);
+            return new SettingItem(setting.key, setting.label, value, setting.tooltip);
         });
     }
 
@@ -183,8 +194,12 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
      */
     public async toggleSetting(settingKey: string): Promise<void> {
         const config = vscode.workspace.getConfiguration('diffTracker');
-        const currentValue = config.get<boolean>(settingKey, true);
-        await config.update(settingKey, !currentValue, vscode.ConfigurationTarget.Global);
+        const setting = this.settings.flatMap(group => group.items).find(item => item.key === settingKey);
+        const currentValue = config.get<boolean>(settingKey, setting?.defaultValue ?? true);
+        const isWebviewDefault = settingKey === 'webviewWordWrap' || settingKey === 'webviewExpandUnchanged';
+        const target = isWebviewDefault && config.inspect(settingKey)?.workspaceValue !== undefined
+            ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+        await config.update(settingKey, !currentValue, target);
         this.refresh();
     }
 
