@@ -74,3 +74,7 @@
 | 最终 CI、PR 状态与发布决策 | 待核对；未发布 | 确切 head/run，审查、合并和发布分别陈述 |
 
 失败必须保留最初日志与修正范围；尚未返回、跳过或仅包装成功均不能记为验收通过。只有本批承诺的有限证据齐全后，才能给出 RC 结论。已可靠拒绝的范围外场景不自动扩成新开发批次；支持范围内的实质安全问题必须修复或可靠阻断。
+
+## 首次 CI 启动检查
+
+[Verification #544](https://github.com/lengmh/DiffTracker/actions/runs/37602035394) 在 `efdcd4d` 上因工作流表达式验证失败而结束，未启动任何测试 job。新增安装 job 的 job-level `env` 使用了该层不提供的 `runner.temp`。修正仅将临时目录初始化移入运行步骤，通过 `$RUNNER_TEMP` 和 `$GITHUB_ENV` 传给后续步骤；保留全部测试、断言和包装依赖。已扫描两个 workflow 的同类 context 位置，并为此入口记录失败/通过 guard 回归。后续实际 Host 与最终 CI 结果仍须分别核对。

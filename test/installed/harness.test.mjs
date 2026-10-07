@@ -50,3 +50,12 @@ test('only the unrelated driver is launched as a development extension', () => {
     assert.match(suite, /extension\.activate\(\)/);
     assert.match(suite, /driver\.storageUri/);
 });
+test('installed job resolves its temporary path after runner assignment', () => {
+    const workflow = readFileSync(new URL('../../.github/workflows/verification.yml', import.meta.url), 'utf8');
+    const installed = workflow.split('  installed-extension-host:\n')[1].split('\n  downgrade-compatibility:')[0];
+    const jobSettings = installed.split('    steps:')[0];
+    // GitHub does not provide runner at jobs.<job_id>.env. It is available
+    // only after assignment, in steps and their process environment.
+    assert.doesNotMatch(jobSettings, /\$\{\{\s*runner[.[]/);
+    assert.match(installed, /RC_ARTIFACTS=\$RUNNER_TEMP\/difftracker-installed-rc-evidence/);
+});

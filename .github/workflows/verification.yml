@@ -71,9 +71,10 @@ jobs:
     name: Installed RC VSIX (Ubuntu Stable)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      RC_ARTIFACTS: ${{ runner.temp }}/difftracker-installed-rc-evidence
     steps:
+      - name: Initialize isolated RC artifact directory
+        shell: bash
+        run: echo "RC_ARTIFACTS=$RUNNER_TEMP/difftracker-installed-rc-evidence" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
