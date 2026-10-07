@@ -28,7 +28,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         ThemeIcon: class { static File = 'file'; },
         ColorThemeKind: { Light: 1 },
         window: { activeColorTheme: { kind: 1 } },
-        workspace: { textDocuments: [], workspaceFolders: [], getWorkspaceFolder: () => undefined,getConfiguration:()=>({get:(_k,f)=>f}) },
+        workspace: { textDocuments: [], workspaceFolders: [], getWorkspaceFolder: () => undefined,getConfiguration:()=>({get:(key,f)=>state.configuration?.[key]??f}),onDidChangeConfiguration:()=>({dispose(){}}) },
         commands: { async executeCommand(...args) {
             commands.push(args);
             if (state.error) { throw state.error; }
@@ -389,22 +389,23 @@ await test('detached old annotation button sends its captured old review token',
     assert.equal(ui.sent[0].reviewToken.currentRevision,'current');assert.equal(ui.sent[0].changeBlockId,'old-block');
 });
 function commandHarness(options={}) {
-    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],...options};
+    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],executed:[],updates:[],pickerItems:[],...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
-    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs']);
+    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode']);
     function visit(node){
         if(ts.isFunctionDeclaration(node)&&['extractFilePath','extractIsDeleted','getDefaultOpenMode','isDeletedReview'].includes(node.name?.text))helpers.push(node.getText(source));
         if(ts.isCallExpression(node)&&node.expression.getText(source)==='vscode.commands.registerCommand'&&names.has(node.arguments[0]?.text))callbacks.push(`${JSON.stringify(node.arguments[0].text)}:${node.arguments[1].getText(source)}`);
         ts.forEachChild(node,visit);
     }
     visit(source);
-    class Uri {constructor(fsPath){this.fsPath=fsPath;}static file(p){return new Uri(p);}}
+    class Uri {constructor(fsPath,scheme='file'){this.fsPath=fsPath;this.scheme=scheme;}static file(p){return new Uri(p);}}
     let sandbox;
-    const vscode={Uri,ViewColumn:{One:1,Two:2},
-        workspace:{getConfiguration:()=>({get:()=>state.mode}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
+    const vscode={Uri,ConfigurationTarget:{Global:1},ViewColumn:{One:1,Two:2},
+        workspace:{getConfiguration:()=>({get:(_key,fallback)=>state.mode??fallback,update:async(...args)=>state.updates.push(args)}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
         window:{
             showTextDocument:async()=>{},
+            showQuickPick:async items=>{state.pickerItems=items;return items.find(item=>item.value===state.chooseMode);},
             showInformationMessage:m=>state.info.push(m),
             showWarningMessage:(message,...args)=>{
                 const modal=args.find(value=>value&&typeof value==='object'&&value.modal===true);
@@ -417,15 +418,61 @@ function commandHarness(options={}) {
                 return undefined;
             }
         },
-        commands:{executeCommand:async(name,...args)=>sandbox.callbacks[name](...args)}};
+        commands:{executeCommand:async(name,...args)=>{state.executed.push([name,...args]);return sandbox.callbacks[name]?.(...args);}}};
     const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
         resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;}};
     sandbox={vscode,diffTracker:tracker,context:{extensionUri:{}},WebviewDiffPanel:{createOrShow:()=>state.panels++},
-        refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},console};
+        settingsTreeDataProvider:{refresh(){}},refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},console};
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`${helpers.join('\n')}globalThis.callbacks={${callbacks.join(',')}};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
-    return {state,run:(name,...args)=>sandbox.callbacks[name](...args)};
+    return {state,Uri,run:(name,...args)=>sandbox.callbacks[name](...args)};
 }
+await test('settings tree shows the selected Native Review label',()=>{
+    const h=harness();h.state.configuration={defaultOpenMode:'nativeReview'};
+    const provider=new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();
+    const display=provider.getChildren().find(item=>item.label==='Display');
+    const item=provider.getChildren(display)[0];
+    assert.equal(item.label,'Default open mode: Native Review');
+    assert.equal(item.command.command,'diffTracker.selectDefaultOpenMode');
+    provider.dispose();
+});
+await test('settings picker exposes Native Review while preserving manifest values and factory defaults',async()=>{
+    const h=commandHarness({mode:'webview',chooseMode:'nativeReview'});
+    await h.run('diffTracker.selectDefaultOpenMode');
+    assert.deepEqual(h.state.updates,[['defaultOpenMode','nativeReview',1]]);
+    assert.deepEqual(Array.from(h.state.pickerItems,item=>item.value),
+        ['webview','inline','sideBySide','original','splitOriginalWebview','nativeReview']);
+    const properties=JSON.parse(fs.readFileSync('package.json','utf8')).contributes.configuration.properties;
+    assert.equal(properties['diffTracker.defaultOpenMode'].default,'webview');
+    assert.deepEqual(properties['diffTracker.defaultOpenMode'].enum,
+        ['webview','inline','sideBySide','original','splitOriginalWebview','nativeReview']);
+    assert.equal(properties['diffTracker.nativeQuickDiff'].default,false);
+    const cancel=commandHarness();await cancel.run('diffTracker.selectDefaultOpenMode');
+    assert.deepEqual(cancel.state.updates,[]);
+});
+await test('ordinary open retains old modes, invalid-value Webview fallback and missing-target no-op',async()=>{
+    for(const [mode,command] of [
+        [undefined,'diffTracker.showWebviewDiff'],['webview','diffTracker.showWebviewDiff'],
+        ['invalid','diffTracker.showWebviewDiff'],['inline','diffTracker.showInlineDiff'],
+        ['sideBySide','diffTracker.showSideBySideDiff'],['original','diffTracker.openOriginalFile'],
+        ['splitOriginalWebview','diffTracker.showOriginalAndWebviewSplit']
+    ]) {
+        const h=commandHarness({mode,deleted:false});await h.run('diffTracker.openDiffDefault',filePath);
+        assert.equal(h.state.executed[0][0],command);
+        assert.deepEqual(h.state.updates,[],'opening a review cannot rewrite settings');
+    }
+    const h=commandHarness({mode:'nativeReview'});await h.run('diffTracker.openDiffDefault');
+    assert.deepEqual(h.state.executed,[]);
+});
+await test('native default delegates the unchanged target to the guarded adapter',async()=>{
+    const h=commandHarness({mode:'nativeReview',deleted:false});
+    for(const target of [filePath,{filePath},new h.Uri(filePath),new h.Uri(filePath,'git')]) {
+        await h.run('diffTracker.openDiffDefault',target);
+        assert.equal(h.state.executed.at(-1)[0],'diffTracker.nativeReview.openFile');
+        assert.equal(h.state.executed.at(-1)[1],target,'preserve the original URI scheme and adapter validation');
+    }
+    assert.equal(h.state.panels,0);
+});
 for(const command of ['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit'])await test(`deleted-file ${command} opens a panel without opening a missing resource`,async()=>{
     const h=commandHarness();await h.run(command,filePath);assert.equal(h.state.opened,0);assert.equal(h.state.panels,1);
 });

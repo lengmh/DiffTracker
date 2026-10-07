@@ -33,6 +33,7 @@ module.exports = async function nativeReviewCheckpoint() {
     const original = name => vscode.commands.executeCommand('diffTracker._testOriginalContent', uri(name).fsPath);
     const run = (command, ...args) => vscode.commands.executeCommand(`diffTracker.nativeReview.${command}`, ...args);
     const config = vscode.workspace.getConfiguration('diffTracker');
+    const previousOpenMode = config.inspect('defaultOpenMode')?.workspaceValue;
     const previousQuickDiff = config.inspect('nativeQuickDiff')?.workspaceValue;
     const until = async (description, predicate, timeout = 10_000) => {
         const end = Math.min(deadline, Date.now() + timeout);
@@ -101,7 +102,7 @@ module.exports = async function nativeReviewCheckpoint() {
         }
     };
     const open = async name => {
-        assert.deepEqual(await run('openFile', uri(name)), { mode: 'single-diff', count: 1 });
+        await vscode.commands.executeCommand('diffTracker.openDiffDefault', uri(name));
         return active(name);
     };
     const selectLine = (editor, line, start = 0) => {
@@ -129,16 +130,44 @@ module.exports = async function nativeReviewCheckpoint() {
     }
     console.log('Native Review menu fixture:', JSON.stringify({ version: vscode.version,
         titleBarStyle: windowConfig.get('titleBarStyle'), menuStyle: windowConfig.get('menuStyle') }));
+    assert.equal(config.get('defaultOpenMode'), 'webview', 'factory open mode remains Webview');
     assert.equal(config.get('nativeQuickDiff'), false, 'native Quick Diff is opt-in');
     assert.equal(await original(A), BASE_A);
     assert.equal(await original(B), BASE_B);
 
     let scenarioFailure;
     try {
-        await config.update('nativeQuickDiff', true, vscode.ConfigurationTarget.Workspace);
-        assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), true);
         write(A, CURRENT_A); write(B, CURRENT_B);
         const firstA = await review(A, CURRENT_A), firstB = await review(B, CURRENT_B);
+        await vscode.commands.executeCommand('diffTracker.openDiffDefault', uri(A));
+        await until('default Webview tab', () => vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputWebview);
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        await config.update('defaultOpenMode', 'nativeReview', vscode.ConfigurationTarget.Workspace);
+        let selectedEditor = await open(A);
+        const selectedDiff = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        assert.ok(selectedDiff instanceof vscode.TabInputTextDiff);
+        assert.equal(selectedDiff.original.scheme, BASE_SCHEME);
+        assert.equal(selectedDiff.modified.scheme, CURRENT_SCHEME);
+        assert.deepEqual(JSON.parse(selectedEditor.document.uri.query), firstA.token);
+        assert.equal(selectedEditor.document.getText(), CURRENT_A);
+        assert.equal((await vscode.workspace.openTextDocument(selectedDiff.original)).getText(), BASE_A);
+        assert.equal(await original(A), BASE_A);
+        assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), false);
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        const opaquePath = uri('native-opaque.bin');
+        fs.writeFileSync(opaquePath.fsPath, Buffer.from([0, 4, 5, 6]));
+        await until('opaque pending review', async () => (await state()).trackedChanges.some(change =>
+            change.filePath === opaquePath.fsPath && change.reviewKind === 'opaque'));
+        await vscode.commands.executeCommand('diffTracker.openDiffDefault', opaquePath);
+        await until('opaque Webview fallback tab', () => vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputWebview);
+        assert.deepEqual(fs.readFileSync(opaquePath.fsPath), Buffer.from([0, 4, 5, 6]));
+        assert.equal((await state()).reviewTokens.some(token => token.filePath === opaquePath.fsPath), false);
+        assert.equal(vscode.workspace.getConfiguration('diffTracker').get('defaultOpenMode'), 'nativeReview');
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        console.log('PASS HOST-NATIVE settings ordinary-open selects immutable Native Review, retains Webview default and safely falls back for opaque without enabling Quick Diff');
+        await config.update('nativeQuickDiff', true, vscode.ConfigurationTarget.Workspace);
+        assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), true);
+
         const fileEditor = await vscode.window.showTextDocument(uri(A));
         selectLine(fileEditor, 1);
         await until('real Quick Diff widget', async () => {
@@ -358,6 +387,8 @@ module.exports = async function nativeReviewCheckpoint() {
                 } else { write(name, content); }
                 assert.equal(read(name), content);
             }
+            fs.writeFileSync(uri('native-opaque.bin').fsPath, Buffer.from([0, 1, 2, 3]));
+            await config.update('defaultOpenMode', previousOpenMode, vscode.ConfigurationTarget.Workspace);
             await config.update('nativeQuickDiff', previousQuickDiff, vscode.ConfigurationTarget.Workspace);
             await vscode.commands.executeCommand('workbench.action.closeAllEditors');
             await vscode.commands.executeCommand('notifications.clearAll');
@@ -366,6 +397,7 @@ module.exports = async function nativeReviewCheckpoint() {
             assert.equal(read(B), BASE_B);
             assert.equal(vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' &&
                 [uri(A).fsPath, uri(B).fsPath].includes(document.uri.fsPath) && document.isDirty), false);
+            assert.equal(vscode.workspace.getConfiguration('diffTracker').get('defaultOpenMode'), 'webview');
             assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), false);
         } catch (cleanupError) {
             console.error('Native Review cleanup failure:', cleanupError.stack || cleanupError);

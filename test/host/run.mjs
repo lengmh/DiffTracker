@@ -51,6 +51,7 @@ try {
         ['batch-a.txt', 'batch a\n'],
         ['batch-b.txt', 'batch b\n'],
         ['native-a.txt', 'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n'],
+        ['native-opaque.bin', Buffer.from([0, 1, 2, 3])],
         ['native-b.txt', 'b header\nbeta value=old\nb footer\n'],
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
