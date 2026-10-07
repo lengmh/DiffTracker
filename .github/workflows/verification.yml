@@ -83,13 +83,26 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Verify installed harness guards
-        run: node --test test/installed/harness.test.mjs
-      - name: Verify official 0.7.2 and package internal candidate without source version changes
-        run: node test/installed/artifacts.mjs "$RC_ARTIFACTS"
+      - name: Verify installed harness and final artifact guards
+        run: node --test test/installed/harness.test.mjs test/installed/final-artifact.test.mjs
+      - name: Build and identify the final-format candidate VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RC_ARTIFACTS"
+          VERSION="$(node -p "require('./package.json').version")"
+          FINAL_VSIX="$RC_ARTIFACTS/code-diff-tracker-$VERSION.vsix"
+          npm run package -- --out "$FINAL_VSIX"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "FINAL_VSIX=$FINAL_VSIX" >> "$GITHUB_ENV"
+          echo "FINAL_VSIX_SHA256=$(sha256sum "$FINAL_VSIX" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      - name: Verify the exact candidate and pinned official 0.7.2
+        run: node test/installed/artifacts.mjs --final "$RC_ARTIFACTS" "$FINAL_VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
       - name: First install, released upgrade and real installed activation recovery
-        run: xvfb-run -a node test/installed/run.mjs "$RC_ARTIFACTS"
-      - name: Keep internal RC evidence (DO NOT PUBLISH)
+        run: xvfb-run -a node test/installed/run.mjs "$RC_ARTIFACTS" --final "$FINAL_VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Validate final artifact evidence
+        run: node test/installed/final-artifact.mjs "$RC_ARTIFACTS/installed-summary.json" "$FINAL_VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Keep PR acceptance evidence (DO NOT PUBLISH)
         if: always()
         uses: actions/upload-artifact@v4
         with:

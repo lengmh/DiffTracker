@@ -79,6 +79,7 @@ async function scenario(phase, report) {
         'installed product must execute in production mode, without development-only test commands');
     report.installedPath = extension.extensionPath;
     report.version = extension.packageJSON.version;
+    report.entryHash = hash(fs.readFileSync(path.join(extension.extensionPath, 'out/extension.js')));
     report.productionActivation = true;
     report.vscodeVersion = vscode.version;
     assert.deepEqual(contents(), beforeActivation, 'activation/recovery must never alter workspace file bytes');

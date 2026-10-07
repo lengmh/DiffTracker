@@ -1,81 +1,117 @@
 # Maintainer release workflow
 
-Code Diff Tracker uses a semi-automatic release flow. GitHub builds and publishes the Git tag, GitHub Release, VSIX package, checksum, and release notes. Publishing the generated VSIX to the Visual Studio Marketplace remains a manual maintainer step.
+Code Diff Tracker uses a semi-automatic release flow. GitHub builds the VSIX,
+validates its exact bytes through installed acceptance, and only then may publish
+the tag, GitHub Release, VSIX and checksum. Marketplace publication remains a
+separate manual maintainer step.
+
+The source is prepared for **0.8.0**. This preparation PR does not authorize a
+Release dispatch, tag, GitHub Release or Marketplace publication. PR #21's merged
+main commit `ef41d2c496875a1de0d894df5f0973df01676f1e` passed
+[Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513),
+attempt 1, 8/8 jobs. That prior result does not verify a later package's bytes.
 
 ## Before running Release
 
-Prepare the release in a normal pull request:
+1. Prepare consistent `package.json`, lockfile root versions and a non-empty exact
+   `## X.Y.Z` changelog section in a normal pull request.
+2. Complete review and Verification for that PR, then obtain merge authorization.
+3. Merge to `main` and wait for successful push Verification on the exact commit.
+4. Obtain separate authorization before dispatching Release. Its `dry_run` input
+   still defaults to **false**; never omit or assume it when a dry run is intended.
 
-1. Update `package.json` to the new version.
-2. Update both package versions in `package-lock.json` (normally by running `npm install --package-lock-only` or the normal npm version workflow).
-3. Add an exact `## X.Y.Z` section to `CHANGELOG.md` with non-empty release notes.
-4. Merge the pull request to `main`.
-5. Wait for the `Verification` workflow on that exact `main` commit to finish successfully.
+The workflow refuses other branches or commits without a successful main push
+Verification run. The 0.8.0 preparation does not change default review behavior:
+WebView remains the factory default, Native Review is selectable and Quick Diff
+remains a separate opt-in.
 
-The release workflow refuses to publish a commit that does not have a successful `Verification` push run.
+## Exact artifact contract
 
-## Create the GitHub release
+Every Release build, dry or real, performs the following in order:
 
-Open **GitHub → Actions → Release → Run workflow** and select `main`.
+1. Validate version, package identity, lockfile versions and release notes.
+2. Audit production dependencies and run artifact/harness guard tests.
+3. Build `code-diff-tracker-X.Y.Z.vsix` once and record its full SHA-256 plus
+   source commit, producing Actions run ID and attempt as build job outputs.
+4. Verify that exact VSIX against its JSON and VSIX identity manifests, current
+   source metadata and complete expected production outputs.
+5. Independently verify the pinned official released `0.7.2` download.
+6. Install the final VSIX and execute all five Ubuntu Stable phases: first install,
+   recording recovery, stopped recovery, official 0.7.2 preparation and same-ID
+   upgrade. Recheck the original digest before installation/phase use and after
+   completion; never rebuild or refresh the expected digest to accept a replacement.
+7. Validate the ordered successful phase evidence and checksum, then upload the
+   VSIX, checksum, release notes and `final-installed-summary.json` as a workflow
+   artifact. No upload, tag or release step precedes successful installed acceptance.
 
-Enter the version without a `v` prefix, for example:
+The separate publish job has write permission only after the build gate passes.
+It downloads that artifact and verifies its bytes and five-phase evidence against
+trusted build job outputs plus the workflow commit/run/attempt. A checksum or
+summary supplied alongside replaced bytes cannot change the trusted expectations.
+Internal `DO-NOT-PUBLISH` VSIX files/evidence cannot satisfy this gate. The publish
+job does not compile or repackage anything.
 
-```text
-0.7.3
-```
+Acceptance proves actual production activation across separate VS Code processes,
+V3-to-V4 text migration, preserved ordered legacy rules and candidate-created
+opaque recovery. It does not prove a physical Reload Window menu click, released
+opaque migration, Marketplace installation or a wider platform matrix. See the
+[installed harness](../test/installed/README.md) and
+[bounded RC checkpoint](./bounded-rc-checkpoint.md).
 
-Stable versions use `X.Y.Z`. A SemVer prerelease suffix such as `0.8.0-beta.1` is also accepted and is published as a GitHub prerelease rather than a stable release.
+## Authorized dry run
 
-Leave **dry_run** disabled for a real release.
+Open **GitHub → Actions → Release → Run workflow**, select `main`, and explicitly
+set the source version and `dry_run: true`. For this preparation the version is
+`0.8.0`. An existing release tag does not block a dry run because it does not
+modify release state.
 
-The workflow then:
+A dry run executes the full exact-VSIX installed gate and uploads validated build
+files, but creates no tag or GitHub Release. It is not a packaging-only shortcut.
+The release preparation PR itself does not dispatch this workflow. PR Verification
+exercises the same final-artifact input path using a separately built CI-only VSIX;
+Release must test its own bytes again.
 
-- confirms it is running from `main`;
-- confirms the exact commit already passed the normal `Verification` workflow;
-- checks `package.json`, `package-lock.json`, package name, publisher, and `CHANGELOG.md`;
-- runs the production dependency audit;
-- builds `code-diff-tracker-X.Y.Z.vsix`;
-- writes `code-diff-tracker-X.Y.Z.vsix.sha256`;
-- uploads the VSIX, checksum, and release notes as a workflow artifact;
+## Authorized GitHub release
+
+For an explicitly approved real release, select `main`, enter the version without
+`v`, and set `dry_run: false`. Stable versions use `X.Y.Z`; a supported SemVer
+prerelease suffix creates a GitHub prerelease. The source and lock versions must
+match the selected version.
+
+After build and publish-side identity checks, the workflow:
+
 - creates annotated tag `vX.Y.Z` on the exact verified commit;
-- creates a draft GitHub Release from the matching `CHANGELOG.md` section;
-- uploads the VSIX and checksum to that draft;
-- publishes the release only after the assets have uploaded successfully.
+- creates a draft GitHub Release with the matching changelog notes;
+- uploads the unchanged VSIX and checksum;
+- publishes only after asset upload succeeds, then verifies publication state.
 
-Build and packaging run with read-only repository permissions and without persisted Git credentials. The separate publish job receives write permission only after the validated release artifact is produced.
+A published release is never overwritten. An existing tag must point to the same
+commit. An incomplete draft is recreated only for that verified tag; a published
+version fails closed instead of silently replacing its assets.
 
-A published GitHub Release is never overwritten. Re-running an already published version fails instead of silently replacing its assets. If a previous run stopped after creating the tag, a later run may continue only when that tag still points to the exact current commit. If a previous run left an incomplete draft release for that same verified tag, the next run removes only that draft and recreates it before uploading the validated assets again.
+## Marketplace publication
 
-## Dry run
+After the separately authorized GitHub Release succeeds:
 
-For a packaging-only check, run the same workflow with **dry_run** enabled. It performs validation, audit, packaging, checksum generation, and workflow-artifact upload, but does not create a tag or GitHub Release.
+1. Download its `code-diff-tracker-X.Y.Z.vsix` and checksum.
+2. Verify the checksum against the downloaded bytes.
+3. Open the `lengmh` Marketplace publisher and update the existing extension.
+4. Confirm the version before submitting the exact downloaded VSIX.
 
-This is useful after changing the release workflow itself. For example, while `package.json` is still `0.7.2`, run:
+Do not upload a local rebuild, PR artifact or internal `DO-NOT-PUBLISH` candidate.
+The release workflow does not publish to Marketplace.
 
-```text
-version: 0.7.2
-dry_run: true
-```
+## Recovery and safety
 
-An existing `v0.7.2` release does not block a dry run because no release state is modified.
-
-## Publish to Visual Studio Marketplace
-
-After the GitHub Release succeeds:
-
-1. Open the new GitHub Release.
-2. Download `code-diff-tracker-X.Y.Z.vsix`.
-3. Open the `lengmh` publisher in Visual Studio Marketplace.
-4. Update the existing **Code Diff Tracker** extension with that VSIX.
-5. Confirm the Marketplace shows the same version before submitting.
-
-The VSIX uploaded to Marketplace should be the exact asset generated by this release workflow, not a separately rebuilt local package.
-
-## Recovery and safety rules
-
-- Do not move or recreate an existing release tag to publish different source code under the same version.
-- Do not overwrite an existing GitHub Release asset for a published version.
-- If validation fails, fix the version metadata or changelog in a new pull request and wait for `Verification` again.
-- If packaging fails before the tag step, no release tag or GitHub Release is created.
-- If tag creation succeeds but later publication fails, rerun only if the existing tag still points to the same `main` commit.
-- An incomplete draft created by this workflow is recoverable on rerun; an already published release is not modified automatically.
+- A failed gate blocks artifact upload and all release mutations. Fix the source
+  or metadata through a new PR and obtain fresh Verification.
+- Never move an existing tag or replace a published asset with different bytes.
+- The producing run attempt is part of identity. **Rerun all jobs** if retrying:
+  rerunning only a failed publish job changes the attempt without rebuilding and
+  is rejected. Do not weaken the provenance comparison to recover it.
+- If a prior attempt created the tag, rerun only while it still points to the
+  same authorized commit. An incomplete draft may be recovered by this workflow;
+  a published release is not modified automatically.
+- Preserve original failure evidence. Historical run #549's later Whole-to-Rules
+  durable-preparation failure remains unattributed; later passing runs and the
+  separate earlier settings-fixture diagnosis are not a blanket root-cause claim.

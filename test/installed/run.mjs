@@ -1,4 +1,4 @@
-// Bounded Ubuntu Stable installed-extension acceptance. Not a release workflow.
+// Bounded Ubuntu Stable acceptance of an internal candidate or exact final VSIX.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -7,11 +7,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath, runTests } from '@vscode/test-electron';
 import { ROOT, ID, CANDIDATE_VERSION, RELEASE, hash, verifyVsix } from './artifacts.mjs';
+import { parseFinalArtifactArgs, verifyFinalArtifact, verifyFinalEvidence } from './final-artifact.mjs';
 
 assert.equal(process.platform, 'linux', 'this bounded checkpoint intentionally targets Ubuntu Stable only');
 assert.ok(process.argv[2], 'usage: node test/installed/run.mjs <artifact-directory>');
 const artifactRoot = path.resolve(process.argv[2]);
-const candidate = path.join(artifactRoot, 'DO-NOT-PUBLISH-code-diff-tracker-0.8.0-internal.vsix');
+const finalMode = process.argv[3] === '--final';
+assert.ok(finalMode || process.argv.length === 3, 'unknown or incomplete installed acceptance mode');
+const expected = finalMode ? parseFinalArtifactArgs(process.argv.slice(4)) : undefined;
+const artifact = finalMode ? verifyFinalArtifact(expected) : undefined;
+const candidate = finalMode ? expected.file : path.join(artifactRoot, `DO-NOT-PUBLISH-code-diff-tracker-${CANDIDATE_VERSION}-internal.vsix`);
+const candidateSha256 = finalMode ? expected.sha256 : JSON.parse(readFileSync(path.join(artifactRoot, 'DO-NOT-PUBLISH-evidence.json'))).candidateSha256;
+const revalidate = () => {
+    assert.equal(hash(readFileSync(candidate)), candidateSha256, 'candidate bytes changed after preparation');
+    assert.equal(hash(readFileSync(released)), RELEASE.sha256, 'official release bytes changed');
+    if (finalMode) { assert.deepEqual(verifyFinalArtifact(expected), artifact); }
+};
 const released = path.join(artifactRoot, RELEASE.assetName);
 assert.equal(hash(readFileSync(released)), RELEASE.sha256);
 const packages = {
@@ -70,12 +81,19 @@ function profile(name, legacy) {
     return result;
 }
 
+const summary = status => ({
+    mode: finalMode ? 'final-release-vsix' : 'internal-rc',
+    warning: finalMode ? 'Exact final VSIX acceptance evidence; publication requires separate authorization.' : 'INTERNAL TEST EVIDENCE. DO NOT PUBLISH THE STAGED VSIX.',
+    status, artifact, release: { ...RELEASE, entryHash: packages.released.entryHash }, results,
+    boundaries: 'Ubuntu Stable only. Real second VS Code process and installed product activation; not a Reload Window menu test. Released opaque migration is not established. Existing three development Host jobs retain their independent coverage.'
+});
 let succeeded = false;
 try {
     const executable = await downloadAndUnzipVSCode('stable');
     const [cli, ...cliPrefix] = resolveCliArgsFromVSCodeExecutablePath(executable, { reuseMachineInstall: true });
     const cliArgs = fixture => [...cliPrefix, '--no-sandbox', `--user-data-dir=${fixture.userData}`, `--extensions-dir=${fixture.extensions}`];
     const install = (fixture, kind) => {
+        revalidate();
         const pkg = packages[kind];
         execFileSync(cli, [...cliArgs(fixture), '--install-extension', pkg.file, '--force'],
             { stdio: 'inherit', timeout: 90_000 });
@@ -84,6 +102,7 @@ try {
         assert.ok(installed.split(/\r?\n/).includes(`${ID}@${pkg.manifest.version}`), installed);
     };
     const phase = async (fixture, name, kind) => {
+        revalidate();
         const beforeSettings = readFileSync(fixture.settingsPath);
         const port = await freePort();
         const report = path.join(artifactRoot, `${name}.json`);
@@ -145,14 +164,12 @@ try {
     assert.deepEqual(upgraded.fileSnapshots, JSON.parse(originalSession).fileSnapshots,
         'V3→V4 upgrade must preserve every accepted text before-image');
     assert.equal(upgraded.effectiveMonitoringScope.kind, 'legacyV3', 'schema migration is not user-authorized scope migration');
+    revalidate();
+    if (finalMode) { verifyFinalEvidence(summary('passed'), artifact); }
     succeeded = true;
     console.log('PASS HOST-INSTALLED-RC: first install, recording/stopped activation recovery, released 0.7.2 upgrade');
 } finally {
-    writeFileSync(path.join(artifactRoot, 'installed-summary.json'), JSON.stringify({
-        warning: 'INTERNAL TEST EVIDENCE. DO NOT PUBLISH THE STAGED VSIX.',
-        status: succeeded ? 'passed' : 'failed', results,
-        boundaries: 'Ubuntu Stable only. Real second VS Code process and installed product activation; not a Reload Window menu test. Existing three development Host jobs retain their independent coverage.'
-    }, null, 2));
+    writeFileSync(path.join(artifactRoot, 'installed-summary.json'), JSON.stringify(summary(succeeded ? 'passed' : 'failed'), null, 2));
     for (const fixture of profiles) {
         const logs = path.join(fixture.userData, 'logs');
         if (existsSync(logs)) {

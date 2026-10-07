@@ -1,17 +1,14 @@
-// Internal RC evidence only. Never publish the staged candidate package.
+// Installed acceptance inputs. Internal candidate packages must never be published.
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-export const ID = 'lengmh.code-diff-tracker';
-export const CANDIDATE_VERSION = '0.8.0'; // VSIX-only identity needed for a real >0.7.2 upgrade.
-export const RELEASE = JSON.parse(readFileSync(new URL('./released-0.7.2.json', import.meta.url), 'utf8'));
-export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-export const zipRead = (file, entry) => execFileSync('unzip', ['-p', file, entry], { maxBuffer: 32 * 1024 * 1024 });
+import { ROOT, ID, RELEASE, hash, zipRead, verifyVsix } from './artifact-common.mjs';
+import { parseFinalArtifactArgs, verifyFinalArtifact } from './final-artifact.mjs';
+export { ROOT, ID, RELEASE, hash, zipRead, verifyVsix };
+export const CANDIDATE_VERSION = JSON.parse(readFileSync(path.join(ROOT, 'package.json'))).version;
 
 export function verifyReleaseMetadata(metadata) {
     assert.equal(metadata.id, RELEASE.releaseId);
@@ -29,18 +26,7 @@ export function verifyReleaseMetadata(metadata) {
     return asset;
 }
 
-export function verifyVsix(file, version) {
-    const manifest = JSON.parse(zipRead(file, 'extension/package.json'));
-    assert.equal(`${manifest.publisher}.${manifest.name}`, ID);
-    assert.equal(manifest.version, version);
-    const listing = execFileSync('unzip', ['-Z1', file], { encoding: 'utf8' }).trim().split('\n');
-    assert.ok(listing.includes('extension/out/extension.js'));
-    assert.ok(!listing.some(item => item.startsWith('extension/test/')), 'test driver must never ship');
-    assert.ok(!listing.some(item => item.startsWith('extension/src/')), 'runtime must use compiled package');
-    return { manifest, entryHash: hash(zipRead(file, 'extension/out/extension.js')) };
-}
-
-export async function prepareArtifacts(destination) {
+export async function prepareReleasedArtifact(destination) {
     mkdirSync(destination, { recursive: true });
     const metadataUrl = `https://api.github.com/repos/${RELEASE.repository}/releases/tags/${RELEASE.tag}`;
     const fetchChecked = async url => {
@@ -58,10 +44,15 @@ export async function prepareArtifacts(destination) {
     verifyVsix(released, '0.7.2');
     writeFileSync(path.join(destination, 'official-release.json'), JSON.stringify(metadata, null, 2));
 
+    return released;
+}
+
+export async function prepareArtifacts(destination) {
+    const released = await prepareReleasedArtifact(destination);
     // vsce overrides only its package stream. Guard both repository manifests
     // byte-for-byte rather than temporarily bumping and attempting to undo them.
     const manifests = ['package.json', 'package-lock.json'].map(name => [name, readFileSync(path.join(ROOT, name))]);
-    const candidate = path.join(destination, 'DO-NOT-PUBLISH-code-diff-tracker-0.8.0-internal.vsix');
+    const candidate = path.join(destination, `DO-NOT-PUBLISH-code-diff-tracker-${CANDIDATE_VERSION}-internal.vsix`);
     try {
         execFileSync(process.execPath, [path.join(ROOT, 'node_modules/@vscode/vsce/vsce'), 'package',
             CANDIDATE_VERSION, '--no-update-package-json', '--no-git-tag-version', '--out', candidate],
@@ -92,6 +83,16 @@ export async function prepareArtifacts(destination) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    assert.ok(process.argv[2], 'usage: node test/installed/artifacts.mjs <artifact-directory>');
-    await prepareArtifacts(path.resolve(process.argv[2]));
+    if (process.argv[2] === '--final') {
+        assert.ok(process.argv[3], 'final artifact directory is required');
+        const expected = parseFinalArtifactArgs(process.argv.slice(4));
+        // Fail before network/download activity; never fall back to packaging.
+        verifyFinalArtifact(expected);
+        await prepareReleasedArtifact(path.resolve(process.argv[3]));
+        verifyFinalArtifact(expected);
+    } else {
+        assert.equal(process.argv.length, 3, 'usage: node test/installed/artifacts.mjs <artifact-directory> OR --final <directory> <file> <version> <sha256> <source-commit> <run-id> <run-attempt>');
+        assert.ok(!process.argv[2].startsWith('--'), 'unknown artifact mode');
+        await prepareArtifacts(path.resolve(process.argv[2]));
+    }
 }

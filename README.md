@@ -11,7 +11,7 @@ Review changes as they happen, then keep or safely revert them by block, file, o
 
 [中文说明](./README_CN.md)
 
-This README describes the current development source, including unreleased monitoring-scope and Native Review work. The package version remains `0.7.2`; this is not a new Marketplace release. The previous Native Review checkpoint passed; the new settings and bounded RC checks are tracked separately in the [RC checkpoint](docs/bounded-rc-checkpoint.md).
+This README describes the `0.8.0` source release preparation. Monitoring-scope, Native Review and bounded RC work are merged; the verified feature baseline passed [Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513), 8/8 jobs. This does not announce a published tag, GitHub release or Marketplace package. See the [RC checkpoint](docs/bounded-rc-checkpoint.md) for evidence and limits, and the [release gates](docs/releasing.md) for the separate final-VSIX checks.
 
 This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
 [`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
@@ -227,9 +227,9 @@ try {
 
 When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
 
-The development build writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
+The `0.8.0` source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
 
-Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The [RC checkpoint](docs/bounded-rc-checkpoint.md) separates installed-VSIX migration evidence from source-level compatibility checks and candidate reload tests.
+Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The installed-VSIX checks proved actual released V3→V4 text/session migration with ordered legacy rules preserved, plus separate candidate-created opaque recovery across process restarts. Released-asset opaque migration remains unproven; process restarts do not prove a physical **Reload Window** click. The [RC checkpoint](docs/bounded-rc-checkpoint.md) records these boundaries separately from source-level compatibility checks.
 
 V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rather than silently discard scope or review data. Preserve the workspace and extension storage before changing versions. Do not delete recovery markers or saved state merely to bypass a compatibility warning.
 
@@ -241,7 +241,7 @@ V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rat
 
 ## Release Notes
 
-Release history is maintained in [CHANGELOG.md](./CHANGELOG.md). GitHub releases provide the corresponding tagged release notes and source archives.
+Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.0` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
 
 ## License
 

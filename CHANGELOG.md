@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## 0.8.0
 
-The entries below describe development work. The source package version remains `0.7.2`; no new release or RC pass is implied. Verification status is recorded in the [Native Review checkpoint](docs/s5-native-review-checkpoint.md) and [bounded RC checkpoint](docs/bounded-rc-checkpoint.md).
+These notes accompany the `0.8.0` source release preparation; they do not announce a published tag, GitHub release or Marketplace package. The merged feature candidate passed its bounded checks; the final release VSIX must separately pass the [release gates](docs/releasing.md) before publication.
 
 - Add file-level text, opaque and unknown review visibility, version-checked **Acknowledge Read-only Change**, and mixed accept/acknowledge semantics. Non-text content is not backed up and cannot be reverted.
 - Add the unified **Manage Monitoring Scope** manager, Rules and Whole Workspace modes, local scope-expansion consent, bounded preparation, explicit scope recovery controls and visible observation gaps.
@@ -11,7 +11,8 @@ The entries below describe development work. The source package version remains 
 - Add **Recheck Observation Coverage** to reinstall coverage and compare against original review baselines without accepting changes or modifying workspace files.
 - Add optional stable-API Native Review with immutable text snapshots, guarded file/full-block Keep/Revert, real Quick Diff navigation and Multi Diff where available. VS Code 1.80 retains the file-picker/single-file Diff fallback.
 - Add `nativeReview` to `diffTracker.defaultOpenMode` and the sidebar **Display → Default open mode** picker. The five existing values remain available, the default remains `webview`, opaque/unknown resources use WebView, and Quick Diff remains a separate disabled-by-default opt-in.
-- Prepare bounded installed-VSIX upgrade/recovery and mixed-workspace resource checks. New acceptance outcomes remain pending until their corresponding logs and artifacts are verified.
+
+Bounded verification includes real installed-product activation and process-restart recovery, released `0.7.2` V3→V4 text/session migration with ordered legacy rules preserved, candidate-created opaque recovery, and mixed-workspace resource checks. It does not prove a physical **Reload Window** click or released-asset opaque migration. Exact candidate/main CI evidence and historical failures are retained in the [bounded RC checkpoint](docs/bounded-rc-checkpoint.md).
 
 ## 0.7.2
 
