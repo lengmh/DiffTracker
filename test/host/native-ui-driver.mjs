@@ -75,6 +75,7 @@ function inspectWorkbench(request) {
     }));
     const result = {
         quickDiff, multiDiff, multiDiffRoots: roots.length, quickPick,
+        documentHasFocus: document.hasFocus(), visibilityState: document.visibilityState,
         activeElement: document.activeElement ? {
             tag: document.activeElement.tagName,
             label: label(document.activeElement).slice(0, 200),
@@ -121,8 +122,15 @@ function inspectWorkbench(request) {
                 // A physical click on rendered text activates that child editor.
                 // The Host then verifies its actual URI and uses the stable
                 // TextEditor.selection API, never an injected Monaco model.
-                const lines = all('.view-lines .view-line', editors[0]).filter(visible);
-                result.focusPoint = lines.map(point).find(Boolean);
+                // Monaco's line wrapper may span far beyond its visible text.
+                // Hit a rendered text leaf, not the center of that large box.
+                const leaves = all('.view-lines .view-line span', editors[0])
+                    .filter(element => !element.childElementCount && text(element) && visible(element));
+                const target = leaves.find(element => point(element));
+                result.focusPoint = target ? point(target) : undefined;
+                result.focusTarget = target ? {
+                    text: text(target).slice(0, 160), tag: target.tagName, className: target.className
+                } : undefined;
                 result.modifiedFocused = editors[0].contains(document.activeElement);
             }
         }
@@ -363,11 +371,13 @@ export async function runNativeUiDriver(portText, operation, argument) {
             return state.entryMatches === 1 && state.focusPoint ? state : undefined;
         });
         await click(before.focusPoint);
-        const after = await until(`modified child focus for ${argument}`, async () => {
-            const state = await inspect('focus');
-            return state.modifiedFocused ? state : undefined;
-        });
-        return { operation, clicked: true, filename: argument, before, after };
+        const after = await inspect('focus');
+        // A delivered mouse click is not proof of editor focus. Return its
+        // evidence promptly; the Host must still observe the exact current
+        // snapshot URI/token through vscode.window.activeTextEditor. Keep DOM
+        // focus as diagnostic evidence rather than a second, private contract.
+        return { operation, clicked: true, filename: argument,
+            domFocusObserved: !!after.modifiedFocused, before, after };
     } catch (error) {
         console.error('Native UI diagnostics:', JSON.stringify({ operation, lastDiscovery, lastState }));
         throw error;

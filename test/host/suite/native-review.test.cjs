@@ -72,6 +72,34 @@ module.exports = async function nativeReviewCheckpoint() {
         return editor?.document.uri.scheme === CURRENT_SCHEME && editor.document.uri.fsPath === uri(name).fsPath
             ? editor : undefined;
     });
+    const activeEvidence = () => {
+        const editor = vscode.window.activeTextEditor;
+        return editor ? { uri: editor.document.uri.toString(), viewColumn: editor.viewColumn,
+            selections: editor.selections.map(selection => ({
+                start: [selection.start.line, selection.start.character],
+                end: [selection.end.line, selection.end.character]
+            })) } : null;
+    };
+    const focusMulti = async (name, token) => {
+        const before = activeEvidence();
+        let physical;
+        try {
+            physical = await ui('focus-multi-diff', name);
+            assert.equal(physical.clicked, true);
+            const editor = await active(name);
+            assert.deepEqual(JSON.parse(editor.document.uri.query), token);
+            console.log('Native Review physical focus evidence:', JSON.stringify({
+                name, before, after: activeEvidence(), domFocusObserved: physical.domFocusObserved,
+                target: physical.before.focusTarget
+            }));
+            return editor;
+        } catch (error) {
+            console.error('Native Review physical focus failure:', JSON.stringify({
+                name, before, after: activeEvidence(), physical
+            }));
+            throw error;
+        }
+    };
     const open = async name => {
         assert.deepEqual(await run('openFile', uri(name)), { mode: 'single-diff', count: 1 });
         return active(name);
@@ -98,6 +126,7 @@ module.exports = async function nativeReviewCheckpoint() {
     assert.equal(await original(A), BASE_A);
     assert.equal(await original(B), BASE_B);
 
+    let scenarioFailure;
     try {
         await config.update('nativeQuickDiff', true, vscode.ConfigurationTarget.Workspace);
         assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), true);
@@ -169,11 +198,8 @@ module.exports = async function nativeReviewCheckpoint() {
                 return [A, B].every(name => probe.multiDiff.some(entry => entry.names.includes(name))) ? probe : undefined;
             });
             assert.equal(rendered.multiDiffRoots, 1);
-            await ui('focus-multi-diff', B);
-            otherUri = (await active(B)).document.uri;
-            assert.deepEqual(JSON.parse(otherUri.query), firstB.token);
-            await ui('focus-multi-diff', A);
-            editor = await active(A);
+            otherUri = (await focusMulti(B, firstB.token)).document.uri;
+            editor = await focusMulti(A, firstA.token);
             console.log('PASS HOST-NATIVE real two-file Multi Diff renders both snapshots and exposes the physically focused modified child');
         } else {
             const picked = await ui('pick-native-file', A);
@@ -289,33 +315,56 @@ module.exports = async function nativeReviewCheckpoint() {
         assert.equal(read(A), later);
         assert.equal(await original(A), KEPT_A);
         console.log('PASS HOST-NATIVE session transition invalidates previously reviewed snapshots');
+    } catch (error) {
+        scenarioFailure = error;
+        // Cleanup must never replace the first failed acceptance assertion or
+        // hide the renderer's diagnostics (especially on the minimum Host).
+        console.error('Native Review primary scenario failure:', error.stack || error);
+        throw error;
     } finally {
-        // This checkpoint runs before any other pending review exists. Restore
-        // the two disposable fixtures and rebuild through public lifecycle
-        // commands so later Host scenarios see their original starting state.
-        await vscode.commands.executeCommand('workbench.action.closeQuickOpen');
-        await vscode.commands.executeCommand('diffTracker.stopRecording');
-        for (const [name, content] of [[A, BASE_A], [B, BASE_B]]) {
-            const document = vscode.workspace.textDocuments.find(candidate => candidate.uri.scheme === 'file' &&
-                candidate.uri.fsPath === uri(name).fsPath && !candidate.isClosed);
-            if (document) {
-                const edit = new vscode.WorkspaceEdit();
-                edit.replace(uri(name), new vscode.Range(0, 0, document.lineCount, 0), content);
-                assert.equal(await vscode.workspace.applyEdit(edit), true);
-                assert.equal(await document.save(), true);
-            } else { write(name, content); }
-            assert.equal(read(name), content);
+        try {
+            // This checkpoint runs before any other pending review exists. Restore
+            // the two disposable fixtures and rebuild through public lifecycle
+            // commands so later Host scenarios see their original starting state.
+            await vscode.commands.executeCommand('workbench.action.closeQuickOpen');
+            await vscode.commands.executeCommand('diffTracker.stopRecording');
+            for (const [name, content] of [[A, BASE_A], [B, BASE_B]]) {
+                const document = vscode.workspace.textDocuments.find(candidate => candidate.uri.scheme === 'file' &&
+                    candidate.uri.fsPath === uri(name).fsPath && !candidate.isClosed);
+                if (document) {
+                    const edit = new vscode.WorkspaceEdit();
+                    edit.replace(uri(name), new vscode.Range(0, 0, document.lineCount, 0), content);
+                    assert.equal(await vscode.workspace.applyEdit(edit), true);
+                    assert.equal(await document.save(), true);
+                } else { write(name, content); }
+                assert.equal(read(name), content);
+            }
+            await config.update('nativeQuickDiff', previousQuickDiff, vscode.ConfigurationTarget.Workspace);
+            await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+            await vscode.commands.executeCommand('notifications.clearAll');
+            assert.equal(await vscode.commands.executeCommand('diffTracker.startRecording'), true);
+            const cleanupDeadline = Date.now() + 15_000;
+            while (Date.now() < cleanupDeadline && (await state()).baselineState !== 'ready') { await delay(100); }
+            assert.equal((await state()).baselineState, 'ready', 'native checkpoint cleanup must restore a ready baseline');
+            assert.equal((await state()).reviewTokens.length, 0, 'native checkpoint leaves no pending fixture reviews');
+            assert.equal(await original(A), BASE_A);
+            assert.equal(await original(B), BASE_B);
+            assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), false);
+        } catch (cleanupError) {
+            console.error('Native Review cleanup failure:', cleanupError.stack || cleanupError);
+            try {
+                const cleanupState = await state();
+                console.error('Native Review cleanup state:', JSON.stringify({
+                    isRecording: cleanupState.isRecording, baselineState: cleanupState.baselineState,
+                    reviewTokens: cleanupState.reviewTokens, coverageGaps: cleanupState.coverageGaps,
+                    subtreeCoverageGaps: cleanupState.subtreeCoverageGaps,
+                    unknownReviewPaths: cleanupState.unknownReviewPaths,
+                    originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null
+                }));
+            } catch (diagnosticError) {
+                console.error('Native Review cleanup diagnostics failed:', diagnosticError.stack || diagnosticError);
+            }
+            if (!scenarioFailure) { throw cleanupError; }
         }
-        await config.update('nativeQuickDiff', previousQuickDiff, vscode.ConfigurationTarget.Workspace);
-        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
-        await vscode.commands.executeCommand('notifications.clearAll');
-        assert.equal(await vscode.commands.executeCommand('diffTracker.startRecording'), true);
-        const cleanupDeadline = Date.now() + 15_000;
-        while (Date.now() < cleanupDeadline && (await state()).baselineState !== 'ready') { await delay(100); }
-        assert.equal((await state()).baselineState, 'ready', 'native checkpoint cleanup must restore a ready baseline');
-        assert.equal((await state()).reviewTokens.length, 0, 'native checkpoint leaves no pending fixture reviews');
-        assert.equal(await original(A), BASE_A);
-        assert.equal(await original(B), BASE_B);
-        assert.equal(vscode.workspace.getConfiguration('diffTracker').get('nativeQuickDiff'), false);
     }
 };

@@ -46,3 +46,13 @@
 - 实现前核对稳定 API 与后端权威边界；实现后独立审查发现旧 hover/decoration provider 会按相同 `fsPath` 将当前状态叠加到不可变快照。CodeLens 已有 `file:` 限制，不存在同类入口。仅对两个新快照 scheme 增加显示隔离，并分别记录 hover、decoration 的失败与通过回归；后端没有修改。
 
 上述结果只描述提交前状态，不能代替新提交的真实 Host、CI 或最终审查结果。
+
+## 首次 Host 验证与测试入口修正
+
+[Verification #537](https://github.com/lengmh/DiffTracker/actions/runs/37575071159) 的 `d817c9d` 首次运行未通过三个 Host。三者均通过真实 Quick Diff 菜单、初始拒绝和重复编辑器保护；1.80.2 也通过真实文件选择器回退。两个 Stable Host 已渲染两文件 Multi Diff，但点击后 helper 以 DOM `activeElement` 证明焦点的等待失败，尚未执行 Host 的 URI 断言。最低版本后续菜单阶段失败，清理断言遮蔽了原始错误，不能据此判定唯一原因。
+
+修正仅调整测试入口与诊断：点击实际文字节点后，以公开的 activeTextEditor 资源、scheme 和完整 token 核验 B → A 焦点切换；保留真实菜单点击和 baseline 结果断言。原始错误先记录，清理错误另外报告，不能覆盖主错误。
+
+VS Code 1.80 Linux 默认的原生标题栏会选择 OS context menu，CDP 无法检查该菜单。测试启动前仅在一次性 user-data 设置中选择 custom title/menu style，仍点击真实 editor/context 菜单并由 VS Code 传入 URI。此证据不等于 OS 原生菜单自动化覆盖。依据：[1.80 窗口设置](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/platform/window/common/window.ts#L142-L165)、[ContextMenuService](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/contextmenu/electron-sandbox/contextmenuService.ts#L50-L57)。
+
+不增加重试或时间上限，不修改生产行为；修正后的真实 Host 结果仍须单独核对。

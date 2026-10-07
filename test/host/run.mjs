@@ -14,6 +14,7 @@ const workspacePath = path.join(tempRoot, 'workspace 中文');
 const secondRoot = path.join(tempRoot, 'second root');
 const workspaceFile = path.join(tempRoot, 'host.code-workspace');
 const restartStorage = path.join(tempRoot, 's4d-restart-storage');
+const userDataPath = path.join(tempRoot, 'user-data');
 const git = (...args) => execFileSync('git', args, {
     cwd: workspacePath,
     encoding: 'utf8',
@@ -32,6 +33,14 @@ async function availableLoopbackPort() {
 }
 
 try {
+    // VS Code 1.80 on Linux otherwise uses an OS-native context menu, which
+    // cannot be inspected through the renderer. Select the real workbench's
+    // custom menu at startup (these application settings require a restart).
+    mkdirSync(path.join(userDataPath, 'User'), { recursive: true });
+    writeFileSync(path.join(userDataPath, 'User', 'settings.json'), JSON.stringify({
+        'window.titleBarStyle': 'custom',
+        'window.menuStyle': 'custom'
+    }));
     mkdirSync(workspacePath, { recursive: true });
     for (const [name, content] of [
         ['existing.txt', 'base\n'],
@@ -93,7 +102,7 @@ try {
         },
         launchArgs: [
             workspaceFile,
-            `--user-data-dir=${path.join(tempRoot, 'user-data')}`,
+            `--user-data-dir=${userDataPath}`,
             `--extensions-dir=${path.join(tempRoot, 'extensions')}`,
             '--remote-debugging-address=127.0.0.1',
             `--remote-debugging-port=${cdpPort}`,
