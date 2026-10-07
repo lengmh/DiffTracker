@@ -157,10 +157,33 @@ module.exports = async function prepareWholeWorkspaceProof({
             // Existing mixed Accept tests later assert exact global counts.
             // Use the confirmed Clear seam while the fixture still has coverage.
             assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
-            await untilStable('S4-D cohort cleared before subsequent Host scenarios', async () => {
-                const current = await state();
-                return current.baselineState === 'ready' && current.trackedChanges.length === 0;
-            });
+            let lastCleanupState;
+            try {
+                await untilStable('S4-D cohort cleared before subsequent Host scenarios', async () => {
+                    const current = await state();
+                    lastCleanupState = current;
+                    return current.baselineState === 'ready' && current.trackedChanges.length === 0;
+                });
+            } catch (error) {
+                // Passive evidence only: preserve the original timeout and never
+                // retry Clear or turn a safely retained unknown into a pass.
+                console.error('S4-D post-Clear last observed state:', JSON.stringify(lastCleanupState && {
+                    isRecording: lastCleanupState.isRecording,
+                    baselineState: lastCleanupState.baselineState,
+                    effectiveMonitoringScope: lastCleanupState.effectiveMonitoringScope,
+                    trackedChanges: lastCleanupState.trackedChanges.map(change => ({
+                        filePath: change.filePath, reviewKind: change.reviewKind,
+                        reviewReason: change.reviewReason, unavailableReason: change.unavailableReason,
+                        baselineExists: change.baselineExists, currentExists: change.currentExists
+                    })),
+                    unknownReviewPaths: lastCleanupState.unknownReviewPaths,
+                    coverageGaps: lastCleanupState.coverageGaps,
+                    subtreeCoverageGaps: lastCleanupState.subtreeCoverageGaps,
+                    reviewTokenCount: lastCleanupState.reviewTokens.length,
+                    opaqueReviewTokenCount: lastCleanupState.opaqueReviewTokens.length
+                }));
+                throw error;
+            }
         },
 
         async restoreWatcherExclude() {

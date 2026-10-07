@@ -78,3 +78,7 @@
 ## 首次 CI 启动检查
 
 [Verification #544](https://github.com/lengmh/DiffTracker/actions/runs/37602035394) 在 `efdcd4d` 上因工作流表达式验证失败而结束，未启动任何测试 job。新增安装 job 的 job-level `env` 使用了该层不提供的 `runner.temp`。修正仅将临时目录初始化移入运行步骤，通过 `$RUNNER_TEMP` 和 `$GITHUB_ENV` 传给后续步骤；保留全部测试、断言和包装依赖。已扫描两个 workflow 的同类 context 位置，并为此入口记录失败/通过 guard 回归。后续实际 Host 与最终 CI 结果仍须分别核对。
+
+[Verification #545](https://github.com/lengmh/DiffTracker/actions/runs/37602431751) 已启动实际 job：三组 Native Review 均通过新增常规设置入口以及全部 13 条 Native 检查，但 Windows 后续既有 S4-D cleanup 的零待审稳定等待超时，不能将整个 Windows Host 记为通过。下一次运行仅增加该失败点的被动状态诊断，保留原断言、时限和错误，不重试 Clear，也不改写未知状态。
+
+同轮安装 job 已完成候选首装的产品激活和文本/opaque 实际观察，但首个进程退出后，配置字节不变断言发现 VS Code 把测试配置 `extensions.autoUpdate: false` 迁移为 `off`。该行为与 [VS Code 官方迁移验证](https://github.com/microsoft/vscode/issues/321146) 一致。测试配置改用当前 Stable 的 `off` 枚举；全局规则和整个配置文件的严格不变断言仍保留。此时升级、后续激活恢复和最终包装尚未通过。

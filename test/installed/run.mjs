@@ -52,7 +52,7 @@ function profile(name, legacy) {
     for (const [name, content] of Object.entries(baseFiles)) { writeFileSync(path.join(workspace, name), content); }
     if (!legacy) { writeFileSync(path.join(workspace, 'opaque.bin'), Buffer.from([0, 12, 24, 36])); }
     const settings = {
-        'extensions.autoUpdate': false, 'extensions.autoCheckUpdates': false,
+        'extensions.autoUpdate': 'off', 'extensions.autoCheckUpdates': false,
         'update.mode': 'none', 'window.restoreWindows': 'none',
         'workbench.startupEditor': 'none', 'workbench.enableExperiments': false,
         ...(legacy ? { 'diffTracker.watchExclude': legacyRules } : {})

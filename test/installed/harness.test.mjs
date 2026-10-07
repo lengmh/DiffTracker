@@ -59,3 +59,8 @@ test('installed job resolves its temporary path after runner assignment', () => 
     assert.doesNotMatch(jobSettings, /\$\{\{\s*runner[.[]/);
     assert.match(installed, /RC_ARTIFACTS=\$RUNNER_TEMP\/difftracker-installed-rc-evidence/);
 });
+test('Stable fixture uses the current auto-update enum without weakening settings preservation', () => {
+    const runner = readFileSync(new URL('./run.mjs', import.meta.url), 'utf8');
+    assert.match(runner, /'extensions\.autoUpdate': 'off'/);
+    assert.match(runner, /assert\.deepEqual\(readFileSync\(fixture\.settingsPath\), beforeSettings/);
+});
