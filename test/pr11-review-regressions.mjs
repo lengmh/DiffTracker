@@ -834,17 +834,36 @@ export function registerPR11ReviewRegressions(h) {
     });
 
     for(const priorBaseline of [false,true]) test(`PR11 stopped apply defers new include baseline (prior=${priorBaseline})`,async()=>{
-        let t=h.getTracker(); const storage=file('stopped-storage');
-        await t.dispose();t=new DiffTracker(Uri.file(storage));h.setTracker(t);
-        if(priorBaseline){
-            const p=file('prior.txt');fs.writeFileSync(p,'pending');
-            t.fileSnapshots.set(p,'prior');t.baselineExistingFiles.add(p);t.snapshotInitialized=true;
-        }
-        const dir=file('stopped-include');fs.mkdirSync(dir);const target=path.join(dir,'new.txt');fs.writeFileSync(target,'not yet recorded');
-        let reads=0;const original=vscode.workspace.fs.readFile;
-        vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===target)reads++;return original(uri);};
+        const previousFolders=vscode.workspace.workspaceFolders;
+        const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
+        const previousFindFiles=vscode.workspace.findFiles;
+        const original=vscode.workspace.fs.readFile;
+        // Configured Rules discovers ignore policy on disk before reading the
+        // listed target. Do not scan every earlier test's retained fixtures.
+        const workspaceRoot=file('stopped-workspace');
+        const storage=file('stopped-storage');
+        fs.mkdirSync(workspaceRoot);
+        fs.writeFileSync(path.join(workspaceRoot,'ProbeName'),'probe');
+        const folder={uri:Uri.file(workspaceRoot),name:'stopped'};
+        let t=h.getTracker();
         try{
-            const result=await t.applyConfiguredMonitoringScope(scope([{scope:'all',path:relative(dir)}]));
+            await t.dispose();
+            vscode.workspace.workspaceFolders=[folder];
+            vscode.workspace.getWorkspaceFolder=uri=>{
+                const rel=path.relative(workspaceRoot,uri.fsPath);
+                return rel!=='..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel)?folder:undefined;
+            };
+            t=new DiffTracker(Uri.file(storage));h.setTracker(t);
+            if(priorBaseline){
+                const p=path.join(workspaceRoot,'prior.txt');fs.writeFileSync(p,'pending');
+                t.fileSnapshots.set(p,'prior');t.baselineExistingFiles.add(p);t.snapshotInitialized=true;
+            }
+            const dir=path.join(workspaceRoot,'stopped-include');fs.mkdirSync(dir);
+            const target=path.join(dir,'new.txt');fs.writeFileSync(target,'not yet recorded');
+            const requested=scope([{scope:'all',path:path.relative(workspaceRoot,dir).split(path.sep).join('/')}]);
+            let reads=0;
+            vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===target)reads++;return original(uri);};
+            const result=await t.applyConfiguredMonitoringScope(requested);
             assert.equal(result.status,'applied',JSON.stringify(result));assert.equal(result.capturedBaselines,0);
             assert.equal(reads,0);assert.equal(t.getOriginalContent(target),undefined);
             assert.equal(t.getIsRecording(),false);
@@ -855,11 +874,18 @@ export function registerPR11ReviewRegressions(h) {
                 'configured effective scope keeps even an empty stopped session durable');
             assert.equal(t.getOriginalContent(target),undefined);
             assert.equal(pending(target),undefined);
-            if(!priorBaseline) assert.equal((await t.applyConfiguredMonitoringScope(scope([{scope:'all',path:relative(dir)}]))).status,'applied');
-            h.setListedFiles([Uri.file(target)]);t.startRecording();
+            if(!priorBaseline) assert.equal((await t.applyConfiguredMonitoringScope(requested)).status,'applied');
+            vscode.workspace.findFiles=async pattern=>pattern.pattern==='**/*'?[Uri.file(target)]:previousFindFiles(pattern);
+            t.startRecording();
             await waitUntil(()=>t.getBaselineState()==='ready');
             assert.equal(t.getOriginalContent(target),'not yet recorded');
-        } finally {vscode.workspace.fs.readFile=original;}
+        } finally {
+            await h.getTracker().dispose();
+            vscode.workspace.fs.readFile=original;
+            vscode.workspace.findFiles=previousFindFiles;
+            vscode.workspace.workspaceFolders=previousFolders;
+            vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
+        }
     });
 
     test('PR11 parent-only delete reconciles retained child before ignored-parent short circuit',async()=>{

@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,7 @@ const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'diff-tracker-host-'));
 const workspacePath = path.join(tempRoot, 'workspace 中文');
 const secondRoot = path.join(tempRoot, 'second root');
 const workspaceFile = path.join(tempRoot, 'host.code-workspace');
+const restartStorage = path.join(tempRoot, 's4d-restart-storage');
 const git = (...args) => execFileSync('git', args, {
     cwd: workspacePath,
     encoding: 'utf8',
@@ -60,13 +62,14 @@ try {
     git('add', '.');
     git('commit', '-m', 'host baseline');
 
-    await runTests({
+    const hostOptions = {
         version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
         extensionDevelopmentPath,
         extensionTestsPath,
         extensionTestsEnv: {
             DIFF_TRACKER_HOST_WORKSPACE: workspacePath,
-            DIFF_TRACKER_HOST_SECOND_ROOT: secondRoot
+            DIFF_TRACKER_HOST_SECOND_ROOT: secondRoot,
+            DIFF_TRACKER_HOST_RESTART_STORAGE: restartStorage
         },
         launchArgs: [
             workspaceFile,
@@ -76,7 +79,30 @@ try {
             '--skip-welcome',
             '--skip-release-notes'
         ]
+    };
+    await runTests({
+        ...hostOptions,
+        extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'prepare' }
     });
+
+    // runTests resolves only after the first VS Code process exits. Keep the
+    // same workspace, user-data, extensions and dedicated session storage, and
+    // make the offline edit here rather than from either Extension Host.
+    const manifestPath = path.join(restartStorage, 'restart-fixture.json');
+    const restart = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    assert.equal(restart.phase, 'prepared');
+    assert.equal(path.resolve(restart.workspace), path.resolve(workspacePath));
+    const offlineFile = path.join(workspacePath, 's4d-restart-owner', 'readme.txt');
+    assert.equal(path.relative(offlineFile, restart.offlineFile), '',
+        'the offline edit must target the known fixture, including Windows drive-letter normalization');
+    assert.equal(readFileSync(offlineFile, 'utf8'), restart.baseline[0]);
+    writeFileSync(offlineFile, restart.offlineContent);
+    writeFileSync(manifestPath, JSON.stringify({ ...restart, phase: 'offline-edited' }));
+    await runTests({
+        ...hostOptions,
+        extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'restore' }
+    });
+    assert.equal(existsSync(restartStorage), false, 'second Host must clean up restart fixture storage');
 } catch (error) {
     console.error('Code Diff Tracker Extension Host tests failed.', error);
     process.exitCode = 1;
