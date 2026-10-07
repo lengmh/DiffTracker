@@ -14,6 +14,7 @@ import { WatchExcludePanel } from './watchExcludePanel';
 import { createInlineDiffUri } from './utils/inlineDiffUri';
 import { GitContextEvent, GitContextMonitor, GitContextSnapshot } from './gitContext';
 import { MonitoringScopeController } from './monitoringScopeController';
+import { NativeReviewAdapter } from './nativeReviewAdapter';
 
 let diffTracker: DiffTracker;
 let decorationManager: DecorationManager;
@@ -263,6 +264,8 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         return result;
     };
+
+    context.subscriptions.push(new NativeReviewAdapter(diffTracker, reportAction));
 
     const reportBatch = (verb: string, result: BatchActionResult): BatchActionResult => {
         refreshReview();

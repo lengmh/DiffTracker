@@ -211,6 +211,12 @@
             }
           },
           "description": "Requested explicit workspace-relative paths to include. Folder-scoped entries require a unique workspace folder name."
+        },
+        "diffTracker.nativeQuickDiff": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Opt in to the Code Diff Tracker Quick Diff provider. Its menu opens a read-only, version-bound Native Review snapshot; it does not apply unversioned Quick Diff hunks."
         }
       }
     },
@@ -395,6 +401,48 @@
         "command": "diffTracker.restoreEffectiveScopeConfiguration",
         "title": "Restore Effective Scope Configuration",
         "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.nativeReview.openFile",
+        "title": "Open Native Review Snapshot",
+        "category": "Code Diff Tracker",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "diffTracker.nativeReview.openChanges",
+        "title": "Review Text Changes Natively",
+        "category": "Code Diff Tracker",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "diffTracker.nativeReview.openFromQuickDiff",
+        "title": "Open Native Review Snapshot",
+        "category": "Code Diff Tracker",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "diffTracker.nativeReview.keepFile",
+        "title": "Keep Reviewed File",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.nativeReview.revertFile",
+        "title": "Revert Reviewed File",
+        "category": "Code Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "diffTracker.nativeReview.keepSelectedBlock",
+        "title": "Keep Selected Whole Block",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.nativeReview.revertSelectedBlock",
+        "title": "Revert Selected Whole Block",
+        "category": "Code Diff Tracker",
+        "icon": "$(discard)"
       }
     ],
     "menus": {
@@ -433,6 +481,11 @@
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == unknownFile",
           "group": "inline"
+        },
+        {
+          "command": "diffTracker.nativeReview.openFile",
+          "when": "view == diffTracker.changesView && viewItem == changedFile",
+          "group": "2_review@3"
         }
       ],
       "explorer/context": [
@@ -467,6 +520,11 @@
           "command": "diffTracker.rebuildGitBaseline",
           "when": "view == diffTracker.changesView",
           "group": "navigation"
+        },
+        {
+          "command": "diffTracker.nativeReview.openChanges",
+          "when": "view == diffTracker.changesView",
+          "group": "review@1"
         }
       ],
       "editor/title": [
@@ -484,6 +542,57 @@
           "command": "diffTracker.showWebviewDiffActive",
           "when": "resourceScheme == file && diffTracker.isRecording",
           "group": "navigation"
+        }
+      ],
+      "scm/change/title": [
+        {
+          "command": "diffTracker.nativeReview.openFromQuickDiff",
+          "when": "config.diffTracker.nativeQuickDiff && originalResourceScheme == diff-tracker-original",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "diffTracker.nativeReview.keepSelectedBlock",
+          "when": "diffTracker.nativeReviewContext",
+          "group": "diffTracker@1"
+        },
+        {
+          "command": "diffTracker.nativeReview.revertSelectedBlock",
+          "when": "diffTracker.nativeReviewContext",
+          "group": "diffTracker@2"
+        },
+        {
+          "command": "diffTracker.nativeReview.keepFile",
+          "when": "diffTracker.nativeReviewContext",
+          "group": "diffTracker@3"
+        },
+        {
+          "command": "diffTracker.nativeReview.revertFile",
+          "when": "diffTracker.nativeReviewContext",
+          "group": "diffTracker@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "diffTracker.nativeReview.openFromQuickDiff",
+          "when": "false"
+        },
+        {
+          "command": "diffTracker.nativeReview.keepSelectedBlock",
+          "when": "false"
+        },
+        {
+          "command": "diffTracker.nativeReview.revertSelectedBlock",
+          "when": "false"
+        },
+        {
+          "command": "diffTracker.nativeReview.keepFile",
+          "when": "false"
+        },
+        {
+          "command": "diffTracker.nativeReview.revertFile",
+          "when": "false"
         }
       ]
     },

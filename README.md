@@ -82,6 +82,14 @@ When recording starts, Code Diff Tracker:
 
 ## Safety and Recovery Behavior
 
+### Optional Native Review
+
+Run **Open Native Review Snapshot** for the active changed file, or **Review Text Changes Natively** for a multi-file view. Both sides are read-only, version-bound snapshots. VS Code 1.80 and hosts without Multi Diff use an explicit file picker and single-file Diff; more than 50 text changes also use this bounded fallback. The default opening mode remains WebView.
+
+Right-click inside the snapshot's current side to **Keep Reviewed File**, **Revert Reviewed File**, or act on one exactly selected whole block. Partial selections, deleted-line blocks, stale snapshots, and ambiguous editor targets are refused. Use file-level review when a block cannot be mapped safely. Block Revert retains the existing unsaved-buffer behavior; save the real file when required, then open a fresh snapshot.
+
+Enable `diffTracker.nativeQuickDiff` to opt in to the **Code Diff Tracker Review** gutter provider. Its **Open Native Review Snapshot** menu opens a fresh review; it does not directly apply unversioned Quick Diff hunks. Read-only/unknown resources remain in the existing Changes view. See the [S5 checkpoint](docs/s5-native-review-checkpoint.md) for the supported boundaries and verification status.
+
 ### Review consistency and persistence
 
 Code Diff Tracker rejects an action when the displayed review is stale, the baseline is incomplete, persistence has failed, or the target cannot be validated safely. Session state is written atomically and retains a last-known-good copy. If recovery data is corrupt or a session write is interrupted, automatic restoration is blocked instead of silently replacing the saved review state.

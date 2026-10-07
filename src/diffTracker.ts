@@ -10188,6 +10188,10 @@ export class DiffTracker {
         return this.trackedChangesCache.slice();
     }
 
+    public getTrackedChange(filePath: string): FileDiff | undefined {
+        return this.trackedChanges.get(this.canonicalTrackingPath(filePath));
+    }
+
     public getLineChanges(filePath: string): LineChange[] | undefined {
         filePath = this.canonicalTrackingPath(filePath);
         return this.lineChanges.get(filePath);
@@ -10196,6 +10200,11 @@ export class DiffTracker {
     public getOriginalContent(filePath: string): string | undefined {
         filePath = this.canonicalTrackingPath(filePath);
         return this.fileSnapshots.get(filePath);
+    }
+
+    public getOriginalFilePath(filePath: string): string | undefined {
+        filePath = this.canonicalTrackingPath(filePath);
+        return this.fileSnapshots.has(filePath) ? filePath : undefined;
     }
 
     public getInlineContent(filePath: string): string | undefined {

@@ -102,6 +102,14 @@ Code Diff Tracker 是一个 VS Code 扩展，用来实时记录工作区文件�
 
 `Code Diff Tracker: Recheck Observation Coverage` 可从命令面板或 Settings → Tools 执行。它适用于正在录制、基线已就绪的已配置范围：重装失效监听，并按原审阅基线进行一次有界核对，保留文本、不透明和未知待审状态。停止录制、存在待处理范围或恢复操作、编辑器有未保存修改时会拒绝执行。核对期间有文件活动、覆盖不受支持或资源超限时，覆盖缺口继续可见；解决原因后可重试。该命令不接受修改、不重建基线，也不写回工作区文件。限制见 [Recheck checkpoint](docs/recheck-observation-coverage-checkpoint.md)。
 
+### 可选的 Native Review
+
+对当前变化文件运行 **Open Native Review Snapshot**，或通过 **Review Text Changes Natively** 打开多文件视图。两侧均为绑定审阅版本的只读快照。VS Code 1.80、不提供 Multi Diff 的宿主以及超过 50 个待审文本的情况，使用明确的文件选择器和单文件 Diff 回退。默认打开方式仍为 WebView。
+
+在快照 **current 侧编辑器内右键**，可执行 **Keep Reviewed File**、**Revert Reviewed File**，或对准确选中的一个完整块执行 Keep/Revert。部分选区、含删除行的块、过期快照或目标不明确时会拒绝；块无法安全映射时使用文件级审阅。块级 Revert 沿用未保存缓冲区语义，必要时保存真实文件后重新打开快照。
+
+启用 `diffTracker.nativeQuickDiff` 可使用 **Code Diff Tracker Review** gutter provider。它的 **Open Native Review Snapshot** 菜单只打开新审阅，不直接应用缺少版本信息的 Quick Diff hunk。非文本和未知资源继续保留在原有 Changes 视图。支持边界和验证状态见 [S5 检查点](docs/s5-native-review-checkpoint.md)。
+
 ## 工作原理
 
 开始录制后，Code Diff Tracker 会：
