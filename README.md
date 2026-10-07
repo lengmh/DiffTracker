@@ -232,7 +232,7 @@ try {
 
 When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
 
-The `0.8.0` source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
+Since `0.8.0`, the source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
 
 Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The installed-VSIX checks proved actual released V3→V4 text/session migration with ordered legacy rules preserved, plus separate candidate-created opaque recovery across process restarts. Released-asset opaque migration remains unproven; process restarts do not prove a physical **Reload Window** click. The [RC checkpoint](docs/bounded-rc-checkpoint.md) records these boundaries separately from source-level compatibility checks.
 
@@ -246,7 +246,7 @@ V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rat
 
 ## Release Notes
 
-Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.0` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
+Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.1` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
 
 ## License
 
