@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { withLookups } from './pr11-final-scope-regressions.mjs';
 
 // Exercise registered production commands and content providers with the real
 // tracker. Only the VS Code host boundary is replaced by this harness.
@@ -203,6 +205,116 @@ export function registerNativeReviewInvariants(h) {
             assert.equal(call[4].selection.end.character, 0);
             assert.deepEqual(h.getTracker().getReviewToken(p), token);
             assert.equal(fs.readFileSync(p, 'utf8'), 'a\nB\n');
+        } finally { ui.restore(); }
+    });
+
+    test('NATIVE Quick Diff hides an opaque review reached through a filesystem case alias', async () => {
+        const dir = file('native-alias'); fs.mkdirSync(dir);
+        const p = path.join(dir, 'asset.bin');
+        const alias = path.join(path.dirname(p), path.basename(p).toUpperCase());
+        seed(p, 'text baseline');
+        fs.writeFileSync(p, Buffer.from([0, 1, 2])); await scan(p);
+        const ui = host(true);
+        try {
+            await withLookups([[alias, p]], [], async () => {
+                assert.equal(pending(p)?.reviewKind, 'opaque');
+                assert.equal(h.getTracker().getOriginalContent(alias), 'text baseline');
+                assert.equal(h.getTracker().getReviewToken(alias), undefined);
+                assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias)), undefined);
+                assert.deepEqual(await ui.run('openFile', alias), { mode: 'existing-review', count: 1 });
+                assert.deepEqual(ui.calls.at(-1), ['diffTracker.showWebviewDiff', p]);
+                assert.equal(h.getTracker().getOriginalContent(p), 'text baseline');
+                assert.deepEqual(fs.readFileSync(p), Buffer.from([0, 1, 2]));
+            });
+        } finally { ui.restore(); }
+    });
+
+    test('NATIVE unknown case alias opens its canonical read-only WebView review', async () => {
+        const dir = file('native-unknown-alias'); fs.mkdirSync(dir);
+        const p = path.join(dir, 'asset.txt'), alias = path.join(dir, 'ASSET.TXT');
+        seed(p, 'text baseline', 'unreadable current'); await scan(p);
+        h.faults.set(p, { read: vscode.FileSystemError.NoPermissions() }); await scan(p);
+        const ui = host(true);
+        try {
+            await withLookups([[alias, p]], [], async () => {
+                assert.equal(pending(p)?.reviewKind, 'unknown');
+                assert.equal(h.getTracker().getOriginalContent(alias), 'text baseline');
+                assert.equal(h.getTracker().getReviewToken(alias), undefined);
+                assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias)), undefined);
+                assert.deepEqual(await ui.run('openFile', Uri.file(alias)), { mode: 'existing-review', count: 1 });
+                assert.deepEqual(ui.calls.at(-1), ['diffTracker.showWebviewDiff', p]);
+                assert.equal(h.getTracker().getOriginalContent(p), 'text baseline');
+                assert.equal(fs.readFileSync(p, 'utf8'), 'unreadable current');
+            });
+        } finally { ui.restore(); h.faults.delete(p); }
+    });
+
+    test('NATIVE text case aliases navigate to canonical snapshots but cannot alias a write context', async () => {
+        const dir = file('native-text-alias'); fs.mkdirSync(dir);
+        const p = path.join(dir, 'asset.txt'), alias = path.join(dir, 'ASSET.TXT');
+        seed(p, 'old text', 'new text'); await scan(p);
+        const token = h.getTracker().getReviewToken(p), ui = host(true);
+        try {
+            await withLookups([[alias, p]], [], async () => {
+                assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(alias)).scheme,
+                    'diff-tracker-original');
+                assert.equal((await ui.run('openFromQuickDiff', Uri.file(alias))).mode, 'single-diff');
+                const [, base, current] = ui.calls.at(-1);
+                assert.deepEqual(JSON.parse(current.query), token);
+                assert.equal(current.fsPath, p);
+                assert.equal(ui.read(base), 'old text'); assert.equal(ui.read(current), 'new text');
+                ui.focus(current);
+                const aliasedContext = current.with({ fsPath: alias });
+                for (const command of ['keepFile', 'revertFile', 'keepSelectedBlock', 'revertSelectedBlock']) {
+                    assert.equal((await ui.run(command, aliasedContext)).status, 'conflict');
+                }
+                assert.deepEqual(h.getTracker().getReviewToken(p), token);
+                assert.equal(h.getTracker().getOriginalContent(p), 'old text');
+                assert.equal(fs.readFileSync(p, 'utf8'), 'new text');
+            });
+        } finally { ui.restore(); }
+    });
+
+    test('NATIVE missing case variant cannot inherit a distinct read-only review', async () => {
+        const dir = file('native-missing-variant'); fs.mkdirSync(dir);
+        const p = path.join(dir, 'asset.bin'), missing = path.join(dir, 'ASSET.BIN');
+        seed(p, 'text baseline'); fs.writeFileSync(p, Buffer.from([0, 1, 2])); await scan(p);
+        const ui = host(true);
+        try {
+            await withLookups([], [missing], async () => {
+                assert.equal(h.getTracker().getOriginalContent(missing), undefined);
+                assert.equal(ui.sources[0].quickDiffProvider.provideOriginalResource(Uri.file(missing)), undefined);
+                assert.deepEqual(await ui.run('openFile', missing), { mode: 'unavailable', count: 0 });
+                assert.equal(ui.calls.some(call => call[0] === 'diffTracker.showWebviewDiff'), false);
+                assert.equal(pending(p)?.reviewKind, 'opaque');
+            });
+        } finally { ui.restore(); }
+    });
+
+    test('NATIVE case-sensitive sibling entries retain separate text and opaque reviews', async () => {
+        const dir = file('native-distinct-cases'); fs.mkdirSync(dir);
+        const opaque = path.join(dir, 'asset.txt'), text = path.join(dir, 'ASSET.TXT');
+        seed(opaque, 'opaque baseline');
+        if (fs.existsSync(text)) {
+            console.log('SKIP real case-distinct entries require a case-sensitive directory; denied-alias coverage still runs');
+            return;
+        }
+        fs.writeFileSync(opaque, Buffer.from([0, 1, 2])); await scan(opaque);
+        seed(text, 'text baseline', 'text current'); await scan(text);
+        const ui = host(true);
+        try {
+            const provider = ui.sources[0].quickDiffProvider;
+            assert.equal(provider.provideOriginalResource(Uri.file(opaque)), undefined);
+            assert.equal(provider.provideOriginalResource(Uri.file(text)).scheme, 'diff-tracker-original');
+            assert.equal((await ui.run('openFile', text)).mode, 'single-diff');
+            const [, base, current] = ui.calls.at(-1);
+            assert.equal(current.fsPath, text);
+            assert.equal(ui.read(base), 'text baseline'); assert.equal(ui.read(current), 'text current');
+            assert.equal((await ui.run('openFile', opaque)).mode, 'existing-review');
+            assert.deepEqual(ui.calls.at(-1), ['diffTracker.showWebviewDiff', opaque]);
+            assert.equal(h.getTracker().getTrackedChanges().length, 2);
+            assert.equal(h.getTracker().getOriginalContent(opaque), 'opaque baseline');
+            assert.equal(h.getTracker().getOriginalContent(text), 'text baseline');
         } finally { ui.restore(); }
     });
 

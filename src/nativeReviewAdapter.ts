@@ -56,7 +56,7 @@ export class NativeReviewAdapter implements vscode.Disposable, vscode.TextDocume
 
     public provideOriginalResource(uri: vscode.Uri): vscode.Uri | undefined {
         if (uri.scheme !== 'file' || this.tracker.getOriginalContent(uri.fsPath) === undefined) { return undefined; }
-        const pending = this.tracker.getTrackedChanges().find(change => change.filePath === uri.fsPath);
+        const pending = this.tracker.getTrackedChange(uri.fsPath);
         if (pending && !this.tracker.getReviewToken(uri.fsPath)) { return undefined; }
         return uri.with({ scheme: 'diff-tracker-original', query: '', fragment: '' });
     }
@@ -104,8 +104,9 @@ export class NativeReviewAdapter implements vscode.Disposable, vscode.TextDocume
             : undefined;
         const token = filePath && this.tracker.getReviewToken(filePath);
         if (!token) {
-            if (filePath && this.tracker.getTrackedChanges().some(change => change.filePath === filePath)) {
-                await vscode.commands.executeCommand('diffTracker.showWebviewDiff', filePath);
+            const pending = filePath ? this.tracker.getTrackedChange(filePath) : undefined;
+            if (pending) {
+                await vscode.commands.executeCommand('diffTracker.showWebviewDiff', pending.filePath);
                 return { mode: 'existing-review', count: 1 };
             }
             void vscode.window.showInformationMessage('No safely reviewable text change is available here. Use the Changes view for read-only or unknown resources.');
