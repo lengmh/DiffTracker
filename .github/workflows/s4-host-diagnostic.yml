@@ -1,0 +1,33 @@
+name: S4 Host Diagnostic
+
+on:
+  push:
+    branches:
+      - diagnose/rc-s4-events-2026-10-07
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-host:
+    name: Same-fixture Ubuntu Host (${{ matrix.vscode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        vscode: ['1.140.0', '1.141.0']
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Run unchanged Host fixtures with failure-only diagnostics
+        env:
+          DIFF_TRACKER_VSCODE_VERSION: ${{ matrix.vscode }}
+        run: xvfb-run -a npm run test:host

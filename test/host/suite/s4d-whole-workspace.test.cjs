@@ -61,6 +61,64 @@ module.exports = async function prepareWholeWorkspaceProof({
     await delay(500);
 
     const original = filePath => vscode.commands.executeCommand('diffTracker._testOriginalContent', filePath);
+    const textEvidence = value => typeof value === 'string'
+        ? { utf8Bytes: Buffer.byteLength(value), fingerprint: fingerprint(Buffer.from(value)) }
+        : null;
+    const changeEvidence = change => change ? {
+        filePath: change.filePath, reviewKind: change.reviewKind,
+        reviewReason: change.reviewReason, unavailableReason: change.unavailableReason,
+        baselineExists: change.baselineExists, currentExists: change.currentExists,
+        isDeleted: change.isDeleted,
+        originalText: textEvidence(change.originalContent), currentText: textEvidence(change.currentContent),
+        baselineFingerprint: change.baselineFingerprint ?? null, currentFingerprint: change.currentFingerprint ?? null,
+        baselineSize: change.baselineSize ?? null, currentSize: change.currentSize ?? null
+    } : null;
+    const contextEvidence = current => current ? {
+        isRecording: current.isRecording, baselineState: current.baselineState,
+        effectiveMonitoringScope: current.effectiveMonitoringScope,
+        policyFingerprint: current.policyFingerprint, coverageGeneration: current.coverageGeneration,
+        gitPauses: current.gitPauses, unknownReviewPaths: current.unknownReviewPaths,
+        retainedReviewPaths: current.retainedReviewPaths,
+        coverageGaps: current.coverageGaps, subtreeCoverageGaps: current.subtreeCoverageGaps,
+        trackedChangeCount: current.trackedChanges.length,
+        reviewTokenCount: current.reviewTokens.length, opaqueReviewTokenCount: current.opaqueReviewTokens.length
+    } : null;
+    const diskEvidence = filePath => {
+        // Failure-only and read-only: inspect just the 18 known fixture paths,
+        // with at most one bounded content read per regular file. Never open a
+        // document, rescan through the tracker, or follow a fixture symlink.
+        let descriptor, evidence;
+        try {
+            const stat = fs.lstatSync(filePath);
+            evidence = {
+                exists: true, type: stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' :
+                    stat.isSymbolicLink() ? 'symlink' : 'other',
+                size: stat.size, mode: stat.mode, mtimeMs: stat.mtimeMs,
+                ctimeMs: stat.ctimeMs, birthtimeMs: stat.birthtimeMs
+            };
+            if (!stat.isFile()) { return evidence; }
+            const readLimit = 64 * 1024;
+            descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+            const before = fs.fstatSync(descriptor);
+            const bytes = Buffer.alloc(readLimit + 1);
+            const bytesRead = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+            const after = fs.fstatSync(descriptor);
+            const stable = before.isFile() && before.dev === stat.dev && before.ino === stat.ino &&
+                before.size === stat.size && before.mtimeMs === stat.mtimeMs && before.ctimeMs === stat.ctimeMs &&
+                before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+            return { ...evidence, bytesRead, readLimit, stable,
+                fingerprint: stable && bytesRead === before.size && bytesRead <= readLimit
+                    ? fingerprint(bytes.subarray(0, bytesRead)) : null,
+                contentReadComplete: stable && bytesRead === before.size && bytesRead <= readLimit };
+        } catch (error) {
+            return { ...evidence, exists: error.code === 'ENOENT' ? false : evidence?.exists ?? null,
+                error: { code: error.code, message: error.message } };
+        } finally {
+            if (descriptor !== undefined) {
+                try { fs.closeSync(descriptor); } catch { /* Diagnostics cannot replace the original failure. */ }
+            }
+        }
+    };
     const assertMode = (current, mode) => {
         assert.equal(current.isRecording, true);
         assert.equal(current.baselineState, 'ready');
@@ -83,6 +141,7 @@ module.exports = async function prepareWholeWorkspaceProof({
 
         async assertObservedChanges() {
             const baseline = await state();
+            const baselineOriginals = new Map();
             assertMode(baseline, 'wholeWorkspace');
             for (const fixture of fixtures) {
                 assert.equal(vscode.workspace.textDocuments.some(document => document.uri.fsPath === fixture.filePath),
@@ -90,7 +149,9 @@ module.exports = async function prepareWholeWorkspaceProof({
                 assert.equal(baseline.trackedChanges.some(change => change.filePath === fixture.filePath), false,
                     `${fixture.relativePath} must have no pending change before the filesystem mutation`);
                 assert.equal(fs.existsSync(fixture.filePath), fixture.operation !== 'create');
-                assert.equal(await original(fixture.filePath),
+                const baselineOriginal = await original(fixture.filePath);
+                baselineOriginals.set(fixture.filePath, textEvidence(baselineOriginal));
+                assert.equal(baselineOriginal,
                     fixture.kind === 'text' && fixture.operation !== 'create' ? fixture.before : undefined,
                     `${fixture.relativePath}: Apply must establish existing text before-images only`);
             }
@@ -101,27 +162,96 @@ module.exports = async function prepareWholeWorkspaceProof({
             }
             // One bounded observation wait covers all 18 outcomes. No reset,
             // rescan, reopen, mode switch or synthetic event may deliver them.
-            const observed = await untilStable('S4-D Whole Workspace text/opaque create/modify/delete across three path classes', async () => {
-                const current = await state();
-                assert.equal(current.isRecording, true);
-                assert.equal(current.effectiveMonitoringScope.mode, 'wholeWorkspace');
-                // New-file absence provenance passes through completeBaseline(),
-                // which reports building while it durably publishes the evidence.
-                // Keep the original bounded wait and require stable Ready at the
-                // result, rather than failing on an intermediate publication.
-                if (current.baselineState !== 'ready') { return undefined; }
-                const changes = new Map(current.trackedChanges.map(change => [change.filePath, change]));
-                return fixtures.every(fixture => {
-                    const change = changes.get(fixture.filePath);
-                    if (!change || change.reviewKind !== fixture.kind || change.unavailableReason ||
-                        change.currentExists !== (fixture.operation !== 'delete')) { return false; }
-                    return fixture.kind === 'text'
-                        ? change.currentContent === (fixture.operation === 'delete' ? '' : fixture.after) &&
-                            current.reviewTokens.some(token => token.filePath === fixture.filePath)
-                        : change.currentFingerprint === (fixture.operation === 'delete' ? undefined : fingerprint(fixture.after)) &&
-                            current.opaqueReviewTokens.some(token => token.filePath === fixture.filePath);
-                }) ? current : undefined;
-            });
+            let observed, lastObservedState, lastObservedAt;
+            let observationCount = 0, readyObservationCount = 0, matchingObservationCount = 0;
+            let firstMatchingObservationAt, lastMatchingObservationAt;
+            const observationStartedAt = Date.now();
+            try {
+                observed = await untilStable('S4-D Whole Workspace text/opaque create/modify/delete across three path classes', async () => {
+                    const current = await state();
+                    lastObservedState = current;
+                    lastObservedAt = Date.now();
+                    observationCount++;
+                    assert.equal(current.isRecording, true);
+                    assert.equal(current.effectiveMonitoringScope.mode, 'wholeWorkspace');
+                    // New-file absence provenance passes through completeBaseline(),
+                    // which reports building while it durably publishes the evidence.
+                    // Keep the original bounded wait and require stable Ready at the
+                    // result, rather than failing on an intermediate publication.
+                    if (current.baselineState !== 'ready') { return undefined; }
+                    readyObservationCount++;
+                    const changes = new Map(current.trackedChanges.map(change => [change.filePath, change]));
+                    const matches = fixtures.every(fixture => {
+                        const change = changes.get(fixture.filePath);
+                        if (!change || change.reviewKind !== fixture.kind || change.unavailableReason ||
+                            change.currentExists !== (fixture.operation !== 'delete')) { return false; }
+                        return fixture.kind === 'text'
+                            ? change.currentContent === (fixture.operation === 'delete' ? '' : fixture.after) &&
+                                current.reviewTokens.some(token => token.filePath === fixture.filePath)
+                            : change.currentFingerprint === (fixture.operation === 'delete' ? undefined : fingerprint(fixture.after)) &&
+                                current.opaqueReviewTokens.some(token => token.filePath === fixture.filePath);
+                    });
+                    if (matches) {
+                        matchingObservationCount++;
+                        firstMatchingObservationAt ??= lastObservedAt;
+                        lastMatchingObservationAt = lastObservedAt;
+                    }
+                    return matches ? current : undefined;
+                });
+            } catch (error) {
+                try {
+                    const current = lastObservedState;
+                    const changes = new Map((current?.trackedChanges ?? []).map(change => [change.filePath, change]));
+                    const fixturePaths = new Set(fixtures.map(fixture => fixture.filePath));
+                    const unrelated = (current?.trackedChanges ?? []).filter(change => !fixturePaths.has(change.filePath));
+                    const rows = fixtures.map(fixture => {
+                        const change = changes.get(fixture.filePath);
+                        const existed = fixture.operation !== 'create';
+                        const exists = fixture.operation !== 'delete';
+                        const textToken = !!current?.reviewTokens.some(token => token.filePath === fixture.filePath);
+                        const opaqueToken = !!current?.opaqueReviewTokens.some(token => token.filePath === fixture.filePath);
+                        const clauses = {
+                            ready: current?.baselineState === 'ready', present: !!change,
+                            reviewKind: change?.reviewKind === fixture.kind,
+                            available: !!change && !change.unavailableReason,
+                            currentExists: change?.currentExists === exists,
+                            currentIdentity: fixture.kind === 'text'
+                                ? !!change && change.currentContent === (exists ? fixture.after : '')
+                                : !!change && change.currentFingerprint === (exists ? fingerprint(fixture.after) : undefined),
+                            token: fixture.kind === 'text' ? textToken : opaqueToken
+                        };
+                        return {
+                            path: fixture.relativePath, cohort: fixture.cohort, kind: fixture.kind, operation: fixture.operation,
+                            expected: { baselineExists: existed, currentExists: exists, isDeleted: !exists,
+                                originalText: fixture.kind === 'text' ? textEvidence(existed ? fixture.before : '') : null,
+                                currentText: fixture.kind === 'text' ? textEvidence(exists ? fixture.after : '') : null,
+                                baselineFingerprint: existed ? fingerprint(fixture.before) : null,
+                                currentFingerprint: exists ? fingerprint(fixture.after) : null,
+                                baselineSize: existed ? Buffer.byteLength(fixture.before) : null,
+                                currentSize: exists ? Buffer.byteLength(fixture.after) : null,
+                                tokenKind: fixture.kind },
+                            observed: changeEvidence(change), textToken, opaqueToken,
+                            clauses, mismatches: Object.keys(clauses).filter(key => !clauses[key]),
+                            baselineOriginalBeforeMutation: baselineOriginals.get(fixture.filePath),
+                            disk: diskEvidence(fixture.filePath)
+                        };
+                    });
+                    console.error('S4-D observation failure evidence:', JSON.stringify({
+                        runtime: { vscode: vscode.version, platform: process.platform, node: process.version },
+                        observation: { startedAt: observationStartedAt, lastObservedAt, failedAt: Date.now(),
+                            observationCount, readyObservationCount, matchingObservationCount,
+                            firstMatchingObservationAt, lastMatchingObservationAt },
+                        baseline: contextEvidence(baseline), lastObserved: contextEvidence(current), rows,
+                        unrelatedPendingCount: unrelated.length,
+                        unrelatedPending: unrelated.slice(0, 64).map(changeEvidence),
+                        unrelatedPendingTruncated: unrelated.length > 64,
+                        limitation: 'Public tracker snapshots and bounded fixture disk reads only; native callbacks and watcher ownership are not traced.'
+                    }));
+                } catch (diagnosticError) {
+                    console.error('S4-D observation diagnostic failed:', diagnosticError);
+                }
+                throw error;
+            }
             assertMode(observed, 'wholeWorkspace');
             for (const fixture of fixtures) {
                 const change = observed.trackedChanges.find(item => item.filePath === fixture.filePath);
