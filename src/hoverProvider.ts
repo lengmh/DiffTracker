@@ -9,6 +9,11 @@ export class DiffHoverProvider implements vscode.HoverProvider {
         position: vscode.Position,
         token: vscode.CancellationToken
     ): vscode.ProviderResult<vscode.Hover> {
+        // Native snapshots are immutable. Live working-state hover data would
+        // describe a different review after an edit or Keep changes the token.
+        if (document.uri.scheme === 'diff-tracker-review-base' || document.uri.scheme === 'diff-tracker-review-current') {
+            return null;
+        }
         if (!this.diffTracker.getIsRecording()) {
             return null;
         }

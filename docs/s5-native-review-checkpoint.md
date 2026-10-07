@@ -1,0 +1,48 @@
+# S5 首批：Native Review 薄适配
+
+本批从 `main@c8a1e7bf223fa82489fdb59aefd7ee981b28fcfc` 实现可选的原生文本审阅入口。实现与真实 Host 验证分开记录；本文件不将尚未返回的 CI 或审查结果记为通过。默认入口仍为 WebView，最低宿主仍为 VS Code 1.80，包版本仍为 `0.7.2`。默认入口决策、RC、合并和发布不属于本检查点。
+
+## 实现前的范围与安全结论
+
+遵循 [ADR-0019](./adr/0019-native-review-as-stable-api-adapter.md)，保留现有后端的 baseline、session、review token、Keep/Revert、Undo、Git context、opaque、scope 与 coverage 权威。不合并 PR #6 的 PoC adapter，不修改后端事务或 Session V4。
+
+稳定的 [`scm/change/title`](https://code.visualstudio.com/api/extension-guides/scm-provider#menus) 只提供文档 URI、行变化和索引，不提供审阅 token、原始文档 URI 或视图版本。同样的行坐标不能证明审阅过同一份内容。因此 Quick Diff 菜单只执行「Open Native Review Snapshot」：打开新的完整只读快照，清空原来的选区。它不直接应用原生 hunk，也不把旧坐标重新解释为当前块。
+
+`vscode.diff`、公开的 [`vscode.changes`](https://code.visualstudio.com/api/references/commands)、SCM QuickDiffProvider、TextDocumentContentProvider 和 editor/context 均使用稳定 API。没有 proposed 菜单、私有 Copilot UI 或 `enabledApiProposals`。
+
+## 可用入口与回退
+
+- 在变化树的文本文件右键菜单，或命令面板运行 `Open Native Review Snapshot`，打开一个文件的只读 baseline/current 快照。
+- `Review Text Changes Natively` 使用宿主的 Multi Diff。宿主不提供该命令、打开失败或待审文本超过 50 个时，明确显示文件选择器并打开单文件 Diff。50 只限制一次 Multi Diff 展示，不改变监控或持久化容量。
+- `diffTracker.nativeQuickDiff` 默认为 `false`。启用后增加 `Code Diff Tracker Review` Quick Diff provider，可与 Git provider 并存。其菜单只导航到上述快照。
+- 在快照的 **current 侧编辑器内右键**，可执行 `Keep Reviewed File`、`Revert Reviewed File`，或对一个完整选中块执行 Keep/Revert。写命令不出现在命令面板、编辑器标题或 Multi Diff 文件头中。
+- 非文本、未知或当前无法安全操作的资源保留原有审阅入口。Native Review 不提供 opaque 内容回滚，也不从未知状态合成文本 token。
+
+## 资源、版本与完整块保护
+
+两侧使用独立的只读虚拟 URI，每对 URI 携带同一个完整后端 token 和规范文件身份。适配器不保存第二套确认状态，也不向旧 URI 发布内容更新。后端 token 已过期时，尚未载入的 provider 请求失败；已打开的旧快照可以继续显示旧内容，但动作会拒绝。需重新打开并审阅新快照。
+
+写操作要求 editor/context 提供的 URI 与实际 active current-snapshot editor 完全一致，并核对快照文本与当前后端内容。随后将原 token 与 blockId 原样传给既有后端。后端继续核验磁盘、dirty editor、session、Git、目标与事务条件，不因原生入口绕过保护。
+
+选区只接受一个块的完整行与字符边界，可包含末尾换行。部分字符、部分块、跨块或多选区、含删除行的块，以及同一快照同时显示在多个编辑器中的选区动作均拒绝。无法证明选区时使用文件级动作，不猜测「唯一块」，也不自动扩大范围。空文件、整文件删除与后端没有提供块的情况遵循既有文件级能力；适配器不新增任意部分行操作或 EOL-only 差异识别。
+
+块级 Revert 沿用现有语义：修改真实文件的编辑器缓冲区，必要时仍需保存。只读快照不会被改写成结果。文件级操作与 Undo 继续沿用已有后端能力和拒绝条件。
+
+## 验证计划与证据边界
+
+1. 逐个垂直切片记录 red → green；注册的生产命令/provider 使用真实 tracker 和文件系统，仅替换 VS Code API 边界。覆盖正常 Keep/Revert、其他块保留、CRLF、过期内容、同坐标新内容、dirty editor、旧 session、虚拟 URI 同路径、错误上下文、部分选区和回退。
+2. `npm test`、编译、lint 与现有 performance 检查保留；不以专项测试代替完整聚合结果。
+3. 三组真实 Host：Windows Stable、Ubuntu Stable、Ubuntu 1.80.2。实际打开 Quick Diff、切换到 DiffTracker provider、点击菜单；Stable 实际打开两个文件的 Multi Diff 并聚焦不同 modified 子编辑器；最低版本验证真实选择器与单文件回退。
+4. 菜单和焦点验证使用仅限测试的 loopback renderer CDP。测试点击真实 UI，不注入 Quick Diff 参数或通过新测试命令替代入口。DOM 选择器不是产品 API；选择器失效必须使验收失败，不能伪造通过。
+5. 独立审查与最终确切 head 的 CI 分别报告。只有三组 Host、质量检查、降级保护和 VSIX job 的最终结果均返回后，才能确认本检查点的验证状态。VSIX 包装不代表发布。
+
+本地环境没有可用的 VS Code/Xvfb，不能将本地 API 边界回归称为真实 Host 验证。Host 结果以本批 PR 的对应提交日志为准；最终 CI、审查与首次失败记录保留在 PR。主要支持范围仍为已验证的 Windows/Linux 本地工作区，不扩大为所有平台、文件系统或异常组合。
+
+## 提交前的本地核验
+
+- 编译、lint、完整 `npm test` 通过：tracker 1062/1062（其中 Native Review 30 项）、review UI 35 项、Git adapter 31/31、真实临时 Git 仓库 9/9，以及既有路径、scope、webview 与 diff 测试。
+- 现有 1,100 文件 performance fixture 通过：scan 357.1 ms、update 2.1 ms、RSS delta 24.1 MiB。这是本地样本，不是新性能承诺。
+- 精确 released `0.7.2` 源码的兼容性检查通过；本地 VSIX 包装通过，Native Review 产物已包含，测试和 CDP 工具未进入 VSIX。
+- 实现前核对稳定 API 与后端权威边界；实现后独立审查发现旧 hover/decoration provider 会按相同 `fsPath` 将当前状态叠加到不可变快照。CodeLens 已有 `file:` 限制，不存在同类入口。仅对两个新快照 scheme 增加显示隔离，并分别记录 hover、decoration 的失败与通过回归；后端没有修改。
+
+上述结果只描述提交前状态，不能代替新提交的真实 Host、CI 或最终审查结果。

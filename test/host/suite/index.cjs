@@ -27,6 +27,10 @@ exports.run = async () => {
         return;
     }
     if (phase !== 'prepare') { throw new Error(`Unknown Extension Host phase: ${phase}`); }
+    // Renderer discovery, real menu activation, two child-editor focuses and
+    // the minimum-host picker have their own budget. Do not borrow from or
+    // relax the existing 150-second full-scenario gate.
+    await bounded('Native Review UI checkpoint', require('./native-review.test.cjs'), 90_000);
     // Preserve the existing full-scenario and per-assertion time budgets. The
     // small process-restart fixture has its own bounded prepare/restore phases.
     await bounded('Extension Host scenario', require('./extension.test.cjs'), 150_000);

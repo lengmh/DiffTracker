@@ -1,4 +1,5 @@
 import { registerPR12BoundedInvariants } from './pr12-bounded-invariants.mjs';
+import { registerNativeReviewInvariants } from './native-review-invariants.mjs';
 import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
 /** Production regression tests. Only the VS Code API boundary is faked.
  * No diff, existence, acceptance or recovery algorithm is copied into this test.
@@ -5255,6 +5256,24 @@ registerPR11ReviewRegressions({
     },
     setVsCodeExcludes: value => { vscodeExcludes = value; },
     fireConfigurationChanged: key => configurationChanged({affectsConfiguration: name => name === key})
+});
+
+registerNativeReviewInvariants({
+    test, vscode, Uri, file, seed, scan, pending, document, faults, counters,
+    getTracker: () => tracker,
+    createAdapter: () => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try { const { NativeReviewAdapter } = require('../out/nativeReviewAdapter.js'); return new NativeReviewAdapter(tracker, result => result); }
+        finally { Module._load = originalLoad; }
+    },
+    createPresentation: () => {
+        Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+        try {
+            const { DiffHoverProvider } = require('../out/hoverProvider.js');
+            const { DecorationManager } = require('../out/decorationManager.js');
+            return { hover: new DiffHoverProvider(tracker), decorations: new DecorationManager(tracker) };
+        } finally { Module._load = originalLoad; }
+    }
 });
 
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}

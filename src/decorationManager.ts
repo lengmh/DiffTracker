@@ -76,6 +76,12 @@ export class DecorationManager {
     }
 
     public updateDecorations(editor: vscode.TextEditor) {
+        // Multi Diff has no stable 1.80 tab-input type to inspect. Snapshot
+        // identity itself excludes live decorations, including stale views.
+        if (editor.document.uri.scheme === 'diff-tracker-review-base' || editor.document.uri.scheme === 'diff-tracker-review-current') {
+            this.clearDecorations(editor);
+            return;
+        }
         if (!this.diffTracker.getIsRecording()) {
             this.clearDecorations(editor);
             return;

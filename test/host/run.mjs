@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { runTests } from '@vscode/test-electron';
 
@@ -19,6 +20,17 @@ const git = (...args) => execFileSync('git', args, {
     stdio: ['ignore', 'pipe', 'pipe']
 });
 
+async function availableLoopbackPort() {
+    const server = createServer();
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+    });
+    const port = server.address().port;
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    return port;
+}
+
 try {
     mkdirSync(workspacePath, { recursive: true });
     for (const [name, content] of [
@@ -28,6 +40,8 @@ try {
         ['deleted.txt', 'delete baseline\n'],
         ['batch-a.txt', 'batch a\n'],
         ['batch-b.txt', 'batch b\n'],
+        ['native-a.txt', 'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n'],
+        ['native-b.txt', 'b header\nbeta value=old\nb footer\n'],
         ['audit-source.txt', 'base\n'],
         ['audit-target.txt', 'edit\n'],
         ['audit-recovery.txt', 'base\n'],
@@ -62,6 +76,10 @@ try {
     git('add', '.');
     git('commit', '-m', 'host baseline');
 
+    // Test-only renderer access for actual Quick Diff menu clicks and Multi
+    // Diff child focus. The helper runs with this Node, not the old Host's Node.
+    // Nothing is registered in production or included in the VSIX.
+    const cdpPort = await availableLoopbackPort();
     const hostOptions = {
         version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
         extensionDevelopmentPath,
@@ -69,12 +87,17 @@ try {
         extensionTestsEnv: {
             DIFF_TRACKER_HOST_WORKSPACE: workspacePath,
             DIFF_TRACKER_HOST_SECOND_ROOT: secondRoot,
-            DIFF_TRACKER_HOST_RESTART_STORAGE: restartStorage
+            DIFF_TRACKER_HOST_RESTART_STORAGE: restartStorage,
+            DIFF_TRACKER_HOST_CDP_PORT: String(cdpPort),
+            DIFF_TRACKER_HOST_NODE: process.execPath
         },
         launchArgs: [
             workspaceFile,
             `--user-data-dir=${path.join(tempRoot, 'user-data')}`,
             `--extensions-dir=${path.join(tempRoot, 'extensions')}`,
+            '--remote-debugging-address=127.0.0.1',
+            `--remote-debugging-port=${cdpPort}`,
+            '--locale=en',
             '--disable-workspace-trust',
             '--skip-welcome',
             '--skip-release-notes'
