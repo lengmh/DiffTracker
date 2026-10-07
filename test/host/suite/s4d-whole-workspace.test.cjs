@@ -11,7 +11,11 @@ const vscode = require('vscode');
 module.exports = async function prepareWholeWorkspaceProof({
     workspacePath, secondRoot, primaryFolder, state, untilStable, delay
 }) {
+    assert.equal((await state()).isRecording, false, 'prepare S4 fixtures only while stopped');
     const fixtureRoot = 's4d-whole-workspace';
+    const watcherTarget = path.join(workspacePath, fixtureRoot, 'watcher-excluded');
+    assert.ok(fs.existsSync(watcherTarget) && fs.statSync(watcherTarget).isDirectory(),
+        'launcher must preseed the concrete S4 watcher directory before the prepare Host');
     const cohorts = ['normal', 'git-ignored', 'watcher-excluded'];
     const fixtures = [];
     const fingerprint = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -44,20 +48,20 @@ module.exports = async function prepareWholeWorkspaceProof({
         'Git must really ignore exactly the Git-ignored cohort, including absent creation paths');
 
     // A workspace-wide literal would also require this target in secondRoot.
-    // Scope the exclusion to the primary folder, where its directory exists.
+    // The launcher seeds the final primary-folder setting between Host processes.
+    // Assert it here: updating it in this Host can leave delayed settings events
+    // that correctly invalidate the subsequent scope transaction.
     const watcherPattern = `${fixtureRoot}/watcher-excluded/**`;
     const filesConfig = vscode.workspace.getConfiguration('files', primaryFolder.uri);
-    const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceFolderValue;
-    await filesConfig.update('watcherExclude', {
-        ...previousWatcherExclude, [watcherPattern]: true
-    }, vscode.ConfigurationTarget.WorkspaceFolder);
+    assert.equal(filesConfig.inspect('watcherExclude')?.workspaceFolderValue?.[watcherPattern], true,
+        'launcher must preseed the S4 exclusion at the primary folder level');
     assert.equal(vscode.workspace.getConfiguration('files', primaryFolder.uri)
         .get('watcherExclude', {})[watcherPattern], true);
     assert.notEqual(vscode.workspace.getConfiguration('files', vscode.Uri.file(secondRoot))
         .get('watcherExclude', {})[watcherPattern], true,
         'the concrete host exclusion must not introduce a missing target in the second root');
-    // Folder settings and the nested .gitignore are real workspace writes.
-    // Settle their policy/watcher events before any scope preparation starts.
+    // Preserve the existing settling interval for the remaining fixture writes.
+    // This delay is not a guarantee that filesystem event queues are drained.
     await delay(500);
 
     const original = filePath => vscode.commands.executeCommand('diffTracker._testOriginalContent', filePath);
@@ -318,7 +322,9 @@ module.exports = async function prepareWholeWorkspaceProof({
 
         async restoreWatcherExclude() {
             assert.equal((await state()).isRecording, false, 'restore fixture settings only while stopped');
-            await filesConfig.update('watcherExclude', previousWatcherExclude,
+            const remaining = { ...filesConfig.inspect('watcherExclude')?.workspaceFolderValue };
+            delete remaining[watcherPattern];
+            await filesConfig.update('watcherExclude', Object.keys(remaining).length ? remaining : undefined,
                 vscode.ConfigurationTarget.WorkspaceFolder);
         }
     };

@@ -134,6 +134,19 @@ try {
     assert.deepEqual(readFileSync(nativeOpaquePath), Buffer.from([0, 1, 2, 3]));
     rmSync(nativeOpaquePath);
     assert.equal(existsSync(nativeOpaquePath), false, 'Native-only opaque fixture must not enter the main Host');
+
+    // Seed the final S4 folder configuration only after Native has exited and
+    // restored its fixtures. A live settings update in prepare can deliver late
+    // create/save events during Whole Workspace Apply. Keep these writes offline.
+    const s4WatcherTarget = path.join(workspacePath, 's4d-whole-workspace', 'watcher-excluded');
+    const primarySettingsPath = path.join(workspacePath, '.vscode', 'settings.json');
+    assert.equal(existsSync(s4WatcherTarget), false, 'S4 watcher target must start absent');
+    assert.equal(existsSync(primarySettingsPath), false, 'S4 seed must not overwrite existing folder settings');
+    mkdirSync(s4WatcherTarget, { recursive: true });
+    mkdirSync(path.dirname(primarySettingsPath), { recursive: true });
+    writeFileSync(primarySettingsPath, JSON.stringify({
+        'files.watcherExclude': { 's4d-whole-workspace/watcher-excluded/**': true }
+    }), { flag: 'wx' });
     await runTests({
         ...hostOptions,
         extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'prepare' }

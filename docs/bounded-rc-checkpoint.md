@@ -108,3 +108,13 @@
 [两版本 Ubuntu 诊断](https://github.com/lengmh/DiffTracker/actions/runs/37608195149) 使用独立分支 `e02d1939a1616cad88e8cca841efcc5fc5ea4b2e`，在同一源码/夹具上分别固定 VS Code 1.140.0 和 1.141.0。两个 job 均通过全部 18 项 S4-D 观察、完整 main suite 和跨进程 restart。该轮未重现 #548 的超时，不能据此证明版本回归、事件丢失，或声称某个根因已被修复；也不代替 PR 的完整实际 Stable gate。
 
 保留的失败遥测仅记录原有观察轮次的最后状态、前置基线、18 个逐项期望/实际条件、文本长度/指纹、opaque 身份、token 是否存在和不相关待审摘要。仅在失败后读取这 18 个已知小文件的有界磁盘证据，并重抛同一个原始错误。Ready、18 项谓词、30 秒期限、750 ms 稳定要求以及所有后续断言不变；不重试观察、不调用 Recheck/Clear、不补事件，不添加后端 hook。若完整 gate 再次失败，应以具体逐文件证据决定后续最小修正。
+
+## Windows 范围事务诊断与夹具修正
+
+[Verification #549](https://github.com/lengmh/DiffTracker/actions/runs/37608725970) 在 `9887973` 上结束：6 个 job 通过，Windows Stable 失败，包装跳过。Windows 已通过 13 条 Native 检查、18 项 S4-D 观察和 post-Clear 检查，随后切回 Rules 时收到 `Configured monitoring scope could not be prepared durably`。该轮没有保留失败前的事务谓词和事件来源，不能确定触发原因，也不能仅凭报错认定磁盘写入失败。
+
+为保留首个失败谓词及回滚前事件，另开隔离诊断分支，在 Windows 1.141.0 上执行[一次诊断](https://github.com/lengmh/DiffTracker/actions/runs/37612574700)。这次在更早的首次 Whole Workspace Apply 失败，未到达 #549 的失败位置。记录显示，主目录 `.vscode` 和 `.vscode/settings.json` 的 create 通知进入事务，首个失败条件是 `observed-events`；事务所有权、epoch、scope/watcher/ignore revision 均匹配，没有 Git 暂停或身份预算耗尽。两条路径来自运行中的 S4 设置夹具。回滚后主 session 与 last-good 字节相同，仍保留原 Rules 范围，保护按预期拒绝了并发活动。[诊断产物](https://github.com/lengmh/DiffTracker/actions/runs/37612574700/artifacts/11477974542) 保留日志和受限 session 证据；诊断分支的后端插桩不进入本 PR。
+
+本次修正只移除已证实的运行中设置写入：Native Host 退出、其专用文件恢复并移除后，在 prepare/main Host 启动前写入最终的主目录 S4 watcher exclusion，并创建对应测试目录。S4 helper 准备阶段改为核对目录级配置和实际目录，不再更新设置。清理仍在停止状态执行，只删除夹具自有键，保留其他配置。Native 独立进程不读取该预置配置。
+
+回归覆盖启动阶段顺序、S4 准备阶段零设置写入、缺失/错误/继承配置拒绝、第二根目录隔离和清理所有权。所有 18 项观察、真实文件操作、期限及生产并发拒绝逻辑保持不变。这消除了本次捕获的夹具写入来源，不保证所有文件系统事件已排空，也不解释或宣称修复 #549 的后续失败。最终候选仍须完整实际 Stable、最低版本、安装升级、质量、降级与包装检查。
