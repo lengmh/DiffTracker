@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Module, { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'diff-tracker-performance-'));
@@ -98,3 +100,11 @@ console.log(JSON.stringify(result, null, 2));
 
 await tracker.dispose();
 fs.rmSync(root, { recursive: true, force: true });
+
+// Isolate the mixed RC fixture's VS Code module stub and process RSS from this
+// original 1,100-text smoke. Its metrics do not inherit the thresholds above.
+const mixed = spawnSync(process.execPath, [fileURLToPath(new URL('./performance-mixed.mjs', import.meta.url))], {
+    stdio: 'inherit'
+});
+assert.ifError(mixed.error);
+assert.equal(mixed.status, 0, `mixed RC fixture exited with ${mixed.signal ?? mixed.status}`);

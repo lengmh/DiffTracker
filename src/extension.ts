@@ -27,7 +27,7 @@ let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
 let gitContextMonitor: GitContextMonitor | undefined;
 
-type DefaultOpenMode = 'webview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
+type DefaultOpenMode = 'webview' | 'nativeReview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
 function extractFilePath(filePathOrItem: string | any): string | undefined {
     if (typeof filePathOrItem === 'string') {
@@ -51,7 +51,7 @@ function extractIsDeleted(filePathOrItem: string | any): boolean | undefined {
 function getDefaultOpenMode(): DefaultOpenMode {
     const config = vscode.workspace.getConfiguration('diffTracker');
     const mode = config.get<string>('defaultOpenMode', 'webview');
-    if (mode === 'inline' || mode === 'sideBySide' || mode === 'original' || mode === 'splitOriginalWebview' || mode === 'webview') {
+    if (mode === 'nativeReview' || mode === 'inline' || mode === 'sideBySide' || mode === 'original' || mode === 'splitOriginalWebview' || mode === 'webview') {
         return mode;
     }
     return 'webview';
@@ -749,6 +749,10 @@ export async function activate(context: vscode.ExtensionContext) {
             }
 
             switch (defaultMode) {
+                case 'nativeReview':
+                    // Preserve URI schemes and snapshot provenance for the adapter.
+                    await vscode.commands.executeCommand('diffTracker.nativeReview.openFile', filePathOrItem);
+                    break;
                 case 'inline':
                     await vscode.commands.executeCommand('diffTracker.showInlineDiff', filePath);
                     break;
@@ -930,7 +934,8 @@ export async function activate(context: vscode.ExtensionContext) {
                 { label: 'Inline (read-only)', description: 'Virtual inline diff document', value: 'inline' },
                 { label: 'Side-by-Side', description: 'VS Code built-in diff editor', value: 'sideBySide' },
                 { label: 'Original', description: 'Open original file directly', value: 'original' },
-                { label: 'Split: Original | Webview', description: 'Left original file, right webview diff', value: 'splitOriginalWebview' }
+                { label: 'Split: Original | Webview', description: 'Left original file, right webview diff', value: 'splitOriginalWebview' },
+                { label: 'Native Review', description: 'Version-bound text snapshots; other resources use Webview', value: 'nativeReview' }
             ];
 
             const selected = await vscode.window.showQuickPick(

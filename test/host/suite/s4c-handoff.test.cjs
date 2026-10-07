@@ -20,9 +20,9 @@ async function until(description, predicate) {
 
 module.exports = async function s4cHandoffHost(workspace) {
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-s4c-host-'));
-    // Keep source and destination on the same filesystem for a genuine move of
-    // an already-populated directory, including on Windows hosted runners.
-    const source = fs.mkdtempSync(path.join(workspace, 's4c-import-source-'));
+    // Stage outside every workspace while retaining a genuine same-filesystem
+    // move, avoiding exposure of staging to workspace-scoped observers.
+    const source = fs.mkdtempSync(path.join(path.dirname(workspace), 's4c-import-source-'));
     const root = vscode.Uri.file(path.join(workspace, 's4c-import-owner')).fsPath;
     const nested = path.join(root, 'deep');
     const directories = [root, nested];
@@ -42,6 +42,9 @@ module.exports = async function s4cHandoffHost(workspace) {
         return watcher;
     };
     try {
+        assert.equal(vscode.workspace.getWorkspaceFolder(vscode.Uri.file(source)), undefined);
+        assert.equal(fs.statSync(source).dev, fs.statSync(workspace).dev,
+            'staging must remain on the destination filesystem');
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workspace));
         assert.ok(folder, 'the imported tree must have an actual workspace owner');
         // This scenario imports into one folder. An all-roots include would

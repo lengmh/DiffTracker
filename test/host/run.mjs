@@ -86,6 +86,11 @@ try {
     git('add', '.');
     git('commit', '-m', 'host baseline');
 
+    // This resource belongs only to Native fallback acceptance, not to the
+    // shared Git baseline or the later scope/recovery fixtures.
+    const nativeOpaquePath = path.join(workspacePath, 'native-opaque.bin');
+    writeFileSync(nativeOpaquePath, Buffer.from([0, 1, 2, 3]));
+
     // Test-only renderer access for actual Quick Diff menu clicks and Multi
     // Diff child focus. The helper runs with this Node, not the old Host's Node.
     // Nothing is registered in production or included in the VSIX.
@@ -126,6 +131,22 @@ try {
         'header\nalpha value=old\nseparator\nbeta value=old\nfooter\n');
     assert.equal(readFileSync(path.join(workspacePath, 'native-b.txt'), 'utf8'),
         'b header\nbeta value=old\nb footer\n');
+    assert.deepEqual(readFileSync(nativeOpaquePath), Buffer.from([0, 1, 2, 3]));
+    rmSync(nativeOpaquePath);
+    assert.equal(existsSync(nativeOpaquePath), false, 'Native-only opaque fixture must not enter the main Host');
+
+    // Seed the final S4 folder configuration only after Native has exited and
+    // restored its fixtures. A live settings update in prepare can deliver late
+    // create/save events during Whole Workspace Apply. Keep these writes offline.
+    const s4WatcherTarget = path.join(workspacePath, 's4d-whole-workspace', 'watcher-excluded');
+    const primarySettingsPath = path.join(workspacePath, '.vscode', 'settings.json');
+    assert.equal(existsSync(s4WatcherTarget), false, 'S4 watcher target must start absent');
+    assert.equal(existsSync(primarySettingsPath), false, 'S4 seed must not overwrite existing folder settings');
+    mkdirSync(s4WatcherTarget, { recursive: true });
+    mkdirSync(path.dirname(primarySettingsPath), { recursive: true });
+    writeFileSync(primarySettingsPath, JSON.stringify({
+        'files.watcherExclude': { 's4d-whole-workspace/watcher-excluded/**': true }
+    }), { flag: 'wx' });
     await runTests({
         ...hostOptions,
         extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_PHASE: 'prepare' }

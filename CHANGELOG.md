@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+The entries below describe development work. The source package version remains `0.7.2`; no new release or RC pass is implied. Verification status is recorded in the [Native Review checkpoint](docs/s5-native-review-checkpoint.md) and [bounded RC checkpoint](docs/bounded-rc-checkpoint.md).
+
+- Add file-level text, opaque and unknown review visibility, version-checked **Acknowledge Read-only Change**, and mixed accept/acknowledge semantics. Non-text content is not backed up and cannot be reverted.
+- Add the unified **Manage Monitoring Scope** manager, Rules and Whole Workspace modes, local scope-expansion consent, bounded preparation, explicit scope recovery controls and visible observation gaps.
+- Persist effective scope and durable gap evidence in Session V4 while retaining supported older session data and blocking incompatible downgrades. Released `0.7.2` already provides opaque identity storage; migration preserves that evidence when present.
+- Add bounded supplemental observation and imported-directory watcher handoff for the verified local Windows/Linux scope, without raising resource limits or claiming universal filesystem coverage.
+- Add **Recheck Observation Coverage** to reinstall coverage and compare against original review baselines without accepting changes or modifying workspace files.
+- Add optional stable-API Native Review with immutable text snapshots, guarded file/full-block Keep/Revert, real Quick Diff navigation and Multi Diff where available. VS Code 1.80 retains the file-picker/single-file Diff fallback.
+- Add `nativeReview` to `diffTracker.defaultOpenMode` and the sidebar **Display → Default open mode** picker. The five existing values remain available, the default remains `webview`, opaque/unknown resources use WebView, and Quick Diff remains a separate disabled-by-default opt-in.
+- Prepare bounded installed-VSIX upgrade/recovery and mixed-workspace resource checks. New acceptance outcomes remain pending until their corresponding logs and artifacts are verified.
+
 ## 0.7.2
 
 - Fix **Clear Diffs** immediately recreating unavailable reviews for stable unsupported files. **Stop Recording** followed by **Clear Diffs** now persists an empty stopped session without modifying workspace files.

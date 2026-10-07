@@ -148,6 +148,7 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
             const defaultOpenMode = config.get<string>('defaultOpenMode', 'webview');
             const modeLabelMap: { [key: string]: string } = {
                 webview: 'Webview',
+                nativeReview: 'Native Review',
                 inline: 'Inline (read-only)',
                 sideBySide: 'Side-by-Side',
                 original: 'Original',

@@ -105,14 +105,16 @@
             "inline",
             "sideBySide",
             "original",
-            "splitOriginalWebview"
+            "splitOriginalWebview",
+            "nativeReview"
           ],
           "enumDescriptions": [
             "Open interactive webview diff panel",
             "Open inline diff editor (read-only)",
             "Open VS Code side-by-side diff editor",
             "Open original file directly",
-            "Open split view: left original file, right webview diff panel"
+            "Open split view: left original file, right webview diff panel",
+            "Open version-bound Native Review snapshots for text; use the webview for read-only or unknown resources"
           ],
           "description": "Default open mode when clicking a changed file in Code Diff Tracker"
         },
@@ -620,11 +622,12 @@
     "test:git-context": "node test/git-context.mjs && node test/git-readiness-race.mjs",
     "test:git-repositories": "node test/git-repository-integration.mjs",
     "test:host": "node test/host/run.mjs",
+    "test:host-fixture": "node --test test/host-fixture-setup.mjs",
     "test:performance": "node test/performance.mjs",
     "test:monitoring-scope": "node test/monitoring-scope.mjs",
     "test:stage2-probes": "node test/known-p0.mjs",
     "test:legacy-manual-policy": "node test/legacy-manual-policy.mjs",
-    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:monitoring-scope && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories"
+    "test": "npm run test:webview-anchors && npm run test:similarity-pairing && npm run test:paths && npm run test:monitoring-scope && npm run test:tracker-safety && npm run test:review-ui && npm run test:git-context && npm run test:git-repositories && npm run test:host-fixture"
   },
   "devDependencies": {
     "@pierre/diffs": "1.0.10",
