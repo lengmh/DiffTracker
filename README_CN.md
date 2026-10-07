@@ -6,7 +6,7 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 [English](./README.md)
 
-本文描述当前开发源码，包含尚未发布的监控范围和 Native Review 改动。包版本仍为 `0.7.2`，不代表 Marketplace 已发布新版本。上一批 Native Review 检查点已通过；本批设置与有界 RC 的新验证状态见 [RC 检查点](docs/bounded-rc-checkpoint.md)。
+本文描述 `0.8.0` 源码发布准备。监控范围、Native Review 和有界 RC 工作已合并；已核验的功能基线通过 [Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513)，8/8 job 成功。这不表示已创建发布 tag、GitHub release 或 Marketplace 包。证据与限制见 [RC 检查点](docs/bounded-rc-checkpoint.md)，最终发布 VSIX 仍需单独通过[发布门禁](docs/releasing.md)。
 
 > 本 fork 的扩展 ID 为 `lengmh.code-diff-tracker`。安装前，请禁用或卸载上游
 > `TinyTigerPan.diff-tracker`，以及此前用于测试的 `lengmh.diff-tracker` VSIX。
@@ -254,9 +254,9 @@ try {
 
 已保存的 session 仍归属于创建它的扩展 ID。`TinyTigerPan.diff-tracker` 和早期 `lengmh.diff-tracker` 测试版的 session 不会自动迁移到 `lengmh.code-diff-tracker`。
 
-当前开发版写入 **Session V4**，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
+`0.8.0` 源码写入 **Session V4**，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
 
-已发布 `0.7.2` 已支持不透明文件的存在性和内容身份。升级必须保留实际保存格式中的证据，不能读取当前文件来倒推出过去的指纹。缺少有效扫描证明或已知 before-image 时，新发现路径保持未知，不伪装成新增或未变化。安装版 VSIX 的迁移、源码级兼容检查与候选版重启恢复分别取证，见 [RC 检查点](docs/bounded-rc-checkpoint.md)。
+已发布 `0.7.2` 已支持不透明文件的存在性和内容身份。升级必须保留实际保存格式中的证据，不能读取当前文件来倒推出过去的指纹。缺少有效扫描证明或已知 before-image 时，新发现路径保持未知，不伪装成新增或未变化。安装版验收已证明从已发布 `0.7.2` 的 V3 状态升级到 V4 时，文本审阅状态和有序旧规则保持不变，并单独证明候选版新建不透明状态的跨进程恢复。已发布资产的不透明状态迁移仍未证明；进程重启不等于实际点击 **Reload Window**。这些证据与源码级兼容检查分别记录在 [RC 检查点](docs/bounded-rc-checkpoint.md)。
 
 V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢弃范围或审阅数据。切换版本前保留工作区和扩展存储；不要通过删除恢复标记或保存状态来绕过兼容性警告。
 
@@ -267,13 +267,13 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 
 ## 版本更新摘要
 
-### 未发布
+### 0.8.0（发布准备）
 
 - 文件级只读审阅、Acknowledge、监控范围管理、Session V4 和独立 Recheck
-- 可选 Native Review、`nativeReview` 打开模式，以及独立启用的 Quick Diff
-- 本地混合资源样本已通过；安装升级、恢复和最终 CI 仍待结果，不表示 RC 已通过或版本已发布
+- 可选 Native Review 与 `nativeReview` 打开模式；WebView 仍为默认，Quick Diff 独立启用且默认关闭
+- 已合并功能候选完成有界安装升级、激活/重启恢复和混合资源验证；确切主线 #551 首次运行 8/8 成功
 
-完整记录见 [CHANGELOG.md](./CHANGELOG.md)。
+完整记录见 [CHANGELOG.md](./CHANGELOG.md)。发布准备不代表已发布；最终发布 VSIX 必须在上传、创建 tag 或 release 前单独核验，并保留校验值、版本、源码提交和运行来源，见[发布门禁](docs/releasing.md)。
 
 ### 0.7.0
 

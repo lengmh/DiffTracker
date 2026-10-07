@@ -1,9 +1,10 @@
 # S5：设置选择与有界 RC 检查点
 
-- 状态：本批进行中；本地设置回归和混合资源样本已通过，新增 Host、安装升级/恢复及最终 CI 结果待核对。
+- 状态（2026-10-07）：设置选择与有界 RC 验证已完成，[PR #21](https://github.com/lengmh/DiffTracker/pull/21) 已合并；最终 PR head #550 与合并主线 #551 均为 8/8 成功。证据边界和历史失败保留如下。
 - 前置基线：已合并的 [PR #20](https://github.com/lengmh/DiffTracker/pull/20)，`main@52c209533b2ca65e3f6531a1dd903e8706466b7e`。
 - 前置验证：[Verification #543](https://github.com/lengmh/DiffTracker/actions/runs/37593362839)，attempt 1、7/7 成功。该轮 tracker 1070、Native Review 38、review UI 35；Windows/Ubuntu Stable 1.140.0 和 Ubuntu 1.80.2 各有 12 条实际 Native PASS。详见 [上一检查点](./s5-native-review-checkpoint.md)。
-- 发布边界：源码包版本仍为 `0.7.2`。本文件不选择新版本号，不宣称 RC 已通过，也不代表发布授权。
+- 当前核验主线：[`ef41d2c496875a1de0d894df5f0973df01676f1e`](https://github.com/lengmh/DiffTracker/commit/ef41d2c496875a1de0d894df5f0973df01676f1e)，tree `7808593414f0935cff3d3f6c4bae9416d9cadbf1`；[Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513) attempt 1，8/8 成功。
+- 发布边界：当前另行准备 `0.8.0` 源码版本、说明与最终 VSIX 门禁；PR #21 的通过不等于发布准备 PR 的 CI 或最终发布包已通过。未创建发布 tag、GitHub release 或 Marketplace 包，实际发布仍需单独授权及[发布门禁](./releasing.md)。
 
 ## 1. 交付范围与保留契约
 
@@ -13,7 +14,7 @@
 
 常规打开入口把原始目标交给已有 guarded adapter，保留 URI scheme 与快照来源信息，不能仅提取 `fsPath` 后把虚拟文档误当真实文件。不透明和未知资源使用现有 WebView 回退。`diffTracker.nativeQuickDiff` 仍为独立、默认关闭的设置，不因选择 Native Review 自动启用。
 
-保留稳定 API、VS Code `^1.80.0`、Session V4 和现有资源预算；不加入任意部分行操作、非文本内容恢复、私有 API、新 provider 或普遍平台兼容承诺。真实同 ID 升级使用临时提高 manifest 版本的内部 VSIX；仅用于让 VS Code 执行升级，不对应产品发布号。产物标注 DO NOT PUBLISH，源码 package.json/package-lock.json 仍为 `0.7.2`，测试暂存不得改动它们或充当新版本决策。
+保留稳定 API、VS Code `^1.80.0`、Session V4 和现有资源预算；不加入任意部分行操作、非文本内容恢复、私有 API、新 provider 或普遍平台兼容承诺。PR #21 的真实同 ID 升级使用临时提高 manifest 版本的内部 VSIX，仅用于让 VS Code 执行升级，不对应产品发布号。该轮产物标注 DO NOT PUBLISH，源码 package.json/package-lock.json 当时保持 `0.7.2`。这些历史验收包不能作为本次 `0.8.0` 最终发布包；最终包须按发布门禁另行构建并验证。
 
 ## 2. 设置与真实入口证据
 
@@ -60,20 +61,22 @@
 
 五次成功运行的范围准备为 **511.6–630.8 ms**，RSS 采样峰值为 **185.3–223.0 MiB**。采样峰值不保证捕获进程的绝对瞬时峰值。事件数受实际文件系统通知影响，不作为固定吞吐承诺。现有 1,100 文件文本夹具也保留并通过；新样本不抬高容量上限，不新增延迟/RSS 发布门槛，不能替代最终候选 CI。
 
-## 5. 本批证据登记
+## 5. 本批证据登记（2026-10-07 最终核对）
 
-| 检查项 | 当前状态 | 需保留的证据 |
+| 检查项 | 当前状态 | 证据与边界 |
 | --- | --- | --- |
-| 设置与原有 adapter 的源码回归 | 本地完整聚合已通过：tracker 1070（Native Review 38）、review UI 39、Git adapter 31、真实临时 Git 仓库 9 | 最终候选确切提交的 CI 仍待核对 |
-| 设置改动独立审查 | 未发现独立 P0/P1/P2 问题；最终候选审查另行核对 | 对应审查范围与提交 |
-| 三组真实开发 Host 的新增设置入口 | #545/#546 三组均通过全部 13 条 Native 检查；不等于完整 Host suite 全部通过 | Windows/Ubuntu Stable、Ubuntu 1.80.2 日志；后续范围失败见下文 |
-| 实际安装、同 ID 升级、recording/stopped 激活恢复 | #546 Ubuntu Stable 五阶段通过 | 官方资产身份、实际 V3→V4、同一存储路径及原文本 before-image；[安装证据](https://github.com/lengmh/DiffTracker/actions/runs/37603115636/artifacts/11473398391) |
-| 候选 opaque 跨 Host 恢复 | #546 通过，独立于旧版迁移 | 候选基线/身份及待审跨 recording/stopped 激活保留 |
-| 混合预检、burst、watcher 峰值、RSS | 五次本地样本通过；独立审查未发现 P0/P1/P2 问题 | 第 4 节的真实文件/API stub 边界、构成、正确性和测量口径；最终 CI 待核对 |
-| 编译、lint、完整聚合与 VSIX | 本地编译、lint、聚合与包装通过；最终候选 CI 待核对 | 完整日志、产物内容和来源；降级保护独立核对 |
-| 最终 CI、PR 状态与发布决策 | 待核对；未发布 | 确切 head/run，审查、合并和发布分别陈述 |
+| 设置与原有 adapter 的源码回归 | 最终 #550/#551 Quality 通过 | 初始本地聚合为 tracker 1070（Native Review 38）、review UI 39、Git adapter 31、真实临时 Git 仓库 9；后续夹具回归和最终日志以确切 run 为准 |
+| 设置改动与最终候选审查 | 设置改动独立审查未发现 P0/P1/P2 问题；最终 head 的 Codex 自动审查完成且无 findings | [PR #21](https://github.com/lengmh/DiffTracker/pull/21)，在最终检查后合并 |
+| 三组真实开发 Host 的新增设置入口 | 最终 #550/#551 三组完整 Host 通过 | Windows/Ubuntu Stable、Ubuntu 1.80.2；每组新增入口和 13 条 Native 检查，保留下面的首次失败 |
+| 实际安装、同 ID 升级、recording/stopped 激活恢复 | #546 首次五阶段通过；最终 #550/#551 Installed RC job 通过 | 官方资产身份、实际 V3→V4、同一存储路径、原文本 before-image 和有序 legacy 规则；[首次安装证据](https://github.com/lengmh/DiffTracker/actions/runs/37603115636/artifacts/11473398391) |
+| 候选 opaque 跨 Host 恢复 | #546 及最终 Installed RC job 通过 | 候选新建基线/身份及待审跨 recording/stopped 激活保留；released 资产的 opaque 迁移仍未证明 |
+| 混合预检、burst、watcher 峰值、RSS | 本地样本和最终 #550/#551 Quality 通过 | 保留第 4 节口径；加入一次显式 Recheck 后的样本另列，不将 stub 对象计为系统 watcher |
+| 编译、lint、完整聚合、降级保护与 VSIX 包装 | 最终 #550/#551 对应 job 通过 | PR #21 源码和内部候选产物的证据，不替代最终 `0.8.0` 发布 VSIX 验收 |
+| 最终 CI 与 PR 状态 | 最终 PR head #550 为 8/8；合并主线 #551 attempt 1 为 8/8；PR #21 已合并 | 确切提交、tree 和 run 见第 6 节；发布准备与实际发布分别验证和授权 |
 
-失败必须保留最初日志与修正范围；尚未返回、跳过或仅包装成功均不能记为验收通过。只有本批承诺的有限证据齐全后，才能给出 RC 结论。已可靠拒绝的范围外场景不自动扩成新开发批次；支持范围内的实质安全问题必须修复或可靠阻断。
+失败必须保留最初日志与修正范围；尚未返回、跳过或仅包装成功均不能记为验收通过。本批结论只覆盖下述确切提交和约定的有限场景。已可靠拒绝的范围外场景不自动扩成新开发批次；支持范围内的实质安全问题必须修复或可靠阻断。
+
+以下按首次观测顺序保留历史记录；其中「待核对」「下一次」描述当时状态，最终结论见第 6 节。
 
 ## 首次 CI 启动检查
 
@@ -117,4 +120,19 @@
 
 本次修正只移除已证实的运行中设置写入：Native Host 退出、其专用文件恢复并移除后，在 prepare/main Host 启动前写入最终的主目录 S4 watcher exclusion，并创建对应测试目录。S4 helper 准备阶段改为核对目录级配置和实际目录，不再更新设置。清理仍在停止状态执行，只删除夹具自有键，保留其他配置。Native 独立进程不读取该预置配置。
 
-回归覆盖启动阶段顺序、S4 准备阶段零设置写入、缺失/错误/继承配置拒绝、第二根目录隔离和清理所有权。所有 18 项观察、真实文件操作、期限及生产并发拒绝逻辑保持不变。这消除了本次捕获的夹具写入来源，不保证所有文件系统事件已排空，也不解释或宣称修复 #549 的后续失败。最终候选仍须完整实际 Stable、最低版本、安装升级、质量、降级与包装检查。
+回归覆盖启动阶段顺序、S4 准备阶段零设置写入、缺失/错误/继承配置拒绝、第二根目录隔离和清理所有权。所有 18 项观察、真实文件操作、期限及生产并发拒绝逻辑保持不变。这消除了本次捕获的夹具写入来源，不保证所有文件系统事件已排空，也不解释或宣称修复 #549 的后续失败。当时最终候选仍须完整实际 Stable、最低版本、安装升级、质量、降级与包装检查；最终结果见下一节。
+
+## 6. 最终收口与 0.8.0 发布准备（2026-10-07）
+
+[PR #21](https://github.com/lengmh/DiffTracker/pull/21) 最终 head 为 `2ea190ede7a53b9394370bf14f57d61402b07852`，[Verification #550](https://github.com/lengmh/DiffTracker/actions/runs/37616591461) 为 8/8 成功。该 head 的 Codex 自动审查完成且无 findings，PR 在最终检查后合并。
+
+合并主线为 `ef41d2c496875a1de0d894df5f0973df01676f1e`，tree 为 `7808593414f0935cff3d3f6c4bae9416d9cadbf1`。[Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513) attempt 1 已完成，8/8 成功：Ubuntu/Windows Quality、Ubuntu/Windows Stable Host、Ubuntu 1.80.2 Host、Installed RC、released `0.7.2` 对 Session V4 的降级拒绝、VSIX 包装。
+
+因此，设置选择和本批约定的有界 RC 检查已收口。结论保留以下限制：
+
+- 五阶段安装验收证明真实产品激活与进程重启恢复，不证明物理点击 **Reload Window**。
+- 实际 released `0.7.2` V3→V4 验收证明文本/session 和有序 legacy 规则保留；候选中新建 opaque 后恢复是另一条证据。released 资产的 opaque 迁移仍未证明，不能描述为旧版不具备该能力。
+- #549 的 Whole Workspace→Rules durable-preparation 失败原因仍未确定。独立诊断捕获的是更早的设置事件引发的 Whole Workspace Apply 拒绝；夹具修正只移除了这一已证实来源。最终两轮通过不能追溯改写为已确定或全面修复 #549 的根因。
+- WebView 仍是出厂默认；Native Review 是可选入口，Quick Diff 独立选择且默认关闭。支持平台、资源预算、Session V4 和后端安全语义不变。
+
+当前 `0.8.0` 发布准备仅整理版本元数据、用户说明和发布门禁，不新增功能，不切换默认入口，也不执行发布。最终发布 VSIX 必须在上传、创建 tag 或 GitHub release 前，以实际待发布字节完成门禁，并关联校验值、包版本、源码提交、验证 run 和 attempt；详见 [Releasing](./releasing.md)。#550/#551 的内部候选验证不能替代这一步，也不表示本次发布准备 PR 的 CI 或未来 release dry-run 已通过。

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, for example 0.7.3"
+        description: "Version to release, for example 0.8.0"
         required: true
         type: string
       dry_run:
@@ -24,6 +24,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha256: ${{ steps.identity.outputs.sha256 }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      run_id: ${{ steps.identity.outputs.run_id }}
+      run_attempt: ${{ steps.identity.outputs.run_attempt }}
     env:
       VERSION: ${{ inputs.version }}
       VSIX: code-diff-tracker-${{ inputs.version }}.vsix
@@ -142,6 +148,9 @@ jobs:
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 
+      - name: Verify artifact and installed harness guards
+        run: node --test test/installed/harness.test.mjs test/installed/final-artifact.test.mjs
+
       - name: Build VSIX
         shell: bash
         run: |
@@ -149,12 +158,30 @@ jobs:
           npm run package -- --out "$VSIX"
           test -s "$VSIX"
 
-      - name: Create SHA-256 checksum
+      - name: Create SHA-256 checksum and producer identity
+        id: identity
         shell: bash
         run: |
           set -euo pipefail
           sha256sum "$VSIX" > "$CHECKSUM"
           cat "$CHECKSUM"
+          echo "sha256=$(sha256sum "$VSIX" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the exact final VSIX through all five installed phases
+        env:
+          FINAL_VSIX_SHA256: ${{ steps.identity.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RC_ARTIFACTS="$RUNNER_TEMP/difftracker-final-installed"
+          node test/installed/artifacts.mjs --final "$RC_ARTIFACTS" "$VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          xvfb-run -a node test/installed/run.mjs "$RC_ARTIFACTS" --final "$VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          node test/installed/final-artifact.mjs "$RC_ARTIFACTS/installed-summary.json" "$VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          sha256sum -c "$CHECKSUM"
+          cp "$RC_ARTIFACTS/installed-summary.json" final-installed-summary.json
 
       - name: Upload release files as workflow artifact
         uses: actions/upload-artifact@v4
@@ -164,6 +191,7 @@ jobs:
             ${{ env.VSIX }}
             ${{ env.CHECKSUM }}
             release-notes.md
+            final-installed-summary.json
           if-no-files-found: error
 
       - name: Dry-run summary
@@ -171,7 +199,7 @@ jobs:
         shell: bash
         run: |
           echo "Dry run complete. No tag or GitHub Release was created."
-          echo "Validated and packaged Code Diff Tracker $VERSION from $GITHUB_SHA."
+          echo "Validated the exact Code Diff Tracker $VERSION VSIX from $GITHUB_SHA across all five installed phases."
 
   publish:
     if: ${{ !inputs.dry_run }}
@@ -185,6 +213,10 @@ jobs:
       TAG: v${{ inputs.version }}
       VSIX: code-diff-tracker-${{ inputs.version }}.vsix
       CHECKSUM: code-diff-tracker-${{ inputs.version }}.vsix.sha256
+      FINAL_VSIX_SHA256: ${{ needs.build.outputs.sha256 }}
+      PRODUCER_COMMIT: ${{ needs.build.outputs.source_commit }}
+      PRODUCER_RUN_ID: ${{ needs.build.outputs.run_id }}
+      PRODUCER_ATTEMPT: ${{ needs.build.outputs.run_attempt }}
 
     steps:
       - name: Require main branch
@@ -206,7 +238,12 @@ jobs:
         with:
           name: code-diff-tracker-${{ inputs.version }}-release-files
 
-      - name: Verify downloaded package checksum
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify downloaded package and installed evidence against the producer
         shell: bash
         run: |
           set -euo pipefail
@@ -214,6 +251,10 @@ jobs:
           test -s "$CHECKSUM"
           test -s release-notes.md
           sha256sum -c "$CHECKSUM"
+          test "$PRODUCER_COMMIT" = "$GITHUB_SHA"
+          test "$PRODUCER_RUN_ID" = "$GITHUB_RUN_ID"
+          test "$PRODUCER_ATTEMPT" = "$GITHUB_RUN_ATTEMPT"
+          node test/installed/final-artifact.mjs final-installed-summary.json "$VSIX" "$VERSION" "$FINAL_VSIX_SHA256" "$PRODUCER_COMMIT" "$PRODUCER_RUN_ID" "$PRODUCER_ATTEMPT"
 
       - name: Check tag and release state
         env:
