@@ -33,7 +33,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 
 按 2026-10-04 优化口径同步：主要 Windows/Linux 本地场景可靠可用，能力不足时保留证据并明确拒绝、显示缺口或暂停；不以穷举边界或清空历史讨论作为完成条件。
 
-当前核对主线为 `c8a1e7bf223fa82489fdb59aefd7ee981b28fcfc`，阶段状态如下：
+当前核对主线为 `52c209533b2ca65e3f6531a1dd903e8706466b7e`，阶段状态如下：
 
 - **S0 / PR #7**：冻结 Native Review 稳定 API adapter 契约、virtual URI 安全边界和 watcher/W1 capability contract。
 - **S1 / PR #8**：完成 opaque / unknown 只读 review visibility。
@@ -43,7 +43,7 @@ Code Diff Tracker 是一个轻量的本地变更审阅工具：在一次工作�
 - **S4-B / [PR #13](https://github.com/lengmh/DiffTracker/pull/13)、[PR #14](https://github.com/lengmh/DiffTracker/pull/14)**：有限支持范围内的 persistent supplemental coverage 已完成并合并；包含生命周期、Rules 目标和嵌套工作区 ownership 修复。未能可靠覆盖的组合仍明确拒绝或保留缺口。
 - **S4-C / [PR #17](https://github.com/lengmh/DiffTracker/pull/17)**：已完成有限 imported bridge 核对、独立接管、临时资源回收及 V4 重启义务并合并；见 [checkpoint](./s4c-handoff-checkpoint.md) 和总路线的确切 CI 证据。
 - **S4-D / [PR #18](https://github.com/lengmh/DiffTracker/pull/18)**：有限真实 Host 验收已完成并合并，补齐 Whole Workspace 文件级观察、接管拒绝/中途事件和跨 Host 进程恢复。最终 PR head 与合并主线的 Verification 均首次运行 7/7 成功，自动审查已完成且无新增问题；确切提交、日志和首次失败历史见 [验收 checkpoint](./s4d-host-acceptance-checkpoint.md)。独立 Recheck 已通过 [PR #19](https://github.com/lengmh/DiffTracker/pull/19) 合并，主线 [Verification #536](https://github.com/lengmh/DiffTracker/actions/runs/37571007704) 为 7/7 成功；不能用 Reset 替代。
-- **S5**：依照 [ADR-0019 的 2026-10-06 时序修订](./adr/0019-native-review-as-stable-api-adapter.md#2026-10-06-时序修订)，在 S5 内完成 production Native Review 稳定 API 薄适配与真实入口验证，通过后再进行默认入口决策和 0.8.0 RC 的迁移、性能、文档及 VSIX 验收。当前只推进首个薄适配检查点，见 [S5 检查点](./s5-native-review-checkpoint.md)；默认入口决策和 RC 仍待后续授权。
+- **S5**：首个 production Native Review 薄适配检查点已通过 [PR #20](https://github.com/lengmh/DiffTracker/pull/20) 合并，主线 [Verification #543](https://github.com/lengmh/DiffTracker/actions/runs/37593362839) 首次运行 7/7 成功；三组 Host 各有 12 条实际 Native PASS，见 [S5 检查点](./s5-native-review-checkpoint.md)。本批已获授权增加 `nativeReview` 设置选项并进行有界 RC 验证；WebView 仍为默认，Quick Diff 仍独立且默认关闭。本地混合工作区资源样本已通过；新增安装升级/恢复与最终 CI 仍待核对，见 [RC 检查点](./bounded-rc-checkpoint.md)，不宣称整个 S5 或 RC 已完成。
 - **S6**：只按实际反馈维护，不预置新的功能大包，也不是 0.8.0 完成门。
 
 Native Review 不成为第二套状态源；DiffTracker 后端继续管理 baseline、session、review token、stale protection、Keep/Revert/Acknowledge、恢复、Git context、scope 和 coverage。任意 block 内部分行 Keep/Revert 不属于 0.8.0 完成门。
@@ -58,7 +58,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 当前实现有单个受支持文本文件 5 MiB、快照条目数 10,000、单份序列化 session 状态 50 MiB、Revert 历史最多 10 条等限制。50 MiB 不是包含备份、归档和临时文件后的整个目录总占用承诺；当前也没有按天清理的通用保留策略。未来调整这些限制，需要独立验证，而不是在功能扩展时直接放大。
 
-当前已合并 S1/S2 的文件级审阅与确认能力、S3 的监控范围/Session V4、S4-A 的 Whole Workspace 有界准备，以及 S4-B 的有限补充监听。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。S4-C 有限实现与 S4-D 有限 Host 验收均已合并；独立 Recheck 已合并并通过主线 CI。S5 的 Native Review 薄适配检查点正在推进，默认入口决策与 RC 验收尚未启动。
+当前已合并 S1/S2 的文件级审阅与确认能力、S3 的监控范围/Session V4、S4-A 的 Whole Workspace 有界准备，以及 S4-B 的有限补充监听。当前仍不保存非文本内容副本，也不能把读取失败当成文件不存在。S4-C 有限实现与 S4-D 有限 Host 验收均已合并；独立 Recheck 已合并并通过主线 CI。S5 首个 Native Review 薄适配检查点已合并；当前新增用户可选的默认打开模式，有界 RC 验证进行中，尚未确认通过。
 
 0.8.x 不重写已经验证的文本 Diff、块级 Keep/Revert 和安全恢复算法。应在其外围分离“文件记录”与“可执行能力”，并继续遵守过期审阅拒绝、未保存缓冲区保护、Git 上下文隔离和持久化失败保护。
 
@@ -169,7 +169,7 @@ Native Review 不成为第二套状态源；DiffTracker 后端继续管理 basel
 
 实现只增加当前需求所需的记录分类、能力判断、监听和持久化支持。不预先建设备份引擎，不为候选功能重写成熟的文本路径，也不以增加 `kind` 字段为由展开整个仓库重构。
 
-S4-C/D 已完成；独立 Recheck 已收口，后续按 S5 的薄适配、默认入口决策与 RC 路线分别推进，不重开已完成阶段。每批明确支持场景、安全退出和结束条件；本文本身不构成启动实现或发布的指令。
+S4-C/D、独立 Recheck 与 S5 首个薄适配检查点已完成。当前按已授权的设置选择与有界 RC 范围推进，不重开已完成阶段。每批明确支持场景、安全退出和结束条件；本文本身不构成启动实现或发布的指令。
 
 ## 6. 0.9.x 及以后的候选路线（未立项）
 

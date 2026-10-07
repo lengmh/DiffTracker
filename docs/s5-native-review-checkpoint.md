@@ -1,6 +1,8 @@
-# S5 首批：Native Review 薄适配
+# S5 首批：Native Review 薄适配（已合并）
 
-本批从 `main@c8a1e7bf223fa82489fdb59aefd7ee981b28fcfc` 实现可选的原生文本审阅入口。实现与真实 Host 验证分开记录；本文件不将尚未返回的 CI 或审查结果记为通过。默认入口仍为 WebView，最低宿主仍为 VS Code 1.80，包版本仍为 `0.7.2`。默认入口决策、RC、合并和发布不属于本检查点。
+本批从 `main@c8a1e7bf223fa82489fdb59aefd7ee981b28fcfc` 实现可选的原生文本审阅入口，已通过 [PR #20](https://github.com/lengmh/DiffTracker/pull/20) 合并。合并主线为 [`52c209533b2ca65e3f6531a1dd903e8706466b7e`](https://github.com/lengmh/DiffTracker/commit/52c209533b2ca65e3f6531a1dd903e8706466b7e)，合并时间为 2026-10-07 16:22:41（北京时间）。[Verification #543](https://github.com/lengmh/DiffTracker/actions/runs/37593362839) 为 attempt 1、7/7 成功。
+
+这是 S5 的首个薄适配检查点完成，不等于整个 S5、RC 或发布完成。该检查点保留 WebView 默认入口、VS Code 1.80 最低宿主和 `0.7.2` 包版本。后续已授权的设置选择与有界 RC 另记于 [RC 检查点](./bounded-rc-checkpoint.md)，新批次不能借用本轮通过结果宣称验收完成。
 
 ## 实现前的范围与安全结论
 
@@ -28,7 +30,7 @@
 
 块级 Revert 沿用现有语义：修改真实文件的编辑器缓冲区，必要时仍需保存。只读快照不会被改写成结果。文件级操作与 Undo 继续沿用已有后端能力和拒绝条件。
 
-## 验证计划与证据边界
+## 原验证计划与证据边界
 
 1. 逐个垂直切片记录 red → green；注册的生产命令/provider 使用真实 tracker 和文件系统，仅替换 VS Code API 边界。覆盖正常 Keep/Revert、其他块保留、CRLF、过期内容、同坐标新内容、dirty editor、旧 session、虚拟 URI 同路径、错误上下文、部分选区和回退。
 2. `npm test`、编译、lint 与现有 performance 检查保留；不以专项测试代替完整聚合结果。
@@ -36,7 +38,7 @@
 4. 菜单和焦点验证使用仅限测试的 loopback renderer CDP。测试点击真实 UI，不注入 Quick Diff 参数或通过新测试命令替代入口。DOM 选择器不是产品 API；选择器失效必须使验收失败，不能伪造通过。
 5. 独立审查与最终确切 head 的 CI 分别报告。只有三组 Host、质量检查、降级保护和 VSIX job 的最终结果均返回后，才能确认本检查点的验证状态。VSIX 包装不代表发布。
 
-本地环境没有可用的 VS Code/Xvfb，不能将本地 API 边界回归称为真实 Host 验证。Host 结果以本批 PR 的对应提交日志为准；最终 CI、审查与首次失败记录保留在 PR。主要支持范围仍为已验证的 Windows/Linux 本地工作区，不扩大为所有平台、文件系统或异常组合。
+首次提交时的本地环境没有可用的 VS Code/Xvfb，因此下面的本地 API 边界回归不属于真实 Host 验证。最终 Host 证据现已由合并主线 Verification #543 提供，见末节；首次失败记录继续保留。主要支持范围仍为已验证的 Windows/Linux 本地工作区，不扩大为所有平台、文件系统或异常组合。
 
 ## 提交前的本地核验
 
@@ -70,3 +72,16 @@ Stable 的缺失动作通过最小生产修正处理：Multi Diff 子编辑器�
 测试同时遵守 VS Code 菜单的 100 ms 初始激活保护：首次发现后等待一次 150 ms，再核验同一启用动作并只点击一次，保留关闭与 baseline 断言。Native 验收改用独立的临时 Host 进程/user-data；还原并校验测试文件与配置后退出，再运行原 prepare → restore 双进程。这样不再在本轮保存事件仍可能排队时，立即重建下轮基线。原 90/150/45 秒验收限制保持不变，文件还原失败仍使测试失败，后端的未知 before-image 保护没有改动。
 
 此轮生产可见性修正后的本地完整聚合为 tracker 1063/1063，编译、lint、性能与 VSIX 均通过；31 项 Native 回归还验证了释放时清理可见性键，故意移除该清理会使回归失败。菜单激活保护依据 [VS Code 1.80 menu.ts](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/base/browser/ui/menu/menu.ts#L462-L542)。两个 Stable 菜单的缺失与 [Multi Diff context scope](https://github.com/microsoft/vscode/blob/main/src/vs/editor/browser/widget/multiDiffEditor/multiDiffEditorWidgetImpl.ts#L208-L225) 一致，但不把推断出的具体旧 key 值当作已直接观测的事实。
+
+## 最终收口与合并证据
+
+后续修正保留原有后端契约：原生导航先解析到 tracker 的规范文件身份，Quick Diff 的 baseline URI 也使用同一身份，以便与基线通知一致。未知或非文本资源通过规范身份找到已有只读审阅；虚拟 URI 不因相同 `fsPath` 获得真实文件权限。别名、Unicode/大小写身份以及过期 token 的拒绝由回归保留，未新增宽松映射。
+
+[PR #20](https://github.com/lengmh/DiffTracker/pull/20) 的合并主线 `52c209533b2ca65e3f6531a1dd903e8706466b7e` 已通过 [Verification #543](https://github.com/lengmh/DiffTracker/actions/runs/37593362839)，attempt 1、七项全部成功：Ubuntu/Windows Quality、Ubuntu/Windows Stable Host、Ubuntu 1.80.2 Host、released `0.7.2` 源码对 V4 的降级拒绝和 VSIX 包装。
+
+- 最终源码聚合：tracker **1070/1070**，其中 Native Review **38/38**；review UI **35/35**。早先的 1062/1063 和 30/31 计数仅描述各历史提交。
+- Windows Stable **1.140.0**、Ubuntu Stable **1.140.0**、Ubuntu **1.80.2** 各有 **12 条实际 `PASS HOST-NATIVE`**。三个 Host 均完成真实 Quick Diff 菜单和 editor/context 动作；Stable 完成两文件 Multi Diff，1.80.2 完成真实选择器与单文件 Diff 回退。
+- 实际入口验证包含完整块 Keep/Revert、文件级动作、删除行/文件处理，以及部分选区、错误资源、重复视图、同坐标内容替换、dirty buffer 和 session 变化的拒绝。
+- 上述 VSIX job 证明本轮包装通过，不证明已安装 VSIX 的升级或激活恢复。原有跨 Host 进程测试、源码级降级检查与本批新增安装版验收必须分别陈述。
+
+#537、#538、#539 的失败和修正保持可追溯；#543 的首次通过不追溯改写这些历史。Settings 中新增 `nativeReview` 选择、安装版升级/恢复与混合工作区资源检查属于下一有界批次，结果见 [RC 检查点](./bounded-rc-checkpoint.md)。

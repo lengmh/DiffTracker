@@ -1,0 +1,10 @@
+{
+  "name": "difftracker-installed-rc-driver",
+  "publisher": "difftracker-internal-tests",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./extension.cjs",
+  "activationEvents": ["*"],
+  "description": "Internal test driver only. DO NOT PUBLISH."
+}

@@ -1,14 +1,17 @@
 # Code Diff Tracker
 
-Code Diff Tracker is a VS Code extension that records workspace file changes and provides three review modes:
+Code Diff Tracker is a VS Code extension that records local workspace file changes. Supported text can be reviewed and safely kept or reverted; non-text resources have file-level visibility and, when their identity can be verified, an Acknowledge action. Review views include:
 
 - Inline read-only diff document
 - VS Code side-by-side diff
 - Cursor-like WebView diff with floating Undo/Keep actions
+- Optional Native Review with read-only, version-bound snapshots
 
 Review changes as they happen, then keep or safely revert them by block, file, or batch. Pending reviews can survive VS Code restarts, stale review actions are rejected, and Git-context changes are guarded before write operations continue.
 
 [中文说明](./README_CN.md)
+
+This README describes the current development source, including unreleased monitoring-scope and Native Review work. The package version remains `0.7.2`; this is not a new Marketplace release. The previous Native Review checkpoint passed; the new settings and bounded RC checks are tracked separately in the [RC checkpoint](docs/bounded-rc-checkpoint.md).
 
 This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
 [`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
@@ -41,33 +44,55 @@ The project retains the MIT license and upstream attribution. The Marketplace ex
 - Git-context protection for branch, detached HEAD, worktree, and conflict changes
 - Automation-only tracking mode for AI/agent or extension-driven edits
 - Configurable WebView opening position (`current group` or `beside`)
-- Automatic recording after extension activation
+- Automatic recording after activation when the effective scope and baseline are ready
 - Activity Bar **Change Recording** tree with file grouping
 - Workspace baseline snapshots with start/stop recording controls
-- Workspace-wide file watching, including external file changes
+- Rules and Whole Workspace monitoring modes with local consent for scope expansion
+- File watching within the effective scope, including external file changes and visible coverage gaps
+- Read-only opaque/unknown review entries, with version-checked Acknowledge for eligible opaque changes
 - Inline read-only diff view with line- and word-level highlights
 - Side-by-side diff (`Original ↔ Current`) through the built-in VS Code diff editor
 - Cursor-like WebView diff with Split/Unified, Wrap, Expand, Keep All, and Reject All
 - Deleted-line badges, CodeLens actions, and hover details
-- Settings panel and Watch Ignore editor with `.gitignore`-style patterns
+- Settings panel and unified **Manage Monitoring Scope** editor with literal includes and restricted `.gitignore`-style excludes
 
 ## Usage
 
 1. Open **Code Diff Tracker** from the Activity Bar.
-2. Recording starts automatically after the extension activates and establishes a baseline.
+2. Recording starts automatically when the effective scope and baseline are ready. A new or expanded scope may need local confirmation first.
 3. Edit files in your workspace.
 4. In **Change Recording**, select a changed file to open the configured review view.
 5. Use the context menu or editor title actions to open:
    - Inline Diff
    - Side-by-Side Diff
    - WebView Diff
+   - Native Review Snapshot
 6. In WebView Diff, use block-level **Undo/Keep** or file-level **Keep All/Reject All**.
-7. Use **Revert File** / **Revert All Changes** when needed.
+7. Use **Revert File** / **Revert Text Changes** for eligible text, or **Acknowledge Read-only Change** for eligible opaque changes.
 8. Stop recording when you no longer want to track changes.
 
 **Clear Diffs** resets the baseline to the current workspace while recording. When recording is stopped, it clears the saved baseline and Undo history and remains stopped, including after reload. It does not modify workspace files or dirty buffers.
 
 **Recheck Observation Coverage** is available in the Command Palette and Settings → Tools. For an active, ready configured scope, it reinstalls failed observation coverage and performs one bounded comparison against the original review baselines. Pending text/opaque reviews and unknown before-images are preserved. It refuses while recording is stopped, scope changes or recovery are pending, or editors have unsaved changes. Activity, unsupported coverage or resource limits may leave a visible coverage gap; retry after resolving the cause. It does not accept changes, rebuild the baseline or modify workspace files. See the [bounded recovery contract](docs/recheck-observation-coverage-checkpoint.md).
+
+## Monitoring Scope and File Types
+
+Open **Settings → Tools → Manage Monitoring Scope**, or run **Code Diff Tracker: Manage Monitoring Scope**. The old **Edit Watch Ignores** command opens this same manager. It shows the requested scope, effective scope, pending changes, preparation errors and current observation coverage.
+
+- **Rules** follows ordinary ignore policy. Explicit workspace-relative includes can add ignored paths; explicit exclusions still take precedence.
+- **Whole Workspace** requests all monitorable resources in the workspace, including ordinarily ignored files. Explicit exclusions and safety boundaries still apply; it does not mean every path is safely observable.
+- Scope expansion requires a trusted workspace and local consent tied to the workspace roots and requested scope. Shared settings do not transfer consent to another machine or extension host. Saving a request alone does not make it effective.
+- Preparation is bounded. Failure, cancellation or capacity limits keep the previous effective scope and pending reviews; an unprepared workspace does not become Ready. Unsupported watcher combinations remain visibly limited or paused.
+- Includes are literal relative paths. New structured excludes use restricted `.gitignore`-style patterns without `!` negation. Use the manager's migration preview for legacy string rules; do not silently rewrite them.
+
+Text baselines store content in workspace-specific extension storage. Opaque resources, such as binary files, unsupported encodings and oversized text, retain existence and bounded identity evidence rather than new content copies. **Acknowledge Read-only Change** rechecks the reviewed identity and persists it as the new baseline. It does not modify the file, back up its bytes or create non-text Undo/Revert capability. An unreadable file or unknown before-image cannot be accepted as a verified opaque baseline merely to clear the list. Coverage diagnostics for directories are separate from file reviews.
+
+Recovery controls have distinct purposes:
+
+- **Apply Pending Scope** reviews and applies a requested scope; **Retry Scope Preparation** retries preparation of an already authorized scope.
+- **Recheck Observation Coverage** repairs observation and compares against the original baselines, as described above.
+- **Restore Effective Scope Configuration** explicitly writes the previous effective scope back to Workspace Settings; **Migrate Legacy Watch Rules** opens migration preview.
+- **Clear Diffs** rebuilds the baseline while recording, or clears saved review state while stopped. It is not a substitute for Recheck.
 
 ## How It Works
 
@@ -84,11 +109,13 @@ When recording starts, Code Diff Tracker:
 
 ### Optional Native Review
 
-Run **Open Native Review Snapshot** for the active changed file, or **Review Text Changes Natively** for a multi-file view. Both sides are read-only, version-bound snapshots. VS Code 1.80 and hosts without Multi Diff use an explicit file picker and single-file Diff; more than 50 text changes also use this bounded fallback. The default opening mode remains WebView.
+Choose **Native Review** in **Settings → Display → Default open mode**, or set `diffTracker.defaultOpenMode` to `nativeReview` in VS Code settings. Clicking a changed file then uses the existing guarded Native Review adapter. The original target and URI provenance are preserved; opaque and unknown resources use the WebView fallback. The default remains `webview`, and all five existing mode values remain available.
+
+You can also run **Open Native Review Snapshot** for the active changed file, or **Review Text Changes Natively** for a multi-file view. Both sides are read-only, version-bound snapshots. VS Code 1.80 and hosts without Multi Diff use an explicit file picker and single-file Diff; more than 50 text changes also use this bounded fallback. This limit applies to one Multi Diff view, not the monitoring capacity.
 
 Right-click inside the snapshot's current side to **Keep Reviewed File**, **Revert Reviewed File**, or act on one exactly selected whole block. Partial selections, deleted-line blocks, stale snapshots, and ambiguous editor targets are refused. Use file-level review when a block cannot be mapped safely. Block Revert retains the existing unsaved-buffer behavior; save the real file when required, then open a fresh snapshot.
 
-Enable `diffTracker.nativeQuickDiff` to opt in to the **Code Diff Tracker Review** gutter provider. Its **Open Native Review Snapshot** menu opens a fresh review; it does not directly apply unversioned Quick Diff hunks. Read-only/unknown resources remain in the existing Changes view. See the [S5 checkpoint](docs/s5-native-review-checkpoint.md) for the supported boundaries and verification status.
+The separate `diffTracker.nativeQuickDiff` setting remains `false` by default; selecting Native Review does not enable it. Enable it explicitly to use the **Code Diff Tracker Review** gutter provider. Its **Open Native Review Snapshot** menu opens a fresh review; it does not directly apply unversioned Quick Diff hunks. Read-only/unknown resources remain in the existing Changes view. See the [S5 checkpoint](docs/s5-native-review-checkpoint.md) for the supported boundaries and verification status.
 
 ### Review consistency and persistence
 
@@ -116,7 +143,7 @@ Changes to folder-scoped or nested ignore semantics may invalidate older scan pr
 
 ### Unsupported or unsafe files
 
-Binary files, unsupported text encodings, UTF-8 BOM files, oversized or unreadable files, paths outside the workspace, and unsafe symlink write targets are skipped or retained as unavailable review entries instead of being decoded and written speculatively. Pure line-ending-style changes are treated as no logical content change.
+Within the effective monitoring scope, binary files, unsupported text encodings, UTF-8 BOM files and oversized resources are represented as read-only opaque changes when sufficient evidence is available. Unreadable resources and unknown before-images retain their uncertainty and reasons. They are not decoded and written speculatively. Paths outside the workspace and unsafe target identities remain excluded or safely refused. Pure line-ending-style changes are treated as no logical content change.
 
 New snapshots and recovery records preserve POSIX file permission bits, including executability. Older sessions without mode metadata cannot reconstruct original permissions. Missing parent directories created during recovery use private permissions (`0700`, subject to umask); existing directory permissions are not changed. Directory ACLs and historical directory modes are not reconstructed automatically.
 
@@ -152,6 +179,7 @@ code --install-extension lengmh.code-diff-tracker
 ## Requirements
 
 - VS Code `^1.80.0`
+- Verified local Host combinations: Windows Stable 1.140.0, Ubuntu Stable 1.140.0 and Ubuntu 1.80.2. This is a finite Windows/Linux support scope, not verification of every platform, filesystem or future Stable version. The minimum-version Host uses the single-file Native Diff fallback.
 
 ## Extension Settings
 
@@ -162,11 +190,15 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.highlightAddedLines` | `true` | Highlight added lines with green background |
 | `diffTracker.highlightModifiedLines` | `true` | Highlight modified lines with blue background |
 | `diffTracker.highlightWordChanges` | `true` | Highlight word-level changes within modified lines |
+| `diffTracker.defaultOpenMode` | `webview` | Changed-file opening mode; select `nativeReview` for version-bound text snapshots with WebView fallback for opaque/unknown resources |
+| `diffTracker.nativeQuickDiff` | `false` | Separate opt-in Quick Diff provider whose menu opens a fresh Native Review snapshot |
+| `diffTracker.monitoringScope` | `rules` | Requested `rules` or `wholeWorkspace` mode; expansion requires local consent and preparation |
+| `diffTracker.watchInclude` | `[]` | Structured literal workspace-relative includes, managed with the scope editor |
 | `diffTracker.openWebviewBeside` | `false` | Open WebView diff in a side editor group instead of the current editor group |
-| `diffTracker.watchExclude` | `[]` | Additional watch-ignore patterns (`.gitignore` style) |
+| `diffTracker.watchExclude` | `[]` | Structured explicit exclusions without `!` negation; legacy string entries retain compatibility until migration |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits while retaining uncertain editor edits for explicit review |
 
-Display/highlight settings can be toggled in the sidebar **Settings** panel. Watch-ignore patterns can be edited through **Edit Watch Ignores**.
+Choose the opening mode in **Settings → Display → Default open mode**, through **Select Default Open Mode**, or in VS Code settings. The values are `webview`, `inline`, `sideBySide`, `original`, `splitOriginalWebview` and `nativeReview`. Display/highlight settings remain in the sidebar Settings panel; monitoring rules are in **Manage Monitoring Scope**.
 
 When `diffTracker.openWebviewBeside` is enabled, WebView diff opens in a side editor group. By default it opens in the current editor group.
 
@@ -195,7 +227,11 @@ try {
 
 When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
 
-If an older saved session lacks current baseline-scan provenance, newly discovered paths may require an explicit baseline rebuild. Existing pending reviews and known baselines are preserved whenever they can be validated safely.
+The development build writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
+
+Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The [RC checkpoint](docs/bounded-rc-checkpoint.md) separates installed-VSIX migration evidence from source-level compatibility checks and candidate reload tests.
+
+V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rather than silently discard scope or review data. Preserve the workspace and extension storage before changing versions. Do not delete recovery markers or saved state merely to bypass a compatibility warning.
 
 ## Known Issues
 

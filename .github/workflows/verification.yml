@@ -67,6 +67,36 @@ jobs:
           DIFF_TRACKER_VSCODE_VERSION: 1.80.2
         run: xvfb-run -a npm run test:host
 
+  installed-extension-host:
+    name: Installed RC VSIX (Ubuntu Stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RC_ARTIFACTS: ${{ runner.temp }}/difftracker-installed-rc-evidence
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify installed harness guards
+        run: node --test test/installed/harness.test.mjs
+      - name: Verify official 0.7.2 and package internal candidate without source version changes
+        run: node test/installed/artifacts.mjs "$RC_ARTIFACTS"
+      - name: First install, released upgrade and real installed activation recovery
+        run: xvfb-run -a node test/installed/run.mjs "$RC_ARTIFACTS"
+      - name: Keep internal RC evidence (DO NOT PUBLISH)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DO-NOT-PUBLISH-installed-rc-evidence
+          path: ${{ env.RC_ARTIFACTS }}
+          if-no-files-found: warn
+          retention-days: 7
+
   downgrade-compatibility:
     name: Released 0.7.2 rejects Session V4
     runs-on: ubuntu-latest
@@ -91,7 +121,7 @@ jobs:
 
   package:
     name: VSIX package
-    needs: [quality, extension-host, minimum-extension-host, downgrade-compatibility]
+    needs: [quality, extension-host, minimum-extension-host, downgrade-compatibility, installed-extension-host]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
