@@ -1,7 +1,7 @@
 # Installed VSIX acceptance
 
-The source package and both lockfile root versions are `0.8.0`. Preparation of
-this version does not publish it. The official `0.7.2` package remains the
+The candidate version comes from `package.json` and must match both lockfile
+root versions. Preparing a source version does not publish it. The official `0.7.2` package remains the
 independently pinned same-ID upgrade input.
 
 ## Exact final VSIX gate
@@ -11,9 +11,9 @@ On Linux with Node 22+, `unzip`, Git, and a working VS Code/Xvfb environment:
 ```sh
 npm ci
 node --test test/installed/harness.test.mjs test/installed/final-artifact.test.mjs
-npm run package -- --out /tmp/code-diff-tracker-0.8.0.vsix
-VSIX=/tmp/code-diff-tracker-0.8.0.vsix
-VERSION=0.8.0
+VERSION=$(node -p "require('./package.json').version")
+VSIX="/tmp/code-diff-tracker-$VERSION.vsix"
+npm run package -- --out "$VSIX"
 SHA256=$(sha256sum "$VSIX" | cut -d ' ' -f 1)
 SOURCE_COMMIT=$(git rev-parse HEAD)
 # Use the actual producing Actions run ID and attempt in CI.

@@ -11,7 +11,7 @@ Review changes as they happen, then keep or safely revert them by block, file, o
 
 [中文说明](./README_CN.md)
 
-This README describes the `0.8.0` source release preparation. Monitoring-scope, Native Review and bounded RC work are merged; the verified feature baseline passed [Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513), 8/8 jobs. This does not announce a published tag, GitHub release or Marketplace package. See the [RC checkpoint](docs/bounded-rc-checkpoint.md) for evidence and limits, and the [release gates](docs/releasing.md) for the separate final-VSIX checks.
+This README describes the `0.8.1` source, adding configurable WebView display defaults to `0.8.0`. The version in source does not announce a new published package; see the [release gates](docs/releasing.md) for final-VSIX checks.
 
 This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
 [`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
@@ -194,11 +194,16 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.nativeQuickDiff` | `false` | Separate opt-in Quick Diff provider whose menu opens a fresh Native Review snapshot |
 | `diffTracker.monitoringScope` | `rules` | Requested `rules` or `wholeWorkspace` mode; expansion requires local consent and preparation |
 | `diffTracker.watchInclude` | `[]` | Structured literal workspace-relative includes, managed with the scope editor |
+| `diffTracker.webviewDiffStyle` | `split` | Initial WebView layout: `split` (side by side) or `unified` (one column) |
+| `diffTracker.webviewWordWrap` | `false` | Wrap long lines in a new WebView panel |
+| `diffTracker.webviewExpandUnchanged` | `false` | Expand all unchanged context lines in a new WebView panel |
 | `diffTracker.openWebviewBeside` | `false` | Open WebView diff in a side editor group instead of the current editor group |
 | `diffTracker.watchExclude` | `[]` | Structured explicit exclusions without `!` negation; legacy string entries retain compatibility until migration |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits while retaining uncertain editor edits for explicit review |
 
 Choose the opening mode in **Settings → Display → Default open mode**, through **Select Default Open Mode**, or in VS Code settings. The values are `webview`, `inline`, `sideBySide`, `original`, `splitOriginalWebview` and `nativeReview`. Display/highlight settings remain in the sidebar Settings panel; monitoring rules are in **Manage Monitoring Scope**.
+
+WebView display defaults are also available under **Settings → Display**: **WebView default layout**, **WebView default: Wrap**, and **WebView default: Expand**. Expand shows unchanged context, including lines outside the changed hunks. These settings initialize a new panel; an existing panel keeps its toolbar choices during updates, hiding/revealing, and file switches. Close the WebView tab and open it again to apply changed defaults. Toolbar clicks do not rewrite your settings. These defaults do not change the native VS Code diff editor.
 
 When `diffTracker.openWebviewBeside` is enabled, WebView diff opens in a side editor group. By default it opens in the current editor group.
 
@@ -227,7 +232,7 @@ try {
 
 When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
 
-The `0.8.0` source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
+Since `0.8.0`, the source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
 
 Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The installed-VSIX checks proved actual released V3→V4 text/session migration with ordered legacy rules preserved, plus separate candidate-created opaque recovery across process restarts. Released-asset opaque migration remains unproven; process restarts do not prove a physical **Reload Window** click. The [RC checkpoint](docs/bounded-rc-checkpoint.md) records these boundaries separately from source-level compatibility checks.
 
@@ -241,7 +246,7 @@ V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rat
 
 ## Release Notes
 
-Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.0` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
+Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.1` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
 
 ## License
 

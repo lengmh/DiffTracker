@@ -6,7 +6,7 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 [English](./README.md)
 
-本文描述 `0.8.0` 源码发布准备。监控范围、Native Review 和有界 RC 工作已合并；已核验的功能基线通过 [Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513)，8/8 job 成功。这不表示已创建发布 tag、GitHub release 或 Marketplace 包。证据与限制见 [RC 检查点](docs/bounded-rc-checkpoint.md)，最终发布 VSIX 仍需单独通过[发布门禁](docs/releasing.md)。
+本文描述 `0.8.1` 源码，在 `0.8.0` 基础上增加 WebView 显示默认值设置。源码版本不代表新版本已发布；最终 VSIX 的核验要求见[发布门禁](docs/releasing.md)。
 
 > 本 fork 的扩展 ID 为 `lengmh.code-diff-tracker`。安装前，请禁用或卸载上游
 > `TinyTigerPan.diff-tracker`，以及此前用于测试的 `lengmh.diff-tracker` VSIX。
@@ -186,11 +186,16 @@ npm run package
 | `diffTracker.nativeQuickDiff` | `false` | 独立启用 Quick Diff provider；其菜单打开新的 Native Review 快照 |
 | `diffTracker.monitoringScope` | `rules` | 请求 `rules` 或 `wholeWorkspace`；范围扩展需要本机确认和准备 |
 | `diffTracker.watchInclude` | `[]` | 由范围管理器编辑的结构化、字面工作区相对路径 |
+| `diffTracker.webviewDiffStyle` | `split` | 新建 WebView 面板的布局：`split` 为分栏，`unified` 为单列 |
+| `diffTracker.webviewWordWrap` | `false` | 新建 WebView 面板时是否对长行自动换行 |
+| `diffTracker.webviewExpandUnchanged` | `false` | 新建 WebView 面板时是否展开全部未改动的上下文行 |
 | `diffTracker.openWebviewBeside` | `false` | 是否将 WebView Diff 打开到旁边的编辑器分组 |
 | `diffTracker.watchExclude` | `[]` | 不支持 `!` 否定的结构化显式排除；旧字符串规则在迁移前保留兼容语义 |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
 
 显示设置位于侧边栏 **Settings**。默认打开方式可从 **Display → Default open mode**、**Select Default Open Mode** 命令或 VS Code 设置修改；监控规则由 **Manage Monitoring Scope** 管理。
+
+WebView 显示默认值也可从 **Settings → Display** 中的 **WebView default layout**、**WebView default: Wrap** 和 **WebView default: Expand** 修改。Expand 展开未改动的上下文，包括变更区块之外的行。这三个设置仅在新建面板时读取；已打开的面板在刷新、隐藏后再次显示和切换文件时保留工具栏选择。关闭 WebView 标签页后重新打开，才会应用新的默认值。工具栏操作不会回写设置，这些默认值也不影响 VS Code 原生 Diff 编辑器。
 
 ## 默认打开模式
 
@@ -254,7 +259,7 @@ try {
 
 已保存的 session 仍归属于创建它的扩展 ID。`TinyTigerPan.diff-tracker` 和早期 `lengmh.diff-tracker` 测试版的 session 不会自动迁移到 `lengmh.code-diff-tracker`。
 
-`0.8.0` 源码写入 **Session V4**，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
+从 `0.8.0` 起，源码写入 **Session V4**，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
 
 已发布 `0.7.2` 已支持不透明文件的存在性和内容身份。升级必须保留实际保存格式中的证据，不能读取当前文件来倒推出过去的指纹。缺少有效扫描证明或已知 before-image 时，新发现路径保持未知，不伪装成新增或未变化。安装版验收已证明从已发布 `0.7.2` 的 V3 状态升级到 V4 时，文本审阅状态和有序旧规则保持不变，并单独证明候选版新建不透明状态的跨进程恢复。已发布资产的不透明状态迁移仍未证明；进程重启不等于实际点击 **Reload Window**。这些证据与源码级兼容检查分别记录在 [RC 检查点](docs/bounded-rc-checkpoint.md)。
 
@@ -267,7 +272,12 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 
 ## 版本更新摘要
 
-### 0.8.0（发布准备）
+### 0.8.1（发布准备）
+
+- 增加 WebView 的 Split/Unified、Wrap、Expand 默认值设置，默认仍为分栏、关闭换行和关闭展开。
+- 设置仅在新建面板时生效；工具栏选择在刷新和切换文件时保留，关闭后重新打开才会读取新默认值。
+
+### 0.8.0
 
 - 文件级只读审阅、Acknowledge、监控范围管理、Session V4 和独立 Recheck
 - 可选 Native Review 与 `nativeReview` 打开模式；WebView 仍为默认，Quick Diff 独立启用且默认关闭
