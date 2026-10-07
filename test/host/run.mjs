@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
@@ -21,6 +21,69 @@ const git = (...args) => execFileSync('git', args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe']
 });
+
+// Preserve only logs and this extension's disposable session-state files. Never
+// copy general User settings, databases, globalStorage, profiles or credentials.
+// This runs after a failed Host exits and before the unchanged normal cleanup.
+function preserveFailureDiagnostics() {
+    const destination = process.env.DIFF_TRACKER_HOST_DIAGNOSTICS_DIR;
+    if (process.env.DIFF_TRACKER_SCOPE_DIAGNOSTICS !== '1' || !destination) { return; }
+    const output = path.resolve(destination);
+    const relativeOutput = path.relative(tempRoot, output);
+    if (!relativeOutput || !relativeOutput.startsWith(`..${path.sep}`) && relativeOutput !== '..' && !path.isAbsolute(relativeOutput)) {
+        throw new Error('Host diagnostics must be outside the temporary Host root');
+    }
+    mkdirSync(output, { recursive: true });
+    const sessionNames = new Set(['session-state.json', 'session-state.tmp.json',
+        'session-state.last-good.json', 'session-state.unsaved']);
+    const manifest = { platform: process.platform, node: process.version,
+        requestedVscodeVersion: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
+        copiedBytes: 0, files: [], skipped: [], skippedCount: 0 };
+    const skipped = (relative, reason) => {
+        manifest.skippedCount++;
+        if (manifest.skipped.length < 64) { manifest.skipped.push({ path: relative.slice(0, 1024), reason }); }
+    };
+    const copyTree = (source, label, sessionOnly = false) => {
+        if (!existsSync(source)) { return; }
+        const pending = [{ absolute: source, relative: '', depth: 0 }];
+        while (pending.length) {
+            const entry = pending.pop();
+            try {
+                const stat = lstatSync(entry.absolute);
+                if (stat.isSymbolicLink()) { skipped(`${label}/${entry.relative}`, 'symlink'); continue; }
+                if (stat.isDirectory()) {
+                    if (entry.depth >= 8) { skipped(`${label}/${entry.relative}`, 'depth-limit'); continue; }
+                    for (const name of readdirSync(entry.absolute)) {
+                        // workspaceStorage traversal is restricted to workspace IDs
+                        // and the extension's own storage folder within each ID.
+                        if (sessionOnly && entry.depth === 1 && name !== 'lengmh.code-diff-tracker') { continue; }
+                        if (sessionOnly && entry.depth >= 2 && !sessionNames.has(name)) { continue; }
+                        pending.push({ absolute: path.join(entry.absolute, name),
+                            relative: path.join(entry.relative, name), depth: entry.depth + 1 });
+                    }
+                    continue;
+                }
+                if (!stat.isFile() || sessionOnly &&
+                    (entry.depth !== 3 || !sessionNames.has(path.basename(entry.relative)))) { continue; }
+                if (manifest.files.length >= 2048 || stat.size > 64 * 1024 * 1024 ||
+                    manifest.copiedBytes + stat.size > 256 * 1024 * 1024) {
+                    skipped(`${label}/${entry.relative}`, 'copy-limit'); continue;
+                }
+                const target = path.join(output, label, entry.relative);
+                mkdirSync(path.dirname(target), { recursive: true });
+                copyFileSync(entry.absolute, target);
+                manifest.files.push({ path: path.join(label, entry.relative), bytes: stat.size });
+                manifest.copiedBytes += stat.size;
+            } catch (error) { skipped(`${label}/${entry.relative}`, String(error).slice(0, 1024)); }
+        }
+    };
+    copyTree(path.join(userDataPath, 'logs'), 'main-logs');
+    copyTree(path.join(nativeUserDataPath, 'logs'), 'native-logs');
+    copyTree(path.join(userDataPath, 'User', 'workspaceStorage'), 'main-session-storage', true);
+    copyTree(path.join(nativeUserDataPath, 'User', 'workspaceStorage'), 'native-session-storage', true);
+    writeFileSync(path.join(output, 'preservation-manifest.json'), JSON.stringify(manifest, null, 2));
+    console.log(`Preserved failed Host diagnostics: ${manifest.files.length} files, ${manifest.copiedBytes} bytes; ${manifest.skippedCount} skipped`);
+}
 
 async function availableLoopbackPort() {
     const server = createServer();
@@ -104,7 +167,8 @@ try {
             DIFF_TRACKER_HOST_SECOND_ROOT: secondRoot,
             DIFF_TRACKER_HOST_RESTART_STORAGE: restartStorage,
             DIFF_TRACKER_HOST_CDP_PORT: String(cdpPort),
-            DIFF_TRACKER_HOST_NODE: process.execPath
+            DIFF_TRACKER_HOST_NODE: process.execPath,
+            DIFF_TRACKER_SCOPE_DIAGNOSTICS: process.env.DIFF_TRACKER_SCOPE_DIAGNOSTICS ?? ''
         },
         launchArgs: [
             workspaceFile,
@@ -161,6 +225,10 @@ try {
     console.error('Code Diff Tracker Extension Host tests failed.', error);
     process.exitCode = 1;
 } finally {
+    if (process.exitCode) {
+        try { preserveFailureDiagnostics(); }
+        catch (error) { console.warn('Unable to preserve failed Host diagnostics:', error); }
+    }
     try { rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
     catch (error) { console.warn(`Unable to remove host-test workspace ${tempRoot}:`, error); }
 }

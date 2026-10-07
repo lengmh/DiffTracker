@@ -230,10 +230,20 @@ interface ImportedDirectoryRollbackState {
     revertHistory: PersistedRevertRecord[];
 }
 
+interface ScopeDurableDiagnostic {
+    startedAt: number;
+    eventCount: number;
+    events: Array<{ sequence: number; time: number; source: string; kind: string; path: string }>;
+    firstScopeFailure?: Record<string, unknown>;
+    firstPersistenceFailure?: Record<string, unknown>;
+    emitted?: boolean;
+}
+
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
     observedEvents?: Map<string, StartupEvent>;
+    scopeDiagnostic?: ScopeDurableDiagnostic;
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
@@ -436,11 +446,83 @@ export class DiffTracker {
     private nextExternalOperationId = 1;
     private activeExternalOperations = new Map<number, { uri: vscode.Uri; kind: 'change' | 'delete' }>();
 
-    private recordBaselineTransactionEvent(uri: vscode.Uri, kind: StartupEvent['kind']): void {
+    private recordBaselineTransactionEvent(uri: vscode.Uri, kind: StartupEvent['kind'], source: string): void {
         const events = this.baselineTransaction?.observedEvents;
         if (!events) { return; }
+        this.recordScopeDiagnosticEvent(uri, kind, source);
         const previous = events.get(uri.fsPath);
         events.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
+    }
+
+    // Isolated diagnostic build only. Never read content, reevaluate a guard,
+    // or perform I/O while the transaction is running. Retain bounded evidence
+    // before rollback erases the candidate and clears a transient write error.
+    private recordScopeDiagnosticEvent(uri: vscode.Uri, kind: string, source: string): void {
+        const diagnostic = this.baselineTransaction?.scopeDiagnostic;
+        if (!diagnostic) { return; }
+        try {
+            const sequence = ++diagnostic.eventCount;
+            if (diagnostic.events.length < 32) {
+                diagnostic.events.push({ sequence, time: Date.now(), source, kind, path: uri.fsPath.slice(0, 1024) });
+            }
+        } catch { /* Diagnostics must not change event handling. */ }
+    }
+
+    private scopeDiagnosticContext(transaction: BaselineTransaction): Record<string, unknown> {
+        const pausedGit: Array<{ root: string; reason: string }> = [];
+        for (const [root, reason] of this.pausedGitRepositories) {
+            if (pausedGit.length >= 8) { break; }
+            pausedGit.push({ root: root.slice(0, 1024), reason: reason.slice(0, 512) });
+        }
+        const observedEvents: Array<{ path: string; firstKind?: string; kind: string }> = [];
+        for (const event of transaction.observedEvents?.values() ?? []) {
+            if (observedEvents.length >= 32) { break; }
+            observedEvents.push({ path: event.uri.fsPath.slice(0, 1024), firstKind: event.firstKind, kind: event.kind });
+        }
+        return {
+            time: Date.now(), transactionEpoch: transaction.epoch, currentEpoch: this.sessionEpoch,
+            transactionOwned: this.baselineTransaction === transaction, disposed: this.disposed,
+            workspaceContextChanged: this.workspaceContextChanged, recoveryBlocked: this.recoveryBlocked,
+            watcherCoverageRevision: this.watcherCoverageRevision, ignorePolicyRevision: this.ignorePolicyRevision,
+            pendingScopeRevision: this.pendingMonitoringScope?.scopeRevision,
+            effectiveScopeRevision: this.effectiveMonitoringScope.scopeRevision,
+            isRecording: this.isRecording, gitContextPending: this.gitContextPending,
+            pausedGitCount: this.pausedGitRepositories.size,
+            pausedGit, observedEventCount: transaction.observedEvents?.size ?? 0, observedEvents
+        };
+    }
+
+    private recordScopePersistenceFailure(
+        transaction: BaselineTransaction | undefined,
+        stage: string,
+        category: string,
+        details: Record<string, unknown> = {},
+        error?: unknown
+    ): false {
+        const diagnostic = transaction?.scopeDiagnostic;
+        if (transaction && diagnostic && !diagnostic.firstPersistenceFailure) {
+            try {
+                const exception = error as { name?: unknown; code?: unknown; message?: unknown } | undefined;
+                diagnostic.firstPersistenceFailure = {
+                    stage, category, ...this.scopeDiagnosticContext(transaction), ...details,
+                    error: exception && { name: String(exception.name).slice(0, 128),
+                        code: String(exception.code).slice(0, 128), message: String(exception.message).slice(0, 1024) }
+                };
+            } catch { /* Diagnostics must preserve the original false return. */ }
+        }
+        return false;
+    }
+
+    private emitScopeDurableDiagnostic(transaction: BaselineTransaction, error: unknown): void {
+        const diagnostic = transaction.scopeDiagnostic;
+        if (!diagnostic || diagnostic.emitted) { return; }
+        diagnostic.emitted = true;
+        try {
+            console.error('SCOPE-DURABLE-DIAGNOSTIC', JSON.stringify({
+                ...diagnostic, failure: String(error).slice(0, 1024),
+                eventsTruncated: diagnostic.eventCount > diagnostic.events.length
+            }));
+        } catch { /* Preserve the original failure even if diagnostic output fails. */ }
     }
 
     private beginExternalOperation(uri: vscode.Uri, kind: 'change' | 'delete'): number {
@@ -1768,9 +1850,10 @@ export class DiffTracker {
             this.effectiveMonitoringScope.mode !== 'wholeWorkspace';
     }
 
-    private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
+    private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number, source = 'host-watcher'): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+        this.recordScopeDiagnosticEvent(uri, kind, source);
         if (path.basename(uri.fsPath) === '.gitignore') {
             if (this.ordinaryIgnorePolicyAffectsCoverage()) {
                 this.scanCoverage = undefined;
@@ -2198,7 +2281,8 @@ export class DiffTracker {
             this.dispatchExternalEvent(
                 vscode.Uri.file(filePath),
                 kind === 'change' ? 'change' : exists ? 'create' : 'delete',
-                epoch
+                epoch,
+                'native-supplemental'
             );
         });
         if (!identityStillCurrent()) {
@@ -2449,7 +2533,7 @@ export class DiffTracker {
             }
             const filePath = path.join(directory, filename.toString());
             if (!this.pathBelongsToRoot(filePath, directory)) { return; }
-            this.dispatchExternalEvent(vscode.Uri.file(filePath), kind === 'change' ? 'change' : fs.existsSync(filePath) ? 'create' : 'delete', epoch);
+            this.dispatchExternalEvent(vscode.Uri.file(filePath), kind === 'change' ? 'change' : fs.existsSync(filePath) ? 'create' : 'delete', epoch, 'native-imported');
         });
         const watcher = { dispose: () => native.close() };
         this.importedDirectoryWatchers.set(directory, { watcher, epoch, provenAbsent });
@@ -3006,14 +3090,19 @@ export class DiffTracker {
         retainFailureMarker = false
     ): Promise<boolean> {
         const epoch = this.sessionEpoch;
-        if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
+        let payload: Uint8Array | undefined;
+        let limitError: string | undefined;
+        const failure = (stage: string, category: string, error?: unknown): false =>
+            this.recordScopePersistenceFailure(transaction, stage, category,
+                { payloadBytes: payload?.byteLength, limitError }, error);
+        if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return failure('entry', 'transaction-current'); }
         if (this.baselineTransaction && !transaction) {
             await this.baselineTransaction.done;
-            if (epoch !== this.sessionEpoch) { return false; }
+            if (epoch !== this.sessionEpoch) { return failure('after-transaction-wait', 'epoch'); }
             return this.flushPersistState(completedBaseline, undefined, retainFailureMarker);
         }
         // A blocked restore must never erase the evidence during shutdown.
-        if (this.recoveryBlocked) { return false; }
+        if (this.recoveryBlocked) { return failure('entry', 'recovery-blocked'); }
         const storageUri = this.storageUri;
         if (!storageUri) {
             return true;
@@ -3022,8 +3111,6 @@ export class DiffTracker {
         const state = this.buildPersistedState();
         // Persist the ready candidate while actions remain blocked in memory.
         if (state && completedBaseline) { state.baselineState = 'ready'; }
-        let payload: Uint8Array | undefined;
-        let limitError: string | undefined;
         if (state) {
             if (state.fileSnapshots.length > this.maxPersistedSnapshots) {
                 limitError = `Failed to persist Code Diff Tracker session: snapshot count exceeds ${this.maxPersistedSnapshots}.`;
@@ -3038,53 +3125,69 @@ export class DiffTracker {
         }
 
         const persistTask = async (): Promise<boolean> => {
-            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && (!transaction ||
-                (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch) && (transaction.valid?.() ?? true)));
-            if (!transactionCurrent()) { return false; }
+            const transactionCurrent = (stage: string): boolean => {
+                const current = epoch === this.sessionEpoch && (!transaction ||
+                    (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch) && (transaction.valid?.() ?? true)));
+                if (!current) { failure(stage, 'transaction-current'); }
+                return current;
+            };
+            if (!transactionCurrent('queued-entry')) { return false; }
             const targetUri = this.getPersistedStateUri();
             const tempUri = this.getPersistedStateUri(this.persistedStateTempFileName);
             const backupUri = this.getPersistedStateUri(this.persistedStateBackupFileName);
             const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
             if (!targetUri || !tempUri || !backupUri) { return true; }
 
+            let operation = 'delete-primary';
             if (!payload) {
                 try {
                     await this.deletePersistedFile(targetUri);
+                    operation = 'delete-temp';
                     await this.deletePersistedFile(tempUri);
+                    operation = 'delete-backup';
                     await this.deletePersistedFile(backupUri);
+                    operation = 'delete-intent';
                     if (failureUri) { await this.deletePersistedFile(failureUri); }
-                    if (!transactionCurrent()) { return false; }
+                    if (!transactionCurrent('after-clear')) { return false; }
                     this.persistenceIssue = undefined;
                     this.persistenceFailed = false;
                     return true;
                 } catch (error) {
+                    failure(operation, 'api-exception', error);
                     if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to clear Code Diff Tracker persisted session state.', error); }
                     return false;
                 }
             }
 
             try {
+                operation = 'create-directory';
                 await vscode.workspace.fs.createDirectory(storageUri);
-                if (!transactionCurrent()) { return false; }
+                if (!transactionCurrent('after-create-directory')) { return false; }
                 // A durable intent survives size-limit failures and interrupted writes.
+                operation = 'write-intent';
                 if (failureUri) { await vscode.workspace.fs.writeFile(failureUri, new TextEncoder().encode('Session write incomplete')); }
-                if (!transactionCurrent()) { return false; }
-                if (limitError) { this.reportPersistenceIssue(limitError); return false; }
+                if (!transactionCurrent('after-write-intent')) { return false; }
+                if (limitError) { failure('validate-payload', 'schema-or-limit'); this.reportPersistenceIssue(limitError); return false; }
+                operation = 'write-temp';
                 await vscode.workspace.fs.writeFile(tempUri, payload);
-                if (!transactionCurrent()) { return false; }
+                if (!transactionCurrent('after-write-temp')) { return false; }
+                operation = 'rename-temp';
                 await vscode.workspace.fs.rename(tempUri, targetUri, { overwrite: true });
-                if (!transactionCurrent()) { return false; } // Keep the incomplete-write marker.
+                if (!transactionCurrent('after-rename-temp')) { return false; } // Keep the incomplete-write marker.
+                operation = 'copy-backup';
                 await vscode.workspace.fs.copy(targetUri, backupUri, { overwrite: true });
-                if (!transactionCurrent()) { return false; }
+                if (!transactionCurrent('after-copy-backup')) { return false; }
 
                 // A scope transaction may durably prepare primary + backup before
                 // its final context validation. Keep the incomplete-write marker
                 // until the caller explicitly commits that prepared publication.
                 if (!retainFailureMarker && failureUri) {
+                    operation = 'delete-intent';
                     await this.deletePersistedFile(failureUri);
                 }
-                if (!transactionCurrent()) {
+                if (!transactionCurrent('final-validation')) {
                     if (!retainFailureMarker && failureUri) {
+                        operation = 'rewrite-intent';
                         await vscode.workspace.fs.writeFile(
                             failureUri,
                             new TextEncoder().encode('Session write interrupted')
@@ -3096,6 +3199,7 @@ export class DiffTracker {
                 this.persistenceFailed = false;
                 return true;
             } catch (error) {
+                failure(operation, 'api-exception', error);
                 try { await this.deletePersistedFile(tempUri); } catch { /* Retain the primary failure. */ }
                 if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to persist Code Diff Tracker session state; the previous valid state was preserved.', error); }
                 return false;
@@ -3119,7 +3223,7 @@ export class DiffTracker {
                 this.baselineTransaction === transaction &&
                 this.isCurrentEpoch(transaction.epoch) &&
                 (transaction.valid?.() ?? true);
-            if (!transactionCurrent()) { return false; }
+            if (!transactionCurrent()) { return this.recordScopePersistenceFailure(transaction, 'commit-queued-entry', 'transaction-current'); }
             try {
                 // Marker deletion is the durable commit point. All context
                 // validation happens before this operation; after it succeeds,
@@ -3129,6 +3233,7 @@ export class DiffTracker {
                 this.persistenceFailed = false;
                 return true;
             } catch (error) {
+                this.recordScopePersistenceFailure(transaction, 'commit-delete-intent', 'api-exception', {}, error);
                 if (epoch === this.sessionEpoch) {
                     this.reportPersistenceIssue(
                         'Failed to commit prepared monitoring-scope persistence; the uncommitted marker was retained.',
@@ -5181,16 +5286,18 @@ export class DiffTracker {
         // Explicit exclusion may never publish retained review without discard
         // consent. Draining can discover reviews after the controller precheck;
         // the same invariant must also hold at every durable transaction barrier.
-        const discardApprovalStillCurrent = (): boolean =>
-            (!discardExplicitlyExcludedReviews || approvedReviewsDiscarded
-                ? this.getExplicitlyExcludedPendingReviewPaths(
-                    scope,
-                    preparationIdentityEvidence
-                ).length === 0
-                : this.getExplicitlyExcludedReviewRevision(
-                    scope,
-                    preparationIdentityEvidence
-                ) === approvedDiscardRevision);
+        const scopeDiagnosticsEnabled = process.env.DIFF_TRACKER_SCOPE_DIAGNOSTICS === '1';
+        let lastDiscardEvaluation: Record<string, unknown> | undefined;
+        const discardApprovalStillCurrent = (): boolean => {
+            if (!discardExplicitlyExcludedReviews || approvedReviewsDiscarded) {
+                const count = this.getExplicitlyExcludedPendingReviewPaths(scope, preparationIdentityEvidence).length;
+                if (scopeDiagnosticsEnabled) { lastDiscardEvaluation = { count, approvedReviewsDiscarded, discardExplicitlyExcludedReviews }; }
+                return count === 0;
+            }
+            const revision = this.getExplicitlyExcludedReviewRevision(scope, preparationIdentityEvidence);
+            if (scopeDiagnosticsEnabled) { lastDiscardEvaluation = { revision, approvedDiscardRevision, approvedReviewsDiscarded, discardExplicitlyExcludedReviews }; }
+            return revision === approvedDiscardRevision;
+        };
         if (!discardApprovalStillCurrent()) {
             return empty('conflict', discardExplicitlyExcludedReviews
                 ? 'Affected review changed after discard approval; confirm the current review set again.'
@@ -5263,26 +5370,45 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        if (scopeDiagnosticsEnabled) {
+            transaction.scopeDiagnostic = { startedAt: Date.now(), eventCount: 0, events: [] };
+        }
         // The candidate matcher refresh below is allowed to establish one new
         // policy generation for the requested scope. Once that refresh
         // completes, every acquisition and durable barrier must stay on that
         // exact ignore-policy generation. A live Rules-policy refresh that
         // publishes during broad capture therefore invalidates the transaction.
         let preparedIgnorePolicyRevision: number | undefined;
+        const scopeCheck = (predicate: string, value: boolean): boolean => {
+            const diagnostic = transaction.scopeDiagnostic;
+            if (!value && diagnostic && !diagnostic.firstScopeFailure) {
+                try {
+                    diagnostic.firstScopeFailure = {
+                        predicate, ...this.scopeDiagnosticContext(transaction),
+                        expectedEpoch: epoch, expectedScopeRevision: scope.scopeRevision,
+                        expectedWatcherCoverageRevision: watcherCoverageRevision,
+                        preparedIgnorePolicyRevision, identityBudgetExhausted: !!preparationIdentityEvidence.exhausted,
+                        rootRemovalReconciliation, lastDiscardEvaluation
+                    };
+                } catch { /* Do not replace the original predicate result. */ }
+            }
+            return value;
+        };
         const scopeContextStillCurrent = (): boolean =>
-            this.isCurrentEpoch(epoch) &&
-            requestStillCurrent() &&
-            (!this.workspaceContextChanged || rootRemovalReconciliation) &&
-            !this.recoveryBlocked &&
-            this.watcherCoverageRevision === watcherCoverageRevision &&
-            (preparedIgnorePolicyRevision === undefined ||
+            scopeCheck('epoch', this.isCurrentEpoch(epoch)) &&
+            scopeCheck('requested-scope', requestStillCurrent()) &&
+            scopeCheck('workspace-context', !this.workspaceContextChanged || rootRemovalReconciliation) &&
+            scopeCheck('recovery-blocked', !this.recoveryBlocked) &&
+            scopeCheck('watcher-coverage-revision', this.watcherCoverageRevision === watcherCoverageRevision) &&
+            scopeCheck('ignore-policy-revision', preparedIgnorePolicyRevision === undefined ||
                 this.ignorePolicyRevision === preparedIgnorePolicyRevision) &&
-            !preparationIdentityEvidence.exhausted &&
-            discardApprovalStillCurrent() &&
-            (transaction.observedEvents?.size ?? 0) === 0 &&
-            (!this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
+            scopeCheck('path-identity-budget', !preparationIdentityEvidence.exhausted) &&
+            scopeCheck('discard-approval', discardApprovalStillCurrent()) &&
+            scopeCheck('observed-events', (transaction.observedEvents?.size ?? 0) === 0) &&
+            scopeCheck('git-context', !this.isRecording || (!this.gitContextPending && this.pausedGitRepositories.size === 0));
         transaction.valid = scopeContextStillCurrent;
         if (!scopeContextStillCurrent()) {
+            this.emitScopeDurableDiagnostic(transaction, 'Scope context rejected before preparation');
             this.endBaselineTransaction(transaction, false);
             return empty('conflict', 'Monitoring scope preparation is blocked by the current workspace or Git context.');
         }
@@ -5416,6 +5542,7 @@ export class DiffTracker {
             this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
             return result;
         } catch (error) {
+            this.emitScopeDurableDiagnostic(transaction, error);
             const observed = new Map(transaction.observedEvents ?? []);
             this.rollbackSupplementalCoverageInstall(supplementalInstall, epoch);
             this.endBaselineTransaction(transaction, false);
@@ -8163,7 +8290,7 @@ export class DiffTracker {
 
         if (this.deferInitialIgnoreEvent(uri)) { return; }
         const filePath = uri.fsPath;
-        this.recordBaselineTransactionEvent(uri, 'change');
+        this.recordBaselineTransactionEvent(uri, 'change', 'external-change');
         if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
             this.preserveDeferredScopeApplyEvent(filePath);
             return;
@@ -8417,7 +8544,7 @@ export class DiffTracker {
 
         if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
         const filePath = uri.fsPath;
-        this.recordBaselineTransactionEvent(uri, 'create');
+        this.recordBaselineTransactionEvent(uri, 'create', 'external-create');
         if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
             this.preserveDeferredScopeApplyEvent(filePath);
             return;
@@ -8720,7 +8847,7 @@ export class DiffTracker {
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
-        this.recordBaselineTransactionEvent(uri, 'delete');
+        this.recordBaselineTransactionEvent(uri, 'delete', 'external-delete');
         if (this.scopeApplyPreflight) {
             // A parent-only delete can arrive after the subtree has already
             // disappeared, so file-system stat cannot recover its type. Route
@@ -10874,7 +11001,7 @@ export class DiffTracker {
             return;
         }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
-        this.recordBaselineTransactionEvent(uri, 'change');
+        this.recordBaselineTransactionEvent(uri, 'change', 'document-change');
         if (this.scopeApplyPreflight && this.pendingScopeExplicitlyExcludes(uri)) {
             this.preserveDeferredScopeApplyEvent(filePath);
             return;

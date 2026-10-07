@@ -1,0 +1,39 @@
+name: Scope Durable Diagnostic
+
+on:
+  push:
+    branches:
+      - diagnose/rc-scope-durable-windows-2026-10-07
+
+permissions:
+  contents: read
+
+jobs:
+  windows-host:
+    name: First-false scope evidence (Windows 1.141.0)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: One focused Host run with passive first-false capture
+        env:
+          DIFF_TRACKER_VSCODE_VERSION: 1.141.0
+          DIFF_TRACKER_SCOPE_DIAGNOSTICS: '1'
+          DIFF_TRACKER_HOST_DIAGNOSTICS_DIR: ${{ runner.temp }}/scope-durable-diagnostics
+        run: npm run test:host
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DO-NOT-PUBLISH-scope-durable-diagnostic
+          path: ${{ runner.temp }}/scope-durable-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
