@@ -74,7 +74,7 @@ for (const [style, root, file] of [
         const tracked = { filePath: file, fileName: 'stale legacy display name', isDeleted: false,
             originalContent: 'before', currentContent: 'after' };
         const tracker = {
-            getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
+            getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewToken:()=>undefined,getUnknownReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
             getSubtreeCoverageGaps:()=>[],
             getTrackedChanges: () => [tracked], getBaselineState: () => 'ready',
             getChangeBlocks: () => []
@@ -122,7 +122,7 @@ await test('multi-root duplicate names remain separate resources and preserve ca
     folders.push({ uri: { fsPath: '/a' }, name: 'Root A' }, { uri: { fsPath: '/b' }, name: 'Root B' });
     const files = ['/a/src/Sample.m', '/a/src/sample.m', '/b/src/sample.m'];
     const provider = new (load('diffTreeView.ts').DiffTreeDataProvider)({
-        getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
+        getReviewToken:()=>undefined,getReviewTokens:()=>[],getOpaqueReviewToken:()=>undefined,getOpaqueReviewTokens:()=>[],getUnknownReviewToken:()=>undefined,getUnknownReviewTokens:()=>[],getUnknownReviewPaths:()=>[],
         getSubtreeCoverageGaps:()=>[],
         getBaselineState: () => 'ready',
         getTrackedChanges: () => files.map(filePath => ({ filePath, fileName: 'sample.m' }))

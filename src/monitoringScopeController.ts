@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { DiffTracker, ObservationCoverageRecheckResult } from './diffTracker';
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
+    configuredScopeExplicitlyExcludesSubtree,
     createLegacySourceFingerprint,
     createScopeConsentRecord,
     createScopeMigrationRecord,
@@ -65,6 +67,8 @@ export interface MonitoringScopeApplyOutcome {
 
 export class MonitoringScopeController implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
+    private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
+    private pendingScopeSettingsWrites = 0;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -305,7 +309,135 @@ export class MonitoringScopeController implements vscode.Disposable {
         };
     }
 
-    public async saveRequestedScope(
+    public hasPendingScopeSettingsWrites(): boolean {
+        return this.pendingScopeSettingsWrites > 0;
+    }
+
+    private enqueueScopeSettingsWrite<T>(write: () => Promise<T>): Promise<T> {
+        // Ownership starts before the queue runs and lasts through settlement,
+        // including after an editor closes while its settings save is pending.
+        this.pendingScopeSettingsWrites++;
+        const operation = this.scopeSettingsWriteQueue.then(write).finally(() => {
+            this.pendingScopeSettingsWrites--;
+        });
+        this.scopeSettingsWriteQueue = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
+
+    /**
+     * Stages a directory-only exclusion in Workspace Settings, never Applies it.
+     * The UI must refuse to call this while a scope-editor draft may be unsaved.
+     */
+    public requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
+        // Merge only after all earlier scope-setting writes have finished.
+        return this.enqueueScopeSettingsWrite(() => this.saveCoverageSubtreeExclusion(targetPath));
+    }
+
+    private async saveCoverageSubtreeExclusion(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
+        const blocked = (reason: string) => ({ status: 'blocked' as const, reason });
+        if (typeof targetPath !== 'string' || !path.isAbsolute(targetPath)) {
+            return blocked('Choose a valid absolute monitored directory.');
+        }
+        const canonicalPath = path.resolve(targetPath);
+        if (!this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
+            return blocked('The coverage warning no longer exists. Refresh Change Recording.');
+        }
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(canonicalPath));
+        if (!folder || folder.uri.scheme !== 'file') {
+            return blocked('The warned directory is outside the active local workspace.');
+        }
+        const relative = path.relative(folder.uri.fsPath, canonicalPath).split(path.sep).join('/');
+        if (!relative || relative === '..' || relative.startsWith('../') || path.posix.isAbsolute(relative)) {
+            return blocked('Cannot exclude the entire workspace root or a directory outside it.');
+        }
+        // A literal path must not be interpreted as a glob or ignore comment.
+        if (relative.split('/').some(segment => !segment || segment === '.' || segment === '..' ||
+            /^[#!]/.test(segment) || /[\\*?\[\]{}]/.test(segment))) {
+            return blocked('This directory name cannot be expressed as an exact exclusion without glob expansion.');
+        }
+
+        const status = this.getStatus();
+        if (!status.requested.ok || !status.requested.scope) {
+            return blocked('The requested monitoring scope is invalid. Fix it in Manage Monitoring Scope first.');
+        }
+        if (!status.legacyMigrationComplete) {
+            return blocked('Finish legacy watch-rule migration before adding a structured exclusion.');
+        }
+        const roots = this.getWorkspaceRoots();
+        if (roots.filter(root => root.name === folder.name).length !== 1) {
+            return blocked('Workspace folder names are ambiguous; rename the roots before creating a folder-scoped exclusion.');
+        }
+        const identity = roots.find(root => root.uri === folder.uri.toString() && root.name === folder.name);
+        if (!identity) { return blocked('The owning workspace folder changed. Refresh the scope manager.'); }
+        const current = status.requested.scope;
+        if (configuredScopeExplicitlyExcludesSubtree(current, identity, relative)) {
+            return { status: 'alreadyExcluded' };
+        }
+        const rule = roots.length === 1
+            ? { scope: 'all' as const, pattern: `/${relative}/` }
+            : { scope: 'folder' as const, folder: folder.name, pattern: `/${relative}/` };
+        const next: MonitoringScopeRequest = {
+            mode: current.mode, includes: current.includes,
+            excludes: [...current.excludes, rule]
+        };
+        const checked = validateAndCanonicalizeScope(next, roots);
+        if (!checked.ok || !checked.scope ||
+            !configuredScopeExplicitlyExcludesSubtree(checked.scope, identity, relative)) {
+            return blocked('The exact directory exclusion cannot be validated for this workspace.');
+        }
+        try {
+            if (status.effective.kind === 'legacyV3' &&
+                !await this.tracker.prepareLegacyCompatibilityPolicySnapshot()) {
+                return blocked('Cannot persist the committed legacy monitoring policy before replacing Workspace settings. The legacy configuration remains unchanged.');
+            }
+            // Snapshot preparation can yield. Recheck migration, the warning,
+            // and root ownership before touching the current request.
+            const latest = this.getStatus();
+            if (!latest.legacyMigrationComplete ||
+                (latest.effective.kind === 'legacyV3' &&
+                    this.legacyMigrationRequired(latest.legacyGlobalRules, latest.legacyCommittedRules) &&
+                    !this.migrationRecordMatches(checked.scope.scopeRevision))) {
+                return blocked('Finish legacy watch-rule migration before adding a structured exclusion.');
+            }
+            if (!this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
+                return blocked('The coverage warning no longer exists. Refresh Change Recording.');
+            }
+            const owningFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(canonicalPath));
+            if (!owningFolder || owningFolder.name !== folder.name ||
+                owningFolder.uri.toString() !== folder.uri.toString()) {
+                return blocked('The owning workspace folder changed. Refresh the scope manager.');
+            }
+            const config = vscode.workspace.getConfiguration('diffTracker');
+            if (this.getRequestedScope().scope?.scopeRevision !== current.scopeRevision) {
+                return blocked('The requested monitoring scope changed. Review it before adding the exclusion.');
+            }
+            // Only edit exclusions: rewriting mode/includes across awaits can
+            // overwrite an external settings edit with the old request. VS Code
+            // has no conditional update, so also check for conflicts afterward.
+            await config.update('watchExclude', checked.scope.excludes, vscode.ConfigurationTarget.Workspace);
+            const now = this.getRequestedScope();
+            if (!now.ok || now.scope?.scopeRevision !== checked.scope.scopeRevision) {
+                return blocked('Workspace Settings changed during the save; inspect the requested scope before applying.');
+            }
+            this.reconcileRequestedScope();
+            return { status: 'saved' };
+        } catch (error) {
+            return blocked(`Could not save the explicit exclusion: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    public saveRequestedScope(
+        request: MonitoringScopeRequest,
+        options?: {
+            allowLegacyMigrationWrite?: boolean;
+            expectedLegacySourceFingerprint?: string;
+        }
+    ): Promise<ScopeValidationResult> {
+        return this.enqueueScopeSettingsWrite(() => this.saveRequestedScopeNow(request, options));
+    }
+
+    // Migration already owns the queue; its nested save must not enqueue again.
+    private async saveRequestedScopeNow(
         request: MonitoringScopeRequest,
         options?: {
             allowLegacyMigrationWrite?: boolean;
@@ -462,7 +594,11 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: applied.status === 'conflict' ? 'conflict' : 'failed', reason: applied.reason };
     }
 
-    public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
+    public migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
+        return this.enqueueScopeSettingsWrite(() => this.migrateLegacyWatchRulesNow());
+    }
+
+    private async migrateLegacyWatchRulesNow(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
         const approvedSource = this.getLegacySourceSnapshot();
         const approvedSourceFingerprint = createLegacySourceFingerprint(approvedSource);
         const liveRules = this.getLegacyWatchRules();
@@ -490,7 +626,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (hasWorkspaceRules) {
             return { status: 'conflict', reason: 'Workspace monitoring-scope settings already exist; migration will not overwrite them automatically.' };
         }
-        const validated = await this.saveRequestedScope({
+        const validated = await this.saveRequestedScopeNow({
             mode: 'rules',
             includes: preview.includes,
             excludes: preview.excludes
@@ -524,7 +660,13 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'migrated' };
     }
 
-    public async completeLegacyMigrationUsingCurrentScope(
+    public completeLegacyMigrationUsingCurrentScope(
+        reviewedTarget?: MonitoringScopeRequest
+    ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
+        return this.enqueueScopeSettingsWrite(() => this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget));
+    }
+
+    private async completeLegacyMigrationUsingCurrentScopeNow(
         reviewedTarget?: MonitoringScopeRequest
     ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
         const roots = this.getWorkspaceRoots();
@@ -534,7 +676,7 @@ export class MonitoringScopeController implements vscode.Disposable {
 
         if (reviewedTarget) {
             try {
-                requested = await this.saveRequestedScope(reviewedTarget, {
+                requested = await this.saveRequestedScopeNow(reviewedTarget, {
                     allowLegacyMigrationWrite: true,
                     // The approved source may be committed-only, but the
                     // mutable Workspace value still has to remain exactly as
@@ -580,7 +722,11 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'completed' };
     }
 
-    public async restoreEffectiveScopeConfiguration(): Promise<void> {
+    public restoreEffectiveScopeConfiguration(): Promise<void> {
+        return this.enqueueScopeSettingsWrite(() => this.restoreEffectiveScopeConfigurationNow());
+    }
+
+    private async restoreEffectiveScopeConfigurationNow(): Promise<void> {
         const config = vscode.workspace.getConfiguration('diffTracker');
         const effective = this.tracker.getEffectiveMonitoringScope();
         if (effective.kind === 'configured') {

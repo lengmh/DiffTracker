@@ -334,6 +334,12 @@ export interface OpaqueReviewToken {
     reviewRevision: string;
 }
 
+export interface UnknownReviewToken {
+    filePath: string;
+    epoch: number;
+    reviewRevision: string;
+}
+
 export interface MonitoringScopeApplyResult {
     status: 'applied' | 'failed' | 'conflict' | 'requiresS4';
     reason?: string;
@@ -536,6 +542,47 @@ export class DiffTracker {
             .map(change => change.filePath);
     }
 
+    private unknownReviewRevision(change: FileDiff): string {
+        // A new tracked-change object always has a new generation, including
+        // rapid same-millisecond updates with an unchanged displayed reason.
+        let instance = this.unknownReviewInstances.get(change);
+        if (instance === undefined) {
+            instance = this.nextUnknownReviewInstance++;
+            this.unknownReviewInstances.set(change, instance);
+        }
+        return createHash('sha256').update(JSON.stringify({
+            instance,
+            reviewKind: change.reviewKind,
+            unavailableReason: change.unavailableReason ?? null,
+            reviewReason: change.reviewReason ?? null,
+            baselineExists: change.baselineExists ?? null,
+            currentExists: change.currentExists ?? null,
+            currentFingerprint: change.currentFingerprint ?? null,
+            currentSize: change.currentSize ?? null,
+            isDeleted: change.isDeleted,
+            timestamp: change.timestamp
+        })).digest('hex');
+    }
+
+    public getUnknownReviewToken(filePath: string): UnknownReviewToken | undefined {
+        filePath = this.canonicalTrackingPath(filePath);
+        const change = this.trackedChanges.get(filePath);
+        if (!change || change.reviewKind !== 'unknown' || this.disposed) { return undefined; }
+        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.unknownReviewRevision(change) };
+    }
+
+    public getUnknownReviewTokens(): UnknownReviewToken[] {
+        return [...this.trackedChanges.keys()].map(filePath => this.getUnknownReviewToken(filePath))
+            .filter((token): token is UnknownReviewToken => !!token);
+    }
+
+    private matchesUnknownReview(token: UnknownReviewToken | undefined): token is UnknownReviewToken {
+        if (!token || !this.isCurrentEpoch(token.epoch)) { return false; }
+        const change = this.trackedChanges.get(token.filePath);
+        return !!change && change.reviewKind === 'unknown' &&
+            token.reviewRevision === this.unknownReviewRevision(change);
+    }
+
     private matchesOpaqueReview(token: OpaqueReviewToken | undefined): token is OpaqueReviewToken {
         if (!token || !this.isCurrentEpoch(token.epoch)) { return false; }
         const change = this.trackedChanges.get(token.filePath);
@@ -649,6 +696,11 @@ export class DiffTracker {
     private unresolvedBaselineFiles: Map<string, string> = new UnresolvedBaselineMap();
     private opaqueBaselineFiles = new Map<string, OpaqueBaselineState>();
     private trackedChanges = new Map<string, FileDiff>();
+    // A file can produce two Unknown reviews within one millisecond. A local
+    // instance sequence keeps their review tokens distinct without invalidating
+    // other files' tokens or persisting transient UI identities.
+    private readonly unknownReviewInstances = new WeakMap<FileDiff, number>();
+    private nextUnknownReviewInstance = 1;
     private trackedChangesVersion = 0;
     private trackedChangesCacheVersion = -1;
     private trackedChangesCache: FileDiff[] = [];
@@ -703,6 +755,7 @@ export class DiffTracker {
     private baselineBuilding = false;
     private pendingExternalChanges = new Set<string>();
     private externalChangeTimers = new Map<string, NodeJS.Timeout>();
+    private readonly pendingSnapshotReads = new Map<string, symbol>();
     private documentChangeTimers = new Map<string, NodeJS.Timeout>();
     private scopeApplyPreflight = false;
     private watcherSuppressionTimers = new Map<string, NodeJS.Timeout>();
@@ -8828,8 +8881,22 @@ export class DiffTracker {
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
         }
         if (this.isPathIgnored(uri)) { return; }
-        const state = await this.readFileSnapshot(uri);
-        if (!this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
+        // A stable snapshot can still arrive out of order: its final stat may
+        // have completed before a later mutation while its promise is delayed.
+        // Only the newest read for this path may publish into the review.
+        const readIdentity = Symbol();
+        this.pendingSnapshotReads.set(filePath, readIdentity);
+        let state: CurrentFileState;
+        let latestRead = false;
+        try {
+            state = await this.readFileSnapshot(uri);
+            latestRead = this.pendingSnapshotReads.get(filePath) === readIdentity;
+        } finally {
+            if (this.pendingSnapshotReads.get(filePath) === readIdentity) {
+                this.pendingSnapshotReads.delete(filePath);
+            }
+        }
+        if (!latestRead || !this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
         // A watcher read can finish after native Undo or another buffer edit.
         // Its disk snapshot must not erase the newer unsaved review.
         const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath);
@@ -9467,7 +9534,9 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
     }
 
-    private beginAcknowledgeTransaction(filePath: string, review: OpaqueReviewToken): BaselineTransaction {
+    private beginAcknowledgeTransaction(
+        filePath: string, review: OpaqueReviewToken | UnknownReviewToken, kind: 'opaque' | 'unknown' = 'opaque'
+    ): BaselineTransaction {
         const previous = {
             snapshotPresent: this.fileSnapshots.has(filePath),
             snapshot: this.fileSnapshots.get(filePath),
@@ -9498,7 +9567,12 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.snapshotInitialized = previous.snapshotInitialized;
         });
-        transaction.valid = () => !this.validateSnapshotTarget(filePath) && this.matchesOpaqueReview(review);
+        // Editor events are debounced, and live ignore policy publishes before
+        // review pruning. Neither transition necessarily changes the token yet.
+        transaction.valid = () => !this.validateSnapshotTarget(filePath) && (kind === 'unknown'
+            ? this.matchesUnknownReview(review) && !this.hasUnknownResetCoverageGap(filePath) &&
+                !this.hasDirtyDocument(filePath) && !this.isPathIgnored(vscode.Uri.file(filePath))
+            : this.matchesOpaqueReview(review));
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -9609,6 +9683,112 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ changedFiles: [filePath], baselineChanged: true });
         await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
         return this.actionResult(filePath, 'success');
+    }
+
+    private hasUnknownResetCoverageGap(filePath: string): boolean {
+        return !!this.coverageGaps.get(filePath)?.file ||
+            this.getSubtreeCoverageGaps().some(gap => this.pathBelongsToRoot(filePath, gap.targetPath));
+    }
+
+    private stableUnknownResetIdentity(state: CurrentFileState): string | undefined {
+        if (state.kind === 'missing') { return 'missing'; }
+        if (state.kind === 'text') {
+            return `text:${this.revision(state.content, true)}:${state.mode ?? 'unknown-mode'}`;
+        }
+        if (this.isStableUnsupportedState(state) && state.fingerprint) {
+            return `opaque:${state.fingerprint}:${state.size}:${state.reason}`;
+        }
+        return undefined;
+    }
+
+    /**
+     * Explicitly abandon one unknown before-image and establish a verified
+     * current-state baseline. This never writes or deletes workspace content.
+     */
+    public resetUnknownBaseline(
+        filePath: string, token = this.getUnknownReviewToken(filePath)
+    ): Promise<ActionResult> {
+        filePath = this.canonicalTrackingPath(filePath);
+        const epoch = this.sessionEpoch;
+        return this.queueRecoveryAction(async () => {
+            const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
+            const task = previous.catch(() => undefined).then(() =>
+                this.resetUnknownBaselineReviewed(filePath, token, epoch));
+            this.fileActionQueues.set(filePath, task);
+            void task.finally(() => {
+                if (this.fileActionQueues.get(filePath) === task) { this.fileActionQueues.delete(filePath); }
+            }).catch(() => undefined);
+            return task;
+        });
+    }
+
+    private async resetUnknownBaselineReviewed(
+        filePath: string, token: UnknownReviewToken | undefined, epoch: number
+    ): Promise<ActionResult> {
+        if (!token || token.filePath !== filePath || !this.matchesUnknownReview(token) || !this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'conflict', 'Unknown review changed; refresh before resetting its baseline');
+        }
+        const invalid = this.validateActionTarget(filePath);
+        if (invalid) { return this.actionResult(filePath, 'conflict', invalid); }
+        if (this.hasUnknownResetCoverageGap(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Monitoring coverage is incomplete; cannot establish a reliable ongoing baseline');
+        }
+        if (this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Save or discard unsaved editor changes before resetting this baseline');
+        }
+        if (this.isPathIgnored(vscode.Uri.file(filePath))) {
+            return this.actionResult(filePath, 'conflict', 'The file is outside the effective monitoring scope');
+        }
+        const first = await this.readCurrentFileState(filePath);
+        const beforeIdentity = this.stableUnknownResetIdentity(first);
+        if (!beforeIdentity) {
+            return this.actionResult(filePath, 'needsAttention', 'The current file state is unreadable or unverified; Unknown was preserved');
+        }
+        if (!this.matchesUnknownReview(token) || this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Unknown review or editor changed during the reset');
+        }
+        const second = await this.readCurrentFileState(filePath);
+        if (this.stableUnknownResetIdentity(second) !== beforeIdentity || !this.matchesUnknownReview(token)) {
+            return this.actionResult(filePath, 'conflict', 'The current file state changed while confirming the new baseline');
+        }
+        const finalError = this.validateActionTarget(filePath);
+        if (finalError || this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', finalError ?? 'An editor now contains unsaved changes');
+        }
+        // Native watcher failures may arrive while the disk reads are pending.
+        // Keep the same condition live through the durable commit barrier too.
+        if (this.hasUnknownResetCoverageGap(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Monitoring coverage changed during the reset; Unknown was preserved');
+        }
+
+        const transaction = this.beginAcknowledgeTransaction(filePath, token, 'unknown');
+        if (!this.applyAcknowledgedStateAsBaseline(filePath, second)) {
+            this.endBaselineTransaction(transaction, false);
+            return this.actionResult(filePath, 'needsAttention', 'No reliable current file state was available');
+        }
+        if (!await this.commitAcknowledgeTransaction(filePath, epoch, transaction)) {
+            return this.actionResult(filePath, 'failed', 'Unknown baseline reset was not saved; the previous unknown state remains pending');
+        }
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'success', 'New baseline was committed before the session changed');
+        }
+        // A successful replacement is not an acknowledgement of the old state.
+        // Reread after publication so intervening edits remain pending.
+        this.emitTrackChangesEvent({ changedFiles: [filePath], baselineChanged: true });
+        await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+        return this.actionResult(filePath, 'success');
+    }
+
+    public async resetAllUnknownBaselines(
+        tokens: UnknownReviewToken[] = this.getUnknownReviewTokens()
+    ): Promise<BatchActionResult> {
+        const results: ActionResult[] = [];
+        for (const token of [...tokens]) {
+            try { results.push(await this.resetUnknownBaseline(token.filePath, token)); }
+            catch { results.push(this.actionResult(token.filePath, 'failed', 'Reset failed unexpectedly; Unknown was preserved')); }
+        }
+        const succeeded = results.filter(result => result.status === 'success').length;
+        return { results, succeeded, failed: results.length - succeeded };
     }
 
     private mixedBatchResult(

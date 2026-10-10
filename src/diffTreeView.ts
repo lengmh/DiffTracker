@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
-import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken, SubtreeCoverageDiagnostic } from './diffTracker';
+import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken, UnknownReviewToken, SubtreeCoverageDiagnostic } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -30,6 +30,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const changes = this.diffTracker.getTrackedChanges();
             const reviewTokens = this.diffTracker.getReviewTokens();
             const opaqueReviewTokens = this.diffTracker.getOpaqueReviewTokens();
+            const unknownReviewTokens = this.diffTracker.getUnknownReviewTokens();
             const subtreeCoverageGaps = this.diffTracker.getSubtreeCoverageGaps();
             items.push(this.createRecordingItem());
             if (subtreeCoverageGaps.length > 0) {
@@ -73,6 +74,19 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 items.push(keepButton);
             }
 
+            if (unknownReviewTokens.length > 0) {
+                const reset = new TreeItem('Reset All Unknown Baselines', vscode.TreeItemCollapsibleState.None);
+                reset.iconPath = new vscode.ThemeIcon('refresh');
+                reset.description = `${unknownReviewTokens.length} unknown file(s)`;
+                reset.tooltip = 'Explicitly discard unknown history and establish reliable current-state baselines for eligible files. No workspace files are modified.';
+                reset.command = {
+                    command: 'diffTracker.resetAllUnknownBaselines',
+                    title: 'Reset All Unknown Baselines',
+                    arguments: [unknownReviewTokens]
+                };
+                items.push(reset);
+            }
+
             const rootNode: DirNode = {
                 name: '',
                 childrenDirs: new Map<string, DirNode>(),
@@ -102,8 +116,10 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const relative = this.toWorkspaceRelative(diagnostic.targetPath).join('/');
             const child = new TreeItem(relative || displayFileName(diagnostic.targetPath), vscode.TreeItemCollapsibleState.None);
             child.iconPath = new vscode.ThemeIcon('warning');
+            child.contextValue = 'coverageDiagnosticSubtree';
+            child.coveragePath = diagnostic.targetPath;
             child.description = diagnostic.reasonCode;
-            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}`;
+            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\nRight-click or use the inline exclude action to stage a narrow explicit exclusion.`;
             child.command = {
                 command: 'diffTracker.manageMonitoringScope',
                 title: 'Manage Monitoring Scope'
@@ -150,6 +166,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         item.filePath = fileDiff.filePath;
         item.reviewToken = this.diffTracker.getReviewToken(fileDiff.filePath);
         item.opaqueReviewToken = this.diffTracker.getOpaqueReviewToken(fileDiff.filePath);
+        item.unknownReviewToken = this.diffTracker.getUnknownReviewToken(fileDiff.filePath);
         item.isDeleted = fileDiff.isDeleted;
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
         item.tooltip = fileDiff.filePath;
@@ -266,6 +283,21 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const dirItem = new TreeItem(childNode.name, vscode.TreeItemCollapsibleState.Expanded);
             dirItem.iconPath = new vscode.ThemeIcon('folder');
             dirItem.children = this.buildTreeItemsFromNode(childNode);
+            // Snapshot actual descendant review tokens, not a recursive path
+            // prefix that might escape a multi-root workspace.
+            const descendants = (items: TreeItem[]): TreeItem[] => items.flatMap(child =>
+                child.children ? descendants(child.children) : child.filePath ? [child] : []);
+            dirItem.reviewEntries = descendants(dirItem.children).map(child => ({
+                filePath: child.filePath!,
+                reviewToken: child.reviewToken,
+                opaqueReviewToken: child.opaqueReviewToken
+            }));
+            const owningRoots = new Set(dirItem.reviewEntries.map(entry =>
+                vscode.workspace.getWorkspaceFolder(vscode.Uri.file(entry.filePath))?.uri.fsPath));
+            // Display labels can collide across separate roots. Never turn a
+            // visually merged group into an action spanning two repositories.
+            dirItem.contextValue = owningRoots.size === 1 && !owningRoots.has(undefined)
+                ? 'reviewFolder' : 'ambiguousReviewFolder';
             dirItem.description = `${this.countFilesInNode(childNode)} file(s)`;
             items.push(dirItem);
         }
@@ -301,9 +333,12 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
 class TreeItem extends vscode.TreeItem {
     public children?: TreeItem[];
     public filePath?: string;
+    public coveragePath?: string;
     public isDeleted?: boolean;
     public reviewToken?: ReviewToken;
     public opaqueReviewToken?: OpaqueReviewToken;
+    public unknownReviewToken?: UnknownReviewToken;
+    public reviewEntries?: Array<{ filePath: string; reviewToken?: ReviewToken; opaqueReviewToken?: OpaqueReviewToken }>;
 
     constructor(
         public readonly label: string,
