@@ -11,7 +11,7 @@ Review changes as they happen, then keep or safely revert them by block, file, o
 
 [中文说明](./README_CN.md)
 
-This README describes the `0.8.1` source, adding configurable WebView display defaults to `0.8.0`. The version in source does not announce a new published package; see the [release gates](docs/releasing.md) for final-VSIX checks.
+This README describes the `0.8.2` source, adding archived Git review restoration and safer scope and review actions. The version in source does not announce a new published package; see the [release gates](docs/releasing.md) for final-VSIX checks.
 
 This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
 [`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
@@ -254,7 +254,7 @@ V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rat
 
 ## Release Notes
 
-Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.1` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
+Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.2` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
 
 ## License
 
