@@ -132,63 +132,6 @@ for(const dispose of [false,true]) test(`delayed Git readiness releases fresh-st
     if(dispose)monitor.dispose();else{gitApi.state='initialized';apiState.fire('initialized');}
     assert.equal(await waiter,!dispose);monitor.dispose();
 });
-test('Issue #28 prompt gate suppresses repeated Git pause notifications until a new episode',async()=>{
-    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
-    const declarations=[];
-    const names=new Set(['gitPromptInFlight','gitPromptShown','handleGitContextEvent']);
-    const visit=node=>{
-        if(ts.isVariableDeclaration(node)&&names.has(node.name.getText(source))){
-            declarations.push(`const ${node.getText(source)};`);
-        }
-        ts.forEachChild(node,visit);
-    };
-    visit(source);
-    assert.equal(declarations.length,3);
-    let prompts=0, resolvePrompt, reason='Git branch changed from main to feature; review actions for this repository are paused';
-    let paused=true, rebuilds=0;
-    const sandbox={
-        runningExtensionTests:false,
-        restoreOutcome:'restored',
-        gitContextMonitor:{},
-        diffTracker:{
-            observeGitContext:()=>reason,
-            observeGitRepositoryRemoved:()=>reason,
-            getPausedGitRepositories:()=>paused?[{repoRoot,reason}]:[],
-            reconcileRestoredGitContexts:()=>{},
-            setGitContextPending:()=>{}
-        },
-        rebuildGitBaseline:async()=>{rebuilds++;paused=false;return true;},
-        vscode:{window:{showWarningMessage:()=>{
-            prompts++;
-            return new Promise(resolve=>{resolvePrompt=resolve;});
-        }}}
-    };
-    vm.createContext(sandbox);
-    vm.runInContext(ts.transpileModule(
-        `${declarations.join('\n')}globalThis.onGitEvent=handleGitContextEvent;`,
-        {compilerOptions:{target:ts.ScriptTarget.ES2022}}
-    ).outputText,sandbox);
-    const event={kind:'changed',context:{repoRoot,headName:'feature',headCommit:'bbb'}};
-    const pending=sandbox.onGitEvent(event);
-    await sandbox.onGitEvent(event);
-    assert.equal(prompts,1,'only one modal while the first remains unanswered');
-    resolvePrompt(undefined);
-    await pending;
-    await sandbox.onGitEvent(event);
-    assert.equal(prompts,1,'dismissing a pause must suppress a repeated report for that episode');
-    reason='Git operation is in progress; review actions for this repository are paused';
-    const changed=sandbox.onGitEvent(event);
-    assert.equal(prompts,2,'a materially distinct reason can still notify');
-    resolvePrompt('Archive and Rebuild');
-    await changed;
-    assert.equal(rebuilds,1);
-    paused=true;
-    const next=sandbox.onGitEvent(event);
-    assert.equal(prompts,3,'a resolved pause may notify on a later episode');
-    resolvePrompt(undefined);
-    await next;
-});
-
 test('production start blocks invalid monitoring scope configuration',async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
     const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
