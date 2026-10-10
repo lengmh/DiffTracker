@@ -5323,6 +5323,117 @@ test('Issue #28 production pause producer and reactivation gate preserve one not
     }
 });
 
+test('ISSUE-26 Unknown Reset establishes a text baseline without modifying disk and tracks later edits',async()=>{
+    const p=file('unknown-reset-text.txt');
+    fs.writeFileSync(p,'unverified current text');
+    tracker.recordUnresolvedBaseline(p,'Prior before-image unknown');
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    const token=tracker.getUnknownReviewToken(p);
+    assert.ok(token);
+    const writes=counters.write;
+    const result=await tracker.resetUnknownBaseline(p,token);
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.equal(disk(p),'unverified current text');
+    assert.equal(tracker.getOriginalContent(p),'unverified current text');
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(pending(p),undefined);
+    assert.ok(counters.write>=writes,'only session persistence may write, never the workspace file');
+    fs.writeFileSync(p,'future edit');
+    await scan(p);
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.originalContent,'unverified current text');
+});
+test('ISSUE-26 Unknown Reset establishes opaque and proven-missing baselines',async()=>{
+    const opaque=file('unknown-reset.png');
+    fs.writeFileSync(opaque,Buffer.from([0,1,2,3]));
+    tracker.recordUnresolvedBaseline(opaque,'Unknown opaque before-image');
+    const result=await tracker.resetUnknownBaseline(opaque,tracker.getUnknownReviewToken(opaque));
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.ok(tracker.opaqueBaselineFiles.has(opaque));
+    assert.equal(pending(opaque),undefined);
+    fs.writeFileSync(opaque,Buffer.from([0,1,9,3]));
+    await scan(opaque);
+    assert.equal(pending(opaque)?.reviewKind,'opaque');
+
+    const missing=file('unknown-reset-missing.txt');
+    tracker.recordUnresolvedBaseline(missing,'Unknown missing file');
+    assert.equal((await tracker.resetUnknownBaseline(missing,tracker.getUnknownReviewToken(missing))).status,'success');
+    assert.equal(fs.existsSync(missing),false);
+    assert.equal(tracker.fileSnapshots.get(missing),'');
+    assert.equal(tracker.baselineExistingFiles.has(missing),false);
+    fs.writeFileSync(missing,'created later');
+    await scan(missing);
+    assert.equal(pending(missing)?.reviewKind,'text');
+    assert.equal(pending(missing)?.baselineExists,false);
+});
+test('ISSUE-26 Unknown Reset refuses stale, dirty and unreadable file states',async()=>{
+    const stale=file('unknown-reset-stale.txt');
+    fs.writeFileSync(stale,'text');
+    tracker.recordUnresolvedBaseline(stale,'Before unknown');
+    const token=tracker.getUnknownReviewToken(stale);
+    tracker.markFileUnavailable(stale,'New uncertainty');
+    assert.equal((await tracker.resetUnknownBaseline(stale,token)).status,'conflict');
+    assert.ok(tracker.unresolvedBaselineFiles.has(stale));
+
+    const dirty=file('unknown-reset-dirty.txt');
+    fs.writeFileSync(dirty,'unverified');
+    tracker.recordUnresolvedBaseline(dirty,'Before unknown');
+    const doc=document(dirty);
+    doc.isDirty=true;
+    assert.equal((await tracker.resetUnknownBaseline(dirty,tracker.getUnknownReviewToken(dirty))).status,'conflict');
+    assert.ok(tracker.unresolvedBaselineFiles.has(dirty));
+    doc.isDirty=false;
+
+    const inaccessible=file('unknown-reset-inaccessible.txt');
+    fs.writeFileSync(inaccessible,'not readable now');
+    tracker.recordUnresolvedBaseline(inaccessible,'Before unknown');
+    faults.set(inaccessible,{read:error('NoPermissions')});
+    const result=await tracker.resetUnknownBaseline(inaccessible,tracker.getUnknownReviewToken(inaccessible));
+    assert.equal(result.status,'needsAttention',JSON.stringify(result));
+    assert.ok(tracker.unresolvedBaselineFiles.has(inaccessible));
+});
+test('ISSUE-26 Reset All Unknown allows partial success and preserves other text review',async()=>{
+    const good=file('unknown-batch-good.txt');
+    const bad=file('unknown-batch-bad.txt');
+    const existing=file('unknown-batch-existing.txt');
+    fs.writeFileSync(good,'current');
+    fs.writeFileSync(bad,'unreadable');
+    seed(existing,'original','pending');
+    await scan(existing);
+    tracker.recordUnresolvedBaseline(good,'Before unknown');
+    tracker.recordUnresolvedBaseline(bad,'Before unknown');
+    faults.set(bad,{read:error('NoPermissions')});
+    const results=await tracker.resetAllUnknownBaselines(tracker.getUnknownReviewTokens());
+    assert.equal(results.succeeded,1);
+    assert.equal(results.failed,1);
+    assert.equal(pending(good),undefined);
+    assert.equal(pending(bad)?.reviewKind,'unknown');
+    assert.equal(tracker.getOriginalContent(existing),'original');
+    assert.equal(pending(existing)?.reviewKind,'text');
+    assert.equal(disk(existing),'pending');
+});
+test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted uncertainty',async()=>{
+    const storage=file('unknown-reset-storage');
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
+    const p=file('unknown-reset-failed-save.txt');
+    fs.writeFileSync(p,'current');
+    tracker.recordUnresolvedBaseline(p,'Unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const persisted=fs.readFileSync(path.join(storage,'session-state.json'),'utf8');
+    const token=tracker.getUnknownReviewToken(p);
+    const target=path.join(storage,'session-state.tmp.json');
+    faults.set(target,{write:error('NoPermissions')});
+    const result=await tracker.resetUnknownBaseline(p,token);
+    assert.equal(result.status,'failed',JSON.stringify(result));
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.equal(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),persisted);
+    assert.equal(disk(p),'current');
+});
+
 registerPR12BoundedInvariants({
     test, vscode, Uri, DiffTracker, file, document, pause,
     getTracker: () => tracker, setTracker: value => { tracker=value; },
