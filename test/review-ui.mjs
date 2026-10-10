@@ -101,7 +101,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         disposed:false,viewGeneration:0,seenRequests:new Set(),activeRequest:undefined,disposables:[],
         panel: { dispose(){},webview: { postMessage: value => messages.push(value), asWebviewUri: uri => uri, cspSource: 'test-source' } }
     });
-    return { panel, tracker, state, messages, commands, load,
+    return { panel, tracker, state, messages, commands, load, vscode,
         open: (target = filePath) => load('webviewDiffPanel.ts').WebviewDiffPanel.createOrShow({ fsPath: '/extension' }, tracker, target) };
 }
 
@@ -283,6 +283,60 @@ await test('subtree coverage diagnostics are visible and actionable without beco
     assert.match(diagnostic.children[0].tooltip, /Imported directory watcher failed/);
     assert.equal(roots.some(item => item.label === 'Pending Review'), false,
         'coverage diagnostics must not fabricate a file review summary');
+});
+
+await test('coverage exclude quick action stages an exact root-local request without Apply',async()=>{
+    const h=harness(null);
+    const root=path.resolve('coverage-scope-test-root');
+    const target=path.join(root,'docs','.aws');
+    const otherRoot=path.resolve('coverage-scope-other-root');
+    const {pathToFileURL}=await import('node:url');
+    const folder=(name,fsPath)=>({name,uri:{
+        fsPath,scheme:'file',toString:()=>pathToFileURL(fsPath).toString()
+    }});
+    const owned=folder('primary',root),other=folder('other',otherRoot);
+    h.vscode.workspace.workspaceFolders=[owned,other];
+    h.vscode.workspace.getWorkspaceFolder=()=>owned;
+    h.state.subtreeCoverageGaps=[{targetPath:target,reason:'watcher failure',reasonCode:'directory-runtime-coverage-gap'}];
+    const roots=[owned,other].map(value=>({
+        name:value.name,uri:value.uri.toString(),caseSensitive:true
+    }));
+    const validate=h.load('monitoringScope.ts').validateAndCanonicalizeScope;
+    let request=validate({mode:'wholeWorkspace',includes:[],excludes:[
+        {scope:'all',pattern:'**/*.tmp'}
+    ]},roots);
+    assert.equal(request.ok,true);
+    const controller=Object.create(h.load('monitoringScopeController.ts').MonitoringScopeController.prototype);
+    let saveCount=0,reconcileCount=0;
+    Object.assign(controller,{
+        tracker:h.tracker,
+        getWorkspaceRoots:()=>roots,
+        getStatus:()=>({requested:request,legacyMigrationComplete:true}),
+        getRequestedScope:()=>request,
+        saveRequestedScope:async next=>{
+            saveCount++;
+            request=validate(next,roots);
+            return request;
+        },
+        reconcileRequestedScope:()=>{reconcileCount++;}
+    });
+    const first=await controller.requestExcludeCoverageSubtree(target);
+    assert.equal(first.status,'saved',JSON.stringify(first));
+    assert.equal(saveCount,1);assert.equal(reconcileCount,1);
+    assert.equal(request.scope.excludes.length,2,'preserve existing user excludes');
+    assert.ok(request.scope.excludes.some(x=>x.scope==='folder'&&x.folder==='primary'&&
+        x.pattern==='/docs/.aws/'),'target only the owning workspace root');
+    const second=await controller.requestExcludeCoverageSubtree(target);
+    assert.equal(second.status,'alreadyExcluded');
+    assert.equal(saveCount,1,'no duplicate settings write');
+    h.state.subtreeCoverageGaps=[];
+    assert.equal((await controller.requestExcludeCoverageSubtree(target)).status,'blocked',
+        'a stale diagnostic cannot stage an exclusion');
+    h.state.subtreeCoverageGaps=[{targetPath:path.join(root,'folder*','nested'),
+        reason:'bad',reasonCode:'directory-runtime-coverage-gap'}];
+    assert.equal((await controller.requestExcludeCoverageSubtree(path.join(root,'folder*','nested'))).status,
+        'blocked','literal special characters must not turn into broad globs');
+    assert.equal(saveCount,1);
 });
 
 await test('opaque file review is visible, read-only and carries identity metadata', async () => {
