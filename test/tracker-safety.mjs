@@ -1278,6 +1278,82 @@ for(const stop of ['stopRecording','dispose']) test(`DT-08 old read cannot publi
     const p=file();seed(p,'base','changed');const gate=pause(p,'read');const operation=scan(p);await gate.entered;
     tracker[stop]();gate.release();await operation;assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),'base');
 });
+for(const kind of ['text','opaque']) test(`DT-08 older clean read cannot erase a newer unopened-file review (${kind})`,async()=>{
+    const p=file(`out-of-order-read.${kind==='text'?'txt':'bin'}`);
+    const before=kind==='text'?'baseline\n':Buffer.from([0,1,2]);
+    const after=kind==='text'?'newer disk change\n':Buffer.from([0,3,4]);
+    if(kind==='text'){seed(p,before);}
+    else{
+        fs.writeFileSync(p,before);
+        tracker.recordOpaqueBaseline(p,await tracker.readFileSnapshot(Uri.file(p)));
+    }
+    const opaqueBaseline=structuredClone(tracker.opaqueBaselineFiles.get(p));
+    const expectedIdentity=kind==='text'?after:createHash('sha256').update(after).digest('hex');
+    const currentIdentity=()=>kind==='text'?pending(p)?.currentContent:pending(p)?.currentFingerprint;
+    const reviewToken=()=>kind==='text'?tracker.getReviewToken(p):tracker.getOpaqueReviewToken(p);
+    const originalStat=vscode.workspace.fs.stat;
+    const entered=deferred(),release=deferred();
+    let statCalls=0;
+    vscode.workspace.fs.stat=async uri=>{
+        const result=await originalStat(uri);
+        if(uri.fsPath===p&&++statCalls===2){
+            // Capture the old read's final metadata before the mutation, but
+            // deliver it after the later read has published its current state.
+            // Both reads remain internally stable; only completion order differs.
+            entered.resolve();await release.promise;
+        }
+        return result;
+    };
+    const olderRead=scan(p);
+    try{
+        await entered.promise;
+        fs.writeFileSync(p,after);
+        await scan(p);
+        assert.equal(pending(p)?.reviewKind,kind);
+        assert.equal(currentIdentity(),expectedIdentity);
+        const newerToken=reviewToken();
+        assert.ok(newerToken);
+        release.resolve();await olderRead;
+        assert.deepEqual(fs.readFileSync(p),Buffer.from(after));
+        assert.equal(tracker.getOriginalContent(p),kind==='text'?before:undefined);
+        assert.deepEqual(tracker.opaqueBaselineFiles.get(p),opaqueBaseline);
+        assert.equal(currentIdentity(),expectedIdentity,
+            'an older clean snapshot must not remove the newer unopened-file review');
+        assert.deepEqual(reviewToken(),newerToken);
+    }finally{
+        release.resolve();await olderRead;
+        vscode.workspace.fs.stat=originalStat;
+    }
+});
+test('DT-08 overlapping reads for different paths preserve both reviews',async()=>{
+    const p=file('overlap-first.txt'),q=file('overlap-second.txt');
+    seed(p,'first baseline\n','first change\n');
+    seed(q,'second baseline\n','second change\n');
+    const originalStat=vscode.workspace.fs.stat;
+    const entered=deferred(),release=deferred();
+    let statCalls=0;
+    vscode.workspace.fs.stat=async uri=>{
+        const result=await originalStat(uri);
+        if(uri.fsPath===p&&++statCalls===2){entered.resolve();await release.promise;}
+        return result;
+    };
+    const firstRead=scan(p);
+    try{
+        await entered.promise;
+        await scan(q);
+        assert.equal(pending(q)?.currentContent,'second change\n');
+        const secondToken=tracker.getReviewToken(q);
+        assert.ok(secondToken);
+        release.resolve();await firstRead;
+        assert.equal(pending(p)?.currentContent,'first change\n');
+        assert.ok(tracker.getReviewToken(p));
+        assert.equal(pending(q)?.currentContent,'second change\n');
+        assert.deepEqual(tracker.getReviewToken(q),secondToken);
+    }finally{
+        release.resolve();await firstRead;
+        vscode.workspace.fs.stat=originalStat;
+    }
+});
 test('DT-08 atomic replacement delete event reads actual replacement',async()=>{
     const p=file();seed(p,'base','replacement');await tracker.onExternalFileDeleted(Uri.file(p));
     assert.equal(pending(p)?.isDeleted,false);assert.equal(pending(p)?.currentContent,'replacement');

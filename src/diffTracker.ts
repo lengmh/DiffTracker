@@ -755,6 +755,7 @@ export class DiffTracker {
     private baselineBuilding = false;
     private pendingExternalChanges = new Set<string>();
     private externalChangeTimers = new Map<string, NodeJS.Timeout>();
+    private readonly pendingSnapshotReads = new Map<string, symbol>();
     private documentChangeTimers = new Map<string, NodeJS.Timeout>();
     private scopeApplyPreflight = false;
     private watcherSuppressionTimers = new Map<string, NodeJS.Timeout>();
@@ -8880,8 +8881,22 @@ export class DiffTracker {
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
         }
         if (this.isPathIgnored(uri)) { return; }
-        const state = await this.readFileSnapshot(uri);
-        if (!this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
+        // A stable snapshot can still arrive out of order: its final stat may
+        // have completed before a later mutation while its promise is delayed.
+        // Only the newest read for this path may publish into the review.
+        const readIdentity = Symbol();
+        this.pendingSnapshotReads.set(filePath, readIdentity);
+        let state: CurrentFileState;
+        let latestRead = false;
+        try {
+            state = await this.readFileSnapshot(uri);
+            latestRead = this.pendingSnapshotReads.get(filePath) === readIdentity;
+        } finally {
+            if (this.pendingSnapshotReads.get(filePath) === readIdentity) {
+                this.pendingSnapshotReads.delete(filePath);
+            }
+        }
+        if (!latestRead || !this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
         // A watcher read can finish after native Undo or another buffer edit.
         // Its disk snapshot must not erase the newer unsaved review.
         const document = vscode.workspace.textDocuments.find(doc => doc.uri.scheme === 'file' && this.canonicalTrackingPath(doc.uri.fsPath) === filePath);
