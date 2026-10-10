@@ -302,6 +302,11 @@
         "icon": "$(repo-pull)"
       },
       {
+        "command": "diffTracker.restoreArchivedGitReview",
+        "title": "Restore Archived Git Review",
+        "category": "Code Diff Tracker"
+      },
+      {
         "command": "diffTracker.acknowledgeOpaqueChange",
         "title": "Acknowledge Read-only Change",
         "category": "Code Diff Tracker",

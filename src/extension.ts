@@ -205,9 +205,9 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     const startRecordingAfterPrechecks = (): boolean => {
-        diffTracker.startRecording();
-        const started = diffTracker.getIsRecording();
-        if (started && gitContextMonitor?.isReady()) {
+        const started = diffTracker.startRecording();
+        if (!started) { return false; }
+        if (gitContextMonitor?.isReady()) {
             diffTracker.setBaselineGitContexts(gitContextMonitor.getSnapshots());
         }
         setRecordingContext(started);
@@ -835,6 +835,50 @@ export async function activate(context: vscode.ExtensionContext) {
                     { placeHolder: 'Choose the paused repository to archive and rebuild' }
                 ).then(item => item?.value);
             return selected ? rebuildGitBaseline(selected.repoRoot) : false;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.restoreArchivedGitReview', async () => {
+            // Query the extension-host Git monitor again before preview and after
+            // confirmation; never change branches or access a Windows-side file.
+            if (!gitContextMonitor?.isReady()) {
+                void vscode.window.showWarningMessage('Code Diff Tracker: Wait for Git context initialization before restoring an archive.');
+                return false;
+            }
+            diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+            const preview = await diffTracker.previewArchivedGitReview();
+            if (preview.status !== 'ready') {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${preview.reason}`);
+                return false;
+            }
+            const archive = preview.archive;
+            const git = archive.gitContext;
+            const detail = [
+                `Repository: ${git.repoRoot} (${git.kind})`,
+                `Branch: ${git.headName ?? '(detached HEAD)'}; HEAD: ${git.headCommit ?? '(unborn)'}`,
+                `Workspace roots: ${archive.workspaceRoots.join(', ')}`,
+                `Saved recording state: ${archive.isRecording ? 'recording' : 'stopped'}.`,
+                `Saved evidence: ${archive.textBaselines} text baseline(s), ${archive.opaqueBaselines} read-only baseline(s), ${archive.unknownBaselines} unknown before-image(s), ${archive.recoveryRecords} recovery record(s).`,
+                'Pending changes are recalculated against current files; saved evidence is not a historical pending-change count.',
+                'The entire current DiffTracker review state will be replaced and first saved in a separate pre-restore safety backup. On-disk files and Git history are unaffected.',
+                'Only the most recent Archive and Rebuild archive is available. The next rebuild overwrites it; this is not per-branch history.',
+                'Storage belongs to this extension host. With Remote-WSL it is WSL-side workspace storage. Pause external automation before continuing.'
+            ].join('\n\n');
+            const answer = await vscode.window.showWarningMessage(
+                'Replace the current DiffTracker review state with the archived Git review?',
+                { modal: true, detail }, 'Restore Archived Review'
+            );
+            if (answer !== 'Restore Archived Review') { return false; }
+            diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+            const result = await diffTracker.restoreArchivedGitReview(preview.token);
+            refreshReview();
+            if (result.status === 'restored') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Archived review restored and saved. Current files and Git history were not changed; the previous review is separately backed up.');
+                return true;
+            }
+            void vscode.window.showWarningMessage(`Code Diff Tracker: ${result.reason ?? result.status}`);
+            return false;
         })
     );
 

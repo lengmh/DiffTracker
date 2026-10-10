@@ -17,6 +17,25 @@ export interface ObservationCoverageRecheckResult {
     reason?: string;
 }
 
+export type ArchivedGitReviewPreview = {
+    status: 'ready';
+    token: string;
+    archive: {
+        workspaceRoots: string[];
+        gitContext: GitContextSnapshot;
+        textBaselines: number;
+        opaqueBaselines: number;
+        unknownBaselines: number;
+        recoveryRecords: number;
+        isRecording: boolean;
+    };
+} | { status: 'refused' | 'missing' | 'invalid'; reason: string };
+
+export interface ArchivedGitReviewRestoreResult {
+    status: 'restored' | 'refused' | 'rolled-back' | 'failed';
+    reason?: string;
+}
+
 export interface FileDiff {
     sourceNote?: string;
     filePath: string;
@@ -770,6 +789,17 @@ export class DiffTracker {
     private readonly persistedStateTempFileName = 'session-state.tmp.json';
     private readonly persistedStateBackupFileName = 'session-state.last-good.json';
     private readonly persistedStateArchiveFileName = 'session-state.archive.json';
+    private readonly preRestoreFileName = 'session-state.pre-restore.json';
+    private readonly archiveRestoreIntentFileName = 'session-state.restore-in-progress.json';
+    // Nested restore discovery may request a durability barrier. During staging
+    // those requests belong to the enclosing transaction's final publication.
+    private archiveRestoreStaging = false;
+    private archiveRestoreTask?: Promise<ArchivedGitReviewRestoreResult>;
+    private archiveRestoreStopRequested = false;
+    private archiveRestoreFinalizingEpoch?: number;
+    // Only live policy events invalidate restore; replay-owned directory scans
+    // also refresh matchers and must not count as external policy changes.
+    private archiveRestorePolicyChanged = false;
     private readonly maxPersistedSnapshots = 10000;
     private readonly maxPersistedBytes = 50 * 1024 * 1024;
     // Preflight is advisory discovery, not a project-size rejection threshold.
@@ -823,6 +853,7 @@ export class DiffTracker {
         this.disposables.push(
             vscode.workspace.onDidCreateFiles(event => {
                 for (const uri of event.files) {
+                    if (this.deferArchiveRestoreEvent(uri, 'create')) { continue; }
                     void this.onExternalFileCreated(uri);
                 }
             })
@@ -850,6 +881,7 @@ export class DiffTracker {
                     e.affectsConfiguration('files.exclude');
                 if (automationPolicyChanged || legacyWatchPolicyChanged ||
                     watcherCoverageChanged || ordinaryExcludeChanged) {
+                    if (this.archiveRestoreTask) { this.archiveRestorePolicyChanged = true; }
                     if (watcherCoverageChanged) {
                         this.watcherCoverageRevision++;
                         this.invalidateConfiguredScopeForWatcherCoverage();
@@ -873,6 +905,24 @@ export class DiffTracker {
         const epoch = this.advanceEpoch();
         this.restoringEpoch = epoch;
         try {
+            const interrupted = await this.readArchiveRestoreIntent();
+            if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+            if (interrupted.kind === 'invalid') {
+                this.recoveryBlocked = true;
+                this.persistenceIssue = interrupted.reason;
+                return 'blocked';
+            }
+            if (interrupted.kind === 'valid') {
+                const outcome = await this.reconcilePersistedState(epoch, interrupted.state);
+                if ((outcome !== 'restored' && outcome !== 'incomplete') || !this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                if (!await this.flushPendingPersistence() || !this.isCurrentEpoch(epoch)) {
+                    this.recoveryBlocked = true;
+                    return 'blocked';
+                }
+                await this.deletePersistedFile(this.getPersistedStateUri(this.archiveRestoreIntentFileName)!);
+                this.persistenceIssue = 'An interrupted archived review restore was rolled back to the pre-restore session. The original archive is unchanged.';
+                return outcome === 'incomplete' ? 'incomplete' : 'recovered';
+            }
             return await this.restorePersistedStateForEpoch(epoch);
         } catch {
             if (this.isCurrentEpoch(epoch)) {
@@ -921,11 +971,17 @@ export class DiffTracker {
             this.snapshotInitialized = false;
             return 'blocked';
         }
-        const state = loaded.state;
+        return this.reconcilePersistedState(epoch, loaded.state, loaded.kind === 'recovered');
+    }
+
+    private async reconcilePersistedState(
+        epoch: number, state: PersistedTrackerState, recovered = false, failOnActivity = false
+    ): Promise<RestoreOutcome> {
+        if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         this.mayAdoptLegacyGitContexts = state.migratedFromV1 === true;
         this.scanCoverage = state.scanCoverage;
         this.recoveryBlocked = false;
-        this.persistenceIssue = loaded.kind === 'recovered'
+        this.persistenceIssue = recovered
             ? 'Recovered the last-good Code Diff Tracker session because the primary state was unreadable.'
             : undefined;
 
@@ -966,6 +1022,10 @@ export class DiffTracker {
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
             configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
+        // An explicit archive restore promises a current-filesystem review even
+        // when the saved session was stopped. Observe just this transaction;
+        // never change its recording intent or emit a recording-start event.
+        const observeForReconciliation = this.isRecording || (failOnActivity && !incomplete);
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         // Runtime diagnostics never own this serialized marker. Scope retirement
         // and rollback use the independent Set, not stale flags in gap records.
@@ -997,7 +1057,7 @@ export class DiffTracker {
         this.workspaceContextChanged = !rootsMatch || !scopeRootsMatch;
 
         // Cover ignore discovery too; restore callbacks queue until reconciliation.
-        if (this.isRecording) {
+        if (observeForReconciliation) {
             try {
                 this.activateExternalWatchers(this.createExternalWatchers(epoch));
             } catch (error) {
@@ -1023,7 +1083,7 @@ export class DiffTracker {
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         let restoredSupplemental: SupplementalCoverageInstall | undefined;
-        if (this.isRecording && restoreSupplementalPlan) {
+        if (observeForReconciliation && restoreSupplementalPlan) {
             restoredSupplemental = await this.installSupplementalCoverageTargets(
                 restoreSupplementalPlan.targets, epoch, true
             );
@@ -1050,9 +1110,9 @@ export class DiffTracker {
 
         // Discover offline additions before rebuilding diffs. An existing empty
         // file and an absent baseline are distinct, including across reloads.
-        if (this.isRecording) {
+        if (observeForReconciliation) {
             try {
-                await this.discoverRestoredFiles(epoch);
+                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
                 this.recoveryBlocked = true;
@@ -1076,10 +1136,11 @@ export class DiffTracker {
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         this.reconcilePendingScopeSuspendedPaths();
         while (this.restoreEvents.size > 0) {
+            if (failOnActivity) { throw new Error('Workspace activity interrupted archive reconciliation; retry after writes settle'); }
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
                 await this.refreshIgnoreMatchers();
                 if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-                await this.discoverRestoredFiles(epoch);
+                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
             }
             const restoreEvents = [...this.restoreEvents.values()];
             this.restoreEvents.clear();
@@ -1104,7 +1165,7 @@ export class DiffTracker {
                             : 'Effective monitoring scope is durably preserved, but its current filesystem identity cannot be safely verified; review is paused until the scope is reconciled or the baseline is rebuilt.';
             return 'incomplete';
         }
-        return loaded.kind === 'recovered' ? 'recovered' : 'restored';
+        return recovered ? 'recovered' : 'restored';
     }
 
     private shouldTrackOnlyAutomatedChanges(): boolean {
@@ -1292,12 +1353,12 @@ export class DiffTracker {
         }
     }
 
-    public startRecording() {
-        if (this.disposed || this.recoveryBlocked) { return; }
+    public startRecording(): boolean {
+        if (this.disposed || this.recoveryBlocked || this.archiveRestoreTask) { return false; }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) {
             vscode.window.showWarningMessage(`Code Diff Tracker: ${identityIssue}. Recording remains paused.`);
-            return;
+            return false;
         }
         let startupSupplementalPlan: SupplementalCoveragePlan | undefined;
         if (this.effectiveMonitoringScope.kind === 'configured') {
@@ -1306,7 +1367,7 @@ export class DiffTracker {
                 vscode.window.showWarningMessage(
                     `Code Diff Tracker: Supplemental coverage cannot be established at ${startupSupplementalPlan.issue}. Narrow the scope before rebuilding.`
                 );
-                return;
+                return false;
             }
         }
         this.sessionWorkspaceRoots = this.getWorkspaceRoots();
@@ -1403,9 +1464,11 @@ export class DiffTracker {
             fullRefresh: true,
             baselineChanged: true
         });
+        return true;
     }
 
     public stopRecording() {
+        if (this.archiveRestoreTask) { this.archiveRestoreStopRequested = true; return; }
         this.advanceEpoch();
         this.isRecording = false;
         this.baselineBuilding = false;
@@ -1824,7 +1887,15 @@ export class DiffTracker {
     private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+        // Both matcher implementations also read workspace-root repository
+        // excludes. Treat their events as policy invalidation during restore,
+        // even though .git metadata is not a tracked review resource.
+        if (this.archiveRestoreTask && this.getSupportedWorkspaceFolders().some(folder =>
+            this.canonicalTrackingPath(path.join(folder.uri.fsPath, '.git', 'info', 'exclude')) === uri.fsPath)) {
+            this.archiveRestorePolicyChanged = true;
+        }
         if (path.basename(uri.fsPath) === '.gitignore') {
+            if (this.archiveRestoreTask) { this.archiveRestorePolicyChanged = true; }
             if (this.ordinaryIgnorePolicyAffectsCoverage()) {
                 this.scanCoverage = undefined;
                 this.schedulePersistState();
@@ -1845,6 +1916,15 @@ export class DiffTracker {
         if (kind === 'create') { void this.onExternalFileCreated(uri); }
         else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
         else { void this.onExternalFileChanged(uri); }
+    }
+
+    private deferArchiveRestoreEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
+        if (!this.archiveRestoreTask || this.restoringEpoch !== this.sessionEpoch ||
+            !this.isCurrentEpoch(this.sessionEpoch) || uri.scheme !== 'file') { return false; }
+        // Editor saves and workspace operations are independent evidence even
+        // when the filesystem watcher has not delivered its notification yet.
+        this.dispatchExternalEvent(uri, kind, this.sessionEpoch);
+        return true;
     }
 
     private deferCoverageRecheckEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
@@ -2035,7 +2115,8 @@ export class DiffTracker {
         root: string,
         epoch: number,
         budget: { remainingEntries: number },
-        creationIsCurrent: () => boolean
+        creationIsCurrent: () => boolean,
+        observeStopped = false
     ): Promise<ImportedCoverageHandoff> {
         const folder = this.owningWorkspaceFolderForTraversal(root);
         if (!folder) { throw new Error('Imported directory has no workspace owner'); }
@@ -2049,7 +2130,7 @@ export class DiffTracker {
         const generation = this.coverageGeneration;
         const policyRevision = this.watcherCoverageRevision;
         const scope = this.effectiveMonitoringScope;
-        const contextCurrent = (): boolean => creationIsCurrent() && this.isRecording &&
+        const contextCurrent = (): boolean => creationIsCurrent() && (this.isRecording || observeStopped) &&
             !this.baselineBuilding && !this.baselineTransaction && !this.scopeApplyPreflight &&
             this.effectiveMonitoringScope === scope && this.ignorePolicyRevision === ignoreRevision &&
             this.ignoreRefreshVersion === ignoreVersion && this.coverageGeneration === generation &&
@@ -3059,6 +3140,8 @@ export class DiffTracker {
         retainFailureMarker = false
     ): Promise<boolean> {
         const epoch = this.sessionEpoch;
+        retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch;
+        if (this.archiveRestoreStaging && !transaction) { return true; }
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
             await this.baselineTransaction.done;
@@ -3201,8 +3284,8 @@ export class DiffTracker {
         return loaded.kind === 'primary' || loaded.kind === 'recovered' ? loaded.state : undefined;
     }
 
-    private async readPersistedCandidate(uri: vscode.Uri): Promise<
-        { kind: 'absent' } | { kind: 'invalid'; reason: string } | { kind: 'valid'; state: PersistedTrackerState }
+    private async readPersistedCandidate(uri: vscode.Uri, requireV4 = false): Promise<
+        { kind: 'absent' } | { kind: 'invalid'; reason: string } | { kind: 'valid'; state: PersistedTrackerState; digest: string }
     > {
         try {
             const payload = await vscode.workspace.fs.readFile(uri);
@@ -3210,8 +3293,12 @@ export class DiffTracker {
                 return { kind: 'invalid', reason: `state exceeds ${this.maxPersistedBytes} bytes` };
             }
             const raw = new TextDecoder('utf-8', { fatal: true }).decode(payload);
-            const state = this.parsePersistedState(JSON.parse(raw) as unknown);
-            return state ? { kind: 'valid', state } : { kind: 'invalid', reason: 'schema or invariant validation failed' };
+            const parsed: unknown = JSON.parse(raw);
+            if (requireV4 && (!parsed || typeof parsed !== 'object' || (parsed as { version?: unknown }).version !== 4)) {
+                return { kind: 'invalid', reason: 'Archive restore requires a complete Session V4 file' };
+            }
+            const state = this.parsePersistedState(parsed);
+            return state ? { kind: 'valid', state, digest: createHash('sha256').update(payload).digest('hex') } : { kind: 'invalid', reason: 'schema or invariant validation failed' };
         } catch (error) {
             if (this.isFileNotFound(error)) { return { kind: 'absent' }; }
             return { kind: 'invalid', reason: error instanceof Error ? error.message : 'read failed' };
@@ -4441,8 +4528,10 @@ export class DiffTracker {
         }
     }
 
+    // Explicit archive restoration also uses this bounded disk walk for legacy
+    // scopes. Without configured exclusions, isPathIgnored applies legacy policy.
     private async enumerateConfiguredCandidateFiles(
-        scope: CanonicalMonitoringScope,
+        scope: CanonicalMonitoringScope | undefined,
         epoch: number,
         scanRoot?: string,
         capacityGuard?: CandidateCapacityGuard,
@@ -4504,7 +4593,7 @@ export class DiffTracker {
                 throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
-            if (configuredScopeExplicitlyExcludesSubtree(
+            if (scope && configuredScopeExplicitlyExcludesSubtree(
                 scope,
                 rootIdentity,
                 relativeDirectory,
@@ -5607,13 +5696,14 @@ export class DiffTracker {
     public isRecoveryBlocked(): boolean { return this.recoveryBlocked; }
 
     public async discardRecoveryState(): Promise<boolean> {
+        if (this.archiveRestoreTask) { return false; }
         if (!this.storageUri) {
             this.recoveryBlocked = false;
             this.persistenceIssue = undefined;
             return true;
         }
         try {
-            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName, this.persistenceFailureFileName]) {
+            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName, this.persistenceFailureFileName, this.archiveRestoreIntentFileName]) {
                 const uri = this.getPersistedStateUri(name);
                 if (uri) { await this.deletePersistedFile(uri); }
             }
@@ -5636,6 +5726,7 @@ export class DiffTracker {
     }
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
+        if (this.deferArchiveRestoreEvent(doc.uri, 'change')) { return; }
         if (this.deferCoverageRecheckEvent(doc.uri, 'change')) { return; }
         if (this.isRecording && !this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath))) {
             this.processDocumentChange(doc);
@@ -7548,12 +7639,13 @@ export class DiffTracker {
     private async completeBaseline(
         epoch: number,
         transaction?: BaselineTransaction,
-        persistenceBudget?: CandidatePersistenceBudget
+        persistenceBudget?: CandidatePersistenceBudget,
+        observeStopped = false
     ): Promise<boolean> {
         ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
-        await this.processPendingExternalChanges();
+        await this.processPendingExternalChanges(observeStopped);
         if (!this.isCurrentEpoch(epoch)) { return false; }
         if (this.persistTimer) {
             clearTimeout(this.persistTimer);
@@ -7884,23 +7976,25 @@ export class DiffTracker {
         }
     }
 
-    private async discoverRestoredFiles(epoch: number, recheckCurrent?: () => boolean): Promise<void> {
+    private async discoverRestoredFiles(
+        epoch: number, recheckCurrent?: () => boolean, archiveDiscovery = false
+    ): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
         const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
             this.effectiveMonitoringScope.mode === 'wholeWorkspace';
-        const wholeWorkspacePreparationBudget = wholeWorkspace || recheckCurrent
+        const wholeWorkspacePreparationBudget = wholeWorkspace || recheckCurrent || archiveDiscovery
             ? { remainingEntries: this.maxScopePreflightEntries }
             : undefined;
-        const durableResourcePaths = wholeWorkspace || recheckCurrent ? new Set([
+        const durableResourcePaths = wholeWorkspace || recheckCurrent || archiveDiscovery ? new Set([
             ...this.fileSnapshots.keys(),
             ...this.unresolvedBaselineFiles.keys(),
             ...this.opaqueBaselineFiles.keys()
         ]) : undefined;
-        const persistenceBudget = wholeWorkspace || recheckCurrent
+        const persistenceBudget = wholeWorkspace || recheckCurrent || archiveDiscovery
             ? this.createCandidatePersistenceBudget()
             : undefined;
         const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
-            (wholeWorkspace || recheckCurrent) && durableResourcePaths
+            (wholeWorkspace || recheckCurrent || archiveDiscovery) && durableResourcePaths
                 ? {
                     remaining: this.remainingCandidatePersistenceSlots(),
                     exemptPaths: new Set([
@@ -7911,9 +8005,10 @@ export class DiffTracker {
                 }
                 : undefined;
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = recheckCurrent
+            const files = recheckCurrent || archiveDiscovery
                 ? (await this.enumerateConfiguredCandidateFiles(
-                    this.effectiveMonitoringScope as CanonicalMonitoringScope, epoch, folder.uri.fsPath,
+                    this.effectiveMonitoringScope.kind === 'configured' ? this.effectiveMonitoringScope : undefined,
+                    epoch, folder.uri.fsPath,
                     wholeWorkspaceCapacityGuard, wholeWorkspacePreparationBudget, recheckCurrent
                 )).map(filePath => vscode.Uri.file(this.canonicalTrackingPath(filePath)))
                 : await this.findScopeFilesUnderDirectory(
@@ -8183,7 +8278,7 @@ export class DiffTracker {
         await new Promise(resolve => setTimeout(resolve, 0));
     }
 
-    private async processPendingExternalChanges(): Promise<void> {
+    private async processPendingExternalChanges(observeStopped = false): Promise<void> {
         const epoch = this.sessionEpoch;
         if (this.pendingExternalChanges.size === 0) {
             return;
@@ -8193,7 +8288,7 @@ export class DiffTracker {
         this.pendingExternalChanges.clear();
 
         for (const filePath of pending) {
-            if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
+            if ((!this.isRecording && !observeStopped) || !this.isCurrentEpoch(epoch)) {
                 return;
             }
 
@@ -8476,11 +8571,12 @@ export class DiffTracker {
     private async onExternalFileCreated(
         uri: vscode.Uri,
         duringScan = false,
-        persistenceBudget?: CandidatePersistenceBudget
+        persistenceBudget?: CandidatePersistenceBudget,
+        observeStopped = false
     ): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
-        if (!this.isRecording || !this.externalWatcherEnabled) {
+        if ((!this.isRecording || !this.externalWatcherEnabled) && !observeStopped) {
             return;
         }
 
@@ -8584,7 +8680,7 @@ export class DiffTracker {
                         !this.baselineBuilding && !this.baselineTransaction) {
                         try {
                             handoff = await this.prepareImportedCoverageHandoff(
-                                filePath, epoch, importedPreparationBudget, creationIsCurrent
+                                filePath, epoch, importedPreparationBudget, creationIsCurrent, observeStopped
                             );
                         } catch (error) {
                             watchFailed = true;
@@ -8621,7 +8717,7 @@ export class DiffTracker {
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
-                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
+                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget, observeStopped);
                         }
                     }
                     if (handoff) {
@@ -8750,7 +8846,7 @@ export class DiffTracker {
                 this.fileSnapshots.set(filePath, '');
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
-                } else if (!await this.completeBaseline(epoch)) {
+                } else if (!await this.completeBaseline(epoch, undefined, undefined, observeStopped)) {
                     return;
                 }
             }
@@ -8788,10 +8884,10 @@ export class DiffTracker {
         }
     }
 
-    private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
+    private async onExternalFileDeleted(uri: vscode.Uri, observeStopped = false): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
-        if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' ||
+        if (((!this.isRecording || !this.externalWatcherEnabled) && !observeStopped) || uri.scheme !== 'file' ||
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
@@ -9019,6 +9115,7 @@ export class DiffTracker {
     }
 
     private validateActionTarget(filePath: string): string | undefined {
+        if (this.archiveRestoreTask) { return 'An archived review restore is in progress; review actions are paused'; }
         if (this.restoringEpoch !== undefined) { return 'Session restoration is still reconciling changes; review is paused'; }
         if (this.persistenceFailed) { return 'Session persistence failed; review actions are paused until it can be saved'; }
         if (this.recoveryBlocked) { return 'Session recovery is blocked; preserve or discard the damaged state before review actions'; }
@@ -9135,6 +9232,372 @@ export class DiffTracker {
         return [...this.pausedGitRepositories.entries()]
             .map(([repoRoot, reason]) => ({ repoRoot, reason }))
             .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot));
+    }
+
+    private async readArchiveRestoreIntent(): Promise<
+        { kind: 'absent' } | { kind: 'invalid'; reason: string } |
+        { kind: 'valid'; state: PersistedTrackerState }
+    > {
+        const intentUri = this.getPersistedStateUri(this.archiveRestoreIntentFileName);
+        const backupUri = this.getPersistedStateUri(this.preRestoreFileName);
+        if (!intentUri || !backupUri) { return { kind: 'absent' }; }
+        try {
+            const bytes = await vscode.workspace.fs.readFile(intentUri);
+            if (bytes.byteLength > 1024) { throw new Error('Invalid restore marker size'); }
+            const intent = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+            if (intent?.version !== 1 || !/^[a-f0-9]{64}$/.test(intent.backupSha256)) {
+                throw new Error('Invalid restore marker');
+            }
+            const backup = await this.readPersistedCandidate(backupUri, true);
+            if (backup.kind !== 'valid' || backup.digest !== intent.backupSha256) {
+                throw new Error('The complete pre-restore safety backup cannot be verified');
+            }
+            return { kind: 'valid', state: backup.state };
+        } catch (error) {
+            if (this.isFileNotFound(error)) { return { kind: 'absent' }; }
+            return { kind: 'invalid', reason: `Archived review recovery is blocked; preserve extension storage: ${String(error)}` };
+        }
+    }
+
+    private archivedReviewConflict(state: PersistedTrackerState): string | undefined {
+        if (this.disposed || this.gitContextPending || this.recoveryBlocked || this.persistenceFailed ||
+            !this.snapshotInitialized || this.baselineBuilding || this.restoringEpoch !== undefined ||
+            this.baselineTransaction || this.activeScopeApplications > 0 || this.scopeApplyPreflight ||
+            this.coverageRecheckEpoch !== undefined || this.pendingMonitoringScope || this.workspaceContextChanged ||
+            this.activeWriteFiles.size || this.pendingWriteFiles.size || this.fileActionQueues.size ||
+            this.activeExternalOperations.size || this.activeCreations.size || this.automationSessions.size) {
+            return 'Wait for a ready review session with no pending scope, recovery, automation or file operation before restoring.';
+        }
+        if (vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty)) {
+            return 'Save or discard unsaved editor changes before restoring the archived review.';
+        }
+        const roots = this.getWorkspaceRoots();
+        const contexts = [...this.latestGitContexts.values()].filter((value): value is GitContextSnapshot => !!value);
+        if (roots.length !== 1 || state.workspaceRoots.length !== 1 || state.gitContexts.length !== 1 ||
+            contexts.length !== 1 || this.getRepositoryRoots().length !== 1 ||
+            !this.pathBelongsToRoot(roots[0], contexts[0].repoRoot)) {
+            return 'This first version restores whole sessions only in a single workspace root owned by one Git repository. Multi-root and multiple-repository sessions are refused to preserve unrelated reviews.';
+        }
+        if (!this.sameStringSet(state.workspaceRoots, roots) ||
+            !this.sameWorkspaceRootIdentities(state.effectiveMonitoringScope.roots, this.currentWorkspaceRootIdentities())) {
+            return 'The archive workspace roots or root identities do not match this extension-host workspace.';
+        }
+        if (state.baselineState !== 'ready' || state.effectiveMonitoringScope.scopeRevision !== this.effectiveMonitoringScope.scopeRevision ||
+            state.effectiveMonitoringScope.kind !== this.effectiveMonitoringScope.kind) {
+            return 'The archive baseline is incomplete or its effective monitoring scope differs from the current session.';
+        }
+        if (state.coverageGaps.length || this.coverageGaps.size || this.importedCoverageObligations.size) {
+            return 'Resolve observation coverage gaps before restoring. Archives with unresolved coverage obligations are not supported in this first version.';
+        }
+        const context = contexts[0];
+        const archivedContext = state.gitContexts[0];
+        if (archivedContext.inProgress || (!archivedContext.headName && !archivedContext.headCommit)) {
+            return 'The archive has no stable Git branch/HEAD context.';
+        }
+        const comparison = compareGitContexts(archivedContext, context);
+        if (!comparison.compatible) {
+            return `${comparison.reason}. Return to the archived branch/worktree yourself; DiffTracker never switches Git branches.`;
+        }
+        const identityIssue = this.getPathIdentityIssue();
+        if (identityIssue) { return identityIssue; }
+        const budget = { remainingEntries: this.maxPathIdentityPreparationEntries };
+        try {
+            for (const filePath of new Set([
+                ...state.fileSnapshots.map(([target]) => target),
+                ...state.opaqueBaselineFiles.map(([target]) => target),
+                ...state.unresolvedBaselineFiles.map(([target]) => target)
+            ])) {
+                const issue = this.validateResourceTarget(filePath, budget);
+                if (issue) { return issue; }
+            }
+        } catch { return 'Archive resource identities cannot be verified within the safe preparation limit.'; }
+        return undefined;
+    }
+
+    private archivedReviewToken(digest: string): string {
+        return createHash('sha256').update(JSON.stringify({
+            digest, epoch: this.sessionEpoch, review: this.trackedChangesVersion,
+            state: this.buildPersistedState(), roots: this.currentWorkspaceRootIdentities(),
+            contexts: [...this.latestGitContexts], watcherRevision: this.watcherCoverageRevision,
+            policyRevision: this.ignorePolicyRevision
+        })).digest('hex');
+    }
+
+    public async previewArchivedGitReview(): Promise<ArchivedGitReviewPreview> {
+        const archiveUri = this.getPersistedStateUri(this.persistedStateArchiveFileName);
+        if (!archiveUri) { return { status: 'refused', reason: 'Extension-host workspace storage is unavailable.' }; }
+        if (this.archiveRestoreTask) { return { status: 'refused', reason: 'An archived review restore is already in progress.' }; }
+        const intent = await this.readArchiveRestoreIntent();
+        if (intent.kind !== 'absent') {
+            return { status: 'refused', reason: 'An interrupted restore needs recovery. Reload this extension host; the archive and pre-restore backup are preserved.' };
+        }
+        const archive = await this.readPersistedCandidate(archiveUri, true);
+        if (archive.kind === 'absent') {
+            return { status: 'missing', reason: 'No archived Git review exists in this extension host’s workspace storage. Archive and Rebuild keeps only the most recent archive.' };
+        }
+        if (archive.kind === 'invalid') { return { status: 'invalid', reason: `The archive is unreadable or invalid: ${archive.reason}. Nothing was replaced.` }; }
+        const conflict = this.archivedReviewConflict(archive.state);
+        if (conflict) { return { status: 'refused', reason: conflict }; }
+        return { status: 'ready', token: this.archivedReviewToken(archive.digest), archive: {
+            workspaceRoots: archive.state.workspaceRoots,
+            gitContext: archive.state.gitContexts[0],
+            textBaselines: archive.state.fileSnapshots.length,
+            opaqueBaselines: archive.state.opaqueBaselineFiles.length,
+            unknownBaselines: archive.state.unresolvedBaselineFiles.length,
+            recoveryRecords: archive.state.revertHistory.length,
+            isRecording: archive.state.isRecording
+        } };
+    }
+
+    public restoreArchivedGitReview(token: string): Promise<ArchivedGitReviewRestoreResult> {
+        if (this.archiveRestoreTask) {
+            return Promise.resolve({ status: 'refused', reason: 'An archived review restore is already in progress.' });
+        }
+        this.archiveRestorePolicyChanged = false;
+        const task = this.queueRecoveryAction(() => this.performArchivedGitReviewRestore(token));
+        this.archiveRestoreTask = task;
+        return task.finally(() => {
+            this.archiveRestoreTask = undefined;
+            this.archiveRestoreStaging = false;
+            this.archiveRestoreFinalizingEpoch = undefined;
+            this.archiveRestorePolicyChanged = false;
+            if (this.archiveRestoreStopRequested) {
+                this.archiveRestoreStopRequested = false;
+                this.stopRecording();
+            }
+        });
+    }
+
+    private async performArchivedGitReviewRestore(token: string): Promise<ArchivedGitReviewRestoreResult> {
+        const archiveUri = this.getPersistedStateUri(this.persistedStateArchiveFileName);
+        const backupUri = this.getPersistedStateUri(this.preRestoreFileName);
+        const intentUri = this.getPersistedStateUri(this.archiveRestoreIntentFileName);
+        if (!archiveUri || !backupUri || !intentUri) { return { status: 'refused', reason: 'Extension storage is unavailable.' }; }
+        const archive = await this.readPersistedCandidate(archiveUri, true);
+        if (archive.kind !== 'valid') { return { status: 'refused', reason: 'The approved archive is no longer readable. Nothing was replaced.' }; }
+        const conflict = this.archivedReviewConflict(archive.state);
+        if (conflict || token !== this.archivedReviewToken(archive.digest)) {
+            return { status: 'refused', reason: conflict ?? 'The archive or current review changed after preview. Preview and confirm again.' };
+        }
+        if ((await this.readArchiveRestoreIntent()).kind !== 'absent') {
+            return { status: 'refused', reason: 'An earlier restore needs recovery; reload the extension host first.' };
+        }
+        if (!await this.flushPendingPersistence()) { return { status: 'failed', reason: 'The complete current session could not be saved; nothing was replaced.' }; }
+        if (token !== this.archivedReviewToken(archive.digest) || this.archiveRestoreStopRequested) {
+            return { status: 'refused', reason: 'The current review changed before backup; preview and confirm again.' };
+        }
+        const previousState = this.buildPersistedState();
+        if (!previousState || !this.parsePersistedState(previousState)) { return { status: 'refused', reason: 'The current session cannot be preserved completely.' }; }
+        const backupBytes = new TextEncoder().encode(JSON.stringify(previousState));
+        const backupSha256 = createHash('sha256').update(backupBytes).digest('hex');
+        const contextSignature = JSON.stringify([...this.latestGitContexts]);
+        const rootsSignature = JSON.stringify(this.currentWorkspaceRootIdentities());
+        const watcherRevision = this.watcherCoverageRevision;
+        const policyRevision = this.ignorePolicyRevision;
+        const oldEpoch = this.sessionEpoch;
+        const stable = (): boolean => this.isCurrentEpoch(oldEpoch) && !this.archiveRestoreStopRequested &&
+            !this.archiveRestorePolicyChanged &&
+            !this.gitContextPending && !this.pendingMonitoringScope && !this.workspaceContextChanged &&
+            this.activeScopeApplications === 0 && this.watcherCoverageRevision === watcherRevision &&
+            this.ignorePolicyRevision === policyRevision && JSON.stringify([...this.latestGitContexts]) === contextSignature &&
+            JSON.stringify(this.currentWorkspaceRootIdentities()) === rootsSignature &&
+            !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty);
+        try {
+            await vscode.workspace.fs.writeFile(backupUri, backupBytes);
+            const backup = await this.readPersistedCandidate(backupUri, true);
+            if (backup.kind !== 'valid' || backup.digest !== backupSha256 || !stable() ||
+                token !== this.archivedReviewToken(archive.digest)) {
+                return { status: 'refused', reason: 'The safety backup or current context changed. Current review and archive are unchanged.' };
+            }
+            const approvedArchive = await this.readPersistedCandidate(archiveUri, true);
+            if (approvedArchive.kind !== 'valid' || approvedArchive.digest !== archive.digest || !stable()) {
+                return { status: 'refused', reason: 'The archive or workspace changed while preparing the backup; preview again.' };
+            }
+            await vscode.workspace.fs.writeFile(intentUri, new TextEncoder().encode(JSON.stringify({ version: 1, backupSha256 })));
+            if (!stable() || token !== this.archivedReviewToken(archive.digest)) {
+                await this.deletePersistedFile(intentUri);
+                return { status: 'refused', reason: 'The current review changed while preparing restoration; preview and confirm again.' };
+            }
+        } catch (error) {
+            try { await this.deletePersistedFile(intentUri); }
+            catch { this.recoveryBlocked = true; }
+            return { status: 'failed', reason: `Cannot preserve the pre-restore session. Nothing was replaced: ${String(error)}` };
+        }
+        // A durable intent now selects the safety backup on every interrupted restart.
+        const previous = {
+            fileSnapshots: new Map(this.fileSnapshots), fileModes: new Map(this.fileModes),
+            baselineExistingFiles: new Set(this.baselineExistingFiles),
+            unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
+            postBaselineUnknownFiles: new Set(this.postBaselineUnknownFiles),
+            opaqueBaselineFiles: new Map(this.opaqueBaselineFiles), trackedChanges: new Map(this.trackedChanges),
+            lineChanges: new Map(this.lineChanges), inlineViews: new Map(this.inlineViews),
+            revertHistory: [...this.revertHistory], baselineGitContexts: new Map(this.baselineGitContexts),
+            pausedGitRepositories: new Map(this.pausedGitRepositories), sessionWorkspaceRoots: [...this.sessionWorkspaceRoots],
+            effectiveMonitoringScope: this.effectiveMonitoringScope, retainedReviewPaths: new Set(this.retainedReviewPaths),
+            coverageGaps: new Map(this.coverageGaps), importedCoverageObligations: new Set(this.importedCoverageObligations),
+            pendingScopeSuspendedPaths: new Set(this.pendingScopeSuspendedPaths),
+            committedLegacyWatchExcludeByRoot: new Map(this.committedLegacyWatchExcludeByRoot),
+            snapshotInitialized: this.snapshotInitialized, baselineBuilding: this.baselineBuilding,
+            scanCoverage: this.scanCoverage, isRecording: this.isRecording, workspaceContextChanged: this.workspaceContextChanged
+        };
+        this.archiveRestoreStaging = true;
+        if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
+        const epoch = this.advanceEpoch();
+        this.restoringEpoch = epoch;
+        this.archiveRestoreFinalizingEpoch = epoch;
+        const contextCurrent = (): boolean => this.isCurrentEpoch(epoch) && !this.archiveRestorePolicyChanged &&
+            !this.gitContextPending && !this.pendingMonitoringScope && !this.workspaceContextChanged &&
+            this.activeScopeApplications === 0 && this.watcherCoverageRevision === watcherRevision &&
+            this.ignorePolicyRevision === policyRevision && JSON.stringify([...this.latestGitContexts]) === contextSignature &&
+            JSON.stringify(this.currentWorkspaceRootIdentities()) === rootsSignature;
+        const current = (): boolean => contextCurrent() && !this.archiveRestoreStopRequested &&
+            !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty);
+        let finalScope: EffectiveMonitoringScope | undefined;
+        const rollbackMemory = (): void => {
+            this.disposeFileWatchers();
+            Object.assign(this, previous);
+            this.resetChangeBlocksCaches();
+            this.trackedChangesVersion++;
+            this.trackedChangesCacheVersion = -1;
+        };
+        const transaction = this.beginBaselineTransaction(rollbackMemory);
+        transaction.valid = current;
+        let committed = false;
+        try {
+            if (!current()) { throw new Error('Context changed before restoration'); }
+            const outcome = await this.reconcilePersistedState(epoch, archive.state, false, true);
+            if (outcome !== 'restored' || !current() || this.coverageGaps.size ||
+                [...this.trackedChanges.values()].some(change => change.reviewKind === 'unknown' &&
+                    !this.unresolvedBaselineFiles.has(change.filePath))) {
+                throw new Error('Archived files, identity or observation coverage could not be safely reconciled');
+            }
+            // Persist only the fully reconciled candidate, with both interruption
+            // markers held until the final context check has passed.
+            if (!await this.flushPersistState(false, transaction, true) || !current() || this.restoreEvents.size) {
+                throw new Error('Restore publication failed or the workspace changed during publication');
+            }
+            // Sole durable commit point. Stop/dispose requests during this await
+            // run after the operation, never roll memory back behind this commit.
+            // Keep the existing incomplete-write marker until any events seen
+            // across this commit have also been reconciled and saved.
+            finalScope = this.effectiveMonitoringScope;
+            await this.deletePersistedFile(intentUri);
+            committed = true;
+            this.endBaselineTransaction(transaction, true);
+            this.persistenceIssue = undefined;
+            this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+            this._onDidChangeRecordingState.fire(this.isRecording);
+            this._onDidChangeBaselineState.fire(this.getBaselineState());
+            return { status: 'restored' };
+        } catch (error) {
+            this.endBaselineTransaction(transaction, false);
+            if (!this.isCurrentEpoch(epoch)) {
+                this.recoveryBlocked = true;
+                return { status: 'failed', reason: 'Restore was interrupted. Reload to recover the preserved pre-restore session; the archive is unchanged.' };
+            }
+            try {
+                this.recoveryBlocked = false;
+                const outcome = await this.reconcilePersistedState(epoch, previousState);
+                this.reconcileRestoredGitContexts([...this.latestGitContexts.values()].filter((value): value is GitContextSnapshot => !!value));
+                this.archiveRestoreStaging = false;
+                if (outcome !== 'restored' || !await this.flushPendingPersistence()) { throw new Error('Rollback could not be saved'); }
+                finalScope = this.effectiveMonitoringScope;
+                await this.deletePersistedFile(intentUri);
+                this.emitTrackChangesEvent({ fullRefresh: true, baselineChanged: true });
+                return { status: 'rolled-back', reason: `Restore did not complete; the current session was recovered and the archive is unchanged. ${String(error)}` };
+            } catch (rollbackError) {
+                this.recoveryBlocked = true;
+                this.isRecording = false;
+                this.disposeFileWatchers();
+                this.persistenceIssue = `Restore rollback needs extension-host reload. Both preserved sessions remain in storage. ${String(rollbackError)}`;
+                return { status: 'failed', reason: this.persistenceIssue };
+            }
+        } finally {
+            if (!committed) { this.endBaselineTransaction(transaction, false); }
+            if (this.isCurrentEpoch(epoch)) {
+                this.archiveRestoreStaging = false;
+                try {
+                    if (!this.recoveryBlocked) {
+                        await this.replayArchiveRestoreEvents(() => contextCurrent() && this.effectiveMonitoringScope === finalScope);
+                    }
+                } catch (error) {
+                    const message = `Archive restoration finished its storage transaction, but newer workspace activity could not be safely reconciled. Review is paused; preserve extension storage before rebuilding. ${String(error)}`;
+                    if (this.isCurrentEpoch(epoch)) {
+                        await this.pauseRecordingForUnpersistableCoverage(message, error);
+                    }
+                    this.recoveryBlocked = true;
+                    this.isRecording = false;
+                    this.disposeFileWatchers();
+                    this.persistenceIssue = message;
+                    return { status: 'failed', reason: message };
+                } finally {
+                    if (this.restoringEpoch === epoch) { this.restoringEpoch = undefined; }
+                    if (!this.isRecording) {
+                        this.disposeFileWatchers();
+                        this.externalWatcherEnabled = false;
+                    }
+                }
+            }
+        }
+    }
+
+    private async replayArchiveRestoreEvents(contextCurrent: () => boolean): Promise<void> {
+        let remainingEvents = this.maxScopePreflightEntries;
+        // Keep restoringEpoch active until every observed event and its durable
+        // evidence is drained. Temporary observation never enables recording.
+        while (true) {
+            if (!contextCurrent() || this.recoveryBlocked) {
+                throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
+            }
+            const events = [...this.restoreEvents.values()];
+            const work = events.length + this.pendingExternalChanges.size;
+            if (work > remainingEvents) {
+                throw new Error('Post-restore activity exceeded the bounded reconciliation allowance');
+            }
+            remainingEvents -= work;
+            this.restoreEvents.clear();
+            for (const { uri, kind } of events) {
+                if (!contextCurrent() || this.recoveryBlocked) {
+                    throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
+                }
+                if (kind === 'create') { await this.onExternalFileCreated(uri, false, undefined, true); }
+                else if (kind === 'delete') { await this.onExternalFileDeleted(uri, true); }
+                else { await this.readFileAndUpdate(uri.fsPath, uri); }
+            }
+            await this.processPendingExternalChanges(true);
+            if (this.coverageGaps.size > 0) {
+                throw new Error('Post-restore activity left observation coverage incomplete');
+            }
+            if (!contextCurrent() || this.recoveryBlocked ||
+                (work > 0 && !await this.flushPendingPersistence())) {
+                throw new Error('Post-restore observations could not be saved');
+            }
+            if (this.restoreEvents.size > 0 || this.pendingExternalChanges.size > 0) { continue; }
+
+            const finish = async (): Promise<boolean> => {
+                if (!contextCurrent() || this.recoveryBlocked ||
+                    this.baselineTransaction || this.activeScopeApplications > 0 ||
+                    this.coverageGaps.size > 0 || !this.snapshotInitialized || this.baselineBuilding) {
+                    throw new Error('Post-restore completion was superseded');
+                }
+                // Work may have arrived while an earlier writer was finishing.
+                if (this.restoreEvents.size > 0 || this.pendingExternalChanges.size > 0) { return false; }
+                // This synchronous cutoff ends the one-shot observation. Later
+                // stopped-session edits are outside this restore; active sessions
+                // resume their ordinary event handlers and persistence queue.
+                this.restoringEpoch = undefined;
+                if (!this.isRecording) {
+                    this.disposeFileWatchers();
+                    this.externalWatcherEnabled = false;
+                }
+                this.archiveRestoreFinalizingEpoch = undefined;
+                const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+                if (failureUri) { await this.deletePersistedFile(failureUri); }
+                return true;
+            };
+            this.persistStateWriteQueue = this.persistStateWriteQueue.then(finish, finish);
+            if (await this.persistStateWriteQueue) { return; }
+        }
     }
 
     private async archiveCurrentSession(): Promise<boolean> {
@@ -11055,6 +11518,7 @@ export class DiffTracker {
     }
 
     private onDocumentChanged(event: vscode.TextDocumentChangeEvent) {
+        if (this.deferArchiveRestoreEvent(event.document.uri, 'change')) { return; }
         const epoch = this.sessionEpoch;
         if (!this.isRecording) {
             return;
@@ -12226,6 +12690,10 @@ export class DiffTracker {
     }
 
     public async dispose(): Promise<void> {
+        if (this.archiveRestoreTask) {
+            this.archiveRestoreStopRequested = true;
+            await this.archiveRestoreTask;
+        }
         this.advanceEpoch();
         this.disposed = true;
         this.creationTempExpiryTimers.forEach(timer => clearTimeout(timer));

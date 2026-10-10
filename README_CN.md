@@ -127,6 +127,16 @@ Revert 基线中不存在的新文件也采用相同规则：人工检查并删�
 有效范围内的二进制、超限、非 UTF-8 和 UTF-8 BOM 文件在证据充分时显示为只读不透明变化。不可读文件和未知 before-image 保留不确定状态及原因，不进行推测性解码写回。工作区外路径和不安全目标身份仍被排除或安全拒绝。纯换行风格变化不作为逻辑内容变化。automation-only 模式也不会把普通保存事件当成人工来源证明；
 来源不明的编辑仍保留待审，需要明确 Keep 或 Revert。
 
+## 恢复已归档的 Git 审阅
+
+运行命令面板中的 `Code Diff Tracker: Restore Archived Git Review`，可恢复最近一次 Archive and Rebuild 保存的审阅会话。命令先展示仓库、分支或 HEAD、工作区根及基线证据，再要求确认替换当前 DiffTracker 审阅状态。恢复前需要自行切回归档对应的分支；命令不切换分支，不修改 Git 历史，也不写入、删除或接受工作区文件。
+
+首版仅支持单工作区根、单仓库，要求工作区根身份及监控范围一致。归档缺失或不兼容、Git 状态无法核验、合并或变基进行中、编辑器尚未保存、范围或恢复操作未完成时，命令会拒绝恢复。切回原分支后仍保留的 Git 暂停状态，只有在归档上下文验证通过后才可清除。恢复以当前磁盘内容核对归档中的审阅基线；未知的 before-image 仍保持未知。
+
+恢复保留归档中的录制状态。正在录制的归档恢复后继续跟踪；已停止录制的归档只执行一次有界核对，包括发现归档后新增的文件，完成后仍保持停止。临时监听器只用于核验恢复事务，停止会话恢复完成后即释放。当前会话已停止，不影响恢复正在录制的归档。**Start Recording** 会以当前文件建立新基线，不会继续沿用归档基线。
+
+每次 Archive and Rebuild 都会覆盖 `session-state.archive.json`，因此只能恢复最近一份归档，不提供逐分支历史。替换当前会话前，Restore 会将完整当前会话保存到独立的 `session-state.pre-restore.json`。这些文件位于扩展宿主的工作区存储中，不在项目目录中。Remote-WSL 使用 WSL 侧扩展宿主存储，无需手工替换 Windows 侧 JSON 文件。恢复中断后，扩展会核验并恢复操作前的会话；若无法安全核验，则阻塞恢复并保留证据。验证范围见[归档审阅恢复说明](docs/archived-git-review-checkpoint.md)。
+
 ## 安装
 
 ### 从 Marketplace 安装
@@ -245,6 +255,7 @@ try {
 - `Code Diff Tracker: Accept / Acknowledge All Changes`
 - `Code Diff Tracker: Acknowledge Read-only Change`
 - `Code Diff Tracker: Archive and Rebuild Paused Git Baseline`
+- `Code Diff Tracker: Restore Archived Git Review`
 - `Code Diff Tracker: Select Default Open Mode`
 - `Code Diff Tracker: Manage Monitoring Scope`
 - `Code Diff Tracker: Apply Pending Scope`

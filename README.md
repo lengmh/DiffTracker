@@ -129,6 +129,14 @@ Fresh recording waits for the VS Code Git API to become ready before establishin
 
 Ordinary commits on the same named branch do not invalidate the review context.
 
+Use **Code Diff Tracker: Restore Archived Git Review** from the Command Palette to restore the latest review saved by Archive and Rebuild. Preview the repository, branch/HEAD, workspace root and saved baseline evidence, then confirm replacement of the current DiffTracker review state. Return to the archived branch yourself before restoring; the command never switches branches or changes Git history or workspace files.
+
+The first version supports one workspace root and one repository, with matching root identities and monitoring scope. A missing/incompatible archive, unverified Git state, merge/rebase, dirty editor or pending scope/recovery operation blocks restoration. A sticky pause from returning to the archived branch can be cleared only after the archived context is validated. Current disk content is reconciled against the archived before-images; unknown before-images stay unknown.
+
+Restoration preserves the archive's recording state. Active archives resume tracking; stopped archives receive one bounded reconciliation, including later-added files, and remain stopped. Temporary watchers verify the restore transaction and are released for a stopped session. A stopped current session can still restore an active archive. **Start Recording** creates a fresh baseline from current files; it does not resume an archived baseline.
+
+Only the latest archive is available: each Archive and Rebuild replaces `session-state.archive.json`. Before Restore replaces the live session, it saves the entire current session separately as `session-state.pre-restore.json`. These are extension-host workspace-storage files, not files in the project. In Remote-WSL, they belong to the WSL extension host; do not swap Windows-side JSON files. Interrupted restoration recovers the validated pre-restore session or blocks with the preserved evidence intact. See [archived review recovery](docs/archived-git-review-checkpoint.md) for the safety boundary and verification notes.
+
 ### Created and deleted files
 
 Code Diff Tracker does not automatically delete a file when a Revert or Undo operation would remove a file that was absent from the baseline. VS Code does not expose a conditional, version-checked delete primitive, so automatic deletion could destroy newer work. Inspect and delete the file manually, then retry the operation if required. Batch Revert reports that item as a conflict and continues with other eligible files.
