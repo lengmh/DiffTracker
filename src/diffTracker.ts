@@ -554,8 +554,7 @@ export class DiffTracker {
             currentFingerprint: change.currentFingerprint ?? null,
             currentSize: change.currentSize ?? null,
             isDeleted: change.isDeleted,
-            timestamp: change.timestamp,
-            unresolvedBaseline: this.unresolvedBaselineFiles.get(change.filePath) ?? null
+            timestamp: change.timestamp
         })).digest('hex');
     }
 
