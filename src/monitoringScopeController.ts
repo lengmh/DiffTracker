@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { DiffTracker, ObservationCoverageRecheckResult } from './diffTracker';
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
+    configuredScopeExplicitlyExcludesSubtree,
     createLegacySourceFingerprint,
     createScopeConsentRecord,
     createScopeMigrationRecord,
@@ -303,6 +305,79 @@ export class MonitoringScopeController implements vscode.Disposable {
             expansionReasons,
             explicitlyExcludedPendingReviews: canonical ? this.tracker.getExplicitlyExcludedPendingReviewPaths(canonical) : []
         };
+    }
+
+    /**
+     * Stages a directory-only exclusion in Workspace Settings, never Applies it.
+     * The UI must refuse to call this while a scope-editor draft may be unsaved.
+     */
+    public async requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
+        const blocked = (reason: string) => ({ status: 'blocked' as const, reason });
+        if (typeof targetPath !== 'string' || !path.isAbsolute(targetPath)) {
+            return blocked('Choose a valid absolute monitored directory.');
+        }
+        const canonicalPath = path.resolve(targetPath);
+        if (!this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
+            return blocked('The coverage warning no longer exists. Refresh Change Recording.');
+        }
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(canonicalPath));
+        if (!folder || folder.uri.scheme !== 'file') {
+            return blocked('The warned directory is outside the active local workspace.');
+        }
+        const relative = path.relative(folder.uri.fsPath, canonicalPath).split(path.sep).join('/');
+        if (!relative || relative === '..' || relative.startsWith('../') || path.posix.isAbsolute(relative)) {
+            return blocked('Cannot exclude the entire workspace root or a directory outside it.');
+        }
+        // A literal path must not be interpreted as a glob or ignore comment.
+        if (relative.split('/').some(segment => !segment || segment === '.' || segment === '..' ||
+            /^[#!]/.test(segment) || /[\\*?\[\]{}]/.test(segment))) {
+            return blocked('This directory name cannot be expressed as an exact exclusion without glob expansion.');
+        }
+
+        const status = this.getStatus();
+        if (!status.requested.ok || !status.requested.scope) {
+            return blocked('The requested monitoring scope is invalid. Fix it in Manage Monitoring Scope first.');
+        }
+        if (!status.legacyMigrationComplete) {
+            return blocked('Finish legacy watch-rule migration before adding a structured exclusion.');
+        }
+        const roots = this.getWorkspaceRoots();
+        if (roots.filter(root => root.name === folder.name).length !== 1) {
+            return blocked('Workspace folder names are ambiguous; rename the roots before creating a folder-scoped exclusion.');
+        }
+        const identity = roots.find(root => root.uri === folder.uri.toString() && root.name === folder.name);
+        if (!identity) { return blocked('The owning workspace folder changed. Refresh the scope manager.'); }
+        const current = status.requested.scope;
+        if (configuredScopeExplicitlyExcludesSubtree(current, identity, relative)) {
+            return { status: 'alreadyExcluded' };
+        }
+        const rule = roots.length === 1
+            ? { scope: 'all' as const, pattern: `/${relative}/` }
+            : { scope: 'folder' as const, folder: folder.name, pattern: `/${relative}/` };
+        const next: MonitoringScopeRequest = {
+            mode: current.mode, includes: current.includes,
+            excludes: [...current.excludes, rule]
+        };
+        const checked = validateAndCanonicalizeScope(next, roots);
+        if (!checked.ok || !checked.scope ||
+            !configuredScopeExplicitlyExcludesSubtree(checked.scope, identity, relative)) {
+            return blocked('The exact directory exclusion cannot be validated for this workspace.');
+        }
+        if (this.getRequestedScope().scope?.scopeRevision !== current.scopeRevision) {
+            return blocked('The requested monitoring scope changed. Review it before adding the exclusion.');
+        }
+        try {
+            const saved = await this.saveRequestedScope(next);
+            if (!saved.ok) { return blocked(saved.errors.map(error => error.message).join('; ')); }
+            const now = this.getRequestedScope();
+            if (!now.ok || now.scope?.scopeRevision !== checked.scope.scopeRevision) {
+                return blocked('Workspace Settings changed during the save; inspect the requested scope before applying.');
+            }
+            this.reconcileRequestedScope();
+            return { status: 'saved' };
+        } catch (error) {
+            return blocked(`Could not save the explicit exclusion: ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
 
     public async saveRequestedScope(
