@@ -334,6 +334,12 @@ export interface OpaqueReviewToken {
     reviewRevision: string;
 }
 
+export interface UnknownReviewToken {
+    filePath: string;
+    epoch: number;
+    reviewRevision: string;
+}
+
 export interface MonitoringScopeApplyResult {
     status: 'applied' | 'failed' | 'conflict' | 'requiresS4';
     reason?: string;
@@ -534,6 +540,42 @@ export class DiffTracker {
         return [...this.trackedChanges.values()]
             .filter(change => change.reviewKind === 'unknown')
             .map(change => change.filePath);
+    }
+
+    private unknownReviewRevision(change: FileDiff): string {
+        // The unknown before-image must never be considered a verified baseline.
+        // This token binds the explicit reset to the particular visible review.
+        return createHash('sha256').update(JSON.stringify({
+            reviewKind: change.reviewKind,
+            unavailableReason: change.unavailableReason ?? null,
+            reviewReason: change.reviewReason ?? null,
+            baselineExists: change.baselineExists ?? null,
+            currentExists: change.currentExists ?? null,
+            currentFingerprint: change.currentFingerprint ?? null,
+            currentSize: change.currentSize ?? null,
+            isDeleted: change.isDeleted,
+            timestamp: change.timestamp,
+            unresolvedBaseline: this.unresolvedBaselineFiles.get(change.filePath) ?? null
+        })).digest('hex');
+    }
+
+    public getUnknownReviewToken(filePath: string): UnknownReviewToken | undefined {
+        filePath = this.canonicalTrackingPath(filePath);
+        const change = this.trackedChanges.get(filePath);
+        if (!change || change.reviewKind !== 'unknown' || this.disposed) { return undefined; }
+        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.unknownReviewRevision(change) };
+    }
+
+    public getUnknownReviewTokens(): UnknownReviewToken[] {
+        return [...this.trackedChanges.keys()].map(filePath => this.getUnknownReviewToken(filePath))
+            .filter((token): token is UnknownReviewToken => !!token);
+    }
+
+    private matchesUnknownReview(token: UnknownReviewToken | undefined): token is UnknownReviewToken {
+        if (!token || !this.isCurrentEpoch(token.epoch)) { return false; }
+        const change = this.trackedChanges.get(token.filePath);
+        return !!change && change.reviewKind === 'unknown' &&
+            token.reviewRevision === this.unknownReviewRevision(change);
     }
 
     private matchesOpaqueReview(token: OpaqueReviewToken | undefined): token is OpaqueReviewToken {
