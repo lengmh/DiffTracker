@@ -5264,7 +5264,20 @@ test('Issue #28 production pause producer and reactivation gate preserve one not
         const subscription=tracker.onDidTrackChanges(sandbox.reset);
         return {...sandbox,dispose:()=>subscription.dispose()};
     };
-    const repoRoot=vscode.workspace.workspaceFolders[0].uri.fsPath;
+    // Scope the actual Stop -> Start to a small workspace. Rebuilding the
+    // entire shared fixture here can make Windows regression runs needlessly slow.
+    const originalFolders=vscode.workspace.workspaceFolders;
+    const originalFolderResolver=vscode.workspace.getWorkspaceFolder;
+    const repoRoot=file('git-pause-small-workspace');
+    fs.mkdirSync(repoRoot,{recursive:true});
+    fs.writeFileSync(path.join(repoRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(repoRoot),name:'git-pause-small-workspace'};
+    vscode.workspace.workspaceFolders=[folder];
+    vscode.workspace.getWorkspaceFolder=uri=>{
+        const rel=path.relative(repoRoot,uri.fsPath);
+        return rel===''||(rel!=='..'&&!rel.startsWith(`..${path.sep}`)&&!path.isAbsolute(rel))?folder:undefined;
+    };
+    try {
     const base={repoRoot,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
     const feature={...base,headName:'feature',headCommit:'bbb'};
     tracker.setBaselineGitContexts([base]);
@@ -5304,6 +5317,10 @@ test('Issue #28 production pause producer and reactivation gate preserve one not
     pending.shift()(undefined);
     await next;
     restoredHost.dispose();
+    } finally {
+        vscode.workspace.workspaceFolders=originalFolders;
+        vscode.workspace.getWorkspaceFolder=originalFolderResolver;
+    }
 });
 
 registerPR12BoundedInvariants({
