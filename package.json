@@ -406,6 +406,12 @@
         "category": "Code Diff Tracker"
       },
       {
+        "command": "diffTracker.excludeCoverageSubtree",
+        "title": "Add This Subtree to Explicit Excludes",
+        "category": "Code Diff Tracker",
+        "icon": "$(eye-closed)"
+      },
+      {
         "command": "diffTracker.manageMonitoringScope",
         "title": "Manage Monitoring Scope",
         "category": "Code Diff Tracker"
@@ -480,6 +486,11 @@
     ],
     "menus": {
       "view/item/context": [
+        {
+          "command": "diffTracker.excludeCoverageSubtree",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtree",
+          "group": "inline"
+        },
         {
           "command": "diffTracker.openOriginalFile",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
