@@ -307,6 +307,9 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     const gitPromptInFlight = new Set<string>();
+    // The in-flight guard prevents overlap. Also remember delivered reasons so
+    // transient Git-context re-notifications do not reopen a dismissed modal.
+    const gitPromptShown = new Map<string, string>();
     const rebuildGitBaseline = async (
         repoRoot: string,
         contextSnapshot?: GitContextSnapshot,
@@ -333,6 +336,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!currentSnapshot || currentSnapshot.inProgress) { return false; }
         const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
         if (rebuilt) {
+            gitPromptShown.delete(repoRoot);
             refreshReview();
             void vscode.window.showInformationMessage('Code Diff Tracker: The repository review was archived and its baseline rebuilt.');
         } else {
@@ -355,8 +359,15 @@ export async function activate(context: vscode.ExtensionContext) {
         const reason = event.kind === 'changed'
             ? diffTracker.observeGitContext(event.context)
             : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
-        if (!reason || runningExtensionTests || gitPromptInFlight.has(repoRoot)) { return; }
+        if (!reason) {
+            if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot)) {
+                gitPromptShown.delete(repoRoot);
+            }
+            return;
+        }
+        if (runningExtensionTests || gitPromptInFlight.has(repoRoot) || gitPromptShown.get(repoRoot) === reason) { return; }
         gitPromptInFlight.add(repoRoot);
+        gitPromptShown.set(repoRoot, reason);
         try {
             const answer = await vscode.window.showWarningMessage(
                 `Code Diff Tracker: ${reason}`,
@@ -365,6 +376,9 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer === 'Archive and Rebuild') {
                 await rebuildGitBaseline(repoRoot, event.kind === 'changed' ? event.context : undefined, true);
+                if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot)) {
+                    gitPromptShown.delete(repoRoot);
+                }
             }
         } finally {
             gitPromptInFlight.delete(repoRoot);
