@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2
+
+- Add **Restore Archived Git Review** to the Command Palette. Restore the most recent Archive & Rebuild review, when compatible, after confirming replacement, with a separate pre-restore backup and current-file reconciliation. Active and stopped sessions are supported; workspace files and Git state are not modified.
+- Fail closed when repository identity, monitoring scope, ignore policy or observation coverage changes during archive restoration. Preserve unknown before-images and recovery evidence if restoration cannot finish safely.
+- Add a coverage-diagnostic shortcut to stage an exact directory exclusion in Workspace Settings. Preserve existing rules and unsaved scope-editor drafts; applying the scope remains explicit.
+- Add category-specific file and folder review actions, including guarded text Accept/Revert, opaque Acknowledge and confirmed current-disk baseline reset for Unknown entries. Protect newer reviews from stale asynchronous reads.
+- Clear stale imported-directory coverage warnings after explicit subtree exclusion, and suppress repeated delivered Git-pause dialogs across reactivation while retaining the paused safety state.
+
 ## 0.8.1
 
 - Add configurable WebView defaults for Split/Unified layout, Wrap, and Expand (all unchanged context lines) in VS Code settings and the sidebar Display group. Existing defaults remain Split, Wrap off, and Expand off.
