@@ -308,6 +308,42 @@
         "icon": "$(check)"
       },
       {
+        "command": "diffTracker.acceptFile",
+        "title": "Accept File Changes",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.acceptFolderText",
+        "title": "Accept Text Changes in Folder",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "diffTracker.revertFolderText",
+        "title": "Revert Text Changes in Folder",
+        "category": "Code Diff Tracker",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "diffTracker.acknowledgeFolderOpaque",
+        "title": "Acknowledge Read-only Changes in Folder",
+        "category": "Code Diff Tracker",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "diffTracker.resetUnknownBaseline",
+        "title": "Reset Unknown Baseline (Current Disk State)",
+        "category": "Code Diff Tracker",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "diffTracker.resetAllUnknownBaselines",
+        "title": "Reset All Unknown Baselines (Current Disk State)",
+        "category": "Code Diff Tracker",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "diffTracker.revertFile",
         "title": "Revert File",
         "category": "Code Diff Tracker",
@@ -492,14 +528,19 @@
           "group": "inline"
         },
         {
-          "command": "diffTracker.openOriginalFile",
+          "command": "diffTracker.acceptFile",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
           "group": "inline"
         },
         {
+          "command": "diffTracker.openOriginalFile",
+          "when": "view == diffTracker.changesView && viewItem == changedFile",
+          "group": "2_review@1"
+        },
+        {
           "command": "diffTracker.showSideBySideDiff",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
-          "group": "inline"
+          "group": "2_review@2"
         },
         {
           "command": "diffTracker.revertFile",
@@ -509,7 +550,7 @@
         {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == changedFile",
-          "group": "inline"
+          "group": "2_review@4"
         },
         {
           "command": "diffTracker.acknowledgeOpaqueChange",
@@ -519,12 +560,32 @@
         {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == opaqueFile",
+          "group": "2_review@1"
+        },
+        {
+          "command": "diffTracker.resetUnknownBaseline",
+          "when": "view == diffTracker.changesView && viewItem == unknownFile",
           "group": "inline"
         },
         {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == unknownFile",
-          "group": "inline"
+          "group": "2_review@1"
+        },
+        {
+          "command": "diffTracker.acceptFolderText",
+          "when": "view == diffTracker.changesView && viewItem == reviewFolder",
+          "group": "2_review@1"
+        },
+        {
+          "command": "diffTracker.revertFolderText",
+          "when": "view == diffTracker.changesView && viewItem == reviewFolder",
+          "group": "2_review@2"
+        },
+        {
+          "command": "diffTracker.acknowledgeFolderOpaque",
+          "when": "view == diffTracker.changesView && viewItem == reviewFolder",
+          "group": "2_review@3"
         },
         {
           "command": "diffTracker.nativeReview.openFile",
