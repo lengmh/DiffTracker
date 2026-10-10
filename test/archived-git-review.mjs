@@ -749,6 +749,82 @@ export function registerArchivedGitReview(h) {
         assert.deepEqual(tree(ctx.workspace), disk);
     }));
 
+    test('ARCHIVE-RESTORE rollback preserves same-session change-first create provenance', () => fixture(async ctx => {
+        const createUnknown = async name => {
+            const target = path.join(ctx.workspace, name);
+            fs.writeFileSync(target, 'new file observed as a change before its create notification\n');
+            await ctx.tracker.onExternalFileChanged(Uri.file(target));
+            await waitUntil(() => changeFor(ctx.tracker, target)?.reviewKind === 'unknown');
+            assert.equal(ctx.tracker.getOriginalContent(target), undefined);
+            assert.ok(ctx.tracker.postBaselineUnknownFiles.has(target),
+                'the current session must retain provenance that a later create notification can upgrade');
+            return target;
+        };
+        const control = await createUnknown('change-first-control.txt');
+        await ctx.tracker.onExternalFileCreated(Uri.file(control));
+        assert.equal(ctx.tracker.getOriginalContent(control), '', 'the equivalent pre-restore create event must upgrade normally');
+        assert.equal(changeFor(ctx.tracker, control)?.unavailableReason, undefined);
+
+        const affected = await createUnknown('change-first-before-rollback.txt');
+        assert.equal(await ctx.tracker.flushPendingPersistence(), true);
+        const before = readState(ctx.storage);
+        const disk = tree(ctx.workspace);
+        const preview = await ready(ctx.tracker);
+        const gate = pause(ctx.target, 'read');
+        const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+        try {
+            await Promise.race([gate.entered, operation.then(result => {
+                throw new Error(`Restore finished before rollback-provenance barrier: ${JSON.stringify(result)}`);
+            })]);
+            emitWatcher('change', Uri.file(ctx.target));
+        } finally { gate.release(); }
+        const result = await operation;
+        assert.equal(result.status, 'rolled-back', result.reason);
+        assert.equal(changeFor(ctx.tracker, affected)?.reviewKind, 'unknown');
+        assert.equal(ctx.tracker.getOriginalContent(affected), undefined);
+        assert.deepEqual(readState(ctx.storage), before);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.deepEqual(tree(ctx.workspace), disk);
+
+        await ctx.tracker.onExternalFileCreated(Uri.file(affected));
+        assert.equal(ctx.tracker.getOriginalContent(affected), '',
+            'a failed archive restore must not disable the same-session change-first-to-create upgrade');
+        assert.equal(ctx.tracker.baselineExistingFiles.has(affected), false);
+        assert.equal(ctx.tracker.unresolvedBaselineFiles.has(affected), false);
+        assert.equal(changeFor(ctx.tracker, affected)?.reviewKind, 'text');
+        assert.equal(changeFor(ctx.tracker, affected)?.unavailableReason, undefined);
+        assert.equal(changeFor(ctx.tracker, affected)?.currentContent,
+            'new file observed as a change before its create notification\n');
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }));
+
+    test('ARCHIVE-RESTORE successful replacement does not inherit current change-first create provenance', () => fixture(async ctx => {
+        const affected = path.join(ctx.workspace, 'current-session-only-create-provenance.txt');
+        fs.writeFileSync(affected, 'current-session creation evidence is not archived evidence\n');
+        await ctx.tracker.onExternalFileChanged(Uri.file(affected));
+        await waitUntil(() => changeFor(ctx.tracker, affected)?.reviewKind === 'unknown');
+        assert.ok(ctx.tracker.postBaselineUnknownFiles.has(affected));
+        assert.equal(await ctx.tracker.flushPendingPersistence(), true);
+        assert.equal(readState(ctx.storage, ARCHIVE).scanCoverage, undefined,
+            'this archive cannot prove that the later-discovered path was absent');
+        const disk = tree(ctx.workspace);
+
+        const result = await ctx.tracker.restoreArchivedGitReview((await ready(ctx.tracker)).token);
+        assert.equal(result.status, 'restored', result.reason);
+        assert.equal(ctx.tracker.postBaselineUnknownFiles.has(affected), false,
+            'successful replacement must discard the replaced session create provenance');
+        assert.equal(ctx.tracker.getOriginalContent(affected), undefined);
+        assert.equal(changeFor(ctx.tracker, affected)?.reviewKind, 'unknown');
+        await ctx.tracker.onExternalFileCreated(Uri.file(affected));
+        assert.equal(ctx.tracker.getOriginalContent(affected), undefined,
+            'current-session provenance must not turn an archived unknown before-image into known absence');
+        assert.equal(changeFor(ctx.tracker, affected)?.reviewKind, 'unknown');
+        assert.equal(ctx.tracker.getReviewToken(affected), undefined);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }, { configured: true }));
+
     test('ARCHIVE-RESTORE failure after primary publication rolls back the whole session', () => fixture(async ctx => {
         const preview = await ready(ctx.tracker);
         const before = readState(ctx.storage);

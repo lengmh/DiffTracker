@@ -9346,6 +9346,7 @@ export class DiffTracker {
             fileSnapshots: new Map(this.fileSnapshots), fileModes: new Map(this.fileModes),
             baselineExistingFiles: new Set(this.baselineExistingFiles),
             unresolvedBaselineFiles: new UnresolvedBaselineMap(this.unresolvedBaselineFiles),
+            postBaselineUnknownFiles: new Set(this.postBaselineUnknownFiles),
             opaqueBaselineFiles: new Map(this.opaqueBaselineFiles), trackedChanges: new Map(this.trackedChanges),
             lineChanges: new Map(this.lineChanges), inlineViews: new Map(this.inlineViews),
             revertHistory: [...this.revertHistory], baselineGitContexts: new Map(this.baselineGitContexts),
