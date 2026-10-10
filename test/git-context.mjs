@@ -132,6 +132,35 @@ for(const dispose of [false,true]) test(`delayed Git readiness releases fresh-st
     if(dispose)monitor.dispose();else{gitApi.state='initialized';apiState.fire('initialized');}
     assert.equal(await waiter,!dispose);monitor.dispose();
 });
+test('Issue #28 deactivate waits for queued Git prompt-state persistence',async()=>{
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const fn=source.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='deactivate');
+    assert.ok(fn,'production deactivate must exist');
+    const writes=[];
+    let finish;
+    const slowWrite=new Promise(resolve=>{finish=resolve;});
+    const sandbox={
+        pendingGitPromptWrites:slowWrite,
+        gitContextMonitor:undefined,diffTracker:undefined,
+        decorationManager:undefined,statusBarManager:undefined,
+        originalContentProvider:undefined,inlineContentProvider:undefined,
+        codeLensProvider:undefined,settingsTreeDataProvider:undefined,diffTreeDataProvider:undefined,
+        console:{warn:(...args)=>writes.push(args)}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(ts.transpileModule(`${fn.getText(source)};globalThis.stop=deactivate;`,{
+        compilerOptions:{target:ts.ScriptTarget.ES2022}
+    }).outputText,sandbox);
+    let complete=false;
+    const closing=sandbox.stop().then(()=>{complete=true;});
+    await Promise.resolve();
+    assert.equal(complete,false,'host deactivation must not finish while receipt clear is pending');
+    finish();
+    await closing;
+    assert.equal(complete,true);
+    assert.equal(writes.length,0);
+});
+
 test('production start blocks invalid monitoring scope configuration',async()=>{
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
     const declarations=[];const visit=node=>{if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingFlow')declarations.push(`const ${node.getText(source)};`);ts.forEachChild(node,visit);};visit(source);
