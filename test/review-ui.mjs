@@ -272,6 +272,14 @@ await test('subtree coverage diagnostics are visible and actionable without beco
     assert.equal(diagnostic.filePath, undefined, 'subtree diagnostics are not file review resources');
     assert.equal(diagnostic.children.length, 1);
     assert.equal(diagnostic.children[0].command.command, 'diffTracker.manageMonitoringScope');
+    assert.equal(diagnostic.children[0].contextValue, 'coverageDiagnosticSubtree');
+    assert.equal(diagnostic.children[0].coveragePath, '/workspace/imported-tree');
+    const manifest = JSON.parse(fs.readFileSync('package.json','utf8'));
+    const menu = manifest.contributes.menus['view/item/context'].find(entry =>
+        entry.command === 'diffTracker.excludeCoverageSubtree');
+    assert.match(menu.when,/coverageDiagnosticSubtree/);
+    assert.equal(menu.group,'inline','inline contribution also appears in right-click context menu');
+
     assert.match(diagnostic.children[0].tooltip, /Imported directory watcher failed/);
     assert.equal(roots.some(item => item.label === 'Pending Review'), false,
         'coverage diagnostics must not fabricate a file review summary');
