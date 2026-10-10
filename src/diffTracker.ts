@@ -9656,6 +9656,102 @@ export class DiffTracker {
         return this.actionResult(filePath, 'success');
     }
 
+    private stableUnknownResetIdentity(state: CurrentFileState): string | undefined {
+        if (state.kind === 'missing') { return 'missing'; }
+        if (state.kind === 'text') {
+            return `text:${this.revision(state.content, true)}:${state.mode ?? 'unknown-mode'}`;
+        }
+        if (this.isStableUnsupportedState(state) && state.fingerprint) {
+            return `opaque:${state.fingerprint}:${state.size}:${state.reason}`;
+        }
+        return undefined;
+    }
+
+    /**
+     * Explicitly abandon one unknown before-image and establish a verified
+     * current-state baseline. This never writes or deletes workspace content.
+     */
+    public resetUnknownBaseline(
+        filePath: string, token = this.getUnknownReviewToken(filePath)
+    ): Promise<ActionResult> {
+        filePath = this.canonicalTrackingPath(filePath);
+        const epoch = this.sessionEpoch;
+        return this.queueRecoveryAction(async () => {
+            const previous = this.fileActionQueues.get(filePath) ?? Promise.resolve();
+            const task = previous.catch(() => undefined).then(() =>
+                this.resetUnknownBaselineReviewed(filePath, token, epoch));
+            this.fileActionQueues.set(filePath, task);
+            void task.finally(() => {
+                if (this.fileActionQueues.get(filePath) === task) { this.fileActionQueues.delete(filePath); }
+            }).catch(() => undefined);
+            return task;
+        });
+    }
+
+    private async resetUnknownBaselineReviewed(
+        filePath: string, token: UnknownReviewToken | undefined, epoch: number
+    ): Promise<ActionResult> {
+        if (!token || token.filePath !== filePath || !this.matchesUnknownReview(token) || !this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'conflict', 'Unknown review changed; refresh before resetting its baseline');
+        }
+        const invalid = this.validateActionTarget(filePath);
+        if (invalid) { return this.actionResult(filePath, 'conflict', invalid); }
+        if (this.coverageGaps.get(filePath)?.file) {
+            return this.actionResult(filePath, 'conflict', 'File coverage is incomplete; cannot establish a verified current baseline');
+        }
+        if (this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Save or discard unsaved editor changes before resetting this baseline');
+        }
+        if (this.isPathIgnored(vscode.Uri.file(filePath))) {
+            return this.actionResult(filePath, 'conflict', 'The file is outside the effective monitoring scope');
+        }
+        const first = await this.readCurrentFileState(filePath);
+        const beforeIdentity = this.stableUnknownResetIdentity(first);
+        if (!beforeIdentity) {
+            return this.actionResult(filePath, 'needsAttention', 'The current file state is unreadable or unverified; Unknown was preserved');
+        }
+        if (!this.matchesUnknownReview(token) || this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Unknown review or editor changed during the reset');
+        }
+        const second = await this.readCurrentFileState(filePath);
+        if (this.stableUnknownResetIdentity(second) !== beforeIdentity || !this.matchesUnknownReview(token)) {
+            return this.actionResult(filePath, 'conflict', 'The current file state changed while confirming the new baseline');
+        }
+        const finalError = this.validateActionTarget(filePath);
+        if (finalError || this.hasDirtyDocument(filePath)) {
+            return this.actionResult(filePath, 'conflict', finalError ?? 'An editor now contains unsaved changes');
+        }
+
+        const transaction = this.beginAcknowledgeTransaction(filePath, token, 'unknown');
+        if (!this.applyAcknowledgedStateAsBaseline(filePath, second)) {
+            this.endBaselineTransaction(transaction, false);
+            return this.actionResult(filePath, 'needsAttention', 'No reliable current file state was available');
+        }
+        if (!await this.commitAcknowledgeTransaction(filePath, epoch, transaction)) {
+            return this.actionResult(filePath, 'failed', 'Unknown baseline reset was not saved; the previous unknown state remains pending');
+        }
+        if (!this.isCurrentEpoch(epoch)) {
+            return this.actionResult(filePath, 'success', 'New baseline was committed before the session changed');
+        }
+        // A successful replacement is not an acknowledgement of the old state.
+        // Reread after publication so intervening edits remain pending.
+        this.emitTrackChangesEvent({ changedFiles: [filePath], baselineChanged: true });
+        await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+        return this.actionResult(filePath, 'success');
+    }
+
+    public async resetAllUnknownBaselines(
+        tokens: UnknownReviewToken[] = this.getUnknownReviewTokens()
+    ): Promise<BatchActionResult> {
+        const results: ActionResult[] = [];
+        for (const token of [...tokens]) {
+            try { results.push(await this.resetUnknownBaseline(token.filePath, token)); }
+            catch { results.push(this.actionResult(token.filePath, 'failed', 'Reset failed unexpectedly; Unknown was preserved')); }
+        }
+        const succeeded = results.filter(result => result.status === 'success').length;
+        return { results, succeeded, failed: results.length - succeeded };
+    }
+
     private mixedBatchResult(
         results: ActionResult[],
         acceptedPaths: Set<string>,
