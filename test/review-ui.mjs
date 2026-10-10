@@ -11,6 +11,7 @@ const require = createRequire(import.meta.url);
 const filePath = '/workspace/研究 folder/empty.m';
 const reviewToken={filePath,epoch:1,baselineRevision:'base',currentRevision:'current'};
 const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
+const unknownReviewToken={filePath,epoch:1,reviewRevision:'unknown-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
@@ -90,7 +91,12 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         },getUnknownReviewPaths:()=> {
             const change = state.changes[0];
             return change?.reviewKind === 'unknown' ? [filePath] : [];
-        },getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
+        },getUnknownReviewToken:(target)=> {
+            const change = state.changes.find(x=>x.filePath===target);
+            return change?.reviewKind==='unknown' ? {...unknownReviewToken,filePath:target} : undefined;
+        },getUnknownReviewTokens:()=> state.changes.filter(x=>x.reviewKind==='unknown')
+            .map(x=>({...unknownReviewToken,filePath:x.filePath})),
+        getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
         getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
