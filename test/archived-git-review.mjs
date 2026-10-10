@@ -18,7 +18,8 @@ export function registerArchivedGitReview(h) {
         pause, emitWatcher, emitWorkspaceFilesCreated, fireConfigurationChanged,
         waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
 
-    async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false, ignoredBaseline = false } = {}) {
+    async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false,
+        ignoredBaseline = false, ignorePolicyFile = '.gitignore' } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -38,12 +39,13 @@ export function registerArchivedGitReview(h) {
         const opaque = path.join(workspace, 'image.bin');
         const uncertain = path.join(workspace, 'unknown.txt');
         const deleted = path.join(workspace, 'deleted-after-archive.txt');
-        const ignoreFile = path.join(workspace, '.gitignore');
+        const ignoreFile = path.join(workspace, ignorePolicyFile);
         const ignored = path.join(workspace, 'policy-hidden.txt');
         fs.writeFileSync(target, 'main before-image\n');
         fs.writeFileSync(opaque, Buffer.from([0, 1, 2]));
         if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
         if (ignoredBaseline) {
+            fs.mkdirSync(path.dirname(ignoreFile), { recursive: true });
             fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n');
             fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
         }
@@ -380,49 +382,51 @@ export function registerArchivedGitReview(h) {
         }, { stoppedArchive: true, configured }));
     }
 
-    for (const stoppedArchive of [false, true]) {
-        test(`ARCHIVE-RESTORE final ignore-policy broadening fails closed (${stoppedArchive ? 'stopped' : 'active'} archive)`, () => fixture(async ctx => {
-            const archived = readState(ctx.storage, ARCHIVE);
-            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ctx.ignored)), true);
-            assert.equal(archived.fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
-            assert.equal(archived.unresolvedBaselineFiles.some(([filePath]) => filePath === ctx.ignored), false);
-            const before = readState(ctx.storage);
-            const preview = await ready(ctx.tracker);
-            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
-            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
-            let disk;
-            try {
-                await Promise.race([gate.entered, operation.then(result => {
-                    throw new Error(`Restore finished before ignore-policy barrier: ${JSON.stringify(result)}`);
-                })]);
-                assert.equal(changeFor(ctx.tracker, ctx.ignored), undefined,
-                    'the file must still be excluded before the commit-boundary policy change');
-                fs.writeFileSync(ctx.ignoreFile, '');
-                emitWatcher('change', Uri.file(ctx.ignoreFile));
-                disk = tree(ctx.workspace);
-            } finally { gate.release(); }
-            const result = await operation;
-            assert.equal(result.status, 'failed', result.reason);
-            assert.equal(ctx.tracker.isRecoveryBlocked(), true);
-            assert.equal(ctx.tracker.getIsRecording(), false);
-            assert.equal(ctx.tracker.getOriginalContent(ctx.ignored), undefined,
-                'being newly included does not prove absence from the archived baseline');
-            assert.equal(ctx.tracker.getReviewToken(ctx.ignored), undefined);
-            assert.equal(readState(ctx.storage).fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
-            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
-            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
-                'policy changes during finalization must leave durable incomplete-reconciliation evidence');
-            assert.equal(watcherInstances.some(watcher => watcher.active), false);
-            assert.deepEqual(readState(ctx.storage, BACKUP), before);
-            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
-            assert.deepEqual(tree(ctx.workspace), disk);
-            assert.equal(await ctx.restart(), 'blocked');
-            assert.equal(ctx.currentTracker().getIsRecording(), false);
-            assert.equal(watcherInstances.some(watcher => watcher.active), false);
-            assert.deepEqual(readState(ctx.storage, BACKUP), before);
-            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
-            assert.deepEqual(tree(ctx.workspace), disk);
-        }, { stoppedArchive, ignoredBaseline: true, configured: true }));
+    for (const ignorePolicyFile of ['.gitignore', '.git/info/exclude']) {
+        for (const stoppedArchive of [false, true]) {
+            test(`ARCHIVE-RESTORE final ignore-policy broadening from ${ignorePolicyFile} fails closed (${stoppedArchive ? 'stopped' : 'active'} archive)`, () => fixture(async ctx => {
+                const archived = readState(ctx.storage, ARCHIVE);
+                assert.equal(ctx.tracker.isPathIgnored(Uri.file(ctx.ignored)), true);
+                assert.equal(archived.fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
+                assert.equal(archived.unresolvedBaselineFiles.some(([filePath]) => filePath === ctx.ignored), false);
+                const before = readState(ctx.storage);
+                const preview = await ready(ctx.tracker);
+                const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+                const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+                let disk;
+                try {
+                    await Promise.race([gate.entered, operation.then(result => {
+                        throw new Error(`Restore finished before ignore-policy barrier: ${JSON.stringify(result)}`);
+                    })]);
+                    assert.equal(changeFor(ctx.tracker, ctx.ignored), undefined,
+                        'the file must still be excluded before the commit-boundary policy change');
+                    fs.writeFileSync(ctx.ignoreFile, '');
+                    emitWatcher('change', Uri.file(ctx.ignoreFile));
+                    disk = tree(ctx.workspace);
+                } finally { gate.release(); }
+                const result = await operation;
+                assert.equal(result.status, 'failed', result.reason);
+                assert.equal(ctx.tracker.isRecoveryBlocked(), true);
+                assert.equal(ctx.tracker.getIsRecording(), false);
+                assert.equal(ctx.tracker.getOriginalContent(ctx.ignored), undefined,
+                    'being newly included does not prove absence from the archived baseline');
+                assert.equal(ctx.tracker.getReviewToken(ctx.ignored), undefined);
+                assert.equal(readState(ctx.storage).fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
+                assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+                assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
+                    'policy changes during finalization must leave durable incomplete-reconciliation evidence');
+                assert.equal(watcherInstances.some(watcher => watcher.active), false);
+                assert.deepEqual(readState(ctx.storage, BACKUP), before);
+                assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+                assert.deepEqual(tree(ctx.workspace), disk);
+                assert.equal(await ctx.restart(), 'blocked');
+                assert.equal(ctx.currentTracker().getIsRecording(), false);
+                assert.equal(watcherInstances.some(watcher => watcher.active), false);
+                assert.deepEqual(readState(ctx.storage, BACKUP), before);
+                assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+                assert.deepEqual(tree(ctx.workspace), disk);
+            }, { stoppedArchive, ignoredBaseline: true, configured: true, ignorePolicyFile }));
+        }
     }
 
     for (const signal of ['search.exclude', 'files.watcherExclude', 'pending monitoring scope']) {

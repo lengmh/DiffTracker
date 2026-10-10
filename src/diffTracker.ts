@@ -1887,6 +1887,13 @@ export class DiffTracker {
     private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+        // Both matcher implementations also read workspace-root repository
+        // excludes. Treat their events as policy invalidation during restore,
+        // even though .git metadata is not a tracked review resource.
+        if (this.archiveRestoreTask && this.getSupportedWorkspaceFolders().some(folder =>
+            this.canonicalTrackingPath(path.join(folder.uri.fsPath, '.git', 'info', 'exclude')) === uri.fsPath)) {
+            this.archiveRestorePolicyChanged = true;
+        }
         if (path.basename(uri.fsPath) === '.gitignore') {
             if (this.archiveRestoreTask) { this.archiveRestorePolicyChanged = true; }
             if (this.ordinaryIgnorePolicyAffectsCoverage()) {
