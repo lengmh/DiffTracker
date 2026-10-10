@@ -152,7 +152,7 @@ test('Issue #28 deactivate waits for queued Git prompt-state persistence',async(
     // Keep the real implementation body, but execute its exported declaration
     // as a script (the VM sandbox has no CommonJS/ESM module loader).
     vm.runInContext(ts.transpileModule(
-        `${fn.getText(source).replace(/^export\\s+/, '')};globalThis.stop=deactivate;`,{
+        `${fn.getText(source).replace(/^export\s+/, '')};globalThis.stop=deactivate;`,{
             compilerOptions:{target:ts.ScriptTarget.ES2022}
         }).outputText,sandbox);
     let complete=false;
