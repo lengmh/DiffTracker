@@ -5384,6 +5384,15 @@ test('ISSUE-26 Unknown Reset refuses stale, dirty and unreadable file states',as
     assert.ok(tracker.unresolvedBaselineFiles.has(dirty));
     doc.isDirty=false;
 
+    const covered=file('unknown-reset-covered.txt');
+    fs.writeFileSync(covered,'current');
+    tracker.recordUnresolvedBaseline(covered,'Before unknown');
+    tracker.setSubtreeCoverageGap(path.dirname(covered),'directory-runtime-coverage-gap','Watcher failed');
+    assert.equal((await tracker.resetUnknownBaseline(covered,tracker.getUnknownReviewToken(covered))).status,
+        'conflict','unknown reset must not promise future monitoring under a known coverage gap');
+    assert.ok(tracker.unresolvedBaselineFiles.has(covered));
+    tracker.clearCoverageGap(path.dirname(covered),'subtree');
+
     const inaccessible=file('unknown-reset-inaccessible.txt');
     fs.writeFileSync(inaccessible,'not readable now');
     tracker.recordUnresolvedBaseline(inaccessible,'Before unknown');
