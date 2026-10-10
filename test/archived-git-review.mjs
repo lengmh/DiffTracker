@@ -15,9 +15,9 @@ const PRIMARY = 'session-state.json';
 
 export function registerArchivedGitReview(h) {
     const { test, Uri, DiffTracker, vscode, file, document, faults, counters,
-        pause, emitWatcher, waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
+        pause, emitWatcher, emitWorkspaceFilesCreated, waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
 
-    async function fixture(run, { compatible = true, unknown = false, configured = false } = {}) {
+    async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -36,9 +36,11 @@ export function registerArchivedGitReview(h) {
         const target = path.join(workspace, 'review.txt');
         const opaque = path.join(workspace, 'image.bin');
         const uncertain = path.join(workspace, 'unknown.txt');
+        const deleted = path.join(workspace, 'deleted-after-archive.txt');
         fs.writeFileSync(target, 'main before-image\n');
         fs.writeFileSync(opaque, Buffer.from([0, 1, 2]));
-        setListedFiles([Uri.file(target), Uri.file(opaque)]);
+        if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
+        setListedFiles([Uri.file(target), Uri.file(opaque), ...(stoppedArchive ? [Uri.file(deleted)] : [])]);
         let tracker = new DiffTracker(Uri.file(storage));
         setTracker(tracker);
         tracker.isRecording = true;
@@ -62,6 +64,7 @@ export function registerArchivedGitReview(h) {
                 tracker.unresolvedBaselineFiles.set(uncertain, 'Before-image could not be verified');
                 tracker.markFileUnavailable(uncertain, 'Before-image could not be verified');
             }
+            if (stoppedArchive) { tracker.stopRecording(); }
             tracker.observeGitContext(feature);
             assert.equal(await tracker.rebuildRepositoryBaseline(workspace, feature), true,
                 tracker.getPersistenceIssue());
@@ -80,7 +83,7 @@ export function registerArchivedGitReview(h) {
                 tracker.reconcileRestoredGitContexts([compatible ? main : feature]);
                 return outcome;
             };
-            await run({ tracker, currentTracker, workspace, storage, target, opaque, uncertain,
+            await run({ tracker, currentTracker, workspace, storage, target, opaque, uncertain, deleted,
                 main, feature, archive, restart });
         } finally {
             faults.clear();
@@ -152,6 +155,438 @@ export function registerArchivedGitReview(h) {
         assert.deepEqual(storageSnapshot(ctx.storage), before);
         assert.deepEqual(tree(ctx.workspace), disk);
     }, { unknown: true }));
+
+    for (const configured of [false, true]) {
+        test(`ARCHIVE-RESTORE recording-state reconciles a stopped archive (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
+            const archived = readState(ctx.storage, ARCHIVE);
+            assert.equal(archived.isRecording, false, 'Archive and Rebuild must preserve the stopped recording state');
+            const added = path.join(ctx.workspace, 'added-after-stopped-archive.txt');
+            fs.unlinkSync(ctx.deleted);
+            fs.writeFileSync(added, 'new file absent from the archived baseline\n');
+            setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(ctx.uncertain), Uri.file(added)]);
+            assert.equal(archived.fileSnapshots.some(([filePath]) => filePath === added), false);
+            assert.equal(archived.baselineExistingFiles.includes(added), false);
+            if (configured) { assert.equal(archived.scanCoverage, undefined); }
+            else { assert.equal(typeof archived.scanCoverage, 'string'); }
+            const assertAddedReview = tracker => {
+                assert.ok(changeFor(tracker, added), 'a stopped archive must not silently omit a later addition');
+                if (configured) {
+                    assert.equal(tracker.getOriginalContent(added), undefined,
+                        'missing scan provenance must not be invented during one-off discovery');
+                    assert.ok(changeFor(tracker, added)?.unavailableReason);
+                    assert.equal(tracker.getReviewToken(added), undefined);
+                } else {
+                    assert.equal(tracker.getOriginalContent(added), '');
+                    assert.equal(changeFor(tracker, added)?.currentContent, 'new file absent from the archived baseline\n');
+                }
+            };
+
+            const before = readState(ctx.storage);
+            const disk = tree(ctx.workspace);
+            const recordingEvents = [];
+            ctx.tracker.onDidChangeRecordingState(value => recordingEvents.push(value));
+            const result = await ctx.tracker.restoreArchivedGitReview((await ready(ctx.tracker)).token);
+            assert.equal(result.status, 'restored', result.reason);
+            assert.equal(ctx.tracker.getIsRecording(), false, 'restoring a stopped archive must not start recording');
+            assert.equal(recordingEvents.includes(true), false, 'one-off reconciliation must not emit a recording-start event');
+            assert.equal(watcherInstances.some(watcher => watcher.active), false, 'temporary restore watchers must be released');
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main before-image\n');
+            assert.equal(changeFor(ctx.tracker, ctx.target)?.currentContent, 'newer current review\n');
+            assert.equal(ctx.tracker.getOriginalContent(ctx.deleted), 'archived deleted-file before-image\n');
+            assert.equal(changeFor(ctx.tracker, ctx.deleted)?.isDeleted, true);
+            assertAddedReview(ctx.tracker);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.uncertain), undefined);
+            assert.ok(changeFor(ctx.tracker, ctx.uncertain)?.unavailableReason);
+            assert.equal(ctx.tracker.getReviewToken(ctx.uncertain), undefined);
+            assert.equal(readState(ctx.storage).isRecording, false);
+            if (configured) {
+                assert.ok(readState(ctx.storage).unresolvedBaselineFiles.some(([filePath]) => filePath === added));
+            } else {
+                assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === added)?.[1], '');
+            }
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(fs.readFileSync(added, 'utf8'), 'new file absent from the archived baseline\n');
+            assert.equal(await ctx.restart(), 'restored');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(ctx.currentTracker().getOriginalContent(ctx.target), 'main before-image\n');
+            assert.equal(changeFor(ctx.currentTracker(), ctx.deleted)?.isDeleted, true);
+            assertAddedReview(ctx.currentTracker());
+            assert.equal(ctx.currentTracker().getOriginalContent(ctx.uncertain), undefined);
+            assert.ok(changeFor(ctx.currentTracker(), ctx.uncertain)?.unavailableReason);
+        }, { stoppedArchive: true, configured, unknown: true }));
+    }
+
+    test('ARCHIVE-RESTORE recording-state temporary watcher failure rolls back a stopped archive', () => fixture(async ctx => {
+        const preview = await ready(ctx.tracker);
+        const before = readState(ctx.storage);
+        const disk = tree(ctx.workspace);
+        const originalCreateWatcher = vscode.workspace.createFileSystemWatcher;
+        let attempted = false;
+        vscode.workspace.createFileSystemWatcher = () => {
+            attempted = true;
+            assert.equal(ctx.tracker.getIsRecording(), false, 'temporary coverage must not turn recording on');
+            throw new Error('injected temporary archive watcher failure');
+        };
+        let result;
+        try { result = await ctx.tracker.restoreArchivedGitReview(preview.token); }
+        finally { vscode.workspace.createFileSystemWatcher = originalCreateWatcher; }
+        assert.equal(attempted, true, 'a stopped archive restore must establish transaction observation');
+        assert.equal(result.status, 'rolled-back', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main pending review\n');
+        assert.deepEqual(readState(ctx.storage), before);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }, { stoppedArchive: true }));
+
+    test('ARCHIVE-RESTORE recording-state activity during stopped archive reconciliation rolls back', () => fixture(async ctx => {
+        const preview = await ready(ctx.tracker);
+        const before = readState(ctx.storage);
+        const recordingEvents = [];
+        ctx.tracker.onDidChangeRecordingState(value => recordingEvents.push(value));
+        const gate = pause(ctx.target, 'read');
+        const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+        let disk;
+        try {
+            await Promise.race([gate.entered, operation.then(result => {
+                throw new Error(`Stopped archive restore finished before reconciliation barrier: ${JSON.stringify(result)}`);
+            })]);
+            assert.equal(ctx.tracker.getIsRecording(), false, 'recording must remain stopped during the transaction');
+            assert.equal(watcherInstances.some(watcher => watcher.active), true,
+                'temporary coverage must observe activity during stopped archive reconciliation');
+            fs.writeFileSync(ctx.target, 'new work during stopped archive reconciliation\n');
+            emitWatcher('change', Uri.file(ctx.target));
+            disk = tree(ctx.workspace);
+        } finally { gate.release(); }
+        const result = await operation;
+        assert.equal(result.status, 'rolled-back', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.equal(recordingEvents.includes(true), false);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main pending review\n');
+        assert.equal(changeFor(ctx.tracker, ctx.target)?.currentContent, 'new work during stopped archive reconciliation\n');
+        assert.deepEqual(readState(ctx.storage), before);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }, { stoppedArchive: true }));
+
+    for (const kind of ['create', 'change', 'delete']) {
+        test(`ARCHIVE-RESTORE recording-state stopped archive retains ${kind} at final intent deletion`, () => fixture(async ctx => {
+            const preview = await ready(ctx.tracker);
+            const before = readState(ctx.storage);
+            const eventPath = kind === 'create' ? path.join(ctx.workspace, 'created-at-stopped-commit.txt')
+                : kind === 'delete' ? ctx.deleted : ctx.target;
+            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+            let disk;
+            try {
+                await Promise.race([gate.entered, operation.then(result => {
+                    throw new Error(`Stopped archive restore finished before final deletion barrier: ${JSON.stringify(result)}`);
+                })]);
+                assert.equal(ctx.tracker.getIsRecording(), false);
+                assert.equal(watcherInstances.some(watcher => watcher.active), true);
+                if (kind === 'delete') { fs.unlinkSync(eventPath); }
+                else { fs.writeFileSync(eventPath, `${kind} during stopped archive commit\n`); }
+                if (kind === 'create') {
+                    setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(ctx.deleted), Uri.file(eventPath)]);
+                }
+                emitWatcher(kind, Uri.file(eventPath));
+                disk = tree(ctx.workspace);
+            } finally { gate.release(); }
+            const result = await operation;
+            assert.equal(result.status, 'restored', result.reason);
+            const assertReconciled = tracker => {
+                assert.equal(tracker.getIsRecording(), false);
+                assert.equal(tracker.getOriginalContent(ctx.target), 'main before-image\n');
+                if (kind === 'create') {
+                    assert.equal(tracker.getOriginalContent(eventPath), '');
+                    assert.equal(changeFor(tracker, eventPath)?.currentContent, 'create during stopped archive commit\n');
+                } else if (kind === 'change') {
+                    assert.equal(changeFor(tracker, eventPath)?.currentContent, 'change during stopped archive commit\n');
+                } else {
+                    assert.equal(tracker.getOriginalContent(eventPath), 'archived deleted-file before-image\n');
+                    assert.equal(changeFor(tracker, eventPath)?.isDeleted, true);
+                }
+            };
+            assertReconciled(ctx.tracker);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(readState(ctx.storage).isRecording, false);
+            if (kind === 'create') {
+                assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === eventPath)?.[1], '',
+                    'a final-boundary addition must be durable before reporting completion');
+            }
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), 'restored');
+            assertReconciled(ctx.currentTracker());
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        }, { stoppedArchive: true }));
+    }
+
+    for (const configured of [false, true]) {
+        test(`ARCHIVE-RESTORE recording-state stopped directory create at final intent deletion preserves children (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
+            const preview = await ready(ctx.tracker);
+            const imported = path.join(ctx.workspace, 'directory-created-at-stopped-commit');
+            const child = path.join(imported, 'child.txt');
+            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+            let disk;
+            try {
+                await Promise.race([gate.entered, operation.then(result => {
+                    throw new Error(`Stopped archive restore finished before directory barrier: ${JSON.stringify(result)}`);
+                })]);
+                assert.equal(ctx.tracker.getIsRecording(), false);
+                fs.mkdirSync(imported);
+                fs.writeFileSync(child, 'child created during stopped archive commit\n');
+                setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(ctx.deleted), Uri.file(child)]);
+                emitWatcher('create', Uri.file(imported));
+                disk = tree(ctx.workspace);
+            } finally { gate.release(); }
+            const result = await operation;
+            assert.equal(result.status, 'restored', result.reason);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            assert.equal(ctx.tracker.getOriginalContent(child), '', 'the directory event proves child creation after the archived baseline');
+            assert.equal(changeFor(ctx.tracker, child)?.currentContent, 'child created during stopped archive commit\n');
+            assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === child)?.[1], '');
+            assert.equal(readState(ctx.storage).isRecording, false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), 'restored');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(ctx.currentTracker().getOriginalContent(child), '');
+            assert.equal(changeFor(ctx.currentTracker(), child)?.currentContent, 'child created during stopped archive commit\n');
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        }, { stoppedArchive: true, configured }));
+    }
+
+    for (const failure of ['replay budget exhaustion', 'replay persistence failure', 'replay failure-marker write failure']) {
+        test(`ARCHIVE-RESTORE recording-state stopped ${failure} after commit blocks with durable evidence`, () => fixture(async ctx => {
+            const preview = await ready(ctx.tracker);
+            const before = readState(ctx.storage);
+            const additions = [path.join(ctx.workspace, 'first-late-stopped-addition.txt'),
+                path.join(ctx.workspace, 'second-late-stopped-addition.txt')];
+            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+            let disk;
+            try {
+                await Promise.race([gate.entered, operation.then(result => {
+                    throw new Error(`Stopped archive restore finished before replay-failure barrier: ${JSON.stringify(result)}`);
+                })]);
+                assert.equal(ctx.tracker.getIsRecording(), false);
+                if (failure === 'replay budget exhaustion') { ctx.tracker.maxScopePreflightEntries = 1; }
+                else {
+                    const failedFile = failure === 'replay failure-marker write failure'
+                        ? 'session-state.unsaved' : 'session-state.tmp.json';
+                    faults.set(path.join(ctx.storage, failedFile), {
+                        write: Object.assign(new Error('injected stopped post-commit persistence failure'), { code: 'EACCES' })
+                    });
+                }
+                for (const added of additions) {
+                    fs.writeFileSync(added, 'late work must survive failed stopped replay\n');
+                    emitWatcher('create', Uri.file(added));
+                }
+                disk = tree(ctx.workspace);
+            } finally { gate.release(); }
+            const result = await operation;
+            faults.clear();
+            assert.equal(result.status, 'failed', result.reason);
+            assert.equal(ctx.tracker.isRecoveryBlocked(), true);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main before-image\n',
+                'failure after the commit point must not roll back behind the committed archived baseline');
+            assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === ctx.target)?.[1], 'main before-image\n');
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
+                'a durable marker must prevent restart from silently dropping unpersisted late events');
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), 'blocked');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.deepEqual(tree(ctx.workspace), disk);
+        }, { stoppedArchive: true }));
+    }
+
+    test('ARCHIVE-RESTORE recording-state saved editor event without filesystem callback invalidates stopped reconciliation', () => fixture(async ctx => {
+        const doc = document(ctx.target);
+        const preview = await ready(ctx.tracker);
+        const before = readState(ctx.storage);
+        const gate = pause(ctx.target, 'read');
+        const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+        let disk;
+        try {
+            await Promise.race([gate.entered, operation.then(result => {
+                throw new Error(`Stopped archive restore finished before editor barrier: ${JSON.stringify(result)}`);
+            })]);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            doc.text = 'editor edit saved during stopped reconciliation\n';
+            doc.isDirty = true;
+            doc.version++;
+            ctx.tracker.onDocumentChanged({ document: doc, contentChanges: [{ text: doc.text }] });
+            ctx.tracker.onWillSaveDocument({ document: doc });
+            assert.equal(await doc.save(), true);
+            ctx.tracker.onDidSaveDocument(doc);
+            assert.equal(doc.isDirty, false, 'clean editor state alone must not hide intervening activity');
+            disk = tree(ctx.workspace);
+        } finally { gate.release(); }
+        const result = await operation;
+        assert.equal(result.status, 'rolled-back', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main pending review\n');
+        assert.equal(changeFor(ctx.tracker, ctx.target)?.currentContent, doc.text);
+        assert.deepEqual(readState(ctx.storage), before);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }, { stoppedArchive: true }));
+
+    test('ARCHIVE-RESTORE recording-state configured Rules discovers an on-disk addition omitted by host search', () => fixture(async ctx => {
+        const added = path.join(ctx.workspace, 'new-file-not-yet-indexed.txt');
+        fs.writeFileSync(added, 'real file omitted by findFiles\n');
+        // Deliberately leave the host search index unchanged. An explicit restore
+        // must reconcile current disk evidence even if host indexing lags.
+        const disk = tree(ctx.workspace);
+        const result = await ctx.tracker.restoreArchivedGitReview((await ready(ctx.tracker)).token);
+        assert.equal(result.status, 'restored', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.ok(changeFor(ctx.tracker, added), 'a real in-scope file must not disappear behind host search exclusions or indexing lag');
+        assert.equal(ctx.tracker.getOriginalContent(added), undefined, 'discovery must preserve the archive missing scan provenance');
+        assert.ok(changeFor(ctx.tracker, added)?.unavailableReason);
+        assert.equal(ctx.tracker.getReviewToken(added), undefined);
+        assert.ok(readState(ctx.storage).unresolvedBaselineFiles.some(([filePath]) => filePath === added));
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.deepEqual(tree(ctx.workspace), disk);
+        assert.equal(await ctx.restart(), 'restored');
+        assert.equal(ctx.currentTracker().getIsRecording(), false);
+        assert.ok(changeFor(ctx.currentTracker(), added)?.unavailableReason);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+    }, { stoppedArchive: true, configured: true }));
+
+    test('ARCHIVE-RESTORE recording-state workspace create without filesystem callback invalidates stopped reconciliation', () => fixture(async ctx => {
+        const preview = await ready(ctx.tracker);
+        const before = readState(ctx.storage);
+        const added = path.join(ctx.workspace, 'workspace-created-during-stopped-restore.txt');
+        const gate = pause(ctx.target, 'read');
+        const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+        let disk;
+        try {
+            await Promise.race([gate.entered, operation.then(result => {
+                throw new Error(`Stopped archive restore finished before workspace-create barrier: ${JSON.stringify(result)}`);
+            })]);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            fs.writeFileSync(added, 'workspace create without a filesystem event\n');
+            emitWorkspaceFilesCreated({ files: [Uri.file(added)] });
+            disk = tree(ctx.workspace);
+        } finally { gate.release(); }
+        const result = await operation;
+        assert.equal(result.status, 'rolled-back', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main pending review\n');
+        assert.deepEqual(readState(ctx.storage), before);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }, { stoppedArchive: true }));
+
+    for (const configured of [false, true]) {
+        test(`ARCHIVE-RESTORE recording-state ${configured ? 'preparation' : 'discovery'} limit fails closed for a stopped archive (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
+            const added = path.join(ctx.workspace, 'beyond-stopped-archive-discovery-limit.txt');
+            fs.writeFileSync(added, 'new work beyond the discovery budget\n');
+            setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(ctx.deleted), Uri.file(ctx.uncertain), Uri.file(added)]);
+            ctx.tracker.maxScopePreflightEntries = 2;
+            const preview = await ready(ctx.tracker);
+            const before = readState(ctx.storage);
+            const disk = tree(ctx.workspace);
+            const result = await ctx.tracker.restoreArchivedGitReview(preview.token);
+            assert.ok(['rolled-back', 'failed'].includes(result.status), result.reason);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main pending review\n');
+            assert.deepEqual(readState(ctx.storage), before);
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), result.status === 'failed',
+                'an unsafe rollback must retain its recovery intent');
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), result.status === 'failed' ? 'recovered' : 'restored');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(ctx.currentTracker().getOriginalContent(ctx.target), 'main pending review\n');
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        }, { stoppedArchive: true, configured, unknown: true }));
+    }
+
+    test('ARCHIVE-RESTORE recording-state revalidates an archive switched to stopped after preview', () => fixture(async ctx => {
+        const preview = await ready(ctx.tracker);
+        const archived = readState(ctx.storage, ARCHIVE);
+        archived.isRecording = false;
+        fs.writeFileSync(path.join(ctx.storage, ARCHIVE), JSON.stringify(archived));
+        const added = path.join(ctx.workspace, 'added-after-preview.txt');
+        fs.writeFileSync(added, 'new work after the active preview\n');
+        setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(added)]);
+        const before = storageSnapshot(ctx.storage);
+        const disk = tree(ctx.workspace);
+        const baseline = ctx.tracker.getOriginalContent(ctx.target);
+
+        const result = await ctx.tracker.restoreArchivedGitReview(preview.token);
+        assert.equal(result.status, 'refused', result.reason);
+        assert.ok(result.reason);
+        assert.deepEqual(storageSnapshot(ctx.storage), before, 'refusal must preserve primary and archive bytes');
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), baseline);
+        assert.deepEqual(tree(ctx.workspace), disk);
+        assert.equal(fs.existsSync(path.join(ctx.storage, BACKUP)), false);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+    }));
+
+    test('ARCHIVE-RESTORE recording-state allows a stopped current session to restore an active archive', () => fixture(async ctx => {
+        ctx.tracker.stopRecording();
+        assert.equal(await ctx.tracker.flushPendingPersistence(), true);
+        const before = readState(ctx.storage);
+        assert.equal(before.isRecording, false);
+        assert.equal(readState(ctx.storage, ARCHIVE).isRecording, true);
+        const added = path.join(ctx.workspace, 'added-while-current-session-stopped.txt');
+        fs.writeFileSync(added, 'new work while current recording was stopped\n');
+        setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(added)]);
+        const disk = tree(ctx.workspace);
+
+        const result = await ctx.tracker.restoreArchivedGitReview((await ready(ctx.tracker)).token);
+        assert.equal(result.status, 'restored', result.reason);
+        assert.equal(ctx.tracker.getIsRecording(), true, 'the restored session uses the active archive recording state');
+        assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'main before-image\n');
+        assert.equal(ctx.tracker.getOriginalContent(added), '');
+        assert.equal(changeFor(ctx.tracker, added)?.currentContent, 'new work while current recording was stopped\n');
+        assert.deepEqual(readState(ctx.storage, BACKUP), before, 'backup preserves the stopped current session');
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.deepEqual(tree(ctx.workspace), disk);
+        assert.equal(await ctx.restart(), 'restored');
+        assert.equal(ctx.currentTracker().getIsRecording(), true);
+        assert.equal(ctx.currentTracker().getOriginalContent(added), '');
+        assert.equal(changeFor(ctx.currentTracker(), added)?.currentContent, 'new work while current recording was stopped\n');
+    }));
 
     test('ARCHIVE-RESTORE restores returned-main review with full distinct backup and no workspace writes', () => fixture(async ctx => {
         const { tracker, storage, target, workspace } = ctx;

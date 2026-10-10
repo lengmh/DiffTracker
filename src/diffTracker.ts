@@ -743,6 +743,7 @@ export class DiffTracker {
     private archiveRestoreStaging = false;
     private archiveRestoreTask?: Promise<ArchivedGitReviewRestoreResult>;
     private archiveRestoreStopRequested = false;
+    private archiveRestoreFinalizingEpoch?: number;
     private readonly maxPersistedSnapshots = 10000;
     private readonly maxPersistedBytes = 50 * 1024 * 1024;
     // Preflight is advisory discovery, not a project-size rejection threshold.
@@ -796,6 +797,7 @@ export class DiffTracker {
         this.disposables.push(
             vscode.workspace.onDidCreateFiles(event => {
                 for (const uri of event.files) {
+                    if (this.deferArchiveRestoreEvent(uri, 'create')) { continue; }
                     void this.onExternalFileCreated(uri);
                 }
             })
@@ -963,6 +965,10 @@ export class DiffTracker {
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
             configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
         this.isRecording = incomplete ? false : state.isRecording;
+        // An explicit archive restore promises a current-filesystem review even
+        // when the saved session was stopped. Observe just this transaction;
+        // never change its recording intent or emit a recording-start event.
+        const observeForReconciliation = this.isRecording || (failOnActivity && !incomplete);
         this.retainedReviewPaths = new Set(state.retainedReviewPaths);
         // Runtime diagnostics never own this serialized marker. Scope retirement
         // and rollback use the independent Set, not stale flags in gap records.
@@ -994,7 +1000,7 @@ export class DiffTracker {
         this.workspaceContextChanged = !rootsMatch || !scopeRootsMatch;
 
         // Cover ignore discovery too; restore callbacks queue until reconciliation.
-        if (this.isRecording) {
+        if (observeForReconciliation) {
             try {
                 this.activateExternalWatchers(this.createExternalWatchers(epoch));
             } catch (error) {
@@ -1020,7 +1026,7 @@ export class DiffTracker {
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         let restoredSupplemental: SupplementalCoverageInstall | undefined;
-        if (this.isRecording && restoreSupplementalPlan) {
+        if (observeForReconciliation && restoreSupplementalPlan) {
             restoredSupplemental = await this.installSupplementalCoverageTargets(
                 restoreSupplementalPlan.targets, epoch, true
             );
@@ -1047,9 +1053,9 @@ export class DiffTracker {
 
         // Discover offline additions before rebuilding diffs. An existing empty
         // file and an absent baseline are distinct, including across reloads.
-        if (this.isRecording) {
+        if (observeForReconciliation) {
             try {
-                await this.discoverRestoredFiles(epoch);
+                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
             } catch (error) {
                 if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
                 this.recoveryBlocked = true;
@@ -1077,7 +1083,7 @@ export class DiffTracker {
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
                 await this.refreshIgnoreMatchers();
                 if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-                await this.discoverRestoredFiles(epoch);
+                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
             }
             const restoreEvents = [...this.restoreEvents.values()];
             this.restoreEvents.clear();
@@ -1847,6 +1853,15 @@ export class DiffTracker {
         else { void this.onExternalFileChanged(uri); }
     }
 
+    private deferArchiveRestoreEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
+        if (!this.archiveRestoreTask || this.restoringEpoch !== this.sessionEpoch ||
+            !this.isCurrentEpoch(this.sessionEpoch) || uri.scheme !== 'file') { return false; }
+        // Editor saves and workspace operations are independent evidence even
+        // when the filesystem watcher has not delivered its notification yet.
+        this.dispatchExternalEvent(uri, kind, this.sessionEpoch);
+        return true;
+    }
+
     private deferCoverageRecheckEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
         if (this.coverageRecheckEpoch !== this.sessionEpoch || this.restoringEpoch !== this.sessionEpoch) { return false; }
         if (!this.restoreEvents.has(uri.fsPath) && this.restoreEvents.size >= this.maxScopePreflightEntries) {
@@ -2035,7 +2050,8 @@ export class DiffTracker {
         root: string,
         epoch: number,
         budget: { remainingEntries: number },
-        creationIsCurrent: () => boolean
+        creationIsCurrent: () => boolean,
+        observeStopped = false
     ): Promise<ImportedCoverageHandoff> {
         const folder = this.owningWorkspaceFolderForTraversal(root);
         if (!folder) { throw new Error('Imported directory has no workspace owner'); }
@@ -2049,7 +2065,7 @@ export class DiffTracker {
         const generation = this.coverageGeneration;
         const policyRevision = this.watcherCoverageRevision;
         const scope = this.effectiveMonitoringScope;
-        const contextCurrent = (): boolean => creationIsCurrent() && this.isRecording &&
+        const contextCurrent = (): boolean => creationIsCurrent() && (this.isRecording || observeStopped) &&
             !this.baselineBuilding && !this.baselineTransaction && !this.scopeApplyPreflight &&
             this.effectiveMonitoringScope === scope && this.ignorePolicyRevision === ignoreRevision &&
             this.ignoreRefreshVersion === ignoreVersion && this.coverageGeneration === generation &&
@@ -3059,6 +3075,7 @@ export class DiffTracker {
         retainFailureMarker = false
     ): Promise<boolean> {
         const epoch = this.sessionEpoch;
+        retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch;
         if (this.archiveRestoreStaging && !transaction) { return true; }
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
@@ -4446,8 +4463,10 @@ export class DiffTracker {
         }
     }
 
+    // Explicit archive restoration also uses this bounded disk walk for legacy
+    // scopes. Without configured exclusions, isPathIgnored applies legacy policy.
     private async enumerateConfiguredCandidateFiles(
-        scope: CanonicalMonitoringScope,
+        scope: CanonicalMonitoringScope | undefined,
         epoch: number,
         scanRoot?: string,
         capacityGuard?: CandidateCapacityGuard,
@@ -4509,7 +4528,7 @@ export class DiffTracker {
                 throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
             }
             const relativeDirectory = this.toPosixPath(path.relative(folder.uri.fsPath, directory));
-            if (configuredScopeExplicitlyExcludesSubtree(
+            if (scope && configuredScopeExplicitlyExcludesSubtree(
                 scope,
                 rootIdentity,
                 relativeDirectory,
@@ -5642,6 +5661,7 @@ export class DiffTracker {
     }
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
+        if (this.deferArchiveRestoreEvent(doc.uri, 'change')) { return; }
         if (this.deferCoverageRecheckEvent(doc.uri, 'change')) { return; }
         if (this.isRecording && !this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath))) {
             this.processDocumentChange(doc);
@@ -7554,12 +7574,13 @@ export class DiffTracker {
     private async completeBaseline(
         epoch: number,
         transaction?: BaselineTransaction,
-        persistenceBudget?: CandidatePersistenceBudget
+        persistenceBudget?: CandidatePersistenceBudget,
+        observeStopped = false
     ): Promise<boolean> {
         ++this.baselineCompletionVersion;
         this.baselineBuilding = true;
         this.snapshotInitialized = true;
-        await this.processPendingExternalChanges();
+        await this.processPendingExternalChanges(observeStopped);
         if (!this.isCurrentEpoch(epoch)) { return false; }
         if (this.persistTimer) {
             clearTimeout(this.persistTimer);
@@ -7890,23 +7911,25 @@ export class DiffTracker {
         }
     }
 
-    private async discoverRestoredFiles(epoch: number, recheckCurrent?: () => boolean): Promise<void> {
+    private async discoverRestoredFiles(
+        epoch: number, recheckCurrent?: () => boolean, archiveDiscovery = false
+    ): Promise<void> {
         const candidates = new Map<string, vscode.Uri>();
         const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
             this.effectiveMonitoringScope.mode === 'wholeWorkspace';
-        const wholeWorkspacePreparationBudget = wholeWorkspace || recheckCurrent
+        const wholeWorkspacePreparationBudget = wholeWorkspace || recheckCurrent || archiveDiscovery
             ? { remainingEntries: this.maxScopePreflightEntries }
             : undefined;
-        const durableResourcePaths = wholeWorkspace || recheckCurrent ? new Set([
+        const durableResourcePaths = wholeWorkspace || recheckCurrent || archiveDiscovery ? new Set([
             ...this.fileSnapshots.keys(),
             ...this.unresolvedBaselineFiles.keys(),
             ...this.opaqueBaselineFiles.keys()
         ]) : undefined;
-        const persistenceBudget = wholeWorkspace || recheckCurrent
+        const persistenceBudget = wholeWorkspace || recheckCurrent || archiveDiscovery
             ? this.createCandidatePersistenceBudget()
             : undefined;
         const wholeWorkspaceCapacityGuard: CandidateCapacityGuard | undefined =
-            (wholeWorkspace || recheckCurrent) && durableResourcePaths
+            (wholeWorkspace || recheckCurrent || archiveDiscovery) && durableResourcePaths
                 ? {
                     remaining: this.remainingCandidatePersistenceSlots(),
                     exemptPaths: new Set([
@@ -7917,9 +7940,10 @@ export class DiffTracker {
                 }
                 : undefined;
         for (const folder of this.getSupportedWorkspaceFolders()) {
-            const files = recheckCurrent
+            const files = recheckCurrent || archiveDiscovery
                 ? (await this.enumerateConfiguredCandidateFiles(
-                    this.effectiveMonitoringScope as CanonicalMonitoringScope, epoch, folder.uri.fsPath,
+                    this.effectiveMonitoringScope.kind === 'configured' ? this.effectiveMonitoringScope : undefined,
+                    epoch, folder.uri.fsPath,
                     wholeWorkspaceCapacityGuard, wholeWorkspacePreparationBudget, recheckCurrent
                 )).map(filePath => vscode.Uri.file(this.canonicalTrackingPath(filePath)))
                 : await this.findScopeFilesUnderDirectory(
@@ -8189,7 +8213,7 @@ export class DiffTracker {
         await new Promise(resolve => setTimeout(resolve, 0));
     }
 
-    private async processPendingExternalChanges(): Promise<void> {
+    private async processPendingExternalChanges(observeStopped = false): Promise<void> {
         const epoch = this.sessionEpoch;
         if (this.pendingExternalChanges.size === 0) {
             return;
@@ -8199,7 +8223,7 @@ export class DiffTracker {
         this.pendingExternalChanges.clear();
 
         for (const filePath of pending) {
-            if (!this.isRecording || !this.isCurrentEpoch(epoch)) {
+            if ((!this.isRecording && !observeStopped) || !this.isCurrentEpoch(epoch)) {
                 return;
             }
 
@@ -8482,11 +8506,12 @@ export class DiffTracker {
     private async onExternalFileCreated(
         uri: vscode.Uri,
         duringScan = false,
-        persistenceBudget?: CandidatePersistenceBudget
+        persistenceBudget?: CandidatePersistenceBudget,
+        observeStopped = false
     ): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
-        if (!this.isRecording || !this.externalWatcherEnabled) {
+        if ((!this.isRecording || !this.externalWatcherEnabled) && !observeStopped) {
             return;
         }
 
@@ -8590,7 +8615,7 @@ export class DiffTracker {
                         !this.baselineBuilding && !this.baselineTransaction) {
                         try {
                             handoff = await this.prepareImportedCoverageHandoff(
-                                filePath, epoch, importedPreparationBudget, creationIsCurrent
+                                filePath, epoch, importedPreparationBudget, creationIsCurrent, observeStopped
                             );
                         } catch (error) {
                             watchFailed = true;
@@ -8627,7 +8652,7 @@ export class DiffTracker {
                     for (const child of children) {
                         if (!creationIsCurrent()) { return; }
                         if (child.fsPath !== filePath && this.pathBelongsToRoot(child.fsPath, filePath)) {
-                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget);
+                            await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget, observeStopped);
                         }
                     }
                     if (handoff) {
@@ -8756,7 +8781,7 @@ export class DiffTracker {
                 this.fileSnapshots.set(filePath, '');
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
-                } else if (!await this.completeBaseline(epoch)) {
+                } else if (!await this.completeBaseline(epoch, undefined, undefined, observeStopped)) {
                     return;
                 }
             }
@@ -8794,10 +8819,10 @@ export class DiffTracker {
         }
     }
 
-    private async onExternalFileDeleted(uri: vscode.Uri): Promise<void> {
+    private async onExternalFileDeleted(uri: vscode.Uri, observeStopped = false): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
-        if (!this.isRecording || !this.externalWatcherEnabled || uri.scheme !== 'file' ||
+        if (((!this.isRecording || !this.externalWatcherEnabled) && !observeStopped) || uri.scheme !== 'file' ||
             this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
@@ -9254,6 +9279,7 @@ export class DiffTracker {
         return task.finally(() => {
             this.archiveRestoreTask = undefined;
             this.archiveRestoreStaging = false;
+            this.archiveRestoreFinalizingEpoch = undefined;
             if (this.archiveRestoreStopRequested) {
                 this.archiveRestoreStopRequested = false;
                 this.stopRecording();
@@ -9335,6 +9361,7 @@ export class DiffTracker {
         if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
         const epoch = this.advanceEpoch();
         this.restoringEpoch = epoch;
+        this.archiveRestoreFinalizingEpoch = epoch;
         const current = (): boolean => this.isCurrentEpoch(epoch) && !this.archiveRestoreStopRequested &&
             !this.gitContextPending && !this.pendingMonitoringScope && !this.workspaceContextChanged &&
             this.activeScopeApplications === 0 && this.watcherCoverageRevision === watcherRevision &&
@@ -9364,11 +9391,10 @@ export class DiffTracker {
             if (!await this.flushPersistState(false, transaction, true) || !current() || this.restoreEvents.size) {
                 throw new Error('Restore publication failed or the workspace changed during publication');
             }
-            if (!await this.commitPreparedScopePersistence(transaction) || !current() || this.restoreEvents.size) {
-                throw new Error('Restore publication could not be finalized safely');
-            }
             // Sole durable commit point. Stop/dispose requests during this await
             // run after the operation, never roll memory back behind this commit.
+            // Keep the existing incomplete-write marker until any events seen
+            // across this commit have also been reconciled and saved.
             await this.deletePersistedFile(intentUri);
             committed = true;
             this.endBaselineTransaction(transaction, true);
@@ -9403,19 +9429,86 @@ export class DiffTracker {
             if (!committed) { this.endBaselineTransaction(transaction, false); }
             if (this.isCurrentEpoch(epoch)) {
                 this.archiveRestoreStaging = false;
-                this.restoringEpoch = undefined;
-                const events = [...this.restoreEvents.values()];
-                this.restoreEvents.clear();
-                if (!this.recoveryBlocked && !this.archiveRestoreStopRequested) {
-                    for (const { uri, kind } of events) {
-                        if (!this.isCurrentEpoch(epoch) || !this.isRecording) { break; }
-                        if (kind === 'create') { await this.onExternalFileCreated(uri); }
-                        else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
-                        else { await this.readFileAndUpdate(uri.fsPath, uri); }
+                try {
+                    if (!this.recoveryBlocked) {
+                        await this.replayArchiveRestoreEvents(epoch);
                     }
-                    await this.processPendingExternalChanges();
+                } catch (error) {
+                    const message = `Archive restoration finished its storage transaction, but newer workspace activity could not be safely reconciled. Review is paused; preserve extension storage before rebuilding. ${String(error)}`;
+                    if (this.isCurrentEpoch(epoch)) {
+                        await this.pauseRecordingForUnpersistableCoverage(message, error);
+                    }
+                    this.recoveryBlocked = true;
+                    this.isRecording = false;
+                    this.disposeFileWatchers();
+                    this.persistenceIssue = message;
+                    return { status: 'failed', reason: message };
+                } finally {
+                    if (this.restoringEpoch === epoch) { this.restoringEpoch = undefined; }
+                    if (!this.isRecording) {
+                        this.disposeFileWatchers();
+                        this.externalWatcherEnabled = false;
+                    }
                 }
             }
+        }
+    }
+
+    private async replayArchiveRestoreEvents(epoch: number): Promise<void> {
+        let remainingEvents = this.maxScopePreflightEntries;
+        // Keep restoringEpoch active until every observed event and its durable
+        // evidence is drained. Temporary observation never enables recording.
+        while (true) {
+            if (!this.isCurrentEpoch(epoch) || this.recoveryBlocked) {
+                throw new Error('Post-restore observation was interrupted');
+            }
+            const events = [...this.restoreEvents.values()];
+            const work = events.length + this.pendingExternalChanges.size;
+            if (work > remainingEvents) {
+                throw new Error('Post-restore activity exceeded the bounded reconciliation allowance');
+            }
+            remainingEvents -= work;
+            this.restoreEvents.clear();
+            for (const { uri, kind } of events) {
+                if (!this.isCurrentEpoch(epoch) || this.recoveryBlocked) {
+                    throw new Error('Post-restore observation was interrupted');
+                }
+                if (kind === 'create') { await this.onExternalFileCreated(uri, false, undefined, true); }
+                else if (kind === 'delete') { await this.onExternalFileDeleted(uri, true); }
+                else { await this.readFileAndUpdate(uri.fsPath, uri); }
+            }
+            await this.processPendingExternalChanges(true);
+            if (this.coverageGaps.size > 0) {
+                throw new Error('Post-restore activity left observation coverage incomplete');
+            }
+            if (!this.isCurrentEpoch(epoch) || this.recoveryBlocked ||
+                (work > 0 && !await this.flushPendingPersistence())) {
+                throw new Error('Post-restore observations could not be saved');
+            }
+            if (this.restoreEvents.size > 0 || this.pendingExternalChanges.size > 0) { continue; }
+
+            const finish = async (): Promise<boolean> => {
+                if (!this.isCurrentEpoch(epoch) || this.recoveryBlocked ||
+                    this.baselineTransaction || this.activeScopeApplications > 0) {
+                    throw new Error('Post-restore completion was superseded');
+                }
+                // Work may have arrived while an earlier writer was finishing.
+                if (this.restoreEvents.size > 0 || this.pendingExternalChanges.size > 0) { return false; }
+                // This synchronous cutoff ends the one-shot observation. Later
+                // stopped-session edits are outside this restore; active sessions
+                // resume their ordinary event handlers and persistence queue.
+                this.restoringEpoch = undefined;
+                if (!this.isRecording) {
+                    this.disposeFileWatchers();
+                    this.externalWatcherEnabled = false;
+                }
+                this.archiveRestoreFinalizingEpoch = undefined;
+                const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
+                if (failureUri) { await this.deletePersistedFile(failureUri); }
+                return true;
+            };
+            this.persistStateWriteQueue = this.persistStateWriteQueue.then(finish, finish);
+            if (await this.persistStateWriteQueue) { return; }
         }
     }
 
@@ -11224,6 +11317,7 @@ export class DiffTracker {
     }
 
     private onDocumentChanged(event: vscode.TextDocumentChangeEvent) {
+        if (this.deferArchiveRestoreEvent(event.document.uri, 'change')) { return; }
         const epoch = this.sessionEpoch;
         if (!this.isRecording) {
             return;

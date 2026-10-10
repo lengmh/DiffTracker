@@ -5338,6 +5338,7 @@ registerPR12BoundedInvariants({
 
 registerArchivedGitReview({
     test, Uri, DiffTracker, vscode, file, document, faults, counters, pause, emitWatcher, waitUntil, watcherInstances,
+    emitWorkspaceFilesCreated: event => workspaceFilesCreated(event),
     getTracker: () => tracker,
     setTracker: value => { tracker = value; },
     setListedFiles: value => { listedFiles = value; }
