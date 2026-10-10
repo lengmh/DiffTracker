@@ -15,9 +15,10 @@ const PRIMARY = 'session-state.json';
 
 export function registerArchivedGitReview(h) {
     const { test, Uri, DiffTracker, vscode, file, document, faults, counters,
-        pause, emitWatcher, emitWorkspaceFilesCreated, waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
+        pause, emitWatcher, emitWorkspaceFilesCreated, fireConfigurationChanged,
+        waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
 
-    async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false } = {}) {
+    async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false, ignoredBaseline = false } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -37,10 +38,17 @@ export function registerArchivedGitReview(h) {
         const opaque = path.join(workspace, 'image.bin');
         const uncertain = path.join(workspace, 'unknown.txt');
         const deleted = path.join(workspace, 'deleted-after-archive.txt');
+        const ignoreFile = path.join(workspace, '.gitignore');
+        const ignored = path.join(workspace, 'policy-hidden.txt');
         fs.writeFileSync(target, 'main before-image\n');
         fs.writeFileSync(opaque, Buffer.from([0, 1, 2]));
         if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
-        setListedFiles([Uri.file(target), Uri.file(opaque), ...(stoppedArchive ? [Uri.file(deleted)] : [])]);
+        if (ignoredBaseline) {
+            fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n');
+            fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
+        }
+        setListedFiles([Uri.file(target), Uri.file(opaque), ...(stoppedArchive ? [Uri.file(deleted)] : []),
+            ...(ignoredBaseline ? [Uri.file(ignoreFile), Uri.file(ignored)] : [])]);
         let tracker = new DiffTracker(Uri.file(storage));
         setTracker(tracker);
         tracker.isRecording = true;
@@ -83,7 +91,7 @@ export function registerArchivedGitReview(h) {
                 tracker.reconcileRestoredGitContexts([compatible ? main : feature]);
                 return outcome;
             };
-            await run({ tracker, currentTracker, workspace, storage, target, opaque, uncertain, deleted,
+            await run({ tracker, currentTracker, workspace, storage, target, opaque, uncertain, deleted, ignoreFile, ignored,
                 main, feature, archive, restart });
         } finally {
             faults.clear();
@@ -371,6 +379,135 @@ export function registerArchivedGitReview(h) {
             assert.equal(watcherInstances.some(watcher => watcher.active), false);
         }, { stoppedArchive: true, configured }));
     }
+
+    for (const stoppedArchive of [false, true]) {
+        test(`ARCHIVE-RESTORE final ignore-policy broadening fails closed (${stoppedArchive ? 'stopped' : 'active'} archive)`, () => fixture(async ctx => {
+            const archived = readState(ctx.storage, ARCHIVE);
+            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ctx.ignored)), true);
+            assert.equal(archived.fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
+            assert.equal(archived.unresolvedBaselineFiles.some(([filePath]) => filePath === ctx.ignored), false);
+            const before = readState(ctx.storage);
+            const preview = await ready(ctx.tracker);
+            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+            let disk;
+            try {
+                await Promise.race([gate.entered, operation.then(result => {
+                    throw new Error(`Restore finished before ignore-policy barrier: ${JSON.stringify(result)}`);
+                })]);
+                assert.equal(changeFor(ctx.tracker, ctx.ignored), undefined,
+                    'the file must still be excluded before the commit-boundary policy change');
+                fs.writeFileSync(ctx.ignoreFile, '');
+                emitWatcher('change', Uri.file(ctx.ignoreFile));
+                disk = tree(ctx.workspace);
+            } finally { gate.release(); }
+            const result = await operation;
+            assert.equal(result.status, 'failed', result.reason);
+            assert.equal(ctx.tracker.isRecoveryBlocked(), true);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.ignored), undefined,
+                'being newly included does not prove absence from the archived baseline');
+            assert.equal(ctx.tracker.getReviewToken(ctx.ignored), undefined);
+            assert.equal(readState(ctx.storage).fileSnapshots.some(([filePath]) => filePath === ctx.ignored), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
+                'policy changes during finalization must leave durable incomplete-reconciliation evidence');
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), 'blocked');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.deepEqual(tree(ctx.workspace), disk);
+        }, { stoppedArchive, ignoredBaseline: true, configured: true }));
+    }
+
+    for (const signal of ['search.exclude', 'files.watcherExclude', 'pending monitoring scope']) {
+        test(`ARCHIVE-RESTORE final ${signal} signal fails closed`, () => fixture(async ctx => {
+            const preview = await ready(ctx.tracker);
+            const before = readState(ctx.storage);
+            const disk = tree(ctx.workspace);
+            const gate = pause(path.join(ctx.storage, INTENT), 'delete');
+            const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+            try {
+                await Promise.race([gate.entered, operation.then(result => {
+                    throw new Error(`Restore finished before scope-signal barrier: ${JSON.stringify(result)}`);
+                })]);
+                if (signal === 'pending monitoring scope') {
+                    const requested = validateAndCanonicalizeScope({ mode: 'rules', includes: [], excludes: [] },
+                        ctx.tracker.effectiveMonitoringScope.roots);
+                    assert.equal(requested.ok, true);
+                    ctx.tracker.setPendingMonitoringScope(requested.scope);
+                } else {
+                    fireConfigurationChanged(signal);
+                }
+            } finally { gate.release(); }
+            const result = await operation;
+            assert.equal(result.status, 'failed', result.reason);
+            assert.equal(ctx.tracker.isRecoveryBlocked(), true);
+            assert.equal(ctx.tracker.getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
+                'a late scope or coverage signal must leave durable incomplete-reconciliation evidence');
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.deepEqual(tree(ctx.workspace), disk);
+            assert.equal(await ctx.restart(), 'blocked');
+            assert.equal(ctx.currentTracker().getIsRecording(), false);
+            assert.equal(watcherInstances.some(watcher => watcher.active), false);
+            assert.deepEqual(readState(ctx.storage, BACKUP), before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+            assert.deepEqual(tree(ctx.workspace), disk);
+        }));
+    }
+
+    test('ARCHIVE-RESTORE final coverage gap during replay persistence cannot clear the failure marker', () => fixture(async ctx => {
+        const preview = await ready(ctx.tracker);
+        const before = readState(ctx.storage);
+        const commitGate = pause(path.join(ctx.storage, INTENT), 'delete');
+        const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
+        let persistenceGate;
+        let disk;
+        try {
+            await Promise.race([commitGate.entered, operation.then(result => {
+                throw new Error(`Restore finished before late-gap commit barrier: ${JSON.stringify(result)}`);
+            })]);
+            fs.writeFileSync(ctx.target, 'late modification awaiting postcommit persistence\n');
+            emitWatcher('change', Uri.file(ctx.target));
+            disk = tree(ctx.workspace);
+            persistenceGate = pause(path.join(ctx.storage, 'session-state.tmp.json'), 'write');
+            commitGate.release();
+            await Promise.race([persistenceGate.entered, operation.then(result => {
+                throw new Error(`Restore finished before late-gap persistence barrier: ${JSON.stringify(result)}`);
+            })]);
+            // A known-file change reaches replay's final persistence barrier
+            // after its first coverage check; invalidate coverage while it waits.
+            ctx.tracker.setFileCoverageGap(ctx.target, 'pending-scope-gap', 'Coverage changed while postcommit observations were being saved');
+        } finally {
+            commitGate.release();
+            persistenceGate?.release();
+        }
+        const result = await operation;
+        assert.equal(result.status, 'failed', result.reason);
+        assert.equal(ctx.tracker.isRecoveryBlocked(), true);
+        assert.equal(ctx.tracker.getIsRecording(), false);
+        assert.equal(watcherInstances.some(watcher => watcher.active), false);
+        assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
+        assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), true,
+            'the queued final completion check must preserve the marker for a late coverage gap');
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.deepEqual(tree(ctx.workspace), disk);
+        assert.equal(await ctx.restart(), 'blocked');
+        assert.equal(ctx.currentTracker().getIsRecording(), false);
+        assert.deepEqual(readState(ctx.storage, BACKUP), before);
+        assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
+        assert.deepEqual(tree(ctx.workspace), disk);
+    }));
 
     for (const failure of ['replay budget exhaustion', 'replay persistence failure', 'replay failure-marker write failure']) {
         test(`ARCHIVE-RESTORE recording-state stopped ${failure} after commit blocks with durable evidence`, () => fixture(async ctx => {
