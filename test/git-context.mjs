@@ -136,29 +136,35 @@ test('Issue #28 deactivate waits for queued Git prompt-state persistence',async(
     const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
     const fn=source.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='deactivate');
     assert.ok(fn,'production deactivate must exist');
-    const writes=[];
+    const warnings=[],order=[];
     let finish;
     const slowWrite=new Promise(resolve=>{finish=resolve;});
     const sandbox={
         pendingGitPromptWrites:slowWrite,
-        gitContextMonitor:undefined,diffTracker:undefined,
+        gitContextMonitor:{dispose:()=>order.push('monitor stopped')},
+        diffTracker:{dispose:async()=>{order.push('tracker stopped');}},
         decorationManager:undefined,statusBarManager:undefined,
         originalContentProvider:undefined,inlineContentProvider:undefined,
         codeLensProvider:undefined,settingsTreeDataProvider:undefined,diffTreeDataProvider:undefined,
-        console:{warn:(...args)=>writes.push(args)}
+        console:{warn:(...args)=>warnings.push(args)}
     };
     vm.createContext(sandbox);
-    vm.runInContext(ts.transpileModule(`${fn.getText(source)};globalThis.stop=deactivate;`,{
-        compilerOptions:{target:ts.ScriptTarget.ES2022}
-    }).outputText,sandbox);
+    // Keep the real implementation body, but execute its exported declaration
+    // as a script (the VM sandbox has no CommonJS/ESM module loader).
+    vm.runInContext(ts.transpileModule(
+        `${fn.getText(source).replace(/^export\\s+/, '')};globalThis.stop=deactivate;`,{
+            compilerOptions:{target:ts.ScriptTarget.ES2022}
+        }).outputText,sandbox);
     let complete=false;
     const closing=sandbox.stop().then(()=>{complete=true;});
     await Promise.resolve();
+    assert.deepEqual(order,['monitor stopped','tracker stopped'],
+        'stop prompt producers before waiting for the final state write');
     assert.equal(complete,false,'host deactivation must not finish while receipt clear is pending');
     finish();
     await closing;
     assert.equal(complete,true);
-    assert.equal(writes.length,0);
+    assert.equal(warnings.length,0);
 });
 
 test('production start blocks invalid monitoring scope configuration',async()=>{
