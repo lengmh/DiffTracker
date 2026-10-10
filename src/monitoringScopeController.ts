@@ -67,7 +67,8 @@ export interface MonitoringScopeApplyOutcome {
 
 export class MonitoringScopeController implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
-    private coverageExclusionQueue: Promise<void> = Promise.resolve();
+    private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
+    private pendingScopeSettingsWrites = 0;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -308,16 +309,28 @@ export class MonitoringScopeController implements vscode.Disposable {
         };
     }
 
+    public hasPendingScopeSettingsWrites(): boolean {
+        return this.pendingScopeSettingsWrites > 0;
+    }
+
+    private enqueueScopeSettingsWrite<T>(write: () => Promise<T>): Promise<T> {
+        // Ownership starts before the queue runs and lasts through settlement,
+        // including after an editor closes while its settings save is pending.
+        this.pendingScopeSettingsWrites++;
+        const operation = this.scopeSettingsWriteQueue.then(write).finally(() => {
+            this.pendingScopeSettingsWrites--;
+        });
+        this.scopeSettingsWriteQueue = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
+
     /**
      * Stages a directory-only exclusion in Workspace Settings, never Applies it.
      * The UI must refuse to call this while a scope-editor draft may be unsaved.
      */
     public requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
-        // Read the requested scope only after earlier quick exclusions have
-        // finished saving, so concurrent actions cannot overwrite one another.
-        const operation = this.coverageExclusionQueue.then(() => this.saveCoverageSubtreeExclusion(targetPath));
-        this.coverageExclusionQueue = operation.then(() => undefined, () => undefined);
-        return operation;
+        // Merge only after all earlier scope-setting writes have finished.
+        return this.enqueueScopeSettingsWrite(() => this.saveCoverageSubtreeExclusion(targetPath));
     }
 
     private async saveCoverageSubtreeExclusion(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
@@ -413,7 +426,18 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
     }
 
-    public async saveRequestedScope(
+    public saveRequestedScope(
+        request: MonitoringScopeRequest,
+        options?: {
+            allowLegacyMigrationWrite?: boolean;
+            expectedLegacySourceFingerprint?: string;
+        }
+    ): Promise<ScopeValidationResult> {
+        return this.enqueueScopeSettingsWrite(() => this.saveRequestedScopeNow(request, options));
+    }
+
+    // Migration already owns the queue; its nested save must not enqueue again.
+    private async saveRequestedScopeNow(
         request: MonitoringScopeRequest,
         options?: {
             allowLegacyMigrationWrite?: boolean;
@@ -570,7 +594,11 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: applied.status === 'conflict' ? 'conflict' : 'failed', reason: applied.reason };
     }
 
-    public async migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
+    public migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
+        return this.enqueueScopeSettingsWrite(() => this.migrateLegacyWatchRulesNow());
+    }
+
+    private async migrateLegacyWatchRulesNow(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
         const approvedSource = this.getLegacySourceSnapshot();
         const approvedSourceFingerprint = createLegacySourceFingerprint(approvedSource);
         const liveRules = this.getLegacyWatchRules();
@@ -598,7 +626,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (hasWorkspaceRules) {
             return { status: 'conflict', reason: 'Workspace monitoring-scope settings already exist; migration will not overwrite them automatically.' };
         }
-        const validated = await this.saveRequestedScope({
+        const validated = await this.saveRequestedScopeNow({
             mode: 'rules',
             includes: preview.includes,
             excludes: preview.excludes
@@ -632,7 +660,13 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'migrated' };
     }
 
-    public async completeLegacyMigrationUsingCurrentScope(
+    public completeLegacyMigrationUsingCurrentScope(
+        reviewedTarget?: MonitoringScopeRequest
+    ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
+        return this.enqueueScopeSettingsWrite(() => this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget));
+    }
+
+    private async completeLegacyMigrationUsingCurrentScopeNow(
         reviewedTarget?: MonitoringScopeRequest
     ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
         const roots = this.getWorkspaceRoots();
@@ -642,7 +676,7 @@ export class MonitoringScopeController implements vscode.Disposable {
 
         if (reviewedTarget) {
             try {
-                requested = await this.saveRequestedScope(reviewedTarget, {
+                requested = await this.saveRequestedScopeNow(reviewedTarget, {
                     allowLegacyMigrationWrite: true,
                     // The approved source may be committed-only, but the
                     // mutable Workspace value still has to remain exactly as
@@ -688,7 +722,11 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'completed' };
     }
 
-    public async restoreEffectiveScopeConfiguration(): Promise<void> {
+    public restoreEffectiveScopeConfiguration(): Promise<void> {
+        return this.enqueueScopeSettingsWrite(() => this.restoreEffectiveScopeConfigurationNow());
+    }
+
+    private async restoreEffectiveScopeConfigurationNow(): Promise<void> {
         const config = vscode.workspace.getConfiguration('diffTracker');
         const effective = this.tracker.getEffectiveMonitoringScope();
         if (effective.kind === 'configured') {

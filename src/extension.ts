@@ -1143,7 +1143,15 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     const openMonitoringScopeManager = () => {
-        WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
+        // Do not capture a draft from settings while a queued scope write is
+        // pending, even if the editor that started that write has closed.
+        if (monitoringScopeController.hasPendingScopeSettingsWrites()) {
+            void vscode.window.showWarningMessage(
+                'Code Diff Tracker: Wait for the monitoring-scope settings save (including quick exclusions) to finish before opening Manage Monitoring Scope.'
+            );
+            return undefined;
+        }
+        return WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
     };
 
     context.subscriptions.push(
@@ -1177,12 +1185,12 @@ export async function activate(context: vscode.ExtensionContext) {
         // Compatibility alias retained for existing keybindings/scripts.
         vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager),
         vscode.commands.registerCommand('diffTracker.applyPendingScope', async () => {
-            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
-            await panel.applyInteractively();
+            const panel = openMonitoringScopeManager();
+            await panel?.applyInteractively();
         }),
         vscode.commands.registerCommand('diffTracker.retryScopePreparation', async () => {
-            const panel = WatchExcludePanel.createOrShow(context.extensionUri, diffTracker, monitoringScopeController);
-            await panel.applyInteractively();
+            const panel = openMonitoringScopeManager();
+            await panel?.applyInteractively();
         }),
         vscode.commands.registerCommand('diffTracker.recheckObservationCoverage', async () => {
             const outcome = await monitoringScopeController.recheckObservationCoverage();
