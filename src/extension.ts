@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, BatchActionResult, DiffTracker, MixedBatchActionResult, OpaqueReviewToken, ReviewToken, TrackChangesEvent } from './diffTracker';
+import { ActionResult, BatchActionResult, DiffTracker, MixedBatchActionResult, OpaqueReviewToken, ReviewToken, UnknownReviewToken, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
 import { DiffTreeDataProvider } from './diffTreeView';
 import { DiffHoverProvider } from './hoverProvider';
@@ -659,6 +659,121 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }
             return reportMixedBatch('Accept result', await diffTracker.acceptAllPendingChanges(textTokens, opaqueTokens, unknownPaths));
+        })
+    );
+
+    type FolderReviewSelection = { reviewEntries?: Array<{
+        filePath: string;
+        reviewToken?: ReviewToken;
+        opaqueReviewToken?: OpaqueReviewToken;
+    }> };
+    const folderReviews = (item: FolderReviewSelection | undefined) => item?.reviewEntries ?? [];
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.acceptFile', async (
+            filePathOrItem: string | { filePath?: string; reviewToken?: ReviewToken },
+            token?: ReviewToken
+        ) => {
+            const filePath = extractFilePath(filePathOrItem);
+            if (!filePath) { return; }
+            const captured = token ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getReviewToken(filePath) : filePathOrItem.reviewToken);
+            if (!captured) { return missingReview(filePath); }
+            const answer = await vscode.window.showWarningMessage(
+                `Accept the current text changes in ${displayFileName(filePath)} as the new baseline?`,
+                { modal: true, detail: 'This does not change workspace files. It discards this file’s previous comparison baseline.' },
+                'Accept Changes'
+            );
+            if (answer !== 'Accept Changes') {
+                return { filePath, status: 'cancelled', reason: 'Accept cancelled' } satisfies ActionResult;
+            }
+            return reportAction(await diffTracker.keepAllChangesInFile(filePath, captured));
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.acceptFolderText', async (item?: FolderReviewSelection) => {
+            const tokens = folderReviews(item).flatMap(entry => entry.reviewToken ? [entry.reviewToken] : []);
+            if (!tokens.length) {
+                void vscode.window.showInformationMessage('Code Diff Tracker: No text reviews in this folder.');
+                return;
+            }
+            const answer = await vscode.window.showWarningMessage(
+                `Accept ${tokens.length} text file(s) in this folder as their new baselines?`,
+                { modal: true, detail: 'Read-only and unknown entries are left untouched.' },
+                'Accept Text Changes'
+            );
+            if (answer !== 'Accept Text Changes') { return; }
+            return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
+        }),
+        vscode.commands.registerCommand('diffTracker.revertFolderText', async (item?: FolderReviewSelection) => {
+            const tokens = folderReviews(item).flatMap(entry => entry.reviewToken ? [entry.reviewToken] : []);
+            if (!tokens.length) {
+                void vscode.window.showInformationMessage('Code Diff Tracker: No text reviews in this folder.');
+                return;
+            }
+            // Reuse the existing confirmed batch revert, including its durable
+            // recovery record and token-based stale-review protection.
+            return vscode.commands.executeCommand('diffTracker.revertAllChanges', tokens);
+        }),
+        vscode.commands.registerCommand('diffTracker.acknowledgeFolderOpaque', async (item?: FolderReviewSelection) => {
+            const tokens = folderReviews(item).flatMap(entry => entry.opaqueReviewToken ? [entry.opaqueReviewToken] : []);
+            if (!tokens.length) {
+                void vscode.window.showInformationMessage('Code Diff Tracker: No read-only reviews in this folder.');
+                return;
+            }
+            const answer = await vscode.window.showWarningMessage(
+                `Acknowledge ${tokens.length} read-only file(s) in this folder?`,
+                { modal: true, detail: 'Advances only saved file identities; does not modify, delete or restore file contents. Unknown items are unchanged.' },
+                'Acknowledge Read-only Changes'
+            );
+            if (answer !== 'Acknowledge Read-only Changes') { return; }
+            const results: ActionResult[] = [];
+            for (const token of tokens) {
+                try { results.push(await diffTracker.acknowledgeOpaqueChange(token.filePath, token)); }
+                catch { results.push({ filePath: token.filePath, status: 'failed', reason: 'Acknowledge failed; pending review retained' }); }
+            }
+            return reportBatch('Acknowledged', {
+                results,
+                succeeded: results.filter(result => result.status === 'success').length,
+                failed: results.filter(result => result.status !== 'success').length
+            });
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.resetUnknownBaseline', async (
+            filePathOrItem?: string | { filePath?: string; unknownReviewToken?: UnknownReviewToken },
+            token?: UnknownReviewToken
+        ) => {
+            const filePath = extractFilePath(filePathOrItem);
+            if (!filePath) { return; }
+            const captured = token ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getUnknownReviewToken(filePath) : filePathOrItem?.unknownReviewToken);
+            if (!captured) { return missingReview(filePath); }
+            const answer = await vscode.window.showWarningMessage(
+                `Reset the unknown baseline for ${displayFileName(filePath)} using its current disk state?`,
+                { modal: true, detail: 'Abandons this file’s unverified history only after the new baseline is safely persisted. Never writes to or removes a workspace file.' },
+                'Reset Unknown Baseline'
+            );
+            if (answer !== 'Reset Unknown Baseline') { return; }
+            return reportAction(await diffTracker.resetUnknownBaseline(filePath, captured));
+        }),
+        vscode.commands.registerCommand('diffTracker.resetAllUnknownBaselines', async (
+            tokens?: UnknownReviewToken[]
+        ) => {
+            const captured = tokens ?? diffTracker.getUnknownReviewTokens();
+            if (!captured.length) {
+                void vscode.window.showInformationMessage('Code Diff Tracker: No unknown reviews to reset.');
+                return;
+            }
+            const answer = await vscode.window.showWarningMessage(
+                `Reset up to ${captured.length} Unknown baseline(s) from current disk state?`,
+                { modal: true, detail: 'Each file must be independently verified. Unreadable, dirty, changed or unsaved targets stay Unknown; unrelated reviews and all disk contents are preserved.' },
+                'Reset Unknown Baselines'
+            );
+            if (answer !== 'Reset Unknown Baselines') { return; }
+            return reportBatch('Reset Unknown baselines for', await diffTracker.resetAllUnknownBaselines(captured));
         })
     );
 
