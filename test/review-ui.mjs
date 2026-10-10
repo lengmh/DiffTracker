@@ -787,7 +787,7 @@ await test('workspace document lookups distinguish file working documents from v
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
 });
-await test('opaque exposes Acknowledge plus inspection while unknown remains inspection-only',()=>{
+await test('opaque exposes Acknowledge and unknown exposes explicit Baseline Reset plus inspection',()=>{
     const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
     const items=manifest.contributes.menus['view/item/context'];
     const opaqueCommands=items
@@ -797,6 +797,6 @@ await test('opaque exposes Acknowledge plus inspection while unknown remains ins
     const unknownCommands=items
         .filter(item=>(item.when??'').includes('viewItem == unknownFile'))
         .map(item=>item.command).sort();
-    assert.deepEqual(unknownCommands,['diffTracker.showWebviewDiff']);
+    assert.deepEqual(unknownCommands,['diffTracker.resetUnknownBaseline','diffTracker.showWebviewDiff']);
 });
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);
