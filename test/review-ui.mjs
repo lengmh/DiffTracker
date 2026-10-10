@@ -382,7 +382,7 @@ await test('review tree exposes versioned Unknown Reset, text Accept and bounded
         assert.equal(opaqueLeaf.contextValue,'opaqueFile');
         assert.equal(unknownLeaf.contextValue,'unknownFile');
         assert.equal(unknownLeaf.unknownReviewToken.filePath,unknown);
-        assert.deepEqual(folder.reviewEntries.map(entry=>entry.filePath).sort(),paths.sort());
+        assert.deepEqual(Array.from(folder.reviewEntries,entry=>entry.filePath).sort(),paths.sort());
         assert.equal(folder.reviewEntries.filter(entry=>entry.reviewToken).length,1);
         assert.equal(folder.reviewEntries.filter(entry=>entry.opaqueReviewToken).length,1);
         const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
