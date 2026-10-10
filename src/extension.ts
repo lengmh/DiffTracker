@@ -1032,6 +1032,32 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.excludeCoverageSubtree', async (item?: string | { coveragePath?: string }) => {
+            // An open scope editor may hold an unsaved JSON draft. Do not
+            // mutate its backing settings behind the editor's current state.
+            if (WatchExcludePanel.currentPanel) {
+                void vscode.window.showWarningMessage(
+                    'Code Diff Tracker: Close Manage Monitoring Scope before using the quick exclusion; an unsaved editor draft must not be overwritten.'
+                );
+                return;
+            }
+            const targetPath = typeof item === 'string' ? item : item?.coveragePath;
+            if (!targetPath) { return; }
+            const outcome = await monitoringScopeController.requestExcludeCoverageSubtree(targetPath);
+            if (outcome.status === 'saved') {
+                void vscode.window.showInformationMessage(
+                    'Code Diff Tracker: Exclusion request saved. Use Apply Pending Scope to make it effective; no review was discarded.'
+                );
+            } else if (outcome.status === 'alreadyExcluded') {
+                void vscode.window.showInformationMessage(
+                    'Code Diff Tracker: This subtree is already excluded by the requested monitoring scope.'
+                );
+            } else {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Could not stage exclusion.'}`);
+            }
+            settingsTreeDataProvider.refresh();
+            return outcome;
+        }),
         vscode.commands.registerCommand('diffTracker.manageMonitoringScope', openMonitoringScopeManager),
         // Compatibility alias retained for existing keybindings/scripts.
         vscode.commands.registerCommand('diffTracker.editWatchExcludes', openMonitoringScopeManager),
