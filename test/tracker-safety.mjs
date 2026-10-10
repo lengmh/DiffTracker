@@ -5218,6 +5218,111 @@ test('S3 pure workspace-root removal can publish a configured contraction withou
     }
 });
 
+
+test('Issue #28 production pause producer and reactivation gate preserve one notice per baseline',async()=>{
+    const ts=require('typescript'),vm=require('node:vm');
+    const source=ts.createSourceFile('extension.ts',fs.readFileSync(new URL('../src/extension.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+    const names=new Set(['gitPromptInFlight','gitPromptStateKey','persistedGitPromptShown',
+        'gitPromptShown','gitPromptWriteQueue','persistGitPromptShown',
+        'resetGitPromptOnBaselineChanged','handleGitContextEvent']);
+    const declarations=[];
+    const visit=node=>{
+        if(ts.isVariableDeclaration(node)&&names.has(node.name.getText(source))){
+            const kind=(node.parent.flags&ts.NodeFlags.Let)?'let':'const';
+            declarations.push(`${kind} ${node.getText(source)};`);
+        }
+        ts.forEachChild(node,visit);
+    };
+    visit(source);
+    assert.equal(declarations.length,names.size,'use production pause handler and persistence code');
+
+    const records=new Map(), pending=[];
+    const workspaceState={
+        get:(key,defaultValue)=>records.get(key)??defaultValue,
+        update:async(key,value)=>{records.set(key,structuredClone(value));}
+    };
+    let promptCount=0;
+    const createHost=()=>{
+        const sandbox={
+            context:{workspaceState},diffTracker:tracker,runningExtensionTests:false,
+            gitContextMonitor:{},
+            vscode:{window:{showWarningMessage:()=>{
+                promptCount++;
+                return new Promise(resolve=>pending.push(resolve));
+            }}},
+            rebuildGitBaseline:async()=>false
+        };
+        vm.createContext(sandbox);
+        vm.runInContext(ts.transpileModule(
+            `${declarations.join('\n')}
+            globalThis.handle=handleGitContextEvent;
+            globalThis.reset=resetGitPromptOnBaselineChanged;
+            globalThis.flushPromptState=()=>gitPromptWriteQueue;
+            globalThis.shown=()=>[...gitPromptShown];`,
+            {compilerOptions:{target:ts.ScriptTarget.ES2022}}
+        ).outputText,sandbox);
+        const subscription=tracker.onDidTrackChanges(sandbox.reset);
+        return {...sandbox,dispose:()=>subscription.dispose()};
+    };
+    // Scope the actual Stop -> Start to a small workspace. Rebuilding the
+    // entire shared fixture here can make Windows regression runs needlessly slow.
+    const originalFolders=vscode.workspace.workspaceFolders;
+    const originalFolderResolver=vscode.workspace.getWorkspaceFolder;
+    const repoRoot=file('git-pause-small-workspace');
+    fs.mkdirSync(repoRoot,{recursive:true});
+    fs.writeFileSync(path.join(repoRoot,'ProbeName'),'probe');
+    const folder={uri:Uri.file(repoRoot),name:'git-pause-small-workspace'};
+    vscode.workspace.workspaceFolders=[folder];
+    vscode.workspace.getWorkspaceFolder=uri=>{
+        const rel=path.relative(repoRoot,uri.fsPath);
+        return rel===''||(rel!=='..'&&!rel.startsWith(`..${path.sep}`)&&!path.isAbsolute(rel))?folder:undefined;
+    };
+    try {
+    const base={repoRoot,kind:'repository',headName:'main',headCommit:'aaa',detached:false,inProgress:false};
+    const feature={...base,headName:'feature',headCommit:'bbb'};
+    tracker.setBaselineGitContexts([base]);
+    const firstHost=createHost();
+    const first=firstHost.handle({kind:'changed',context:feature});
+    await firstHost.handle({kind:'changed',context:feature});
+    await firstHost.handle({kind:'removed',repoRoot});
+    assert.equal(promptCount,1,'real tracker emits just one pause transition before dismiss');
+    assert.equal(tracker.getPausedGitRepositories().length,1,'review remains paused');
+    pending.shift()(undefined);
+    await first;
+    await firstHost.handle({kind:'changed',context:feature});
+    assert.equal(promptCount,1,'dismiss and repeated Git events cannot create another modal');
+    await firstHost.flushPromptState();
+    assert.equal(records.get('diffTracker.gitPausePromptShown.v1').length,1);
+
+    firstHost.dispose();
+    // A new extension-host activation can reconstruct the same review before
+    // it has observed an already-delivered pause; the workspace notification
+    // receipt must survive the activation boundary.
+    tracker.pausedGitRepositories.clear();
+    const restoredHost=createHost();
+    await restoredHost.handle({kind:'changed',context:feature});
+    assert.equal(promptCount,1,'re-activation does not repeat the old pause prompt');
+    assert.equal(tracker.getPausedGitRepositories().length,1);
+
+    // Stop and Start replace the baseline, so an identical later branch
+    // transition is a new pause episode and must be reported.
+    tracker.stopRecording();
+    tracker.startRecording();
+    tracker.setBaselineGitContexts([base]);
+    await restoredHost.flushPromptState();
+    assert.equal(restoredHost.shown().length,0,'new baseline invalidates the prior notice receipt');
+    assert.deepEqual(records.get('diffTracker.gitPausePromptShown.v1'),[]);
+    const next=restoredHost.handle({kind:'changed',context:feature});
+    assert.equal(promptCount,2,'same mismatch on a new baseline produces a new prompt');
+    pending.shift()(undefined);
+    await next;
+    restoredHost.dispose();
+    } finally {
+        vscode.workspace.workspaceFolders=originalFolders;
+        vscode.workspace.getWorkspaceFolder=originalFolderResolver;
+    }
+});
+
 registerPR12BoundedInvariants({
     test, vscode, Uri, DiffTracker, file, document, pause,
     getTracker: () => tracker, setTracker: value => { tracker=value; },

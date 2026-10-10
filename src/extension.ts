@@ -26,6 +26,8 @@ let settingsTreeDataProvider: SettingsTreeDataProvider;
 let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
 let gitContextMonitor: GitContextMonitor | undefined;
+// Await the most recent workspace notification write before extension-host shutdown.
+let pendingGitPromptWrites: Promise<void> = Promise.resolve();
 
 type DefaultOpenMode = 'webview' | 'nativeReview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
@@ -307,6 +309,34 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     const gitPromptInFlight = new Set<string>();
+    // An in-flight guard alone is activation-local; retain acknowledged pause
+    // notifications across extension-host reloads on the same workspace.
+    const gitPromptStateKey = 'diffTracker.gitPausePromptShown.v1';
+    const persistedGitPromptShown = context.workspaceState.get<Array<[string, string]>>(gitPromptStateKey, []);
+    const gitPromptShown = new Map<string, string>(
+        Array.isArray(persistedGitPromptShown)
+            ? persistedGitPromptShown.filter((entry): entry is [string, string] =>
+                Array.isArray(entry) && entry.length === 2 &&
+                typeof entry[0] === 'string' && typeof entry[1] === 'string')
+            : []
+    );
+    let gitPromptWriteQueue: Promise<void> = Promise.resolve();
+    const persistGitPromptShown = (): void => {
+        const snapshot = [...gitPromptShown];
+        // Serialize writes so a new-baseline reset cannot be overwritten by
+        // a slower save from an earlier pause notification.
+        gitPromptWriteQueue = gitPromptWriteQueue.catch(() => undefined)
+            .then(() => context.workspaceState.update(gitPromptStateKey, snapshot));
+        pendingGitPromptWrites = gitPromptWriteQueue;
+        void gitPromptWriteQueue.catch(error => console.warn('Code Diff Tracker: Cannot save Git pause notification state', error));
+    };
+    const resetGitPromptOnBaselineChanged = (event: TrackChangesEvent): void => {
+        if (event.baselineChanged && gitPromptShown.size > 0 &&
+            diffTracker.getPausedGitRepositories().length === 0) {
+            gitPromptShown.clear();
+            persistGitPromptShown();
+        }
+    };
     const rebuildGitBaseline = async (
         repoRoot: string,
         contextSnapshot?: GitContextSnapshot,
@@ -333,6 +363,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!currentSnapshot || currentSnapshot.inProgress) { return false; }
         const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
         if (rebuilt) {
+            if (gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
             refreshReview();
             void vscode.window.showInformationMessage('Code Diff Tracker: The repository review was archived and its baseline rebuilt.');
         } else {
@@ -355,8 +386,15 @@ export async function activate(context: vscode.ExtensionContext) {
         const reason = event.kind === 'changed'
             ? diffTracker.observeGitContext(event.context)
             : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
-        if (!reason || runningExtensionTests || gitPromptInFlight.has(repoRoot)) { return; }
+        if (!reason) {
+            if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot) &&
+                gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
+            return;
+        }
+        if (runningExtensionTests || gitPromptInFlight.has(repoRoot) || gitPromptShown.get(repoRoot) === reason) { return; }
         gitPromptInFlight.add(repoRoot);
+        gitPromptShown.set(repoRoot, reason);
+        persistGitPromptShown();
         try {
             const answer = await vscode.window.showWarningMessage(
                 `Code Diff Tracker: ${reason}`,
@@ -365,6 +403,8 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer === 'Archive and Rebuild') {
                 await rebuildGitBaseline(repoRoot, event.kind === 'changed' ? event.context : undefined, true);
+                if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot) &&
+                    gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
             }
         } finally {
             gitPromptInFlight.delete(repoRoot);
@@ -1064,6 +1104,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Update decorations when changes are tracked
     context.subscriptions.push(
         diffTracker.onDidTrackChanges((event: TrackChangesEvent) => {
+            resetGitPromptOnBaselineChanged(event);
             refreshChangesTree();
 
             if (event.fullRefresh) {
@@ -1132,12 +1173,18 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
+    // Stop Git events and tracker callbacks before capturing the final receipt
+    // queue. Otherwise a new prompt-state write can be enqueued while awaiting
+    // an earlier write, and get lost when the extension host exits.
     if (gitContextMonitor) {
         gitContextMonitor.dispose();
     }
     if (diffTracker) {
         await diffTracker.dispose();
     }
+    // Includes the final clear following a fresh recording baseline.
+    try { await pendingGitPromptWrites; }
+    catch (error) { console.warn('Code Diff Tracker: Git pause notification state could not be saved', error); }
     if (decorationManager) {
         decorationManager.dispose();
     }
