@@ -307,9 +307,33 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     const gitPromptInFlight = new Set<string>();
-    // The in-flight guard prevents overlap. Also remember delivered reasons so
-    // transient Git-context re-notifications do not reopen a dismissed modal.
-    const gitPromptShown = new Map<string, string>();
+    // An in-flight guard alone is activation-local; retain acknowledged pause
+    // notifications across extension-host reloads on the same workspace.
+    const gitPromptStateKey = 'diffTracker.gitPausePromptShown.v1';
+    const persistedGitPromptShown = context.workspaceState.get<Array<[string, string]>>(gitPromptStateKey, []);
+    const gitPromptShown = new Map<string, string>(
+        Array.isArray(persistedGitPromptShown)
+            ? persistedGitPromptShown.filter((entry): entry is [string, string] =>
+                Array.isArray(entry) && entry.length === 2 &&
+                typeof entry[0] === 'string' && typeof entry[1] === 'string')
+            : []
+    );
+    let gitPromptWriteQueue: Promise<void> = Promise.resolve();
+    const persistGitPromptShown = (): void => {
+        const snapshot = [...gitPromptShown];
+        // Serialize writes so a new-baseline reset cannot be overwritten by
+        // a slower save from an earlier pause notification.
+        gitPromptWriteQueue = gitPromptWriteQueue.catch(() => undefined)
+            .then(() => context.workspaceState.update(gitPromptStateKey, snapshot));
+        void gitPromptWriteQueue.catch(error => console.warn('Code Diff Tracker: Cannot save Git pause notification state', error));
+    };
+    const resetGitPromptOnBaselineChanged = (event: TrackChangesEvent): void => {
+        if (event.baselineChanged && gitPromptShown.size > 0 &&
+            diffTracker.getPausedGitRepositories().length === 0) {
+            gitPromptShown.clear();
+            persistGitPromptShown();
+        }
+    };
     const rebuildGitBaseline = async (
         repoRoot: string,
         contextSnapshot?: GitContextSnapshot,
@@ -336,7 +360,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!currentSnapshot || currentSnapshot.inProgress) { return false; }
         const rebuilt = await diffTracker.rebuildRepositoryBaseline(repoRoot, currentSnapshot);
         if (rebuilt) {
-            gitPromptShown.delete(repoRoot);
+            if (gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
             refreshReview();
             void vscode.window.showInformationMessage('Code Diff Tracker: The repository review was archived and its baseline rebuilt.');
         } else {
@@ -360,14 +384,14 @@ export async function activate(context: vscode.ExtensionContext) {
             ? diffTracker.observeGitContext(event.context)
             : diffTracker.observeGitRepositoryRemoved(event.repoRoot);
         if (!reason) {
-            if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot)) {
-                gitPromptShown.delete(repoRoot);
-            }
+            if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot) &&
+                gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
             return;
         }
         if (runningExtensionTests || gitPromptInFlight.has(repoRoot) || gitPromptShown.get(repoRoot) === reason) { return; }
         gitPromptInFlight.add(repoRoot);
         gitPromptShown.set(repoRoot, reason);
+        persistGitPromptShown();
         try {
             const answer = await vscode.window.showWarningMessage(
                 `Code Diff Tracker: ${reason}`,
@@ -376,9 +400,8 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             if (answer === 'Archive and Rebuild') {
                 await rebuildGitBaseline(repoRoot, event.kind === 'changed' ? event.context : undefined, true);
-                if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot)) {
-                    gitPromptShown.delete(repoRoot);
-                }
+                if (!diffTracker.getPausedGitRepositories().some(item => item.repoRoot === repoRoot) &&
+                    gitPromptShown.delete(repoRoot)) { persistGitPromptShown(); }
             }
         } finally {
             gitPromptInFlight.delete(repoRoot);
@@ -1078,6 +1101,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Update decorations when changes are tracked
     context.subscriptions.push(
         diffTracker.onDidTrackChanges((event: TrackChangesEvent) => {
+            resetGitPromptOnBaselineChanged(event);
             refreshChangesTree();
 
             if (event.fullRefresh) {
