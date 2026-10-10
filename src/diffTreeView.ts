@@ -102,8 +102,10 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const relative = this.toWorkspaceRelative(diagnostic.targetPath).join('/');
             const child = new TreeItem(relative || displayFileName(diagnostic.targetPath), vscode.TreeItemCollapsibleState.None);
             child.iconPath = new vscode.ThemeIcon('warning');
+            child.contextValue = 'coverageDiagnosticSubtree';
+            child.coveragePath = diagnostic.targetPath;
             child.description = diagnostic.reasonCode;
-            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}`;
+            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\nRight-click or use the inline exclude action to stage a narrow explicit exclusion.`;
             child.command = {
                 command: 'diffTracker.manageMonitoringScope',
                 title: 'Manage Monitoring Scope'
@@ -301,6 +303,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
 class TreeItem extends vscode.TreeItem {
     public children?: TreeItem[];
     public filePath?: string;
+    public coveragePath?: string;
     public isDeleted?: boolean;
     public reviewToken?: ReviewToken;
     public opaqueReviewToken?: OpaqueReviewToken;
