@@ -5495,11 +5495,33 @@ export class DiffTracker {
             false, evidence.targetKind === 'subtree').source === 'explicitExclude';
     }
 
+    private isDormantExcludedImportedGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
+        if (evidence.targetKind !== 'subtree' ||
+            (evidence.reasonCode !== 'directory-scan-coverage-gap' &&
+                evidence.reasonCode !== 'directory-runtime-coverage-gap')) { return false; }
+        // Keep the durable uncertainty for a later re-include: the original
+        // imported-directory owner may no longer exist, even though this subtree
+        // is explicitly excluded from the committed monitoring scope today.
+        const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
+        if (scope.kind !== 'configured') { return false; }
+        const folder = this.owningWorkspaceFolderForTraversal(targetPath);
+        if (!folder) { return false; }
+        const relative = this.toPosixPath(path.relative(folder.uri.fsPath, targetPath));
+        return configuredScopeExplicitlyExcludesSubtree(
+            scope, this.workspaceRootIdentityForFolder(folder), relative
+        );
+    }
+
+    private isDormantCoverageGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
+        return this.isDormantPendingScopeGap(targetPath, evidence) ||
+            this.isDormantExcludedImportedGap(targetPath, evidence);
+    }
+
     public getCoverageGaps(): Array<[string, string]> {
         const result: Array<[string, string]> = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (record.file && !this.isDormantPendingScopeGap(targetPath, record.file)) { result.push([targetPath, record.file.reason]); }
-            if (record.subtree && !this.isDormantPendingScopeGap(targetPath, record.subtree)) { result.push([targetPath, record.subtree.reason]); }
+            if (record.file && !this.isDormantCoverageGap(targetPath, record.file)) { result.push([targetPath, record.file.reason]); }
+            if (record.subtree && !this.isDormantCoverageGap(targetPath, record.subtree)) { result.push([targetPath, record.subtree.reason]); }
         }
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
@@ -5509,7 +5531,7 @@ export class DiffTracker {
     public getSubtreeCoverageGaps(): SubtreeCoverageDiagnostic[] {
         const result: SubtreeCoverageDiagnostic[] = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (!record.subtree || this.isDormantPendingScopeGap(targetPath, record.subtree)) { continue; }
+            if (!record.subtree || this.isDormantCoverageGap(targetPath, record.subtree)) { continue; }
             result.push({
                 targetPath,
                 reasonCode: record.subtree.reasonCode,
