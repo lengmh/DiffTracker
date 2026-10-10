@@ -74,8 +74,8 @@ DT_TEST_FILTER=ARCHIVE-RESTORE node test/tracker-safety.mjs
 On 2026-10-10, the final corrected working tree passed:
 
 - `npm run compile`, `npm run lint` and `git diff --check`.
-- Full `npm test`: 1,150 tracker regressions (including all 78 `ARCHIVE-RESTORE` cases), 71 Review UI cases, 32 Git-context adapter cases plus the readiness race, 9 real temporary Git-repository scenarios, 10 host-fixture setup cases, and the existing mapping/similarity/path/scope suites.
-- `npm run test:performance`: 1,100-file baseline scan 342 ms, update 1.8 ms and RSS delta 26.2 MiB in this Linux/Node 24 run; the mixed text/opaque/native-watcher probe also passed. These measurements are descriptive, not cross-platform performance guarantees.
+- Full `npm test`: 1,165 tracker regressions (including all 78 `ARCHIVE-RESTORE` cases), 99 Review UI cases, 32 Git-context adapter cases plus the readiness race, 9 real temporary Git-repository scenarios, 10 host-fixture setup cases, and the existing mapping/similarity/path/scope suites.
+- `npm run test:performance`: 1,100-file baseline scan 285.5 ms, update 1.7 ms and RSS delta 24.8 MiB in this Linux/Node 24 run; the mixed text/opaque/native-watcher probe also passed. These measurements are descriptive, not cross-platform performance guarantees.
 - `npm run test:stage2-probes`: 4/4 conservative safety probes.
 - Installed-harness/final-artifact guard tests: 33/33.
 - `npm audit --omit=dev --audit-level=high`: zero vulnerabilities.
@@ -90,6 +90,10 @@ A further review of `648349e` identified ignore-policy changes at the final comm
 The corrected working tree passed `npm run compile`, all 78 `ARCHIVE-RESTORE` cases (including 19 recording-state regressions), and `git diff --check`. The added regressions cover the stopped-session discovery omission, late commit-boundary activity, editor/workspace events without filesystem callbacks, direct filesystem enumeration and durable blocking after postcommit failures. These are production-tracker tests with a mocked VS Code boundary, not a new host-verification result. The aggregate, lint, performance, safety probes and packaging checks above were rerun after this correction. A second independent review found no remaining confirmed P0/P1 findings and independently verified the double-write-failure regression.
 
 The production tracker/UI suites mock the VS Code boundary. A real Stable host launch was not reached: the installed Xorg dummy server could not establish its local display sockets in this environment. No Windows/Remote-WSL computer was available. The original PR commit `202ba070` subsequently passed Windows Stable, VS Code 1.80, installed RC and both Quality jobs in CI; Ubuntu Stable failed in the pre-existing Quick Diff provider dropdown helper before tracker actions. Those results do not verify this corrected commit or a real Remote-WSL setup. No new VS Code 1.80/S4-D diagnosis was performed.
+
+## Integration with current main
+
+Main `0592a78906105802023a97c7eb3484af10c431d6` (merged PR #30) was merged into the archive-restoration branch. The automatic merge preserved both sets of production changes. Independent review found a duplicate test-only `deferred()` helper in the combined UI harness; the less capable duplicate was removed, retaining the shared helper and all tests. The final combined tree passed the full local checks listed above, including 1,165 tracker regressions and 99 UI cases. Independent tracker and command integration reviews found no remaining confirmed production regressions or lost parent fixes. Exact merge-head CI and automatic review are tracked on PR #31 separately.
 
 ## Host verification
 

@@ -1279,6 +1279,82 @@ for(const stop of ['stopRecording','dispose']) test(`DT-08 old read cannot publi
     const p=file();seed(p,'base','changed');const gate=pause(p,'read');const operation=scan(p);await gate.entered;
     tracker[stop]();gate.release();await operation;assert.equal(pending(p),undefined);assert.equal(tracker.getOriginalContent(p),'base');
 });
+for(const kind of ['text','opaque']) test(`DT-08 older clean read cannot erase a newer unopened-file review (${kind})`,async()=>{
+    const p=file(`out-of-order-read.${kind==='text'?'txt':'bin'}`);
+    const before=kind==='text'?'baseline\n':Buffer.from([0,1,2]);
+    const after=kind==='text'?'newer disk change\n':Buffer.from([0,3,4]);
+    if(kind==='text'){seed(p,before);}
+    else{
+        fs.writeFileSync(p,before);
+        tracker.recordOpaqueBaseline(p,await tracker.readFileSnapshot(Uri.file(p)));
+    }
+    const opaqueBaseline=structuredClone(tracker.opaqueBaselineFiles.get(p));
+    const expectedIdentity=kind==='text'?after:createHash('sha256').update(after).digest('hex');
+    const currentIdentity=()=>kind==='text'?pending(p)?.currentContent:pending(p)?.currentFingerprint;
+    const reviewToken=()=>kind==='text'?tracker.getReviewToken(p):tracker.getOpaqueReviewToken(p);
+    const originalStat=vscode.workspace.fs.stat;
+    const entered=deferred(),release=deferred();
+    let statCalls=0;
+    vscode.workspace.fs.stat=async uri=>{
+        const result=await originalStat(uri);
+        if(uri.fsPath===p&&++statCalls===2){
+            // Capture the old read's final metadata before the mutation, but
+            // deliver it after the later read has published its current state.
+            // Both reads remain internally stable; only completion order differs.
+            entered.resolve();await release.promise;
+        }
+        return result;
+    };
+    const olderRead=scan(p);
+    try{
+        await entered.promise;
+        fs.writeFileSync(p,after);
+        await scan(p);
+        assert.equal(pending(p)?.reviewKind,kind);
+        assert.equal(currentIdentity(),expectedIdentity);
+        const newerToken=reviewToken();
+        assert.ok(newerToken);
+        release.resolve();await olderRead;
+        assert.deepEqual(fs.readFileSync(p),Buffer.from(after));
+        assert.equal(tracker.getOriginalContent(p),kind==='text'?before:undefined);
+        assert.deepEqual(tracker.opaqueBaselineFiles.get(p),opaqueBaseline);
+        assert.equal(currentIdentity(),expectedIdentity,
+            'an older clean snapshot must not remove the newer unopened-file review');
+        assert.deepEqual(reviewToken(),newerToken);
+    }finally{
+        release.resolve();await olderRead;
+        vscode.workspace.fs.stat=originalStat;
+    }
+});
+test('DT-08 overlapping reads for different paths preserve both reviews',async()=>{
+    const p=file('overlap-first.txt'),q=file('overlap-second.txt');
+    seed(p,'first baseline\n','first change\n');
+    seed(q,'second baseline\n','second change\n');
+    const originalStat=vscode.workspace.fs.stat;
+    const entered=deferred(),release=deferred();
+    let statCalls=0;
+    vscode.workspace.fs.stat=async uri=>{
+        const result=await originalStat(uri);
+        if(uri.fsPath===p&&++statCalls===2){entered.resolve();await release.promise;}
+        return result;
+    };
+    const firstRead=scan(p);
+    try{
+        await entered.promise;
+        await scan(q);
+        assert.equal(pending(q)?.currentContent,'second change\n');
+        const secondToken=tracker.getReviewToken(q);
+        assert.ok(secondToken);
+        release.resolve();await firstRead;
+        assert.equal(pending(p)?.currentContent,'first change\n');
+        assert.ok(tracker.getReviewToken(p));
+        assert.equal(pending(q)?.currentContent,'second change\n');
+        assert.deepEqual(tracker.getReviewToken(q),secondToken);
+    }finally{
+        release.resolve();await firstRead;
+        vscode.workspace.fs.stat=originalStat;
+    }
+});
 test('DT-08 atomic replacement delete event reads actual replacement',async()=>{
     const p=file();seed(p,'base','replacement');await tracker.onExternalFileDeleted(Uri.file(p));
     assert.equal(pending(p)?.isDeleted,false);assert.equal(pending(p)?.currentContent,'replacement');
@@ -5322,6 +5398,279 @@ test('Issue #28 production pause producer and reactivation gate preserve one not
         vscode.workspace.workspaceFolders=originalFolders;
         vscode.workspace.getWorkspaceFolder=originalFolderResolver;
     }
+});
+
+test('ISSUE-26 Unknown Reset establishes a text baseline without modifying disk and tracks later edits',async()=>{
+    const p=file('unknown-reset-text.txt');
+    fs.writeFileSync(p,'unverified current text');
+    tracker.recordUnresolvedBaseline(p,'Prior before-image unknown');
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    const token=tracker.getUnknownReviewToken(p);
+    assert.ok(token);
+    const writes=counters.write;
+    const result=await tracker.resetUnknownBaseline(p,token);
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.equal(disk(p),'unverified current text');
+    assert.equal(tracker.getOriginalContent(p),'unverified current text');
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(pending(p),undefined);
+    assert.ok(counters.write>=writes,'only session persistence may write, never the workspace file');
+    fs.writeFileSync(p,'future edit');
+    await scan(p);
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(pending(p)?.originalContent,'unverified current text');
+});
+test('ISSUE-26 Unknown Reset establishes opaque and proven-missing baselines',async()=>{
+    const opaque=file('unknown-reset.png');
+    fs.writeFileSync(opaque,Buffer.from([0,1,2,3]));
+    tracker.recordUnresolvedBaseline(opaque,'Unknown opaque before-image');
+    const result=await tracker.resetUnknownBaseline(opaque,tracker.getUnknownReviewToken(opaque));
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.ok(tracker.opaqueBaselineFiles.has(opaque));
+    assert.equal(pending(opaque),undefined);
+    fs.writeFileSync(opaque,Buffer.from([0,1,9,3]));
+    await scan(opaque);
+    assert.equal(pending(opaque)?.reviewKind,'opaque');
+
+    const missing=file('unknown-reset-missing.txt');
+    tracker.recordUnresolvedBaseline(missing,'Unknown missing file');
+    assert.equal((await tracker.resetUnknownBaseline(missing,tracker.getUnknownReviewToken(missing))).status,'success');
+    assert.equal(fs.existsSync(missing),false);
+    assert.equal(tracker.fileSnapshots.get(missing),'');
+    assert.equal(tracker.baselineExistingFiles.has(missing),false);
+    fs.writeFileSync(missing,'created later');
+    await scan(missing);
+    assert.equal(pending(missing)?.reviewKind,'text');
+    assert.equal(pending(missing)?.baselineExists,false);
+});
+test('ISSUE-26 Unknown Reset refuses stale, dirty and unreadable file states',async()=>{
+    const stale=file('unknown-reset-stale.txt');
+    fs.writeFileSync(stale,'text');
+    tracker.recordUnresolvedBaseline(stale,'Before unknown');
+    const token=tracker.getUnknownReviewToken(stale);
+    tracker.markFileUnavailable(stale,'New uncertainty');
+    assert.equal((await tracker.resetUnknownBaseline(stale,token)).status,'conflict');
+    assert.ok(tracker.unresolvedBaselineFiles.has(stale));
+
+    const dirty=file('unknown-reset-dirty.txt');
+    fs.writeFileSync(dirty,'unverified');
+    tracker.recordUnresolvedBaseline(dirty,'Before unknown');
+    const doc=document(dirty);
+    doc.isDirty=true;
+    assert.equal((await tracker.resetUnknownBaseline(dirty,tracker.getUnknownReviewToken(dirty))).status,'conflict');
+    assert.ok(tracker.unresolvedBaselineFiles.has(dirty));
+    doc.isDirty=false;
+
+    const covered=file('unknown-reset-covered.txt');
+    fs.writeFileSync(covered,'current');
+    tracker.recordUnresolvedBaseline(covered,'Before unknown');
+    tracker.setSubtreeCoverageGap(path.dirname(covered),'directory-runtime-coverage-gap','Watcher failed');
+    assert.equal((await tracker.resetUnknownBaseline(covered,tracker.getUnknownReviewToken(covered))).status,
+        'conflict','unknown reset must not promise future monitoring under a known coverage gap');
+    assert.ok(tracker.unresolvedBaselineFiles.has(covered));
+    tracker.clearCoverageGap(path.dirname(covered),'subtree');
+
+    const inaccessible=file('unknown-reset-inaccessible.txt');
+    fs.writeFileSync(inaccessible,'not readable now');
+    tracker.recordUnresolvedBaseline(inaccessible,'Before unknown');
+    faults.set(inaccessible,{read:error('NoPermissions')});
+    const result=await tracker.resetUnknownBaseline(inaccessible,tracker.getUnknownReviewToken(inaccessible));
+    assert.equal(result.status,'needsAttention',JSON.stringify(result));
+    assert.ok(tracker.unresolvedBaselineFiles.has(inaccessible));
+});
+for(const phase of ['read','persistence']) test(`ISSUE-26 Unknown Reset preserves uncertainty when coverage fails during ${phase}`,async()=>{
+    const storage=file(`unknown-late-gap-storage-${phase}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const directory=file(`unknown-late-gap-${phase}`);
+    fs.mkdirSync(directory);
+    const p=path.join(directory,'item.txt');
+    fs.writeFileSync(p,'current');
+    tracker.recordUnresolvedBaseline(p,'Unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const gate=phase==='read'?pause(p,'read'):pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=tracker.resetUnknownBaseline(p,tracker.getUnknownReviewToken(p));
+    await gate.entered;
+    tracker.setSubtreeCoverageGap(path.dirname(p),'directory-runtime-coverage-gap','Watcher failed during reset');
+    gate.release();
+    const result=await operation;
+    assert.notEqual(result.status,'success','late loss of ongoing coverage must invalidate Unknown reset');
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===path.dirname(p)));
+    assert.equal(disk(p),'current');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    assert.ok(fs.readFileSync(path.join(storage,'session-state.json'),'utf8').includes('Unknown before-image'));
+});
+for(const phase of ['write','copy']) test(`ISSUE-26 Unknown Reset preserves uncertainty when an editor becomes dirty during persistence ${phase}`,async()=>{
+    const storage=file(`unknown-late-dirty-storage-${phase}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const p=file(`unknown-late-dirty-${phase}.txt`);
+    fs.writeFileSync(p,'current disk text');
+    const doc=document(p);
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const persisted=fs.readFileSync(path.join(storage,'session-state.json'),'utf8');
+    const token=tracker.getUnknownReviewToken(p);
+    const before={apply:counters.apply,save:counters.save};
+    const gate=pause(path.join(storage,phase==='write'?'session-state.tmp.json':'session-state.json'),phase);
+    const operation=tracker.resetUnknownBaseline(p,token);
+    await gate.entered;
+    doc.text='new unsaved editor text';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc});
+    assert.deepEqual(tracker.getUnknownReviewToken(p),token,
+        'the production document event has not yet published its debounced review');
+    gate.release();
+    const result=await operation;
+    assert.notEqual(result.status,'success','dirty editor must invalidate the durable Unknown reset');
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.equal(tracker.opaqueBaselineFiles.has(p),false);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.equal(pending(p)?.unavailableReason,'Original unknown before-image');
+    assert.equal(tracker.getBaselineState(),'ready');
+    assert.equal(doc.getText(),'new unsaved editor text');
+    assert.equal(doc.isDirty,true);
+    assert.equal(disk(p),'current disk text');
+    assert.deepEqual({apply:counters.apply,save:counters.save},before);
+    for(const name of ['session-state.json',tracker.persistedStateBackupFileName]) {
+        assert.equal(fs.readFileSync(path.join(storage,name),'utf8'),persisted,
+            'rollback restores the original durable uncertainty, including already-published state');
+    }
+    assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false);
+});
+for(const excludesTarget of [true,false]) test(`ISSUE-26 Unknown Reset rechecks live scope during persistence (excluded=${excludesTarget})`,async()=>{
+    const storage=file(`unknown-late-scope-storage-${excludesTarget}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const directory=file('unknown-scope-watch-resume');
+    fs.mkdirSync(directory);
+    await tracker.onExternalFileCreated(Uri.file(directory));
+    watchExclude=[path.basename(directory)+'/'];
+    await tracker.refreshIgnoreMatchers();
+    const p=file('unknown-late-scope.txt');
+    fs.writeFileSync(p,'current disk text');
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const token=tracker.getUnknownReviewToken(p);
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=tracker.resetUnknownBaseline(p,token);
+    await persistGate.entered;
+    const entered=deferred(),release=deferred(),open=fs.promises.opendir;
+    fs.promises.opendir=async(target,...args)=>{
+        if(path.resolve(String(target))===directory){entered.resolve();await release.promise;}
+        return open(target,...args);
+    };
+    let refresh;
+    try {
+        watchExclude=[excludesTarget?path.basename(p):'unrelated-file.txt'];
+        configurationChanged({affectsConfiguration:key=>key==='diffTracker.watchExclude'});
+        refresh=tracker.ignoreRefreshPromise;
+        await entered.promise;
+        assert.equal(tracker.isPathIgnored(Uri.file(p)),excludesTarget,
+            'live policy publishes before imported watcher resumption finishes');
+        assert.deepEqual(tracker.getUnknownReviewToken(p),token,
+            'review pruning has not run while physical watcher resumption is pending');
+        persistGate.release();
+        const result=await operation;
+        if(excludesTarget) {
+            assert.notEqual(result.status,'success','new exclusion must invalidate the durable Unknown reset');
+            assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image');
+            assert.equal(tracker.getOriginalContent(p),undefined);
+            assert.equal(pending(p)?.reviewKind,'unknown');
+            for(const name of ['session-state.json',tracker.persistedStateBackupFileName]) {
+                const persisted=JSON.parse(fs.readFileSync(path.join(storage,name),'utf8'));
+                assert.deepEqual(persisted.unresolvedBaselineFiles.find(([target])=>target===p),
+                    [p,'Original unknown before-image']);
+                assert.equal(persisted.fileSnapshots.some(([target])=>target===p),false);
+            }
+        } else {
+            assert.equal(result.status,'success','a policy change that still includes the target remains eligible');
+            assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+            assert.equal(tracker.getOriginalContent(p),'current disk text');
+            assert.equal(pending(p),undefined);
+        }
+        assert.equal(disk(p),'current disk text');
+        assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false);
+    } finally {
+        persistGate.release();release.resolve();fs.promises.opendir=open;
+        await operation;await refresh;
+    }
+    if(excludesTarget) {
+        assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image',
+            'later scope pruning must not erase the rolled-back uncertainty');
+    }
+});
+test('ISSUE-26 Unknown Reset remains eligible for retained review outside ordinary scope',async()=>{
+    const {validateAndCanonicalizeScope}=require('../out/monitoringScope.js');
+    const validation=validateAndCanonicalizeScope({mode:'rules',includes:[],excludes:[]},
+        tracker.currentWorkspaceRootIdentities());
+    assert.equal(validation.ok,true);
+    tracker.effectiveMonitoringScope={kind:'configured',...validation.scope};
+    await tracker.refreshIgnoreMatchers();
+    const p=file('unknown-retained-scope.txt');
+    fs.writeFileSync(p,'current disk text');
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    vscodeExcludes['files.exclude']={[path.basename(p)]:true};
+    configurationChanged({affectsConfiguration:key=>key==='files.exclude'});
+    await tracker.ignoreRefreshPromise;
+    assert.equal(tracker.retainedReviewPaths.has(p),true);
+    assert.equal(tracker.isPathIgnored(Uri.file(p),false,false),true);
+    assert.equal(tracker.isPathIgnored(Uri.file(p)),false,'retained review remains minimally observable');
+    const result=await tracker.resetUnknownBaseline(p,tracker.getUnknownReviewToken(p));
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(pending(p),undefined);
+    assert.equal(tracker.retainedReviewPaths.has(p),false);
+    assert.equal(tracker.getOriginalContent(p),undefined,'resolved retained review releases its excluded baseline');
+    assert.equal(disk(p),'current disk text');
+});
+test('ISSUE-26 Reset All Unknown allows partial success and preserves other text review',async()=>{
+    const good=file('unknown-batch-good.txt');
+    const bad=file('unknown-batch-bad.txt');
+    const existing=file('unknown-batch-existing.txt');
+    fs.writeFileSync(good,'current');
+    fs.writeFileSync(bad,'unreadable');
+    seed(existing,'original','pending');
+    await scan(existing);
+    tracker.recordUnresolvedBaseline(good,'Before unknown');
+    tracker.recordUnresolvedBaseline(bad,'Before unknown');
+    faults.set(bad,{read:error('NoPermissions')});
+    const results=await tracker.resetAllUnknownBaselines(tracker.getUnknownReviewTokens());
+    assert.equal(results.succeeded,1);
+    assert.equal(results.failed,1);
+    assert.equal(pending(good),undefined);
+    assert.equal(pending(bad)?.reviewKind,'unknown');
+    assert.equal(tracker.getOriginalContent(existing),'original');
+    assert.equal(pending(existing)?.reviewKind,'text');
+    assert.equal(disk(existing),'pending');
+});
+test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted uncertainty',async()=>{
+    const storage=file('unknown-reset-storage');
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true; tracker.externalWatcherEnabled=true; tracker.snapshotInitialized=true;
+    const p=file('unknown-reset-failed-save.txt');
+    fs.writeFileSync(p,'current');
+    tracker.recordUnresolvedBaseline(p,'Unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const persisted=fs.readFileSync(path.join(storage,'session-state.json'),'utf8');
+    const token=tracker.getUnknownReviewToken(p);
+    const target=path.join(storage,'session-state.tmp.json');
+    faults.set(target,{write:error('NoPermissions')});
+    const result=await tracker.resetUnknownBaseline(p,token);
+    assert.equal(result.status,'failed',JSON.stringify(result));
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.equal(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),persisted);
+    assert.equal(disk(p),'current');
 });
 
 registerPR12BoundedInvariants({

@@ -5,6 +5,45 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vscode = require('vscode');
 
+// Test-only, bounded tracing. Return each production method's exact result;
+// never await, synthesize events, rescan, or change tracker state here.
+function traceFixtureObservation(fixtures) {
+    const prototype = require('../../../out/diffTracker.js').DiffTracker.prototype;
+    const paths = new Map(fixtures.map(fixture => [fixture.filePath, fixture.relativePath]));
+    const events = [];
+    let dropped = 0;
+    const originals = new Map();
+    for (const name of ['dispatchExternalEvent', 'onExternalFileChanged', 'onExternalFileCreated',
+        'onExternalFileDeleted', 'readFileAndUpdate', 'updateTrackedDiff', 'setTrackedChange', 'deleteTrackedChange']) {
+        const original = prototype[name];
+        originals.set(name, original);
+        prototype[name] = function (...args) {
+            const filePath = typeof args[0] === 'string' ? args[0] : args[0]?.fsPath;
+            if (paths.has(filePath)) {
+                if (events.length < 512) {
+                    const content = name === 'updateTrackedDiff' ? args[1]
+                        : name === 'setTrackedChange' ? args[1]?.currentContent : undefined;
+                    events.push({ at: Date.now(), path: paths.get(filePath), method: name,
+                        kind: name === 'dispatchExternalEvent' ? args[1] : undefined,
+                        callbackEpoch: name === 'dispatchExternalEvent' ? args[2] : undefined,
+                        epoch: this.sessionEpoch, recording: this.isRecording,
+                        externalWatcherEnabled: this.externalWatcherEnabled,
+                        baselineBuilding: this.baselineBuilding, snapshotInitialized: this.snapshotInitialized,
+                        scopeApplyPreflight: this.scopeApplyPreflight,
+                        pendingWrite: this.pendingWriteFiles.has(filePath),
+                        existingReviewKind: this.trackedChanges.get(filePath)?.reviewKind,
+                        contentFingerprint: typeof content === 'string'
+                            ? createHash('sha256').update(content).digest('hex') : undefined });
+                } else { dropped++; }
+            }
+            return original.apply(this, args);
+        };
+    }
+    return { events, get dropped() { return dropped; }, dispose() {
+        for (const [name, original] of originals) { prototype[name] = original; }
+    } };
+}
+
 // Seed before Rules starts and before recording Whole Workspace Apply. Every
 // directory already exists when coverage is installed; these are ordinary
 // unopened-file events, not imported-directory or editor-event substitutes.
@@ -160,17 +199,19 @@ module.exports = async function prepareWholeWorkspaceProof({
                     `${fixture.relativePath}: Apply must establish existing text before-images only`);
             }
 
-            for (const fixture of fixtures) {
-                if (fixture.operation === 'delete') { fs.unlinkSync(fixture.filePath); }
-                else { fs.writeFileSync(fixture.filePath, fixture.after); }
-            }
+            const trace = traceFixtureObservation(fixtures);
             // One bounded observation wait covers all 18 outcomes. No reset,
             // rescan, reopen, mode switch or synthetic event may deliver them.
             let observed, lastObservedState, lastObservedAt;
             let observationCount = 0, readyObservationCount = 0, matchingObservationCount = 0;
             let firstMatchingObservationAt, lastMatchingObservationAt;
-            const observationStartedAt = Date.now();
+            let observationStartedAt;
             try {
+                for (const fixture of fixtures) {
+                    if (fixture.operation === 'delete') { fs.unlinkSync(fixture.filePath); }
+                    else { fs.writeFileSync(fixture.filePath, fixture.after); }
+                }
+                observationStartedAt = Date.now();
                 observed = await untilStable('S4-D Whole Workspace text/opaque create/modify/delete across three path classes', async () => {
                     const current = await state();
                     lastObservedState = current;
@@ -249,13 +290,18 @@ module.exports = async function prepareWholeWorkspaceProof({
                         unrelatedPendingCount: unrelated.length,
                         unrelatedPending: unrelated.slice(0, 64).map(changeEvidence),
                         unrelatedPendingTruncated: unrelated.length > 64,
-                        limitation: 'Public tracker snapshots and bounded fixture disk reads only; native callbacks and watcher ownership are not traced.'
+                        events: trace.events, droppedEvents: trace.dropped,
+                        limitation: 'Bounded fixture-only method-entry tracing; no synthetic events, rescans, or native backend instrumentation.'
                     }));
                 } catch (diagnosticError) {
                     console.error('S4-D observation diagnostic failed:', diagnosticError);
                 }
                 throw error;
+            } finally {
+                trace.dispose();
             }
+            console.log('S4-D normal modify observation trace:', JSON.stringify(
+                trace.events.filter(event => event.path === `${fixtureRoot}/normal/modify.txt`)));
             assertMode(observed, 'wholeWorkspace');
             for (const fixture of fixtures) {
                 const change = observed.trackedChanges.find(item => item.filePath === fixture.filePath);

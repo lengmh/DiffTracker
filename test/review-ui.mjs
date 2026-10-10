@@ -11,6 +11,7 @@ const require = createRequire(import.meta.url);
 const filePath = '/workspace/研究 folder/empty.m';
 const reviewToken={filePath,epoch:1,baselineRevision:'base',currentRevision:'current'};
 const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
+const unknownReviewToken={filePath,epoch:1,reviewRevision:'unknown-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
@@ -90,7 +91,12 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         },getUnknownReviewPaths:()=> {
             const change = state.changes[0];
             return change?.reviewKind === 'unknown' ? [filePath] : [];
-        },getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
+        },getUnknownReviewToken:(target)=> {
+            const change = state.changes.find(x=>x.filePath===target);
+            return change?.reviewKind==='unknown' ? {...unknownReviewToken,filePath:target} : undefined;
+        },getUnknownReviewTokens:()=> state.changes.filter(x=>x.reviewKind==='unknown')
+            .map(x=>({...unknownReviewToken,filePath:x.filePath})),
+        getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
         getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
@@ -101,7 +107,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         disposed:false,viewGeneration:0,seenRequests:new Set(),activeRequest:undefined,disposables:[],
         panel: { dispose(){},webview: { postMessage: value => messages.push(value), asWebviewUri: uri => uri, cspSource: 'test-source' } }
     });
-    return { panel, tracker, state, messages, commands, load,
+    return { panel, tracker, state, messages, commands, load, vscode,
         open: (target = filePath) => load('webviewDiffPanel.ts').WebviewDiffPanel.createOrShow({ fsPath: '/extension' }, tracker, target) };
 }
 
@@ -272,9 +278,606 @@ await test('subtree coverage diagnostics are visible and actionable without beco
     assert.equal(diagnostic.filePath, undefined, 'subtree diagnostics are not file review resources');
     assert.equal(diagnostic.children.length, 1);
     assert.equal(diagnostic.children[0].command.command, 'diffTracker.manageMonitoringScope');
+    assert.equal(diagnostic.children[0].contextValue, 'coverageDiagnosticSubtree');
+    assert.equal(diagnostic.children[0].coveragePath, '/workspace/imported-tree');
+    const manifest = JSON.parse(fs.readFileSync('package.json','utf8'));
+    const menu = manifest.contributes.menus['view/item/context'].find(entry =>
+        entry.command === 'diffTracker.excludeCoverageSubtree');
+    assert.match(menu.when,/coverageDiagnosticSubtree/);
+    assert.equal(menu.group,'inline','inline contribution also appears in right-click context menu');
+
     assert.match(diagnostic.children[0].tooltip, /Imported directory watcher failed/);
     assert.equal(roots.some(item => item.label === 'Pending Review'), false,
         'coverage diagnostics must not fabricate a file review summary');
+});
+
+await test('coverage exclude quick action stages an exact root-local request without Apply',async()=>{
+    const h=harness(null);
+    const root=path.resolve('coverage-scope-test-root');
+    const target=path.join(root,'docs','.aws');
+    const otherRoot=path.resolve('coverage-scope-other-root');
+    const {pathToFileURL}=await import('node:url');
+    const folder=(name,fsPath)=>({name,uri:{
+        fsPath,scheme:'file',toString:()=>pathToFileURL(fsPath).toString()
+    }});
+    const owned=folder('primary',root),other=folder('other',otherRoot);
+    h.vscode.workspace.workspaceFolders=[owned,other];
+    h.vscode.workspace.getWorkspaceFolder=()=>owned;
+    h.state.subtreeCoverageGaps=[{targetPath:target,reason:'watcher failure',reasonCode:'directory-runtime-coverage-gap'}];
+    const roots=[owned,other].map(value=>({
+        name:value.name,uri:value.uri.toString(),caseSensitive:true
+    }));
+    const validate=h.load('monitoringScope.ts').validateAndCanonicalizeScope;
+    let request=validate({mode:'wholeWorkspace',includes:[],excludes:[
+        {scope:'all',pattern:'**/*.tmp'}
+    ]},roots);
+    assert.equal(request.ok,true);
+    const controller=Object.create(h.load('monitoringScopeController.ts').MonitoringScopeController.prototype);
+    let saveCount=0,reconcileCount=0;
+    Object.assign(controller,{
+        tracker:h.tracker,
+        scopeSettingsWriteQueue:Promise.resolve(),
+        pendingScopeSettingsWrites:0,
+        getWorkspaceRoots:()=>roots,
+        getStatus:()=>({requested:request,legacyMigrationComplete:true,effective:{kind:'configured'}}),
+        getRequestedScope:()=>request,
+        reconcileRequestedScope:()=>{reconcileCount++;}
+    });
+    h.vscode.workspace.getConfiguration=()=>({update:async(key,value,target)=>{
+        assert.equal(key,'watchExclude','the quick action must only update exclusions');
+        assert.equal(target,h.vscode.ConfigurationTarget.Workspace);
+        saveCount++;
+        request=validate({...request.scope,excludes:value},roots);
+    }});
+    const first=await controller.requestExcludeCoverageSubtree(target);
+    assert.equal(first.status,'saved',JSON.stringify(first));
+    assert.equal(saveCount,1);assert.equal(reconcileCount,1);
+    assert.equal(request.scope.excludes.length,2,'preserve existing user excludes');
+    assert.ok(request.scope.excludes.some(x=>x.scope==='folder'&&x.folder==='primary'&&
+        x.pattern==='/docs/.aws/'),'target only the owning workspace root');
+    const second=await controller.requestExcludeCoverageSubtree(target);
+    assert.equal(second.status,'alreadyExcluded');
+    assert.equal(saveCount,1,'no duplicate settings write');
+    h.state.subtreeCoverageGaps=[];
+    assert.equal((await controller.requestExcludeCoverageSubtree(target)).status,'blocked',
+        'a stale diagnostic cannot stage an exclusion');
+    h.state.subtreeCoverageGaps=[{targetPath:path.join(root,'folder*','nested'),
+        reason:'bad',reasonCode:'directory-runtime-coverage-gap'}];
+    assert.equal((await controller.requestExcludeCoverageSubtree(path.join(root,'folder*','nested'))).status,
+        'blocked','literal special characters must not turn into broad globs');
+    assert.equal(saveCount,1);
+});
+
+function coverageExclusionHarness(){
+    const h=harness(null);
+    const root=path.resolve('.');
+    const {pathToFileURL}=require('node:url');
+    const folder={name:'primary',uri:{fsPath:root,scheme:'file',toString:()=>pathToFileURL(root).toString()}};
+    h.vscode.workspace.workspaceFolders=[folder];
+    h.vscode.workspace.getWorkspaceFolder=()=>folder;
+    h.state.workspaceConfiguration={
+        monitoringScope:'wholeWorkspace',
+        watchInclude:[{scope:'all',path:'test'}],
+        watchExclude:[{scope:'all',pattern:'**/*.tmp'}]
+    };
+    let writes=Promise.resolve();
+    h.vscode.workspace.getConfiguration=()=>({
+        get:(key,fallback)=>h.state.workspaceConfiguration[key]??h.state.configuration[key]??fallback,
+        inspect:key=>({workspaceValue:h.state.workspaceConfiguration[key],globalValue:h.state.configuration[key]}),
+        update:(key,value,target)=>{
+            const write=writes.then(async()=>{
+                h.state.updates.push([key,value,target]);
+                await h.state.beforeConfigurationUpdate?.(key,value);
+                await new Promise(resolve=>setImmediate(resolve));
+                h.state.workspaceConfiguration[key]=structuredClone(value);
+                await h.state.afterConfigurationUpdate?.(key,value);
+            });
+            writes=write.catch(()=>undefined);
+            return write;
+        }
+    });
+    const roots=[{name:folder.name,uri:folder.uri.toString(),caseSensitive:true}];
+    const effective={kind:'configured',...h.load('monitoringScope.ts').validateAndCanonicalizeScope({
+        mode:h.state.workspaceConfiguration.monitoringScope,
+        includes:h.state.workspaceConfiguration.watchInclude,
+        excludes:h.state.workspaceConfiguration.watchExclude
+    },roots).scope};
+    Object.assign(h.tracker,{
+        getEffectiveMonitoringScope:()=>effective,
+        getCommittedLegacyCompatibilityPolicy:()=>[],
+        getExplicitlyExcludedPendingReviewPaths:()=>[],
+        setPendingMonitoringScope:scope=>{h.state.pendingScope=scope;}
+    });
+    const workspaceState=new Map();
+    const controller=new (h.load('monitoringScopeController.ts').MonitoringScopeController)(
+        {workspaceState:{get:key=>workspaceState.get(key),update:async(key,value)=>workspaceState.set(key,value)}},h.tracker);
+    const targets=['a','b'].map(name=>path.join(root,name));
+    h.state.subtreeCoverageGaps=targets.map(targetPath=>({
+        targetPath,reason:'watcher failure',reasonCode:'directory-runtime-coverage-gap'
+    }));
+    return {...h,controller,targets};
+}
+
+// Run the production activation statements for scope commands unchanged. The
+// controller and panel are real; only the VS Code host and tracker are stubs.
+function monitoringScopeCommandHarness() {
+    const h = coverageExclusionHarness();
+    const callbacks = new Map();
+    h.state.warnings = [];
+    h.state.info = [];
+    h.state.applies = 0;
+    h.vscode.window.showWarningMessage = message => h.state.warnings.push(message);
+    h.vscode.window.showInformationMessage = message => h.state.info.push(message);
+    h.vscode.commands.registerCommand = (name, callback) => {
+        callbacks.set(name, callback);
+        return { dispose() {} };
+    };
+    Object.assign(h.tracker, {
+        getRetainedReviewPaths: () => [],
+        getCoverageGaps: () => [],
+        getCoverageGeneration: () => 1,
+        getPolicyFingerprint: () => 'test-policy'
+    });
+    h.controller.applyPendingScope = async () => {
+        h.state.applies++;
+        return { status: 'applied' };
+    };
+    const WatchExcludePanel = h.load('watchExcludePanel.ts').WatchExcludePanel;
+    const source = ts.createSourceFile('extension.ts', fs.readFileSync('src/extension.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+    const activation = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'activate');
+    const statements = activation.body.statements;
+    const commandIndex = statements.findIndex(statement => {
+        let found = false;
+        function visit(node) {
+            if (ts.isCallExpression(node) && node.expression.getText(source) === 'vscode.commands.registerCommand' &&
+                node.arguments[0]?.text === 'diffTracker.excludeCoverageSubtree') { found = true; }
+            ts.forEachChild(node, visit);
+        }
+        visit(statement);
+        return found;
+    });
+    assert.ok(commandIndex >= 0, 'scope commands must be registered in activation');
+    let start = commandIndex;
+    while (start > 0 && ts.isVariableStatement(statements[start - 1])) { start--; }
+    const code = statements.slice(start, commandIndex + 1).map(statement => statement.getText(source)).join('\n');
+    vm.runInNewContext(ts.transpileModule(code, {
+        compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+    }).outputText, {
+        vscode: h.vscode, WatchExcludePanel, diffTracker: h.tracker,
+        monitoringScopeController: h.controller,
+        context: { extensionUri: { fsPath: '/extension' }, subscriptions: [] },
+        settingsTreeDataProvider: { refresh() {} }
+    });
+    return { ...h, WatchExcludePanel, run: (name, ...args) => callbacks.get(`diffTracker.${name}`)(...args) };
+}
+
+function deferred() {
+    let resolve, reject;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+}
+
+const scopeEditorCommands = ['manageMonitoringScope', 'editWatchExcludes', 'applyPendingScope', 'retryScopePreparation'];
+for (const command of scopeEditorCommands) {
+    await test(`scope command ${command} cannot capture a draft during a quick exclusion save`, async () => {
+        const h = monitoringScopeCommandHarness();
+        const entered = deferred(), gate = deferred();
+        h.state.beforeConfigurationUpdate = async () => { entered.resolve(); await gate.promise; };
+        const save = h.run('excludeCoverageSubtree', { coveragePath: h.targets[0] });
+        try {
+            await entered.promise;
+            await h.run(command);
+            assert.equal(h.WatchExcludePanel.currentPanel, undefined,
+                'no scope editor may capture the pre-save request');
+            assert.equal(h.state.createdPanels.length, 0);
+            assert.equal(h.state.applies, 0, 'Apply must not proceed against the pre-save request');
+            assert.match(h.state.warnings.at(-1), /exclusion.*sav|sav.*exclusion/i);
+        } finally {
+            gate.resolve();
+            await save;
+        }
+        await h.run(command);
+        const panel = h.WatchExcludePanel.currentPanel;
+        assert.ok(panel, 'normal panel opening resumes after the settings save');
+        assert.equal(h.state.applies, /apply|retry/.test(command) ? 1 : 0);
+        await panel.handleMessage({ command: 'reload' });
+        const draft = h.messages.at(-1).rawRequested;
+        assert.ok(draft.excludes.some(rule => rule.pattern === '/a/'), 'the fresh editor includes the quick exclusion');
+        await panel.handleMessage({ command: 'saveRequest', ...draft });
+        assert.ok(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'),
+            'saving the fresh editor must retain the quick exclusion');
+        panel.dispose();
+    });
+}
+
+await test('scope editor remains blocked until all queued quick exclusion commands settle', async () => {
+    const h = monitoringScopeCommandHarness();
+    const entered = [deferred(), deferred()], gates = [deferred(), deferred()];
+    let writes = 0;
+    h.state.beforeConfigurationUpdate = async () => {
+        const index = writes++;
+        entered[index].resolve();
+        await gates[index].promise;
+    };
+    const first = h.run('excludeCoverageSubtree', h.targets[0]);
+    for (const command of scopeEditorCommands) {
+        await h.run(command);
+        assert.equal(h.WatchExcludePanel.currentPanel, undefined, 'ownership starts before the controller queue runs');
+    }
+    const second = h.run('excludeCoverageSubtree', h.targets[1]);
+    try {
+        await entered[0].promise;
+        gates[0].resolve();
+        assert.equal((await first).status, 'saved');
+        await entered[1].promise;
+        for (const command of scopeEditorCommands) {
+            await h.run(command);
+            assert.equal(h.WatchExcludePanel.currentPanel, undefined,
+                'settling the first write cannot release ownership held by a queued request');
+        }
+        assert.equal(h.state.applies, 0);
+    } finally {
+        gates.forEach(gate => gate.resolve());
+        await Promise.all([first, second]);
+    }
+    await h.run('manageMonitoringScope');
+    assert.ok(h.WatchExcludePanel.currentPanel);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule => rule.pattern).sort(),
+        ['**/*.tmp', '/a/', '/b/'].sort());
+    h.WatchExcludePanel.currentPanel.dispose();
+});
+
+for (const failure of ['rejected operation', 'failed settings write']) {
+    await test(`scope editor ownership is released after a ${failure}`, async () => {
+        const h = monitoringScopeCommandHarness();
+        if (failure === 'rejected operation') {
+            h.tracker.getSubtreeCoverageGaps = () => { throw new Error('controlled coverage lookup failure'); };
+            await assert.rejects(h.run('excludeCoverageSubtree', h.targets[0]), /controlled coverage lookup failure/);
+        } else {
+            h.state.beforeConfigurationUpdate = async () => { throw new Error('controlled settings failure'); };
+            assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'blocked');
+        }
+        await h.run('manageMonitoringScope');
+        assert.ok(h.WatchExcludePanel.currentPanel, 'a failed command must not leave the editor locked');
+        h.WatchExcludePanel.currentPanel.dispose();
+    });
+}
+
+await test('an already open scope editor still prevents quick exclusion commands', async () => {
+    const h = monitoringScopeCommandHarness();
+    await h.run('manageMonitoringScope');
+    const panel = h.WatchExcludePanel.currentPanel;
+    assert.equal(await h.run('excludeCoverageSubtree', h.targets[0]), undefined);
+    assert.equal(h.state.updates.length, 0, 'the existing draft must retain exclusive ownership');
+    assert.match(h.state.warnings.at(-1), /Close Manage Monitoring Scope/);
+    panel.dispose();
+    assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'saved');
+});
+
+await test('closing a saving scope editor preserves ownership and the next quick exclusion merges its final draft', async () => {
+    const h = monitoringScopeCommandHarness();
+    await h.run('manageMonitoringScope');
+    const panel = h.WatchExcludePanel.currentPanel;
+    const draft = { mode: 'rules', includes: [{ scope: 'all', path: 'src' }],
+        excludes: [{ scope: 'all', pattern: '/editor-owned/' }] };
+    const entered = deferred(), gate = deferred();
+    h.state.beforeConfigurationUpdate = async () => {
+        h.state.beforeConfigurationUpdate = undefined;
+        entered.resolve();
+        await gate.promise;
+    };
+    const save = panel.handleMessage({ command: 'saveRequest', ...draft });
+    panel.dispose();
+    const quick = h.run('excludeCoverageSubtree', h.targets[0]);
+    try {
+        await entered.promise;
+        for (const command of scopeEditorCommands) {
+            await h.run(command);
+            assert.equal(h.WatchExcludePanel.currentPanel, undefined, 'a closed but still-saving editor retains ownership');
+        }
+        assert.deepEqual(h.state.updates.map(([key]) => key), ['monitoringScope'],
+            'the quick exclusion cannot write between the editor’s settings writes');
+    } finally { gate.resolve(); }
+    await save;
+    assert.equal((await quick).status, 'saved');
+    assert.equal(h.state.workspaceConfiguration.monitoringScope, draft.mode);
+    assert.deepEqual(h.state.workspaceConfiguration.watchInclude, draft.includes);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule => rule.pattern).sort(), ['/a/', '/editor-owned/']);
+    assert.deepEqual(h.state.updates.map(([key]) => key), ['monitoringScope', 'watchInclude', 'watchExclude', 'watchExclude']);
+    await h.run('manageMonitoringScope');
+    assert.ok(h.WatchExcludePanel.currentPanel);
+    h.WatchExcludePanel.currentPanel.dispose();
+});
+
+for (const kind of ['automatic', 'manual']) {
+    await test(`${kind} migration owns one queued write through its nested save and finishes without deadlock`, async () => {
+        const h = monitoringScopeCommandHarness();
+        h.tracker.getEffectiveMonitoringScope = () => ({ kind: 'legacyV3' });
+        h.tracker.prepareLegacyCompatibilityPolicySnapshot = async () => true;
+        h.state.configuration.watchExclude = [kind === 'automatic' ? '# legacy note' : 'legacy/'];
+        h.state.workspaceConfiguration = {};
+        const entered = deferred(), gate = deferred();
+        h.state.beforeConfigurationUpdate = async () => {
+            h.state.beforeConfigurationUpdate = undefined;
+            entered.resolve();
+            await gate.promise;
+        };
+        const migration = kind === 'automatic' ? h.run('migrateLegacyWatchRules')
+            : h.controller.completeLegacyMigrationUsingCurrentScope({
+                mode: 'rules', includes: [], excludes: [{ scope: 'all', pattern: 'legacy/' }]
+            });
+        try {
+            await Promise.race([entered.promise, migration.then(result => assert.fail(`Migration did not reach its settings save: ${JSON.stringify(result)}`))]);
+            for (const command of scopeEditorCommands) {
+                await h.run(command);
+                assert.equal(h.WatchExcludePanel.currentPanel, undefined, 'migration must not expose partially written settings');
+            }
+        } finally { gate.resolve(); }
+        assert.equal((await migration).status, kind === 'automatic' ? 'migrated' : 'completed');
+        assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
+        assert.deepEqual(h.state.updates.map(([key]) => key), ['monitoringScope', 'watchInclude', 'watchExclude']);
+        assert.equal(h.controller.getStatus().legacyMigrationComplete, true);
+        await h.run('manageMonitoringScope');
+        assert.ok(h.WatchExcludePanel.currentPanel);
+        h.WatchExcludePanel.currentPanel.dispose();
+    });
+}
+
+for (const first of ['restore', 'quick']) {
+    await test(`${first}-first restore and quick commands serialize complete settings writes`, async () => {
+        const h = monitoringScopeCommandHarness();
+        const initial = structuredClone(h.state.workspaceConfiguration);
+        h.vscode.window.showWarningMessage = (message, options) => options?.modal ? 'Restore Effective Scope'
+            : h.state.warnings.push(message);
+        const entered = deferred(), gate = deferred();
+        h.state.beforeConfigurationUpdate = async () => {
+            h.state.beforeConfigurationUpdate = undefined;
+            entered.resolve();
+            await gate.promise;
+        };
+        const restore = () => h.run('restoreEffectiveScopeConfiguration');
+        const quick = () => h.run('excludeCoverageSubtree', h.targets[0]);
+        const earlier = first === 'restore' ? restore() : quick();
+        await entered.promise;
+        const later = first === 'restore' ? quick() : restore();
+        try {
+            for (const command of scopeEditorCommands) {
+                await h.run(command);
+                assert.equal(h.WatchExcludePanel.currentPanel, undefined);
+            }
+        } finally { gate.resolve(); }
+        await Promise.all([earlier, later]);
+        assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
+        assert.equal(h.state.workspaceConfiguration.monitoringScope, initial.monitoringScope);
+        assert.deepEqual(h.state.workspaceConfiguration.watchInclude, initial.watchInclude);
+        assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule => rule.pattern).sort(),
+            first === 'restore' ? ['**/*.tmp', '/a/'] : ['**/*.tmp'],
+            'a later confirmed Restore intentionally replaces the request; a later quick action merges it');
+        assert.deepEqual(h.state.updates.map(([key]) => key), first === 'restore'
+            ? ['monitoringScope', 'watchInclude', 'watchExclude', 'watchExclude']
+            : ['watchExclude', 'monitoringScope', 'watchInclude', 'watchExclude']);
+    });
+}
+
+for (const answer of [undefined, 'Restore Effective Scope']) {
+    await test(`restore confirmation ${answer ? 'acceptance' : 'cancellation'} owns no settings write before the decision`, async () => {
+        const h = monitoringScopeCommandHarness();
+        const decision = deferred();
+        h.vscode.window.showWarningMessage = (message, options) => options?.modal ? decision.promise
+            : h.state.warnings.push(message);
+        const restore = h.run('restoreEffectiveScopeConfiguration');
+        assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
+        assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'saved');
+        decision.resolve(answer);
+        assert.equal(await restore, !!answer);
+        assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
+        assert.equal(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'), !answer);
+    });
+}
+
+await test('concurrent coverage exclusions preserve both requests and existing scope rules',async()=>{
+    const h=coverageExclusionHarness();
+    const original=structuredClone(h.state.workspaceConfiguration);
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.state.beforeConfigurationUpdate=async()=>{
+        h.state.beforeConfigurationUpdate=undefined;
+        enter();await gate;
+    };
+    const first=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([entered,first.then(result=>assert.fail(`Save did not reach the configuration boundary: ${JSON.stringify(result)}`))]);
+    const second=h.controller.requestExcludeCoverageSubtree(h.targets[1]);
+    release();
+    const results=await Promise.all([first,second]);
+    assert.deepEqual(Array.from(results,result=>result.status),['saved','saved']);
+    assert.equal(h.state.workspaceConfiguration.monitoringScope,original.monitoringScope);
+    assert.deepEqual(h.state.workspaceConfiguration.watchInclude,original.watchInclude);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/a/','/b/'].sort(),'a later quick action must retain the earlier saved exclusion');
+    assert.ok(h.state.updates.every(([, ,target])=>target===h.vscode.ConfigurationTarget.Workspace));
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude','watchExclude']);
+    assert.equal(h.state.pendingScope.scopeRevision,h.controller.getRequestedScope().scope.scopeRevision);
+});
+
+await test('concurrent duplicate coverage exclusions perform only one settings save',async()=>{
+    const h=coverageExclusionHarness();
+    const results=await Promise.all([
+        h.controller.requestExcludeCoverageSubtree(h.targets[0]),
+        h.controller.requestExcludeCoverageSubtree(h.targets[0])
+    ]);
+    assert.deepEqual(Array.from(results,result=>result.status),['saved','alreadyExcluded']);
+    assert.equal(h.state.updates.length,1,'the duplicate must not rewrite any scope setting');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/a/'].sort());
+});
+
+await test('coverage exclusion does not overwrite an external edit after its first settings write',async()=>{
+    const h=coverageExclusionHarness();
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.state.afterConfigurationUpdate=async()=>{
+        h.state.afterConfigurationUpdate=undefined;
+        enter();await gate;
+    };
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([entered,operation.then(result=>assert.fail(`Save did not reach the configuration boundary: ${JSON.stringify(result)}`))]);
+    const external={
+        monitoringScope:'wholeWorkspace',
+        watchInclude:[{scope:'all',path:'src'}],
+        watchExclude:[{scope:'all',pattern:'/external/'}]
+    };
+    h.state.workspaceConfiguration=structuredClone(external);
+    release();
+    const result=await operation;
+    assert.deepEqual(h.state.workspaceConfiguration,external,
+        'a quick exclusion must not overwrite externally edited scope settings');
+    assert.equal(result.status,'blocked','a concurrent settings edit must not be reported as saved');
+    assert.match(result.reason,/changed during the save/);
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude']);
+});
+
+function deferLegacyCoverageSnapshot(h){
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3'});
+    h.state.workspaceConfiguration.watchExclude=[];
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>{
+        enter();return gate;
+    };
+    return {entered,release};
+}
+
+await test('coverage exclusion waits for a durable legacy policy snapshot before its single write',async()=>{
+    const h=coverageExclusionHarness();
+    const snapshot=deferLegacyCoverageSnapshot(h);
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+    assert.equal(h.state.updates.length,0,'no settings write before the snapshot is durable');
+    snapshot.release(true);
+    assert.equal((await operation).status,'saved');
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude']);
+});
+
+await test('coverage exclusion leaves settings unchanged when legacy policy cannot be persisted',async()=>{
+    const h=coverageExclusionHarness();
+    const snapshot=deferLegacyCoverageSnapshot(h);
+    const original=structuredClone(h.state.workspaceConfiguration);
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+    snapshot.release(false);
+    const result=await operation;
+    assert.equal(result.status,'blocked');
+    assert.match(result.reason,/Cannot persist the committed legacy monitoring policy/);
+    assert.deepEqual(h.state.workspaceConfiguration,original);
+    assert.equal(h.state.updates.length,0);
+});
+
+for(const scenario of [
+    {name:'scope edit',change:h=>{
+        h.state.workspaceConfiguration.watchInclude=[{scope:'all',path:'src'}];
+        h.state.workspaceConfiguration.watchExclude=[{scope:'all',pattern:'/external/'}];
+    },reason:/requested monitoring scope changed/},
+    {name:'legacy source edit',change:h=>{
+        h.state.workspaceConfiguration.watchExclude=['external/'];
+    },reason:/legacy watch-rule migration/},
+    {name:'workspace root change',change:h=>{
+        h.vscode.workspace.workspaceFolders[0].name='renamed';
+    },reason:/requested monitoring scope changed/},
+    {name:'owning folder change',change:h=>{
+        const folder=h.vscode.workspace.workspaceFolders[0];
+        h.vscode.workspace.getWorkspaceFolder=()=>({...folder,name:'different'});
+    },reason:/owning workspace folder changed/},
+    {name:'resolved warning',change:h=>{
+        h.state.subtreeCoverageGaps=[];
+    },reason:/coverage warning no longer exists/}
+]){
+    await test(`coverage exclusion revalidates ${scenario.name} after legacy snapshot preparation`,async()=>{
+        const h=coverageExclusionHarness();
+        const snapshot=deferLegacyCoverageSnapshot(h);
+        const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+        await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+        scenario.change(h);
+        const external=structuredClone(h.state.workspaceConfiguration);
+        snapshot.release(true);
+        const result=await operation;
+        assert.equal(result.status,'blocked');
+        assert.match(result.reason,scenario.reason);
+        assert.deepEqual(h.state.workspaceConfiguration,external);
+        assert.equal(h.state.updates.length,0,'stale quick actions must not write settings');
+    });
+}
+
+await test('coverage exclusion queue recovers after a rejected operation',async()=>{
+    const h=coverageExclusionHarness();
+    const gaps=h.tracker.getSubtreeCoverageGaps;
+    h.tracker.getSubtreeCoverageGaps=()=>{
+        h.tracker.getSubtreeCoverageGaps=gaps;
+        throw new Error('controlled coverage lookup failure');
+    };
+    const [first,second]=await Promise.allSettled([
+        h.controller.requestExcludeCoverageSubtree(h.targets[0]),
+        h.controller.requestExcludeCoverageSubtree(h.targets[1])
+    ]);
+    assert.equal(first.status,'rejected');
+    assert.match(first.reason.message,/controlled coverage lookup failure/);
+    assert.equal(second.status,'fulfilled');
+    assert.equal(second.value.status,'saved');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/b/'].sort());
+});
+
+await test('review tree exposes versioned Unknown Reset, text Accept and bounded folder actions',async()=>{
+    const h=harness(null);
+    const pathRoot=path.resolve('review-tree-scoped');
+    const text=path.join(pathRoot,'mixed','text.txt');
+    const opaque=path.join(pathRoot,'mixed','binary.png');
+    const unknown=path.join(pathRoot,'mixed','uncertain.dat');
+    const paths=[text,opaque,unknown];
+    h.state.changes=paths.map((filePath,index)=>({
+        filePath,fileName:path.basename(filePath),originalContent:'prior',currentContent:'changed',
+        isDeleted:false,reviewKind:['text','opaque','unknown'][index]
+    }));
+    h.tracker.getReviewToken=target=>target===text?{...reviewToken,filePath:target}:undefined;
+    h.tracker.getReviewTokens=()=>[{...reviewToken,filePath:text}];
+    h.tracker.getOpaqueReviewToken=target=>target===opaque?{...opaqueReviewToken,filePath:target}:undefined;
+    h.tracker.getOpaqueReviewTokens=()=>[{...opaqueReviewToken,filePath:opaque}];
+    h.tracker.getUnknownReviewToken=target=>target===unknown?{...unknownReviewToken,filePath:target}:undefined;
+    h.tracker.getUnknownReviewTokens=()=>[{...unknownReviewToken,filePath:unknown}];
+    const originalGetFolder=h.vscode.workspace.getWorkspaceFolder;
+    h.vscode.workspace.getWorkspaceFolder=()=>({
+        name:'local',uri:{fsPath:pathRoot,scheme:'file'}
+    });
+    try{
+        const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+        const root=await tree.getChildren();
+        const resetAll=root.find(item=>item.command?.command==='diffTracker.resetAllUnknownBaselines');
+        assert.ok(resetAll);
+        assert.equal(resetAll.command.arguments[0][0].filePath,unknown);
+        const folder=root.find(item=>item.contextValue==='reviewFolder');
+        assert.ok(folder,'a virtual folder groups only its actual pending descendants');
+        const leaves=folder.children;
+        const textLeaf=leaves.find(item=>item.filePath===text);
+        const opaqueLeaf=leaves.find(item=>item.filePath===opaque);
+        const unknownLeaf=leaves.find(item=>item.filePath===unknown);
+        assert.equal(textLeaf.contextValue,'changedFile');
+        assert.equal(opaqueLeaf.contextValue,'opaqueFile');
+        assert.equal(unknownLeaf.contextValue,'unknownFile');
+        assert.equal(unknownLeaf.unknownReviewToken.filePath,unknown);
+        assert.deepEqual(Array.from(folder.reviewEntries,entry=>entry.filePath).sort(),paths.sort());
+        assert.equal(folder.reviewEntries.filter(entry=>entry.reviewToken).length,1);
+        assert.equal(folder.reviewEntries.filter(entry=>entry.opaqueReviewToken).length,1);
+        const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+        const menus=manifest.contributes.menus['view/item/context'];
+        for(const command of ['diffTracker.acceptFolderText','diffTracker.revertFolderText','diffTracker.acknowledgeFolderOpaque']){
+            assert.ok(menus.some(item=>item.command===command&&item.when.includes('reviewFolder')),
+                `${command} must be scoped to virtual directory rows`);
+        }
+        assert.ok(menus.some(item=>item.command==='diffTracker.acceptFile'&&item.group==='inline'));
+        assert.ok(menus.some(item=>item.command==='diffTracker.resetUnknownBaseline'&&item.group==='inline'));
+    }finally{h.vscode.workspace.getWorkspaceFolder=originalGetFolder;}
 });
 
 await test('opaque file review is visible, read-only and carries identity metadata', async () => {
@@ -690,13 +1293,6 @@ await test('clear command cancellation performs no baseline reset',async()=>{
     assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,0);
 });
 
-function deferred() {
-    let resolve;
-    const promise = new Promise(done => { resolve = done; });
-    return { promise, resolve };
-}
-
-
 for (const alreadyRecording of [false, true]) {
     await test(`refused recording start never replaces Git baselines or context (previous recording=${alreadyRecording})`, () => {
         const preserved = [{ ...archivedReviewPreview().archive.gitContext, headCommit: 'preserved-before-image-head' }];
@@ -936,7 +1532,7 @@ await test('workspace document lookups distinguish file working documents from v
     visit(sourceFile);
     assert.deepEqual(offenders,[]);
 });
-await test('opaque exposes Acknowledge plus inspection while unknown remains inspection-only',()=>{
+await test('opaque exposes Acknowledge and unknown exposes explicit Baseline Reset plus inspection',()=>{
     const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
     const items=manifest.contributes.menus['view/item/context'];
     const opaqueCommands=items
@@ -946,6 +1542,6 @@ await test('opaque exposes Acknowledge plus inspection while unknown remains ins
     const unknownCommands=items
         .filter(item=>(item.when??'').includes('viewItem == unknownFile'))
         .map(item=>item.command).sort();
-    assert.deepEqual(unknownCommands,['diffTracker.showWebviewDiff']);
+    assert.deepEqual(unknownCommands,['diffTracker.resetUnknownBaseline','diffTracker.showWebviewDiff']);
 });
 console.log(`${count} production review UI cases passed (VS Code, DOM and renderer boundaries mocked).`);
