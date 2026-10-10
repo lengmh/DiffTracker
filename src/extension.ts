@@ -1173,16 +1173,18 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
-    // This includes a queued clear following a new baseline; failing to flush
-    // it could suppress the next genuine Git pause after window reload.
-    try { await pendingGitPromptWrites; }
-    catch (error) { console.warn('Code Diff Tracker: Git pause notification state could not be saved', error); }
+    // Stop Git events and tracker callbacks before capturing the final receipt
+    // queue. Otherwise a new prompt-state write can be enqueued while awaiting
+    // an earlier write, and get lost when the extension host exits.
     if (gitContextMonitor) {
         gitContextMonitor.dispose();
     }
     if (diffTracker) {
         await diffTracker.dispose();
     }
+    // Includes the final clear following a fresh recording baseline.
+    try { await pendingGitPromptWrites; }
+    catch (error) { console.warn('Code Diff Tracker: Git pause notification state could not be saved', error); }
     if (decorationManager) {
         decorationManager.dispose();
     }
