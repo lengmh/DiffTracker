@@ -318,15 +318,16 @@ await test('coverage exclude quick action stages an exact root-local request wit
         tracker:h.tracker,
         coverageExclusionQueue:Promise.resolve(),
         getWorkspaceRoots:()=>roots,
-        getStatus:()=>({requested:request,legacyMigrationComplete:true}),
+        getStatus:()=>({requested:request,legacyMigrationComplete:true,effective:{kind:'configured'}}),
         getRequestedScope:()=>request,
-        saveRequestedScope:async next=>{
-            saveCount++;
-            request=validate(next,roots);
-            return request;
-        },
         reconcileRequestedScope:()=>{reconcileCount++;}
     });
+    h.vscode.workspace.getConfiguration=()=>({update:async(key,value,target)=>{
+        assert.equal(key,'watchExclude','the quick action must only update exclusions');
+        assert.equal(target,h.vscode.ConfigurationTarget.Workspace);
+        saveCount++;
+        request=validate({...request.scope,excludes:value},roots);
+    }});
     const first=await controller.requestExcludeCoverageSubtree(target);
     assert.equal(first.status,'saved',JSON.stringify(first));
     assert.equal(saveCount,1);assert.equal(reconcileCount,1);
@@ -368,6 +369,7 @@ function coverageExclusionHarness(){
                 await h.state.beforeConfigurationUpdate?.(key,value);
                 await new Promise(resolve=>setImmediate(resolve));
                 h.state.workspaceConfiguration[key]=structuredClone(value);
+                await h.state.afterConfigurationUpdate?.(key,value);
             });
             writes=write.catch(()=>undefined);
             return write;
@@ -415,6 +417,7 @@ await test('concurrent coverage exclusions preserve both requests and existing s
     assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
         ['**/*.tmp','/a/','/b/'].sort(),'a later quick action must retain the earlier saved exclusion');
     assert.ok(h.state.updates.every(([, ,target])=>target===h.vscode.ConfigurationTarget.Workspace));
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude','watchExclude']);
     assert.equal(h.state.pendingScope.scopeRevision,h.controller.getRequestedScope().scope.scopeRevision);
 });
 
@@ -425,10 +428,108 @@ await test('concurrent duplicate coverage exclusions perform only one settings s
         h.controller.requestExcludeCoverageSubtree(h.targets[0])
     ]);
     assert.deepEqual(Array.from(results,result=>result.status),['saved','alreadyExcluded']);
-    assert.equal(h.state.updates.length,3,'the duplicate must not rewrite any scope setting');
+    assert.equal(h.state.updates.length,1,'the duplicate must not rewrite any scope setting');
     assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
         ['**/*.tmp','/a/'].sort());
 });
+
+await test('coverage exclusion does not overwrite an external edit after its first settings write',async()=>{
+    const h=coverageExclusionHarness();
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.state.afterConfigurationUpdate=async()=>{
+        h.state.afterConfigurationUpdate=undefined;
+        enter();await gate;
+    };
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([entered,operation.then(result=>assert.fail(`Save did not reach the configuration boundary: ${JSON.stringify(result)}`))]);
+    const external={
+        monitoringScope:'wholeWorkspace',
+        watchInclude:[{scope:'all',path:'src'}],
+        watchExclude:[{scope:'all',pattern:'/external/'}]
+    };
+    h.state.workspaceConfiguration=structuredClone(external);
+    release();
+    const result=await operation;
+    assert.deepEqual(h.state.workspaceConfiguration,external,
+        'a quick exclusion must not overwrite externally edited scope settings');
+    assert.equal(result.status,'blocked','a concurrent settings edit must not be reported as saved');
+    assert.match(result.reason,/changed during the save/);
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude']);
+});
+
+function deferLegacyCoverageSnapshot(h){
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3'});
+    h.state.workspaceConfiguration.watchExclude=[];
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>{
+        enter();return gate;
+    };
+    return {entered,release};
+}
+
+await test('coverage exclusion waits for a durable legacy policy snapshot before its single write',async()=>{
+    const h=coverageExclusionHarness();
+    const snapshot=deferLegacyCoverageSnapshot(h);
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+    assert.equal(h.state.updates.length,0,'no settings write before the snapshot is durable');
+    snapshot.release(true);
+    assert.equal((await operation).status,'saved');
+    assert.deepEqual(h.state.updates.map(([key])=>key),['watchExclude']);
+});
+
+await test('coverage exclusion leaves settings unchanged when legacy policy cannot be persisted',async()=>{
+    const h=coverageExclusionHarness();
+    const snapshot=deferLegacyCoverageSnapshot(h);
+    const original=structuredClone(h.state.workspaceConfiguration);
+    const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+    snapshot.release(false);
+    const result=await operation;
+    assert.equal(result.status,'blocked');
+    assert.match(result.reason,/Cannot persist the committed legacy monitoring policy/);
+    assert.deepEqual(h.state.workspaceConfiguration,original);
+    assert.equal(h.state.updates.length,0);
+});
+
+for(const scenario of [
+    {name:'scope edit',change:h=>{
+        h.state.workspaceConfiguration.watchInclude=[{scope:'all',path:'src'}];
+        h.state.workspaceConfiguration.watchExclude=[{scope:'all',pattern:'/external/'}];
+    },reason:/requested monitoring scope changed/},
+    {name:'legacy source edit',change:h=>{
+        h.state.workspaceConfiguration.watchExclude=['external/'];
+    },reason:/legacy watch-rule migration/},
+    {name:'workspace root change',change:h=>{
+        h.vscode.workspace.workspaceFolders[0].name='renamed';
+    },reason:/requested monitoring scope changed/},
+    {name:'owning folder change',change:h=>{
+        const folder=h.vscode.workspace.workspaceFolders[0];
+        h.vscode.workspace.getWorkspaceFolder=()=>({...folder,name:'different'});
+    },reason:/owning workspace folder changed/},
+    {name:'resolved warning',change:h=>{
+        h.state.subtreeCoverageGaps=[];
+    },reason:/coverage warning no longer exists/}
+]){
+    await test(`coverage exclusion revalidates ${scenario.name} after legacy snapshot preparation`,async()=>{
+        const h=coverageExclusionHarness();
+        const snapshot=deferLegacyCoverageSnapshot(h);
+        const operation=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+        await Promise.race([snapshot.entered,operation.then(result=>assert.fail(`Save did not prepare legacy policy: ${JSON.stringify(result)}`))]);
+        scenario.change(h);
+        const external=structuredClone(h.state.workspaceConfiguration);
+        snapshot.release(true);
+        const result=await operation;
+        assert.equal(result.status,'blocked');
+        assert.match(result.reason,scenario.reason);
+        assert.deepEqual(h.state.workspaceConfiguration,external);
+        assert.equal(h.state.updates.length,0,'stale quick actions must not write settings');
+    });
+}
 
 await test('coverage exclusion queue recovers after a rejected operation',async()=>{
     const h=coverageExclusionHarness();

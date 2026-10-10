@@ -372,12 +372,36 @@ export class MonitoringScopeController implements vscode.Disposable {
             !configuredScopeExplicitlyExcludesSubtree(checked.scope, identity, relative)) {
             return blocked('The exact directory exclusion cannot be validated for this workspace.');
         }
-        if (this.getRequestedScope().scope?.scopeRevision !== current.scopeRevision) {
-            return blocked('The requested monitoring scope changed. Review it before adding the exclusion.');
-        }
         try {
-            const saved = await this.saveRequestedScope(next);
-            if (!saved.ok) { return blocked(saved.errors.map(error => error.message).join('; ')); }
+            if (status.effective.kind === 'legacyV3' &&
+                !await this.tracker.prepareLegacyCompatibilityPolicySnapshot()) {
+                return blocked('Cannot persist the committed legacy monitoring policy before replacing Workspace settings. The legacy configuration remains unchanged.');
+            }
+            // Snapshot preparation can yield. Recheck migration, the warning,
+            // and root ownership before touching the current request.
+            const latest = this.getStatus();
+            if (!latest.legacyMigrationComplete ||
+                (latest.effective.kind === 'legacyV3' &&
+                    this.legacyMigrationRequired(latest.legacyGlobalRules, latest.legacyCommittedRules) &&
+                    !this.migrationRecordMatches(checked.scope.scopeRevision))) {
+                return blocked('Finish legacy watch-rule migration before adding a structured exclusion.');
+            }
+            if (!this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
+                return blocked('The coverage warning no longer exists. Refresh Change Recording.');
+            }
+            const owningFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(canonicalPath));
+            if (!owningFolder || owningFolder.name !== folder.name ||
+                owningFolder.uri.toString() !== folder.uri.toString()) {
+                return blocked('The owning workspace folder changed. Refresh the scope manager.');
+            }
+            const config = vscode.workspace.getConfiguration('diffTracker');
+            if (this.getRequestedScope().scope?.scopeRevision !== current.scopeRevision) {
+                return blocked('The requested monitoring scope changed. Review it before adding the exclusion.');
+            }
+            // Only edit exclusions: rewriting mode/includes across awaits can
+            // overwrite an external settings edit with the old request. VS Code
+            // has no conditional update, so also check for conflicts afterward.
+            await config.update('watchExclude', checked.scope.excludes, vscode.ConfigurationTarget.Workspace);
             const now = this.getRequestedScope();
             if (!now.ok || now.scope?.scopeRevision !== checked.scope.scopeRevision) {
                 return blocked('Workspace Settings changed during the save; inspect the requested scope before applying.');
