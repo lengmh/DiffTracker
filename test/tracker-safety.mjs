@@ -5503,6 +5503,133 @@ for(const phase of ['read','persistence']) test(`ISSUE-26 Unknown Reset preserve
     assert.equal(await tracker.flushPendingPersistence(),true);
     assert.ok(fs.readFileSync(path.join(storage,'session-state.json'),'utf8').includes('Unknown before-image'));
 });
+for(const phase of ['write','copy']) test(`ISSUE-26 Unknown Reset preserves uncertainty when an editor becomes dirty during persistence ${phase}`,async()=>{
+    const storage=file(`unknown-late-dirty-storage-${phase}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const p=file(`unknown-late-dirty-${phase}.txt`);
+    fs.writeFileSync(p,'current disk text');
+    const doc=document(p);
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const persisted=fs.readFileSync(path.join(storage,'session-state.json'),'utf8');
+    const token=tracker.getUnknownReviewToken(p);
+    const before={apply:counters.apply,save:counters.save};
+    const gate=pause(path.join(storage,phase==='write'?'session-state.tmp.json':'session-state.json'),phase);
+    const operation=tracker.resetUnknownBaseline(p,token);
+    await gate.entered;
+    doc.text='new unsaved editor text';doc.isDirty=true;doc.version++;
+    tracker.onDocumentChanged({document:doc});
+    assert.deepEqual(tracker.getUnknownReviewToken(p),token,
+        'the production document event has not yet published its debounced review');
+    gate.release();
+    const result=await operation;
+    assert.notEqual(result.status,'success','dirty editor must invalidate the durable Unknown reset');
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.equal(tracker.opaqueBaselineFiles.has(p),false);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.equal(pending(p)?.unavailableReason,'Original unknown before-image');
+    assert.equal(tracker.getBaselineState(),'ready');
+    assert.equal(doc.getText(),'new unsaved editor text');
+    assert.equal(doc.isDirty,true);
+    assert.equal(disk(p),'current disk text');
+    assert.deepEqual({apply:counters.apply,save:counters.save},before);
+    for(const name of ['session-state.json',tracker.persistedStateBackupFileName]) {
+        assert.equal(fs.readFileSync(path.join(storage,name),'utf8'),persisted,
+            'rollback restores the original durable uncertainty, including already-published state');
+    }
+    assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false);
+});
+for(const excludesTarget of [true,false]) test(`ISSUE-26 Unknown Reset rechecks live scope during persistence (excluded=${excludesTarget})`,async()=>{
+    const storage=file(`unknown-late-scope-storage-${excludesTarget}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const directory=file('unknown-scope-watch-resume');
+    fs.mkdirSync(directory);
+    await tracker.onExternalFileCreated(Uri.file(directory));
+    watchExclude=[path.basename(directory)+'/'];
+    await tracker.refreshIgnoreMatchers();
+    const p=file('unknown-late-scope.txt');
+    fs.writeFileSync(p,'current disk text');
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const token=tracker.getUnknownReviewToken(p);
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=tracker.resetUnknownBaseline(p,token);
+    await persistGate.entered;
+    const entered=deferred(),release=deferred(),open=fs.promises.opendir;
+    fs.promises.opendir=async(target,...args)=>{
+        if(path.resolve(String(target))===directory){entered.resolve();await release.promise;}
+        return open(target,...args);
+    };
+    let refresh;
+    try {
+        watchExclude=[excludesTarget?path.basename(p):'unrelated-file.txt'];
+        configurationChanged({affectsConfiguration:key=>key==='diffTracker.watchExclude'});
+        refresh=tracker.ignoreRefreshPromise;
+        await entered.promise;
+        assert.equal(tracker.isPathIgnored(Uri.file(p)),excludesTarget,
+            'live policy publishes before imported watcher resumption finishes');
+        assert.deepEqual(tracker.getUnknownReviewToken(p),token,
+            'review pruning has not run while physical watcher resumption is pending');
+        persistGate.release();
+        const result=await operation;
+        if(excludesTarget) {
+            assert.notEqual(result.status,'success','new exclusion must invalidate the durable Unknown reset');
+            assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image');
+            assert.equal(tracker.getOriginalContent(p),undefined);
+            assert.equal(pending(p)?.reviewKind,'unknown');
+            for(const name of ['session-state.json',tracker.persistedStateBackupFileName]) {
+                const persisted=JSON.parse(fs.readFileSync(path.join(storage,name),'utf8'));
+                assert.deepEqual(persisted.unresolvedBaselineFiles.find(([target])=>target===p),
+                    [p,'Original unknown before-image']);
+                assert.equal(persisted.fileSnapshots.some(([target])=>target===p),false);
+            }
+        } else {
+            assert.equal(result.status,'success','a policy change that still includes the target remains eligible');
+            assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+            assert.equal(tracker.getOriginalContent(p),'current disk text');
+            assert.equal(pending(p),undefined);
+        }
+        assert.equal(disk(p),'current disk text');
+        assert.equal(fs.existsSync(path.join(storage,'session-state.unsaved')),false);
+    } finally {
+        persistGate.release();release.resolve();fs.promises.opendir=open;
+        await operation;await refresh;
+    }
+    if(excludesTarget) {
+        assert.equal(tracker.unresolvedBaselineFiles.get(p),'Original unknown before-image',
+            'later scope pruning must not erase the rolled-back uncertainty');
+    }
+});
+test('ISSUE-26 Unknown Reset remains eligible for retained review outside ordinary scope',async()=>{
+    const {validateAndCanonicalizeScope}=require('../out/monitoringScope.js');
+    const validation=validateAndCanonicalizeScope({mode:'rules',includes:[],excludes:[]},
+        tracker.currentWorkspaceRootIdentities());
+    assert.equal(validation.ok,true);
+    tracker.effectiveMonitoringScope={kind:'configured',...validation.scope};
+    await tracker.refreshIgnoreMatchers();
+    const p=file('unknown-retained-scope.txt');
+    fs.writeFileSync(p,'current disk text');
+    tracker.recordUnresolvedBaseline(p,'Original unknown before-image');
+    vscodeExcludes['files.exclude']={[path.basename(p)]:true};
+    configurationChanged({affectsConfiguration:key=>key==='files.exclude'});
+    await tracker.ignoreRefreshPromise;
+    assert.equal(tracker.retainedReviewPaths.has(p),true);
+    assert.equal(tracker.isPathIgnored(Uri.file(p),false,false),true);
+    assert.equal(tracker.isPathIgnored(Uri.file(p)),false,'retained review remains minimally observable');
+    const result=await tracker.resetUnknownBaseline(p,tracker.getUnknownReviewToken(p));
+    assert.equal(result.status,'success',JSON.stringify(result));
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(pending(p),undefined);
+    assert.equal(tracker.retainedReviewPaths.has(p),false);
+    assert.equal(tracker.getOriginalContent(p),undefined,'resolved retained review releases its excluded baseline');
+    assert.equal(disk(p),'current disk text');
+});
 test('ISSUE-26 Reset All Unknown allows partial success and preserves other text review',async()=>{
     const good=file('unknown-batch-good.txt');
     const bad=file('unknown-batch-bad.txt');

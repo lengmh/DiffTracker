@@ -9567,8 +9567,11 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.snapshotInitialized = previous.snapshotInitialized;
         });
+        // Editor events are debounced, and live ignore policy publishes before
+        // review pruning. Neither transition necessarily changes the token yet.
         transaction.valid = () => !this.validateSnapshotTarget(filePath) && (kind === 'unknown'
-            ? this.matchesUnknownReview(review) && !this.hasUnknownResetCoverageGap(filePath)
+            ? this.matchesUnknownReview(review) && !this.hasUnknownResetCoverageGap(filePath) &&
+                !this.hasDirtyDocument(filePath) && !this.isPathIgnored(vscode.Uri.file(filePath))
             : this.matchesOpaqueReview(review));
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
