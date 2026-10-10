@@ -543,9 +543,15 @@ export class DiffTracker {
     }
 
     private unknownReviewRevision(change: FileDiff): string {
-        // The unknown before-image must never be considered a verified baseline.
-        // This token binds the explicit reset to the particular visible review.
+        // A new tracked-change object always has a new generation, including
+        // rapid same-millisecond updates with an unchanged displayed reason.
+        let instance = this.unknownReviewInstances.get(change);
+        if (instance === undefined) {
+            instance = this.nextUnknownReviewInstance++;
+            this.unknownReviewInstances.set(change, instance);
+        }
         return createHash('sha256').update(JSON.stringify({
+            instance,
             reviewKind: change.reviewKind,
             unavailableReason: change.unavailableReason ?? null,
             reviewReason: change.reviewReason ?? null,
@@ -690,6 +696,11 @@ export class DiffTracker {
     private unresolvedBaselineFiles: Map<string, string> = new UnresolvedBaselineMap();
     private opaqueBaselineFiles = new Map<string, OpaqueBaselineState>();
     private trackedChanges = new Map<string, FileDiff>();
+    // A file can produce two Unknown reviews within one millisecond. A local
+    // instance sequence keeps their review tokens distinct without invalidating
+    // other files' tokens or persisting transient UI identities.
+    private readonly unknownReviewInstances = new WeakMap<FileDiff, number>();
+    private nextUnknownReviewInstance = 1;
     private trackedChangesVersion = 0;
     private trackedChangesCacheVersion = -1;
     private trackedChangesCache: FileDiff[] = [];
@@ -9695,8 +9706,9 @@ export class DiffTracker {
         }
         const invalid = this.validateActionTarget(filePath);
         if (invalid) { return this.actionResult(filePath, 'conflict', invalid); }
-        if (this.coverageGaps.get(filePath)?.file) {
-            return this.actionResult(filePath, 'conflict', 'File coverage is incomplete; cannot establish a verified current baseline');
+        if (this.coverageGaps.get(filePath)?.file ||
+            this.getSubtreeCoverageGaps().some(gap => this.pathBelongsToRoot(filePath, gap.targetPath))) {
+            return this.actionResult(filePath, 'conflict', 'Monitoring coverage is incomplete; cannot establish a reliable ongoing baseline');
         }
         if (this.hasDirtyDocument(filePath)) {
             return this.actionResult(filePath, 'conflict', 'Save or discard unsaved editor changes before resetting this baseline');
