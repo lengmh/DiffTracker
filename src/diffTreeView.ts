@@ -283,7 +283,6 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const dirItem = new TreeItem(childNode.name, vscode.TreeItemCollapsibleState.Expanded);
             dirItem.iconPath = new vscode.ThemeIcon('folder');
             dirItem.children = this.buildTreeItemsFromNode(childNode);
-            dirItem.contextValue = 'reviewFolder';
             // Snapshot actual descendant review tokens, not a recursive path
             // prefix that might escape a multi-root workspace.
             const descendants = (items: TreeItem[]): TreeItem[] => items.flatMap(child =>
@@ -293,6 +292,12 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 reviewToken: child.reviewToken,
                 opaqueReviewToken: child.opaqueReviewToken
             }));
+            const owningRoots = new Set(dirItem.reviewEntries.map(entry =>
+                vscode.workspace.getWorkspaceFolder(vscode.Uri.file(entry.filePath))?.uri.fsPath));
+            // Display labels can collide across separate roots. Never turn a
+            // visually merged group into an action spanning two repositories.
+            dirItem.contextValue = owningRoots.size === 1 && !owningRoots.has(undefined)
+                ? 'reviewFolder' : 'ambiguousReviewFolder';
             dirItem.description = `${this.countFilesInNode(childNode)} file(s)`;
             items.push(dirItem);
         }
