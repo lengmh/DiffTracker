@@ -26,6 +26,8 @@ let settingsTreeDataProvider: SettingsTreeDataProvider;
 let diffTreeDataProvider: DiffTreeDataProvider;
 let changesTreeView: vscode.TreeView<any> | undefined;
 let gitContextMonitor: GitContextMonitor | undefined;
+// Await the most recent workspace notification write before extension-host shutdown.
+let pendingGitPromptWrites: Promise<void> = Promise.resolve();
 
 type DefaultOpenMode = 'webview' | 'nativeReview' | 'inline' | 'sideBySide' | 'original' | 'splitOriginalWebview';
 
@@ -325,6 +327,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // a slower save from an earlier pause notification.
         gitPromptWriteQueue = gitPromptWriteQueue.catch(() => undefined)
             .then(() => context.workspaceState.update(gitPromptStateKey, snapshot));
+        pendingGitPromptWrites = gitPromptWriteQueue;
         void gitPromptWriteQueue.catch(error => console.warn('Code Diff Tracker: Cannot save Git pause notification state', error));
     };
     const resetGitPromptOnBaselineChanged = (event: TrackChangesEvent): void => {
@@ -1170,6 +1173,10 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
+    // This includes a queued clear following a new baseline; failing to flush
+    // it could suppress the next genuine Git pause after window reload.
+    try { await pendingGitPromptWrites; }
+    catch (error) { console.warn('Code Diff Tracker: Git pause notification state could not be saved', error); }
     if (gitContextMonitor) {
         gitContextMonitor.dispose();
     }
