@@ -52,6 +52,39 @@ export function registerPR12BoundedInvariants(h) {
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 
+    test('Issue #24 dormant imported-directory diagnostics follow committed exclusions without losing evidence',()=>fixture(async({tracker,dir,scope})=>{
+        const excluded=path.join(dir,'docs','.aws');
+        const monitored=path.join(dir,'scripts','.codex');
+        fs.mkdirSync(excluded,{recursive:true});
+        fs.mkdirSync(monitored,{recursive:true});
+        tracker.setSubtreeCoverageGap(excluded,'directory-runtime-coverage-gap','Imported watcher limit');
+        tracker.setSubtreeCoverageGap(monitored,'directory-scan-coverage-gap','Other monitored subtree');
+        assert.equal(tracker.watchImportedDirectory(excluded,tracker.sessionEpoch),true);
+        const owner=h.nativeDirectoryWatchers.find(item=>item.directory===excluded&&item.active);
+        assert.ok(owner);
+        const requested=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'/docs/.aws/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested,false,()=>false)).status,'conflict');
+        assert.equal(tracker.getSubtreeCoverageGaps().length,2,'rejected Apply cannot hide previous warnings');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested)).status,'applied');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps().map(item=>item.targetPath),[monitored]);
+        assert.deepEqual(tracker.getCoverageGaps().map(([target])=>target),[monitored]);
+        assert.equal(owner.active,false,'excluded direct watcher no longer consumes resources');
+        assert.ok(tracker.coverageGaps.has(excluded),'retain uncertainty for a future re-include');
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri;
+        const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json'),'utf8'));
+        assert.ok(saved.coverageGaps.some(([target])=>target===excluded),'evidence survives persistence');
+        await tracker.dispose();
+        const resumed=new DiffTracker(storage);
+        setTracker(resumed);
+        assert.equal(await resumed.restorePersistedState(),'restored');
+        assert.equal(resumed.getSubtreeCoverageGaps().some(item=>item.targetPath===excluded),false,
+            'reloading excluded scope must not resurrect a dormant warning');
+        resumed.effectiveMonitoringScope=scope;
+        assert.equal(resumed.getSubtreeCoverageGaps().some(item=>item.targetPath===excluded),true,
+            're-including without verified watcher handoff must reveal the original gap');
+    }));
+
     test('PR12 AUDIT universal exclusion skips all policy discovery in preflight and refresh',()=>fixture(async({tracker,scope,dir})=>{
         const oldFind=vscode.workspace.findFiles, oldOpen=fs.promises.opendir;
         let searches=0, opens=0;
