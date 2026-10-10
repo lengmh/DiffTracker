@@ -186,7 +186,7 @@ test('production start blocks invalid monitoring scope configuration',async()=>{
         })},
         diffTracker:{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
-            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+            startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
@@ -216,7 +216,7 @@ test('production start revalidates scope after rebuild confirmation',async()=>{
         diffTracker:{
             isRecoveryBlocked:()=>true,getIsRecording:()=>false,getBaselineState:()=> 'idle',
             discardRecoveryState:async()=>{calls.push('discard');return true;},
-            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+            startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{commands:{executeCommand:async()=>{}},window:{
             showWarningMessage:async()=>undefined,
@@ -256,7 +256,7 @@ test('production start blocks reset Workspace scope when configured effective di
         })},
         diffTracker:{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
-            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+            startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
@@ -284,7 +284,7 @@ test('production start blocks an unapplied configured scope revision',async()=>{
         })},
         diffTracker:{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
-            startRecording:()=>calls.push('start'),setBaselineGitContexts:()=>calls.push('capture')
+            startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
@@ -302,7 +302,7 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
     let release;const ready=new Promise(resolve=>{release=resolve;});const calls=[];let recording=scenario==='restored';
     const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
         diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',
-            startRecording:()=>{recording=true;calls.push('start');},stopRecording:()=>{recording=false;calls.push('stop');},
+            startRecording:()=>{recording=true;calls.push('start');return true;},stopRecording:()=>{recording=false;calls.push('stop');},
             setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
             setGitContextPending:()=>calls.push('release')},
         gitContextMonitor:{whenReady:()=>ready,isReady:()=>true,getSnapshots:()=>[context()]},

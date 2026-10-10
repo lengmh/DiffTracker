@@ -406,12 +406,31 @@ await test('detached old annotation button sends its captured old review token',
     wrapper.children[1].listeners.click({stopPropagation(){}});
     assert.equal(ui.sent[0].reviewToken.currentRevision,'current');assert.equal(ui.sent[0].changeBlockId,'old-block');
 });
+const archiveRestoreCommand = 'diffTracker.restoreArchivedGitReview';
+function archivedReviewPreview(gitOverrides={}) {
+    return {
+        status: 'ready', token: 'preview-bound-archive-token',
+        archive: {
+            workspaceRoots: ['/home/test/研究 workspace', '/home/test/other-root'],
+            gitContext: {
+                repoRoot: '/home/test/研究 workspace', kind: 'worktree',
+                headName: 'feature/archive-review', headCommit: '0123456789abcdef',
+                inProgress: false, ...gitOverrides
+            },
+            textBaselines: 7, opaqueBaselines: 3, unknownBaselines: 2,
+            recoveryRecords: 4, isRecording: true
+        }
+    };
+}
 function commandHarness(options={}) {
-    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],executed:[],updates:[],pickerItems:[],...options};
+    const state={deleted:true,mode:'splitOriginalWebview',recording:false,resetResult:true,confirmClear:true,opened:0,panels:0,resets:0,legacyClears:0,info:[],warnings:[],prompts:[],executed:[],updates:[],pickerItems:[],
+        archivePreview:archivedReviewPreview(),archiveResult:{status:'restored'},archiveAnswer:'Restore Archived Review',
+        startResult:true,starts:0,baselineGitContexts:[],recordingContexts:[],gitReady:true,gitSnapshots:[],archiveEvents:[],reconciliations:[],restoreTokens:[],previews:0,reviewRefreshes:0,...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
-    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode','diffTracker.selectWebviewDiffStyle']);
+    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode','diffTracker.selectWebviewDiffStyle',archiveRestoreCommand]);
     function visit(node){
+        if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='startRecordingAfterPrechecks')helpers.push(`const ${node.getText(source)};`);
         if(ts.isFunctionDeclaration(node)&&['extractFilePath','extractIsDeleted','getDefaultOpenMode','isDeletedReview'].includes(node.name?.text))helpers.push(node.getText(source));
         if(ts.isCallExpression(node)&&node.expression.getText(source)==='vscode.commands.registerCommand'&&names.has(node.arguments[0]?.text))callbacks.push(`${JSON.stringify(node.arguments[0].text)}:${node.arguments[1].getText(source)}`);
         ts.forEachChild(node,visit);
@@ -424,26 +443,42 @@ function commandHarness(options={}) {
         window:{
             showTextDocument:async()=>{},
             showQuickPick:async items=>{state.pickerItems=items;return items.find(item=>item.value===state.chooseMode);},
-            showInformationMessage:m=>state.info.push(m),
+            showInformationMessage:m=>{state.archiveEvents.push('information');state.info.push(m);},
             showWarningMessage:(message,...args)=>{
                 const modal=args.find(value=>value&&typeof value==='object'&&value.modal===true);
                 if(modal){
                     state.prompts.push({message,args});
+                    if(args.includes('Restore Archived Review')) {
+                        state.archiveEvents.push('confirmation');
+                        return Promise.resolve(state.onArchiveConfirmation?.()).then(()=>state.archiveAnswer);
+                    }
                     if(state.toggleRecordingOnConfirm) state.recording=!state.recording;
                     return state.confirmClear?'Clear Diffs':undefined;
                 }
+                state.archiveEvents.push('warning');
                 state.warnings.push(message);
                 return undefined;
             }
         },
         commands:{executeCommand:async(name,...args)=>{state.executed.push([name,...args]);return sandbox.callbacks[name]?.(...args);}}};
     const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
-        resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;}};
+        startRecording:()=>{state.archiveEvents.push('start');state.starts++;if(state.startResult)state.recording=true;return state.startResult;},
+        setBaselineGitContexts:contexts=>{state.archiveEvents.push('setBaselineGitContexts');state.baselineGitContexts.push(contexts);},
+        resetBaselineToCurrentState:async()=>{state.resets++;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;},
+        reconcileRestoredGitContexts:contexts=>{state.archiveEvents.push('reconcile');state.reconciliations.push(contexts);},
+        previewArchivedGitReview:async()=>{state.archiveEvents.push('preview');state.previews++;await state.archivePreviewGate;return state.archivePreview;},
+        restoreArchivedGitReview:async token=>{state.archiveEvents.push('restore');state.restoreTokens.push(token);state.onArchiveRestore?.(token);await state.archiveRestoreGate;return state.archiveResult;}};
+    const gitContextMonitor=state.noGitMonitor?undefined:{
+        isReady:()=>{state.archiveEvents.push('ready');return state.gitReady;},
+        getSnapshots:()=>{state.archiveEvents.push('snapshots');return state.gitSnapshots;}
+    };
     sandbox={vscode,diffTracker:tracker,context:{extensionUri:{}},WebviewDiffPanel:{createOrShow:()=>state.panels++},
-        settingsTreeDataProvider:{refresh(){}},refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},console};
+        settingsTreeDataProvider:{refresh(){}},refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},
+        setRecordingContext:value=>{state.archiveEvents.push('setRecordingContext');state.recordingContexts.push(value);},
+        gitContextMonitor,refreshReview:()=>{state.archiveEvents.push('refresh');state.reviewRefreshes++;},console};
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`${helpers.join('\n')}globalThis.callbacks={${callbacks.join(',')}};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
-    return {state,Uri,run:(name,...args)=>sandbox.callbacks[name](...args)};
+    return {state,Uri,startRecording:()=>vm.runInContext('startRecordingAfterPrechecks()',sandbox),registeredCommands:callbacks.map(callback=>JSON.parse(callback.slice(0,callback.indexOf(':')))),run:(name,...args)=>sandbox.callbacks[name](...args)};
 }
 // Exercise the real constructor and generated inline script, including the
 // one-time default boundary. No settings initializer is copied into this test.
@@ -654,6 +689,239 @@ await test('clear command cancellation performs no baseline reset',async()=>{
     const h=commandHarness({confirmClear:false});assert.equal(await h.run('diffTracker.clearDiffs'),false);
     assert.equal(h.state.prompts.length,1);assert.equal(h.state.resets,0);assert.equal(h.state.info.length,0);assert.equal(h.state.warnings.length,0);
 });
+
+function deferred() {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+}
+
+
+for (const alreadyRecording of [false, true]) {
+    await test(`refused recording start never replaces Git baselines or context (previous recording=${alreadyRecording})`, () => {
+        const preserved = [{ ...archivedReviewPreview().archive.gitContext, headCommit: 'preserved-before-image-head' }];
+        const latest = [{ ...preserved[0], headCommit: 'unreviewed-current-head' }];
+        const h = commandHarness({ startResult: false, recording: alreadyRecording, gitSnapshots: latest, baselineGitContexts: [preserved] });
+        assert.equal(h.startRecording(), false);
+        assert.equal(h.state.starts, 1);
+        assert.equal(h.state.recording, alreadyRecording);
+        assert.deepEqual(h.state.baselineGitContexts, [preserved], 'busy restore must preserve the Git context belonging to old before-images');
+        assert.deepEqual(h.state.recordingContexts, [], 'refused start cannot publish a recording-context update');
+        assert.deepEqual(h.state.archiveEvents, ['start'], 'return immediately without reading/capturing current Git state');
+        assert.deepEqual(h.state.executed, []);
+        assert.deepEqual(h.state.info, []);
+        assert.deepEqual(h.state.warnings, []);
+    });
+}
+
+await test('successful recording start captures ready Git context and reports the returned boolean', () => {
+    const snapshots = [archivedReviewPreview().archive.gitContext];
+    const h = commandHarness({ startResult: true, recording: false, gitSnapshots: snapshots });
+    assert.equal(h.startRecording(), true);
+    assert.equal(h.state.starts, 1);
+    assert.equal(h.state.recording, true);
+    assert.equal(h.state.baselineGitContexts[0], snapshots);
+    assert.deepEqual(h.state.recordingContexts, [true]);
+    assert.deepEqual(h.state.archiveEvents, ['start', 'ready', 'snapshots', 'setBaselineGitContexts', 'setRecordingContext']);
+});
+
+await test('Restore Archived Git Review is registered once and discoverable in the command palette', () => {
+    const h = commandHarness();
+    const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    const contributions = manifest.contributes.commands.filter(item => item.command === archiveRestoreCommand);
+    assert.equal(contributions.length, 1);
+    assert.equal(contributions[0].title, 'Restore Archived Git Review');
+    assert.equal(contributions[0].category, 'Code Diff Tracker');
+    assert.equal(h.registeredCommands.filter(command => command === archiveRestoreCommand).length, 1);
+    assert.equal(manifest.contributes.menus.commandPalette.some(item =>
+        item.command === archiveRestoreCommand && item.when === 'false'), false);
+});
+
+for (const unavailable of ['missing monitor', 'initializing monitor']) {
+    await test(`archive restore refuses ${unavailable} before reading the archive`, async () => {
+        const h = commandHarness({ noGitMonitor: unavailable === 'missing monitor', gitReady: false });
+        assert.equal(await h.run(archiveRestoreCommand), false);
+        assert.equal(h.state.previews, 0);
+        assert.deepEqual(h.state.reconciliations, []);
+        assert.deepEqual(h.state.restoreTokens, []);
+        assert.deepEqual(h.state.prompts, []);
+        assert.deepEqual(h.state.info, []);
+        assert.equal(h.state.reviewRefreshes, 0);
+        assert.equal(h.state.warnings.length, 1);
+        assert.match(h.state.warnings[0], /Git context initialization/i);
+    });
+}
+
+for (const status of ['missing', 'invalid', 'refused']) {
+    await test(`archive ${status} preview is reported without confirmation or mutation`, async () => {
+        const reason = `${status}: controlled archive verification reason`;
+        const snapshots = [archivedReviewPreview().archive.gitContext];
+        const h = commandHarness({ archivePreview: { status, reason }, gitSnapshots: snapshots });
+        assert.equal(await h.run(archiveRestoreCommand), false);
+        assert.equal(h.state.previews, 1);
+        assert.equal(h.state.reconciliations[0], snapshots);
+        assert.deepEqual(h.state.archiveEvents, ['ready', 'snapshots', 'reconcile', 'preview', 'warning']);
+        assert.deepEqual(h.state.restoreTokens, []);
+        assert.deepEqual(h.state.prompts, []);
+        assert.deepEqual(h.state.info, []);
+        assert.equal(h.state.reviewRefreshes, 0);
+        assert.equal(h.state.warnings.length, 1);
+        assert.ok(h.state.warnings[0].includes(reason));
+    });
+}
+
+for (const isRecording of [true, false]) {
+    await test(`archive confirmation discloses identity, saved ${isRecording ? 'recording' : 'stopped'} state and full replacement scope`, async () => {
+        const preview = archivedReviewPreview();
+        preview.archive.isRecording = isRecording;
+        const h = commandHarness({ archivePreview: preview, archiveAnswer: undefined });
+        assert.equal(await h.run(archiveRestoreCommand), false);
+        assert.equal(h.state.prompts.length, 1);
+        const prompt = h.state.prompts[0];
+        const modal = prompt.args.find(value => value && typeof value === 'object');
+        assert.equal(modal.modal, true);
+        assert.match(prompt.message, /replace the current DiffTracker review state/i);
+        assert.equal(prompt.args.at(-1), 'Restore Archived Review');
+        for (const value of [preview.archive.gitContext.repoRoot, preview.archive.gitContext.kind,
+            preview.archive.gitContext.headName, preview.archive.gitContext.headCommit,
+            ...preview.archive.workspaceRoots]) {
+            assert.ok(modal.detail.includes(value), `confirmation must disclose ${value}`);
+        }
+        assert.match(modal.detail, isRecording ? /Saved recording state: recording/i : /Saved recording state: stopped/i);
+        assert.match(modal.detail, /7 text baseline\(s\)/);
+        assert.match(modal.detail, /3 read-only baseline\(s\)/);
+        assert.match(modal.detail, /2 unknown before-image\(s\)/);
+        assert.match(modal.detail, /4 recovery record\(s\)/);
+        assert.match(modal.detail, /pending changes are recalculated against current files/i);
+        assert.match(modal.detail, /not a historical pending-change count/i);
+        assert.match(modal.detail, /entire current DiffTracker review state will be replaced/i);
+        assert.match(modal.detail, /first saved in a separate pre-restore safety backup/i);
+        assert.match(modal.detail, /on-disk files and Git history are unaffected/i);
+        assert.match(modal.detail, /only the most recent Archive and Rebuild archive/i);
+        assert.match(modal.detail, /next rebuild overwrites it/i);
+        assert.match(modal.detail, /not per-branch history/i);
+        assert.match(modal.detail, /storage belongs to this extension host/i);
+        assert.match(modal.detail, /Remote-WSL.*WSL-side workspace storage/i);
+        assert.match(modal.detail, /pause external automation/i);
+        assert.deepEqual(h.state.restoreTokens, []);
+        assert.equal(h.state.reviewRefreshes, 0);
+        assert.deepEqual(h.state.info, []);
+        assert.deepEqual(h.state.warnings, []);
+    });
+}
+
+await test('archive confirmation labels detached and unborn HEAD without inventing branch metadata', async () => {
+    const h = commandHarness({ archivePreview: archivedReviewPreview({ headName: undefined, headCommit: undefined }), archiveAnswer: undefined });
+    assert.equal(await h.run(archiveRestoreCommand), false);
+    const detail = h.state.prompts[0].args[0].detail;
+    assert.match(detail, /Branch: \(detached HEAD\); HEAD: \(unborn\)/);
+    assert.doesNotMatch(detail, /undefined|null/);
+});
+
+await test('archive preview and modal are awaited; dismissal never starts restore or changes files/settings', async () => {
+    const previewGate = deferred(), modalGate = deferred(), modalEntered = deferred();
+    const h = commandHarness({
+        archivePreviewGate: previewGate.promise, archiveAnswer: undefined,
+        onArchiveConfirmation: () => { modalEntered.resolve(); return modalGate.promise; }
+    });
+    let settled = false;
+    const pending = h.run(archiveRestoreCommand).then(result => { settled = true; return result; });
+    assert.equal(h.state.previews, 1);
+    assert.deepEqual(h.state.prompts, [], 'confirmation must wait for archive verification');
+    assert.equal(settled, false);
+    previewGate.resolve();
+    await modalEntered.promise;
+    assert.deepEqual(h.state.restoreTokens, [], 'restore must wait for explicit approval');
+    assert.equal(settled, false);
+    modalGate.resolve();
+    assert.equal(await pending, false);
+    assert.equal(h.state.reconciliations.length, 1, 'cancel does not proceed with a second restore preparation');
+    assert.deepEqual(h.state.restoreTokens, []);
+    assert.equal(h.state.resets, 0);
+    assert.equal(h.state.legacyClears, 0);
+    assert.equal(h.state.opened, 0);
+    assert.deepEqual(h.state.executed, [], 'no Git checkout, shell command, or alternate restore');
+    assert.deepEqual(h.state.updates, []);
+    assert.equal(h.state.reviewRefreshes, 0);
+    assert.deepEqual(h.state.info, []);
+    assert.deepEqual(h.state.warnings, []);
+});
+
+await test('archive restore re-reads Git snapshots after confirmation and passes the original preview token', async () => {
+    const oldSnapshots = [archivedReviewPreview().archive.gitContext];
+    const latestSnapshots = [{ ...oldSnapshots[0], headName: 'changed-during-modal', headCommit: 'fedcba9876543210' }];
+    const modalGate = deferred(), modalEntered = deferred();
+    const reason = 'Git context changed after preview. Preview and confirm again.';
+    const h = commandHarness({
+        gitSnapshots: oldSnapshots, archiveResult: { status: 'refused', reason },
+        onArchiveConfirmation: () => { modalEntered.resolve(); return modalGate.promise; }
+    });
+    const pending = h.run(archiveRestoreCommand);
+    await modalEntered.promise;
+    assert.equal(h.state.reconciliations[0], oldSnapshots);
+    h.state.gitSnapshots = latestSnapshots;
+    modalGate.resolve();
+    assert.equal(await pending, false);
+    assert.equal(h.state.reconciliations.length, 2);
+    assert.equal(h.state.reconciliations[1], latestSnapshots, 'never use the pre-confirmation Git snapshot');
+    assert.equal(h.state.previews, 1, 'never silently replace the user-approved archive preview');
+    assert.deepEqual(h.state.restoreTokens, [h.state.archivePreview.token]);
+    assert.deepEqual(h.state.archiveEvents.filter(event => event !== 'ready'), [
+        'snapshots', 'reconcile', 'preview', 'confirmation', 'snapshots', 'reconcile', 'restore', 'refresh', 'warning'
+    ]);
+    assert.deepEqual(h.state.info, []);
+    assert.ok(h.state.warnings[0].includes(reason));
+    assert.deepEqual(h.state.executed, []);
+});
+
+for (const status of ['restored', 'refused', 'rolled-back', 'failed']) {
+    await test(`archive ${status} result is awaited and ${status === 'restored' ? 'alone reports success' : 'returns false without success claims'}`, async () => {
+        const restoreGate = deferred(), restoreEntered = deferred();
+        const reason = `${status}: controlled durable restore outcome`;
+        const h = commandHarness({
+            archiveResult: { status, reason }, archiveRestoreGate: restoreGate.promise,
+            onArchiveRestore: () => restoreEntered.resolve()
+        });
+        let settled = false;
+        const pending = h.run(archiveRestoreCommand).then(result => { settled = true; return result; });
+        await restoreEntered.promise;
+        assert.equal(settled, false, 'command must await the durable restore result');
+        assert.deepEqual(h.state.info, []);
+        assert.deepEqual(h.state.warnings, []);
+        assert.equal(h.state.reviewRefreshes, 0, 'do not render a not-yet-settled restore as complete');
+        restoreGate.resolve();
+        assert.equal(await pending, status === 'restored');
+        assert.deepEqual(h.state.restoreTokens, [h.state.archivePreview.token]);
+        assert.equal(h.state.reviewRefreshes, 1);
+        assert.deepEqual(h.state.archiveEvents.slice(-2), ['refresh', status === 'restored' ? 'information' : 'warning']);
+        if (status === 'restored') {
+            assert.equal(h.state.info.length, 1);
+            assert.match(h.state.info[0], /restored and saved/i);
+            assert.match(h.state.info[0], /files and Git history were not changed/i);
+            assert.match(h.state.info[0], /previous review is separately backed up/i);
+            assert.deepEqual(h.state.warnings, []);
+        } else {
+            assert.deepEqual(h.state.info, []);
+            assert.equal(h.state.warnings.length, 1);
+            assert.ok(h.state.warnings[0].includes(reason));
+        }
+        assert.equal(h.state.resets, 0);
+        assert.equal(h.state.legacyClears, 0);
+        assert.equal(h.state.opened, 0);
+        assert.deepEqual(h.state.executed, []);
+        assert.deepEqual(h.state.updates, []);
+    });
+}
+
+await test('archive failure without a reason still reports its non-success status', async () => {
+    const h = commandHarness({ archiveResult: { status: 'failed' } });
+    assert.equal(await h.run(archiveRestoreCommand), false);
+    assert.deepEqual(h.state.info, []);
+    assert.equal(h.state.warnings.length, 1);
+    assert.match(h.state.warnings[0], /failed/);
+    assert.doesNotMatch(h.state.warnings[0], /undefined|null/);
+});
+
 await test('workspace document lookups distinguish file working documents from virtual documents',()=>{
     const sourceText=fs.readFileSync('src/diffTracker.ts','utf8');
     const sourceFile=ts.createSourceFile('diffTracker.ts',sourceText,ts.ScriptTarget.Latest,true);

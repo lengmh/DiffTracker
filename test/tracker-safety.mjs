@@ -1,3 +1,4 @@
+import { registerArchivedGitReview } from './archived-git-review.mjs';
 import { registerPR12BoundedInvariants } from './pr12-bounded-invariants.mjs';
 import { registerNativeReviewInvariants } from './native-review-invariants.mjs';
 import { registerPR11ReviewRegressions } from './pr11-review-regressions.mjs';
@@ -5333,6 +5334,13 @@ registerPR12BoundedInvariants({
     fireConfigurationChanged: key => configurationChanged({
         affectsConfiguration: name => name === key
     })
+});
+
+registerArchivedGitReview({
+    test, Uri, DiffTracker, vscode, file, document, faults, counters, pause, emitWatcher, waitUntil, watcherInstances,
+    getTracker: () => tracker,
+    setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; }
 });
 
 registerStateSchemaCompatibility({
