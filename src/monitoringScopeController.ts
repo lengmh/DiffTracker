@@ -67,6 +67,7 @@ export interface MonitoringScopeApplyOutcome {
 
 export class MonitoringScopeController implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
+    private coverageExclusionQueue: Promise<void> = Promise.resolve();
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -311,7 +312,15 @@ export class MonitoringScopeController implements vscode.Disposable {
      * Stages a directory-only exclusion in Workspace Settings, never Applies it.
      * The UI must refuse to call this while a scope-editor draft may be unsaved.
      */
-    public async requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
+    public requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
+        // Read the requested scope only after earlier quick exclusions have
+        // finished saving, so concurrent actions cannot overwrite one another.
+        const operation = this.coverageExclusionQueue.then(() => this.saveCoverageSubtreeExclusion(targetPath));
+        this.coverageExclusionQueue = operation.then(() => undefined, () => undefined);
+        return operation;
+    }
+
+    private async saveCoverageSubtreeExclusion(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
         const blocked = (reason: string) => ({ status: 'blocked' as const, reason });
         if (typeof targetPath !== 'string' || !path.isAbsolute(targetPath)) {
             return blocked('Choose a valid absolute monitored directory.');

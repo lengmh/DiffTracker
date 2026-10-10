@@ -9568,7 +9568,8 @@ export class DiffTracker {
             this.snapshotInitialized = previous.snapshotInitialized;
         });
         transaction.valid = () => !this.validateSnapshotTarget(filePath) && (kind === 'unknown'
-            ? this.matchesUnknownReview(review) : this.matchesOpaqueReview(review));
+            ? this.matchesUnknownReview(review) && !this.hasUnknownResetCoverageGap(filePath)
+            : this.matchesOpaqueReview(review));
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -9681,6 +9682,11 @@ export class DiffTracker {
         return this.actionResult(filePath, 'success');
     }
 
+    private hasUnknownResetCoverageGap(filePath: string): boolean {
+        return !!this.coverageGaps.get(filePath)?.file ||
+            this.getSubtreeCoverageGaps().some(gap => this.pathBelongsToRoot(filePath, gap.targetPath));
+    }
+
     private stableUnknownResetIdentity(state: CurrentFileState): string | undefined {
         if (state.kind === 'missing') { return 'missing'; }
         if (state.kind === 'text') {
@@ -9721,8 +9727,7 @@ export class DiffTracker {
         }
         const invalid = this.validateActionTarget(filePath);
         if (invalid) { return this.actionResult(filePath, 'conflict', invalid); }
-        if (this.coverageGaps.get(filePath)?.file ||
-            this.getSubtreeCoverageGaps().some(gap => this.pathBelongsToRoot(filePath, gap.targetPath))) {
+        if (this.hasUnknownResetCoverageGap(filePath)) {
             return this.actionResult(filePath, 'conflict', 'Monitoring coverage is incomplete; cannot establish a reliable ongoing baseline');
         }
         if (this.hasDirtyDocument(filePath)) {
@@ -9746,6 +9751,11 @@ export class DiffTracker {
         const finalError = this.validateActionTarget(filePath);
         if (finalError || this.hasDirtyDocument(filePath)) {
             return this.actionResult(filePath, 'conflict', finalError ?? 'An editor now contains unsaved changes');
+        }
+        // Native watcher failures may arrive while the disk reads are pending.
+        // Keep the same condition live through the durable commit barrier too.
+        if (this.hasUnknownResetCoverageGap(filePath)) {
+            return this.actionResult(filePath, 'conflict', 'Monitoring coverage changed during the reset; Unknown was preserved');
         }
 
         const transaction = this.beginAcknowledgeTransaction(filePath, token, 'unknown');

@@ -316,6 +316,7 @@ await test('coverage exclude quick action stages an exact root-local request wit
     let saveCount=0,reconcileCount=0;
     Object.assign(controller,{
         tracker:h.tracker,
+        coverageExclusionQueue:Promise.resolve(),
         getWorkspaceRoots:()=>roots,
         getStatus:()=>({requested:request,legacyMigrationComplete:true}),
         getRequestedScope:()=>request,
@@ -343,6 +344,109 @@ await test('coverage exclude quick action stages an exact root-local request wit
     assert.equal((await controller.requestExcludeCoverageSubtree(path.join(root,'folder*','nested'))).status,
         'blocked','literal special characters must not turn into broad globs');
     assert.equal(saveCount,1);
+});
+
+function coverageExclusionHarness(){
+    const h=harness(null);
+    const root=path.resolve('.');
+    const {pathToFileURL}=require('node:url');
+    const folder={name:'primary',uri:{fsPath:root,scheme:'file',toString:()=>pathToFileURL(root).toString()}};
+    h.vscode.workspace.workspaceFolders=[folder];
+    h.vscode.workspace.getWorkspaceFolder=()=>folder;
+    h.state.workspaceConfiguration={
+        monitoringScope:'wholeWorkspace',
+        watchInclude:[{scope:'all',path:'test'}],
+        watchExclude:[{scope:'all',pattern:'**/*.tmp'}]
+    };
+    let writes=Promise.resolve();
+    h.vscode.workspace.getConfiguration=()=>({
+        get:(key,fallback)=>h.state.workspaceConfiguration[key]??fallback,
+        inspect:key=>({workspaceValue:h.state.workspaceConfiguration[key]}),
+        update:(key,value,target)=>{
+            const write=writes.then(async()=>{
+                h.state.updates.push([key,value,target]);
+                await h.state.beforeConfigurationUpdate?.(key,value);
+                await new Promise(resolve=>setImmediate(resolve));
+                h.state.workspaceConfiguration[key]=structuredClone(value);
+            });
+            writes=write.catch(()=>undefined);
+            return write;
+        }
+    });
+    const roots=[{name:folder.name,uri:folder.uri.toString(),caseSensitive:true}];
+    const effective={kind:'configured',...h.load('monitoringScope.ts').validateAndCanonicalizeScope({
+        mode:h.state.workspaceConfiguration.monitoringScope,
+        includes:h.state.workspaceConfiguration.watchInclude,
+        excludes:h.state.workspaceConfiguration.watchExclude
+    },roots).scope};
+    Object.assign(h.tracker,{
+        getEffectiveMonitoringScope:()=>effective,
+        getCommittedLegacyCompatibilityPolicy:()=>[],
+        getExplicitlyExcludedPendingReviewPaths:()=>[],
+        setPendingMonitoringScope:scope=>{h.state.pendingScope=scope;}
+    });
+    const controller=new (h.load('monitoringScopeController.ts').MonitoringScopeController)(
+        {workspaceState:{get:()=>undefined}},h.tracker);
+    const targets=['a','b'].map(name=>path.join(root,name));
+    h.state.subtreeCoverageGaps=targets.map(targetPath=>({
+        targetPath,reason:'watcher failure',reasonCode:'directory-runtime-coverage-gap'
+    }));
+    return {...h,controller,targets};
+}
+
+await test('concurrent coverage exclusions preserve both requests and existing scope rules',async()=>{
+    const h=coverageExclusionHarness();
+    const original=structuredClone(h.state.workspaceConfiguration);
+    let enter,release;
+    const entered=new Promise(resolve=>{enter=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    h.state.beforeConfigurationUpdate=async()=>{
+        h.state.beforeConfigurationUpdate=undefined;
+        enter();await gate;
+    };
+    const first=h.controller.requestExcludeCoverageSubtree(h.targets[0]);
+    await Promise.race([entered,first.then(result=>assert.fail(`Save did not reach the configuration boundary: ${JSON.stringify(result)}`))]);
+    const second=h.controller.requestExcludeCoverageSubtree(h.targets[1]);
+    release();
+    const results=await Promise.all([first,second]);
+    assert.deepEqual(Array.from(results,result=>result.status),['saved','saved']);
+    assert.equal(h.state.workspaceConfiguration.monitoringScope,original.monitoringScope);
+    assert.deepEqual(h.state.workspaceConfiguration.watchInclude,original.watchInclude);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/a/','/b/'].sort(),'a later quick action must retain the earlier saved exclusion');
+    assert.ok(h.state.updates.every(([, ,target])=>target===h.vscode.ConfigurationTarget.Workspace));
+    assert.equal(h.state.pendingScope.scopeRevision,h.controller.getRequestedScope().scope.scopeRevision);
+});
+
+await test('concurrent duplicate coverage exclusions perform only one settings save',async()=>{
+    const h=coverageExclusionHarness();
+    const results=await Promise.all([
+        h.controller.requestExcludeCoverageSubtree(h.targets[0]),
+        h.controller.requestExcludeCoverageSubtree(h.targets[0])
+    ]);
+    assert.deepEqual(Array.from(results,result=>result.status),['saved','alreadyExcluded']);
+    assert.equal(h.state.updates.length,3,'the duplicate must not rewrite any scope setting');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/a/'].sort());
+});
+
+await test('coverage exclusion queue recovers after a rejected operation',async()=>{
+    const h=coverageExclusionHarness();
+    const gaps=h.tracker.getSubtreeCoverageGaps;
+    h.tracker.getSubtreeCoverageGaps=()=>{
+        h.tracker.getSubtreeCoverageGaps=gaps;
+        throw new Error('controlled coverage lookup failure');
+    };
+    const [first,second]=await Promise.allSettled([
+        h.controller.requestExcludeCoverageSubtree(h.targets[0]),
+        h.controller.requestExcludeCoverageSubtree(h.targets[1])
+    ]);
+    assert.equal(first.status,'rejected');
+    assert.match(first.reason.message,/controlled coverage lookup failure/);
+    assert.equal(second.status,'fulfilled');
+    assert.equal(second.value.status,'saved');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule=>rule.pattern).sort(),
+        ['**/*.tmp','/b/'].sort());
 });
 
 await test('review tree exposes versioned Unknown Reset, text Accept and bounded folder actions',async()=>{

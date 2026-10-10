@@ -5477,6 +5477,32 @@ test('ISSUE-26 Unknown Reset refuses stale, dirty and unreadable file states',as
     assert.equal(result.status,'needsAttention',JSON.stringify(result));
     assert.ok(tracker.unresolvedBaselineFiles.has(inaccessible));
 });
+for(const phase of ['read','persistence']) test(`ISSUE-26 Unknown Reset preserves uncertainty when coverage fails during ${phase}`,async()=>{
+    const storage=file(`unknown-late-gap-storage-${phase}`);
+    await tracker.dispose();
+    tracker=new DiffTracker(Uri.file(storage));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const directory=file(`unknown-late-gap-${phase}`);
+    fs.mkdirSync(directory);
+    const p=path.join(directory,'item.txt');
+    fs.writeFileSync(p,'current');
+    tracker.recordUnresolvedBaseline(p,'Unknown before-image');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    const gate=phase==='read'?pause(p,'read'):pause(path.join(storage,'session-state.tmp.json'),'write');
+    const operation=tracker.resetUnknownBaseline(p,tracker.getUnknownReviewToken(p));
+    await gate.entered;
+    tracker.setSubtreeCoverageGap(path.dirname(p),'directory-runtime-coverage-gap','Watcher failed during reset');
+    gate.release();
+    const result=await operation;
+    assert.notEqual(result.status,'success','late loss of ongoing coverage must invalidate Unknown reset');
+    assert.equal(tracker.unresolvedBaselineFiles.get(p),'Unknown before-image');
+    assert.equal(tracker.getOriginalContent(p),undefined);
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===path.dirname(p)));
+    assert.equal(disk(p),'current');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    assert.ok(fs.readFileSync(path.join(storage,'session-state.json'),'utf8').includes('Unknown before-image'));
+});
 test('ISSUE-26 Reset All Unknown allows partial success and preserves other text review',async()=>{
     const good=file('unknown-batch-good.txt');
     const bad=file('unknown-batch-bad.txt');
