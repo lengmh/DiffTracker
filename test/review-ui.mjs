@@ -345,6 +345,57 @@ await test('coverage exclude quick action stages an exact root-local request wit
     assert.equal(saveCount,1);
 });
 
+await test('review tree exposes versioned Unknown Reset, text Accept and bounded folder actions',async()=>{
+    const h=harness(null);
+    const pathRoot=path.resolve('review-tree-scoped');
+    const text=path.join(pathRoot,'mixed','text.txt');
+    const opaque=path.join(pathRoot,'mixed','binary.png');
+    const unknown=path.join(pathRoot,'mixed','uncertain.dat');
+    const paths=[text,opaque,unknown];
+    h.state.changes=paths.map((filePath,index)=>({
+        filePath,fileName:path.basename(filePath),originalContent:'prior',currentContent:'changed',
+        isDeleted:false,reviewKind:['text','opaque','unknown'][index]
+    }));
+    h.tracker.getReviewToken=target=>target===text?{...reviewToken,filePath:target}:undefined;
+    h.tracker.getReviewTokens=()=>[{...reviewToken,filePath:text}];
+    h.tracker.getOpaqueReviewToken=target=>target===opaque?{...opaqueReviewToken,filePath:target}:undefined;
+    h.tracker.getOpaqueReviewTokens=()=>[{...opaqueReviewToken,filePath:opaque}];
+    h.tracker.getUnknownReviewToken=target=>target===unknown?{...unknownReviewToken,filePath:target}:undefined;
+    h.tracker.getUnknownReviewTokens=()=>[{...unknownReviewToken,filePath:unknown}];
+    const originalGetFolder=h.vscode.workspace.getWorkspaceFolder;
+    h.vscode.workspace.getWorkspaceFolder=()=>({
+        name:'local',uri:{fsPath:pathRoot,scheme:'file'}
+    });
+    try{
+        const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+        const root=await tree.getChildren();
+        const resetAll=root.find(item=>item.command?.command==='diffTracker.resetAllUnknownBaselines');
+        assert.ok(resetAll);
+        assert.equal(resetAll.command.arguments[0][0].filePath,unknown);
+        const folder=root.find(item=>item.contextValue==='reviewFolder');
+        assert.ok(folder,'a virtual folder groups only its actual pending descendants');
+        const leaves=folder.children;
+        const textLeaf=leaves.find(item=>item.filePath===text);
+        const opaqueLeaf=leaves.find(item=>item.filePath===opaque);
+        const unknownLeaf=leaves.find(item=>item.filePath===unknown);
+        assert.equal(textLeaf.contextValue,'changedFile');
+        assert.equal(opaqueLeaf.contextValue,'opaqueFile');
+        assert.equal(unknownLeaf.contextValue,'unknownFile');
+        assert.equal(unknownLeaf.unknownReviewToken.filePath,unknown);
+        assert.deepEqual(folder.reviewEntries.map(entry=>entry.filePath).sort(),paths.sort());
+        assert.equal(folder.reviewEntries.filter(entry=>entry.reviewToken).length,1);
+        assert.equal(folder.reviewEntries.filter(entry=>entry.opaqueReviewToken).length,1);
+        const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+        const menus=manifest.contributes.menus['view/item/context'];
+        for(const command of ['diffTracker.acceptFolderText','diffTracker.revertFolderText','diffTracker.acknowledgeFolderOpaque']){
+            assert.ok(menus.some(item=>item.command===command&&item.when.includes('reviewFolder')),
+                `${command} must be scoped to virtual directory rows`);
+        }
+        assert.ok(menus.some(item=>item.command==='diffTracker.acceptFile'&&item.group==='inline'));
+        assert.ok(menus.some(item=>item.command==='diffTracker.resetUnknownBaseline'&&item.group==='inline'));
+    }finally{h.vscode.workspace.getWorkspaceFolder=originalGetFolder;}
+});
+
 await test('opaque file review is visible, read-only and carries identity metadata', async () => {
     const fingerprint = 'a'.repeat(64);
     const h = harness({
