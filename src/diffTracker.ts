@@ -9509,7 +9509,9 @@ export class DiffTracker {
         this.emitTrackChangesEvent({ removedFiles: [filePath], baselineChanged });
     }
 
-    private beginAcknowledgeTransaction(filePath: string, review: OpaqueReviewToken): BaselineTransaction {
+    private beginAcknowledgeTransaction(
+        filePath: string, review: OpaqueReviewToken | UnknownReviewToken, kind: 'opaque' | 'unknown' = 'opaque'
+    ): BaselineTransaction {
         const previous = {
             snapshotPresent: this.fileSnapshots.has(filePath),
             snapshot: this.fileSnapshots.get(filePath),
@@ -9540,7 +9542,8 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.snapshotInitialized = previous.snapshotInitialized;
         });
-        transaction.valid = () => !this.validateSnapshotTarget(filePath) && this.matchesOpaqueReview(review);
+        transaction.valid = () => !this.validateSnapshotTarget(filePath) && (kind === 'unknown'
+            ? this.matchesUnknownReview(review) : this.matchesOpaqueReview(review));
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
