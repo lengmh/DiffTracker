@@ -33,6 +33,162 @@ export function registerS4BSupplementalCoverage(h, fixture) {
     const {test, Uri, DiffTracker, file, getTracker, setTracker, setVsCodeExcludes, nativeDirectoryWatchers,
         fireConfigurationChanged} = h;
 
+    test('Issue #39 deleted supplemental target retires only after committed exclusion and keeps review evidence', () => fixture(async ({tracker,dir,scope}) => {
+        const blind = path.join(dir, '.aws');
+        const pending = path.join(dir, 'pending.txt');
+        const gitHead = path.join(dir, '.git', 'HEAD');
+        fs.mkdirSync(blind);
+        fs.mkdirSync(path.dirname(gitHead));
+        fs.writeFileSync(gitHead, 'ref: refs/heads/main\n');
+        fs.writeFileSync(pending, 'before');
+        setVsCodeExcludes({'files.watcherExclude': {'.aws/**': true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        const oldOwner = activeNativeWatcher(nativeDirectoryWatchers, blind);
+        assert.ok(oldOwner);
+        fs.writeFileSync(pending, 'pending');
+        await tracker.onExternalFileChanged(Uri.file(pending));
+        await h.waitUntil(() => tracker.getReviewToken(pending));
+        fs.rmdirSync(blind);
+        await tracker.onExternalFileDeleted(Uri.file(blind));
+        assert.equal(oldOwner.active, false, 'confirmed deletion closes the dead native owner');
+        assert.equal(tracker.getSubtreeCoverageGaps().find(gap => gap.targetPath === blind)?.reasonCode,
+            'supplemental-watcher-target-missing-gap');
+        const before = {
+            snapshots: [...tracker.fileSnapshots], reviews: structuredClone(tracker.getTrackedChanges()),
+            token: tracker.getReviewToken(pending), head: fs.readFileSync(gitHead, 'utf8')
+        };
+        const requested = configuredScope(tracker, 'wholeWorkspace', [], [{scope:'all', pattern:'/.aws/'}]);
+        tracker.setPendingMonitoringScope(requested);
+        assert.equal(tracker.getSubtreeCoverageGaps().length, 1, 'saved request alone is not effective exclusion');
+        const commit = tracker.commitPreparedScopePersistence.bind(tracker);
+        let preparing = 0;
+        tracker.commitPreparedScopePersistence = async (...args) => {
+            preparing++;
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 1, 'in-flight Apply still exposes committed coverage');
+            assert.deepEqual(tracker.getEffectiveMonitoringScope().excludes, []);
+            return commit(...args);
+        };
+        try {
+            const result = await tracker.applyConfiguredMonitoringScope(requested);
+            assert.equal(result.status, 'applied', JSON.stringify(result));
+        } finally { tracker.commitPreparedScopePersistence = commit; }
+        assert.equal(preparing, 1);
+        assert.equal(tracker.isPathIgnored(Uri.file(blind), true), true, 'effective directory probe proves explicit exclusion');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+        assert.deepEqual(tracker.getCoverageGaps(), []);
+        assert.equal(tracker.supplementalCoverageRoots.has(blind), false);
+        assert.deepEqual([...tracker.fileSnapshots], before.snapshots);
+        assert.deepEqual(tracker.getTrackedChanges(), before.reviews);
+        assert.deepEqual(tracker.getReviewToken(pending), before.token);
+        assert.equal(fs.readFileSync(pending, 'utf8'), 'pending');
+        assert.equal(fs.readFileSync(gitHead, 'utf8'), before.head);
+        assert.ok(tracker.coverageGaps.get(blind)?.subtree, 'retirement preserves durable uncertainty');
+        // Recreated path has a different inode. Apply may reinstall coverage,
+        // but cannot certify the earlier unobserved interval.
+        fs.mkdirSync(blind);
+        fs.writeFileSync(path.join(blind, 'new.txt'), 'new incarnation');
+        tracker.setPendingMonitoringScope(scope);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        tracker.setPendingMonitoringScope(undefined);
+        const freshOwner = activeNativeWatcher(nativeDirectoryWatchers, blind);
+        assert.ok(freshOwner);
+        assert.notEqual(freshOwner, oldOwner);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+        assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), [], 'only successful live reconciliation certifies the subtree');
+        assert.equal(tracker.getOriginalContent(pending), 'before');
+        assert.deepEqual(tracker.getReviewToken(pending), before.token);
+    }));
+
+    for (const outcome of ['failed', 'cancelled']) test(`Issue #39 ${outcome} Apply keeps supplemental diagnostics and owner`, () => fixture(async ({tracker,dir,scope}) => {
+        const blind = path.join(dir, '.aws');
+        fs.mkdirSync(blind);
+        setVsCodeExcludes({'files.watcherExclude': {'.aws/**': true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        const owner = activeNativeWatcher(nativeDirectoryWatchers, blind);
+        // A recreated target can have live future observation and an unresolved
+        // earlier deletion interval simultaneously.
+        tracker.setSubtreeCoverageGap(blind, 'supplemental-watcher-target-missing-gap', 'Unreconciled deletion');
+        const requested = configuredScope(tracker, 'wholeWorkspace', [], [{scope:'all', pattern:'/.aws/'}]);
+        const commit = tracker.commitPreparedScopePersistence.bind(tracker);
+        const capture = tracker.captureConfiguredExpansionBaselines.bind(tracker);
+        let current = true;
+        tracker.commitPreparedScopePersistence = async () => {
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 1);
+            assert.equal(owner.active, true, 'committed owner survives candidate preparation');
+            return false;
+        };
+        if (outcome === 'cancelled') {
+            tracker.commitPreparedScopePersistence = commit;
+            tracker.captureConfiguredExpansionBaselines = async (...args) => {
+                const result = await capture(...args);
+                current = false;
+                return result;
+            };
+        }
+        try {
+            const result = await tracker.applyConfiguredMonitoringScope(requested, false, () => current);
+            assert.equal(result.status, 'failed', JSON.stringify(result));
+            assert.equal(tracker.getSubtreeCoverageGaps().length, 1);
+            assert.deepEqual(tracker.getEffectiveMonitoringScope(), scope);
+            assert.equal(owner.active, true);
+            assert.equal(tracker.supplementalCoverageRoots.has(blind), true);
+        } finally {
+            tracker.commitPreparedScopePersistence = commit;
+            tracker.captureConfiguredExpansionBaselines = capture;
+        }
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested)).status, 'applied');
+        assert.equal(owner.active, false, 'successful scope retirement releases the live owner');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+    }));
+
+    test('Issue #39 root-specific exclusion releases only its own overlapping coverage owner', () => fixture(async ({tracker,dir,folder}) => {
+        const outer = path.join(dir, '.aws');
+        const nestedRoot = path.join(outer, 'workspace');
+        const inner = path.join(nestedRoot, '.aws');
+        fs.mkdirSync(inner, {recursive:true});
+        const nested = {uri:Uri.file(nestedRoot), name:'nested'};
+        const {vscode} = h;
+        const previousGet = vscode.workspace.getWorkspaceFolder;
+        const previousConfig = vscode.workspace.getConfiguration;
+        vscode.workspace.workspaceFolders = [folder, nested];
+        vscode.workspace.getWorkspaceFolder = uri =>
+            tracker.pathBelongsToRoot(uri.fsPath, nestedRoot) ? nested : previousGet(uri);
+        vscode.workspace.getConfiguration = (section, resource) => {
+            const config = previousConfig(section, resource);
+            return {...config, get:(key, fallback) => key === 'files.watcherExclude'
+                ? {'.aws/**':true} : config.get(key, fallback)};
+        };
+        try {
+            tracker.sessionWorkspaceRoots = tracker.getWorkspaceRoots();
+            tracker.effectiveMonitoringScope = configuredScope(tracker, 'rules');
+            const included = configuredScope(tracker, 'wholeWorkspace');
+            assert.equal((await tracker.applyConfiguredMonitoringScope(included)).status, 'applied');
+            const outerOwner = activeNativeWatcher(nativeDirectoryWatchers, outer);
+            const innerOwner = activeNativeWatcher(nativeDirectoryWatchers, inner);
+            assert.ok(outerOwner);
+            assert.ok(innerOwner);
+            // The same relative missing-root uncertainty belongs to two distinct
+            // workspace identities, despite their physical containment.
+            for (const target of [outer, inner]) {
+                tracker.setSubtreeCoverageGap(target, 'supplemental-watcher-target-missing-gap', 'Earlier deletion interval');
+            }
+            const excluded = configuredScope(tracker, 'wholeWorkspace', [], [
+                {scope:'folder', folder:folder.name, pattern:'/.aws/'}
+            ]);
+            assert.equal((await tracker.applyConfiguredMonitoringScope(excluded)).status, 'applied');
+            assert.deepEqual(tracker.getSubtreeCoverageGaps().map(gap => gap.targetPath), [inner]);
+            assert.deepEqual(tracker.getCoverageGaps().map(([target]) => target), [inner]);
+            assert.equal(outerOwner.active, false);
+            assert.equal(innerOwner.active, true, 'nested root keeps its legitimate direct watcher');
+            assert.deepEqual([...tracker.supplementalCoverageRoots], [inner]);
+            assert.ok(tracker.coverageGaps.has(outer));
+        } finally {
+            vscode.workspace.getWorkspaceFolder = previousGet;
+            vscode.workspace.getConfiguration = previousConfig;
+        }
+    }));
+
     for (const mode of ['rules', 'wholeWorkspace']) test(`S4-B nested workspace ${mode} retains independent observation and review baselines`, () => fixture(async ({tracker,dir,folder}) => {
         const outer = path.join(dir, 'vendor');
         const nestedRoot = path.join(outer, 'pkg');

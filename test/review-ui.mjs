@@ -291,6 +291,31 @@ await test('subtree coverage diagnostics are visible and actionable without beco
         'coverage diagnostics must not fabricate a file review summary');
 });
 
+await test('Issue #39 tree and status bar consume the same active subtree gaps after scope Apply', async () => {
+    const h = harness(null);
+    const item = {show(){},dispose(){}};
+    h.vscode.StatusBarAlignment = {Right: 2};
+    h.vscode.ThemeColor = class {constructor(id){this.id=id;}};
+    h.vscode.window.createStatusBarItem = () => item;
+    h.tracker.onDidChangeRecordingState = () => ({dispose(){}});
+    h.tracker.onDidChangeBaselineState = () => ({dispose(){}});
+    const listeners = [];
+    h.tracker.onDidTrackChanges = listener => {listeners.push(listener);return {dispose(){}};};
+    h.state.subtreeCoverageGaps = [{targetPath:'/workspace/.aws',
+        reasonCode:'supplemental-watcher-target-missing-gap',reason:'Deleted supplemental root'}];
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const status = new (h.load('statusBarManager.ts').StatusBarManager)(h.tracker);
+    assert.match(item.text, /Coverage Limited/);
+    assert.match(item.tooltip, /1 subtree/);
+    assert.ok((await tree.getChildren()).some(row => row.label === 'Monitoring Coverage Limited'));
+    h.state.subtreeCoverageGaps = [];
+    for (const listener of listeners) { listener({fullRefresh:true,baselineChanged:true}); }
+    assert.equal((await tree.getChildren()).some(row => row.label === 'Monitoring Coverage Limited'), false);
+    assert.equal(item.text, '$(circle-filled) Recording');
+    assert.equal(item.command, 'diffTracker.toggleRecording');
+    status.dispose();
+});
+
 // VS Code TreeMenus separates group `inline` (primary/hover) from all other
 // groups (secondary/right-click). One contribution does not provide both.
 // https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/browser/parts/views/treeView.ts#L1500-L1522

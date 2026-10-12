@@ -52,12 +52,13 @@ export function registerPR12BoundedInvariants(h) {
     const serialized=tracker=>Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
     const unresolvedPlan=reason=>({kind:'unresolved',reason});
 
-    test('Issue #24 dormant imported-directory diagnostics follow committed exclusions without losing evidence',()=>fixture(async({tracker,dir,scope})=>{
+    for (const reasonCode of ['directory-runtime-coverage-gap', 'supplemental-watcher-target-missing-gap'])
+    test(`Issue #24/#39 dormant ${reasonCode} follows committed exclusions without losing evidence`,()=>fixture(async({tracker,dir,scope})=>{
         const excluded=path.join(dir,'docs','.aws');
         const monitored=path.join(dir,'scripts','.codex');
         fs.mkdirSync(excluded,{recursive:true});
         fs.mkdirSync(monitored,{recursive:true});
-        tracker.setSubtreeCoverageGap(excluded,'directory-runtime-coverage-gap','Imported watcher limit');
+        tracker.setSubtreeCoverageGap(excluded,reasonCode,'Directory observation uncertainty');
         tracker.setSubtreeCoverageGap(monitored,'directory-scan-coverage-gap','Other monitored subtree');
         assert.equal(tracker.watchImportedDirectory(excluded,tracker.sessionEpoch),true);
         const owner=h.nativeDirectoryWatchers.find(item=>item.directory===excluded&&item.active);
@@ -83,6 +84,60 @@ export function registerPR12BoundedInvariants(h) {
         resumed.effectiveMonitoringScope=scope;
         assert.equal(resumed.getSubtreeCoverageGaps().some(item=>item.targetPath===excluded),true,
             're-including without verified watcher handoff must reveal the original gap');
+    }));
+
+    test('Issue #39 mixed excluded subtree gaps share one active view without suppressing file uncertainty',()=>fixture(async({tracker,dir})=>{
+        const paths=['.aws','docs/.aws','scripts/.agents','scripts/.codex'];
+        const kinds=['supplemental-watcher-target-missing-gap','directory-runtime-coverage-gap',
+            'directory-scan-coverage-gap','directory-runtime-coverage-gap'];
+        for (let index=0; index<paths.length; index++) {
+            tracker.setSubtreeCoverageGap(path.join(dir,paths[index]),kinds[index],paths[index]);
+        }
+        const other=path.join(dir,'unrelated');
+        tracker.setSubtreeCoverageGap(other,'supplemental-watcher-target-missing-gap','Unrelated subtree');
+        const excluded=path.join(dir,'.aws');
+        tracker.setFileCoverageGap(excluded,'file-read-failed','File-level uncertainty');
+        const requested=scopeFor(tracker,'wholeWorkspace',paths.map(relative=>({scope:'all',pattern:`/${relative}/`})));
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested)).status,'applied');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps().map(gap=>gap.targetPath),[other]);
+        assert.deepEqual(tracker.getCoverageGaps(),[[excluded,'File-level uncertainty'],[other,'Unrelated subtree']]);
+        tracker.clearCoverageGap(other,'subtree');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[], 'all four report subtrees are dormant');
+        assert.equal(tracker.coverageGaps.size,4,'the mixed failure evidence remains available after exclusion');
+    }));
+
+    for (const pattern of ['/.aws/child/', '/other/', '/.AWS/'])
+    test(`Issue #39 partial or unproven alias exclusion ${pattern} leaves missing target visible`,()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'.aws');
+        tracker.setSubtreeCoverageGap(target,'supplemental-watcher-target-missing-gap','Missing directory');
+        tracker.effectiveMonitoringScope=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern}]);
+        assert.equal(tracker.getSubtreeCoverageGaps().length,1);
+        assert.equal(tracker.getCoverageGaps().length,1);
+    }));
+
+    test('Issue #39 alias uncertainty follows effective exclusions and requires a workspace owner',()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'.aws');
+        fs.mkdirSync(target);
+        const sibling=path.join(dir,'other');
+        fs.mkdirSync(sibling);
+        fs.symlinkSync(sibling,path.join(dir,'alias'),process.platform==='win32'?'junction':'dir');
+        tracker.setSubtreeCoverageGap(target,'supplemental-watcher-target-missing-gap','Earlier missing target');
+        const aliasScope=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'/alias/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(aliasScope)).status,'applied');
+        // The shared matcher fails closed when an exclusion has unresolved
+        // symlink identity. Diagnostics follow that actual effective scope,
+        // rather than introducing a separate interpretation of the rule.
+        assert.equal(tracker.isPathIgnored(Uri.file(target),true),true);
+        assert.equal(tracker.getSubtreeCoverageGaps().length,0);
+        tracker.effectiveMonitoringScope=scopeFor(tracker);
+        assert.equal(tracker.getSubtreeCoverageGaps().length,1,'uncertainty returns when effective exclusion ends');
+        tracker.effectiveMonitoringScope=scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'/.aws/'}]);
+        assert.equal(tracker.getSubtreeCoverageGaps().length,0);
+        const folders=vscode.workspace.workspaceFolders;
+        try {
+            vscode.workspace.workspaceFolders=[];
+            assert.equal(tracker.getSubtreeCoverageGaps().length,1,'a removed workspace root cannot prove exclusion');
+        } finally { vscode.workspace.workspaceFolders=folders; }
     }));
 
     test('PR12 AUDIT universal exclusion skips all policy discovery in preflight and refresh',()=>fixture(async({tracker,scope,dir})=>{

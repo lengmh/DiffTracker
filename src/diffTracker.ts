@@ -5664,13 +5664,14 @@ export class DiffTracker {
             false, evidence.targetKind === 'subtree').source === 'explicitExclude';
     }
 
-    private isDormantExcludedImportedGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
+    private isDormantExcludedDirectoryGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
         if (evidence.targetKind !== 'subtree' ||
             (evidence.reasonCode !== 'directory-scan-coverage-gap' &&
-                evidence.reasonCode !== 'directory-runtime-coverage-gap')) { return false; }
+                evidence.reasonCode !== 'directory-runtime-coverage-gap' &&
+                evidence.reasonCode !== 'supplemental-watcher-target-missing-gap')) { return false; }
         // Keep the durable uncertainty for a later re-include: the original
-        // imported-directory owner may no longer exist, even though this subtree
-        // is explicitly excluded from the committed monitoring scope today.
+        // imported or deleted supplemental owner may no longer exist, even though
+        // this subtree is explicitly excluded from the committed scope today.
         const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
         if (scope.kind !== 'configured') { return false; }
         const folder = this.owningWorkspaceFolderForTraversal(targetPath);
@@ -5683,7 +5684,7 @@ export class DiffTracker {
 
     private isDormantCoverageGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
         return this.isDormantPendingScopeGap(targetPath, evidence) ||
-            this.isDormantExcludedImportedGap(targetPath, evidence);
+            this.isDormantExcludedDirectoryGap(targetPath, evidence);
     }
 
     public getCoverageGaps(): Array<[string, string]> {
