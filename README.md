@@ -125,7 +125,11 @@ Baseline growth and Keep operations must be persisted before review actions resu
 
 ### Git context changes
 
-Fresh recording waits for the VS Code Git API to become ready before establishing the Git baseline. If a repository later changes branch, detached HEAD, worktree identity, or enters an unstable merge/rebase state, existing review data is preserved but write actions for that repository pause. Use **Archive and Rebuild Paused Git Baseline** only after the repository reaches a stable state.
+Fresh recording waits for the VS Code Git API to become ready before establishing the Git baseline. If a repository later changes branch, detached HEAD, worktree identity, or enters an unstable merge/rebase state, existing review data is preserved, while Revert and Undo actions for that repository pause. Use **Archive and Rebuild Paused Git Baseline** only after the repository reaches a stable state.
+
+After switching between stable named branches in the same verified repository and worktree, text **Keep** can still update the selected review baselines. Both branches must have commits, and the review version, current content, unsaved-editor state, monitoring scope and saved-session checks must pass. Keep does not modify workspace files, the Git index or HEAD. It does not change the Git context originally recorded with the session or clear its pause.
+
+This applies to file, block, folder and batch text Keep. Batch confirmation shows the number of eligible text files; mixed batches do not relax the restrictions on non-text **Acknowledge** or unknown-baseline reset. If the Git context or reviewed content changes while Keep is pending, the operation is refused or rolled back. **Revert**, **Undo**, non-text **Acknowledge** and unknown-baseline reset retain their existing Git-context restrictions.
 
 Ordinary commits on the same named branch do not invalidate the review context.
 

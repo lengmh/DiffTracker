@@ -85,6 +85,10 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(monitoringScopeController);
     // Commands and restored review views must never precede Git reconciliation.
     diffTracker.setGitContextPending(true);
+    // Re-read authoritative Git state for every Keep validation, including
+    // immediately before committing a new review baseline.
+    diffTracker.setGitContextProvider(() => gitContextMonitor?.isReady()
+        ? gitContextMonitor.getSnapshots() : undefined);
     const restoreOutcome = await diffTracker.restorePersistedState();
     monitoringScopeController.reconcileRequestedScope();
     decorationManager = new DecorationManager(diffTracker);
@@ -396,9 +400,17 @@ export async function activate(context: vscode.ExtensionContext) {
         gitPromptShown.set(repoRoot, reason);
         persistGitPromptShown();
         try {
+            const branchChanged = reason.startsWith('Git branch changed from ');
+            // Git events can precede the text-review scan. Explain the policy
+            // without treating an empty eligible-token count as a blanket block.
+            const displayedReason = branchChanged
+                ? reason.replace(/; review actions for this repository are paused$/, '') + '; Revert and other workspace-writing actions remain blocked'
+                : reason;
             const answer = await vscode.window.showWarningMessage(
-                `Code Diff Tracker: ${reason}`,
-                { modal: true, detail: 'The existing review is preserved. Closing this message keeps it paused.' },
+                `Code Diff Tracker: ${displayedReason}`,
+                { modal: true, detail: branchChanged
+                    ? 'The existing review is preserved. Verified text Keep / Accept can remain available on a stable named branch without changing workspace files. Unsafe or unverified Git contexts stay blocked. Revert remains blocked until the Git context is restored or the baseline rebuilt.'
+                    : 'The existing review is preserved. Closing this message keeps it paused. Keep / Accept and Revert remain blocked for unsafe Git contexts.' },
                 'Archive and Rebuild'
             );
             if (answer === 'Archive and Rebuild') {
@@ -623,12 +635,28 @@ export async function activate(context: vscode.ExtensionContext) {
             // Explicit token callers retain the legacy text-only contract.
             if (reviewTokens) {
                 if (reviewTokens.length === 0) { return { results: [], succeeded: 0, failed: 0 } satisfies BatchActionResult; }
-                return reportBatch('Accepted', await diffTracker.keepAllChanges(reviewTokens));
+                // Capture values before the modal: do not replace stale tokens
+                // with a newer review after the user confirms.
+                const tokens = reviewTokens.map(token => ({ ...token }));
+                const crossBranchCount = diffTracker.getCrossBranchKeepCount(tokens);
+                if (crossBranchCount > 0) {
+                    const answer = await vscode.window.showWarningMessage(
+                        `Accept ${tokens.length} text file(s), including ${crossBranchCount} eligible text file(s) across Git branches?`,
+                        { modal: true, detail: 'Keep advances the selected review baselines without changing workspace files. Revert across branches remains blocked.' },
+                        'Accept Text Changes',
+                        'Cancel'
+                    );
+                    if (answer !== 'Accept Text Changes') {
+                        return { results: tokens.map(token => ({ filePath: token.filePath, status: 'cancelled', reason: 'Accept cancelled' } as ActionResult)), succeeded: 0, failed: tokens.length } satisfies BatchActionResult;
+                    }
+                }
+                return reportBatch('Accepted', await diffTracker.keepAllChanges(tokens));
             }
 
-            const textTokens = diffTracker.getReviewTokens();
-            const opaqueTokens = diffTracker.getOpaqueReviewTokens();
-            const unknownPaths = diffTracker.getUnknownReviewPaths();
+            const textTokens = diffTracker.getReviewTokens().map(token => ({ ...token }));
+            const opaqueTokens = diffTracker.getOpaqueReviewTokens().map(token => ({ ...token }));
+            const unknownPaths = [...diffTracker.getUnknownReviewPaths()];
+            const crossBranchCount = diffTracker.getCrossBranchKeepCount(textTokens);
             if (textTokens.length === 0 && opaqueTokens.length === 0 && unknownPaths.length === 0) {
                 return {
                     results: [], succeeded: 0, failed: 0,
@@ -637,10 +665,10 @@ export async function activate(context: vscode.ExtensionContext) {
                     failures: 0, conflicts: 0, cancelled: 0
                 } satisfies MixedBatchActionResult;
             }
-            if (opaqueTokens.length > 0 || unknownPaths.length > 0) {
+            if (crossBranchCount > 0 || opaqueTokens.length > 0 || unknownPaths.length > 0) {
                 const answer = await vscode.window.showWarningMessage(
-                    `Accept ${textTokens.length} text file(s) and acknowledge ${opaqueTokens.length} read-only file(s)? ${unknownPaths.length} unknown item(s) will remain pending.`,
-                    { modal: true, detail: 'Acknowledge advances only the saved file identity. It does not write, delete, restore, or copy read-only file content.' },
+                    `Accept ${textTokens.length} text file(s) and acknowledge ${opaqueTokens.length} read-only file(s)? ${unknownPaths.length} unknown item(s) will remain pending.${crossBranchCount > 0 ? ` Includes ${crossBranchCount} eligible text file(s) across Git branches.` : ''}`,
+                    { modal: true, detail: 'Acknowledge advances only the saved file identity. It does not write, delete, restore, or copy read-only file content.' + (crossBranchCount > 0 ? ' Keep advances text review baselines without changing workspace files. Revert across branches remains blocked.' : '') },
                     'Accept / Acknowledge',
                     'Cancel'
                 );
@@ -693,14 +721,15 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.acceptFolderText', async (item?: FolderReviewSelection) => {
-            const tokens = folderReviews(item).flatMap(entry => entry.reviewToken ? [entry.reviewToken] : []);
+            const tokens = folderReviews(item).flatMap(entry => entry.reviewToken ? [{ ...entry.reviewToken }] : []);
             if (!tokens.length) {
                 void vscode.window.showInformationMessage('Code Diff Tracker: No text reviews in this folder.');
                 return;
             }
+            const crossBranchCount = diffTracker.getCrossBranchKeepCount(tokens);
             const answer = await vscode.window.showWarningMessage(
-                `Accept ${tokens.length} text file(s) in this folder as their new baselines?`,
-                { modal: true, detail: 'Read-only and unknown entries are left untouched.' },
+                `Accept ${tokens.length} text file(s) in this folder as their new baselines?${crossBranchCount > 0 ? ` Includes ${crossBranchCount} eligible text file(s) across Git branches.` : ''}`,
+                { modal: true, detail: 'Read-only and unknown entries are left untouched.' + (crossBranchCount > 0 ? ' Keep does not change workspace files. Revert across branches remains blocked.' : '') },
                 'Accept Text Changes'
             );
             if (answer !== 'Accept Text Changes') { return; }

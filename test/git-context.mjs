@@ -30,6 +30,29 @@ const context=(overrides={})=>({
 });
 const tests=[]; const test=(name,run)=>tests.push({name,run});
 
+test('text Keep exception requires two verified stable named Git contexts',()=>{
+    const a=context(),b=context({headName:'feature',headCommit:'bbb'});
+    assert.equal(api.canKeepAcrossGitBranches(a,b),true);
+    assert.equal(api.compareGitContexts(a,b).compatible,false,'workspace writes retain strict branch matching');
+    for(const patch of [{repoRoot:repoRoot+'-other'},{kind:'worktree'},{headName:undefined},
+        {headCommit:undefined},{detached:true},{inProgress:true}]) {
+        assert.equal(api.canKeepAcrossGitBranches(a,{...b,...patch}),false);
+        assert.equal(api.canKeepAcrossGitBranches({...a,...patch},b),false);
+    }
+});
+test('authoritative readiness fails closed while Git API returns to uninitialized',async()=>{
+    const opened=new Emitter(),closed=new Emitter(),apiState=new Emitter();
+    const gitApi={state:'initialized',repositories:[],onDidChangeState:apiState.event,
+        onDidOpenRepository:opened.event,onDidCloseRepository:closed.event};
+    installedExtension={isActive:true,exports:{enabled:true,getAPI:()=>gitApi}};
+    const monitor=new api.GitContextMonitor(()=>{});await monitor.start();
+    assert.equal(monitor.isReady(),true);
+    gitApi.state='uninitialized';apiState.fire('uninitialized');assert.equal(monitor.isReady(),false);
+    gitApi.state='initialized';apiState.fire('initialized');assert.equal(monitor.isReady(),true);
+    monitor.dispose();assert.equal(monitor.isReady(),false);
+});
+
+
 test('ordinary commit and fast-forward on the same branch remain compatible',()=>{
     assert.deepEqual(api.compareGitContexts(context(),context({headCommit:'bbb'})),{compatible:true});
 });
@@ -337,6 +360,7 @@ for(const scenario of ['delayed','immediate','unavailable','recovered','incomple
             reconcileRequestedScope(){}
         },
         DiffTracker:class {
+            setGitContextProvider(provider){assert.equal(provider(),undefined);this.provider=provider;}
             setGitContextPending(value){pending=value;calls.push(value?'pause':'release');}
             async restorePersistedState(){assert.equal(pending,true);return restored;}
             getIsRecording(){return scenario!=='stopped';}

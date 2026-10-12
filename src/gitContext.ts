@@ -121,6 +121,13 @@ export function compareGitContexts(baseline: GitContextSnapshot, current: GitCon
         : { compatible: false, reason: 'Git unborn or unnamed HEAD identity changed' };
 }
 
+/** Baseline-only text acceptance may cross named branches, never uncertain Git states. */
+export function canKeepAcrossGitBranches(baseline: GitContextSnapshot, current: GitContextSnapshot): boolean {
+    return baseline.repoRoot === current.repoRoot && baseline.kind === current.kind &&
+        !baseline.inProgress && !current.inProgress && !baseline.detached && !current.detached &&
+        !!baseline.headName && !!current.headName && !!baseline.headCommit && !!current.headCommit;
+}
+
 export class GitContextMonitor implements vscode.Disposable {
     private readyWaiters: Array<(ready: boolean) => void> = [];
 
@@ -265,7 +272,7 @@ export class GitContextMonitor implements vscode.Disposable {
     }
 
     public isReady(): boolean {
-        return this.ready;
+        return !this.disposed && this.ready && this.api?.state === 'initialized';
     }
 
     public dispose(): void {
