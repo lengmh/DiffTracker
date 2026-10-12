@@ -129,7 +129,7 @@ Fresh recording waits for the VS Code Git API to become ready before establishin
 
 After switching between stable named branches in the same verified repository and worktree, text **Keep** can still update the selected review baselines. Both branches must have commits, and the review version, current content, unsaved-editor state, monitoring scope and saved-session checks must pass. Keep does not modify workspace files, the Git index or HEAD. It does not change the Git context originally recorded with the session or clear its pause.
 
-This applies to file, block, folder and batch text Keep. Batch confirmation shows the number of eligible text files; mixed batches do not relax the restrictions on non-text **Acknowledge** or unknown-baseline reset. If the Git context or reviewed content changes while Keep is pending, the operation is refused or rolled back. **Revert**, **Undo**, non-text **Acknowledge** and unknown-baseline reset retain their existing Git-context restrictions.
+This applies to file, block, folder and batch text Keep. Batch confirmation shows the number of eligible text files; mixed batches do not relax the restrictions on non-text **Acknowledge** or unknown-baseline reset. If the Git context or reviewed content changes while Keep is pending, the operation is refused or rolled back. If saving is interrupted, reload to recover the saved review before starting a new baseline. **Revert**, **Undo**, non-text **Acknowledge** and unknown-baseline reset retain their existing Git-context restrictions.
 
 Ordinary commits on the same named branch do not invalidate the review context.
 

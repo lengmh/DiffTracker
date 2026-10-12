@@ -88,7 +88,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Re-read authoritative Git state for every Keep validation, including
     // immediately before committing a new review baseline.
     diffTracker.setGitContextProvider(() => gitContextMonitor?.isReady()
-        ? gitContextMonitor.getSnapshots() : undefined);
+        ? gitContextMonitor.getVerifiedSnapshots() : undefined);
     const restoreOutcome = await diffTracker.restorePersistedState();
     monitoringScopeController.reconcileRequestedScope();
     decorationManager = new DecorationManager(diffTracker);

@@ -103,7 +103,7 @@ vm.runInNewContext(ts.transpileModule(providerInstall, { compilerOptions: { targ
 assert.equal(providerSandbox.provider(), undefined);
 let ready = false;
 let snapshots = [{ headName: 'branch-b' }];
-providerSandbox.gitContextMonitor = { isReady: () => ready, getSnapshots: () => snapshots };
+providerSandbox.gitContextMonitor = { isReady: () => ready, getVerifiedSnapshots: () => snapshots };
 assert.equal(providerSandbox.provider(), undefined);
 ready = true;
 assert.equal(providerSandbox.provider(), snapshots);

@@ -100,6 +100,325 @@ export function registerCrossBranchKeep(h) {
             vscode.workspace.getWorkspaceFolder = oldGetFolder;
         }
     }
+    for (const phase of ['temporary write', 'primary publication']) {
+        for (const action of ['file', 'block', 'batch']) {
+            test(`CROSS-BRANCH-KEEP LIFECYCLE stopped ${action} during ${phase} blocks Start until recovery`, () => fixture(async ctx => {
+                const { tracker, target } = ctx;
+                const gate = phase === 'temporary write'
+                    ? pause(path.join(ctx.storage, 'session-state.tmp.json'), 'write')
+                    : pause(path.join(ctx.storage, 'session-state.json'), 'copy');
+                const operation = action === 'file' ? tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                    : action === 'block' ? tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                    : tracker.keepAllChanges(tracker.getReviewTokens());
+                const disk = snapshot(ctx);
+                try {
+                    await Promise.race([gate.entered, operation.then(result => { throw new Error(`Keep ended before Stop barrier: ${JSON.stringify(result)}`); })]);
+                    assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), true);
+                    tracker.stopRecording();
+                    assert.equal(tracker.isRecoveryBlocked(), true);
+                    assert.equal(tracker.startRecording(), false, 'Start must not overwrite the pre-Keep recovery source');
+                } finally { gate.release(); }
+                const result = await operation;
+                if (action === 'batch') { assert.equal(result.succeeded, 0); assert.equal(result.failed, 2); }
+                else assert.notEqual(result.status, 'success');
+                assert.equal(tracker.isRecoveryBlocked(), true);
+                assert.equal(tracker.startRecording(), false);
+                assert.equal(tracker.getOriginalContent(target), before);
+                assert.deepEqual(snapshot(ctx), disk);
+                const reloaded = await ctx.restart();
+                assert.equal(reloaded.getOriginalContent(target), before);
+                assert.ok(pending(reloaded, target));
+                assert.equal(reloaded.isRecoveryBlocked(), false);
+                assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), false);
+                assert.equal(reloaded.startRecording(), true);
+                const deadline = Date.now() + 2000;
+                while (reloaded.baselineBuilding && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+                assert.equal(reloaded.baselineBuilding, false, 'fresh recording must finish after recovery');
+                assert.equal(await reloaded.flushPendingPersistence(), true);
+                assert.equal((await ctx.restart()).getOriginalContent(target), after,
+                    'a later explicit fresh baseline must not be reverted by a stale Keep intent');
+            }));
+        }
+    }
+    for (const action of ['file', 'block', 'batch']) {
+        test(`CROSS-BRANCH-KEEP LIFECYCLE discard waits for stopped ${action} intent write and cannot resurrect review`, () => fixture(async ctx => {
+            const { tracker, target } = ctx;
+            const intent = path.join(ctx.storage, 'session-state.keep-in-progress.json');
+            const gate = pause(intent, 'write');
+            const operation = action === 'file' ? tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                : action === 'block' ? tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                : tracker.keepAllChanges(tracker.getReviewTokens());
+            let discard, settled = false;
+            const disk = snapshot(ctx);
+            try {
+                await Promise.race([gate.entered, operation.then(result => { throw new Error(`Keep ended before intent-write Stop barrier: ${JSON.stringify(result)}`); })]);
+                tracker.stopRecording();
+                assert.equal(tracker.isRecoveryBlocked(), true);
+                discard = tracker.discardRecoveryState().then(result => { settled = true; return result; });
+                await new Promise(resolve => setImmediate(resolve));
+                assert.equal(settled, false, 'discard must wait until the previously queued intent write settles');
+                assert.equal(tracker.startRecording(), false);
+            } finally { gate.release(); }
+            const result = await operation;
+            if (action === 'batch') assert.equal(result.succeeded, 0);
+            else assert.notEqual(result.status, 'success');
+            assert.equal(await discard, true);
+            for (const name of ['session-state.json', 'session-state.last-good.json', 'session-state.unsaved', 'session-state.keep-in-progress.json']) {
+                assert.equal(fs.existsSync(path.join(ctx.storage, name)), false, `${name} must stay discarded after late writes settle`);
+            }
+            const image = crashImage(ctx);
+            const restarted = new DiffTracker(Uri.file(image));
+            try {
+                assert.equal(await restarted.restorePersistedState(), 'absent');
+                assert.equal(restarted.getOriginalContent(target), undefined);
+                assert.equal(restarted.isRecoveryBlocked(), false);
+            } finally { await restarted.dispose(); }
+            assert.deepEqual(snapshot(ctx), disk);
+        }));
+    }
+    for (const action of ['file', 'block', 'batch']) {
+        test(`CROSS-BRANCH-KEEP LIFECYCLE synchronous Stop after ${action} durable commit cannot roll it back`, () => fixture(async ctx => {
+            const { tracker, target } = ctx;
+            let stopped = false;
+            const listener = tracker.onDidChangeBaselineState(state => {
+                if (state !== 'ready' || stopped) return;
+                assert.equal(tracker.baselineTransaction?.durablyCommitted, true);
+                assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), false);
+                stopped = true;
+                tracker.stopRecording();
+            });
+            const disk = snapshot(ctx);
+            let result;
+            try {
+                result = action === 'file' ? await tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                    : action === 'block' ? await tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                    : await tracker.keepAllChanges(tracker.getReviewTokens());
+            } finally { listener.dispose(); }
+            assert.equal(stopped, true);
+            if (action === 'batch') { assert.equal(result.succeeded, 1); assert.equal(result.failed, 1); }
+            else assert.equal(result.status, 'success');
+            const accepted = action === 'block' ? before.replace('old first', 'new first') : after;
+            assert.equal(tracker.getOriginalContent(target), accepted);
+            assert.equal(tracker.isRecoveryBlocked(), false);
+            const reloaded = await ctx.restart();
+            assert.equal(reloaded.getOriginalContent(target), accepted);
+            assert.equal(reloaded.isRecoveryBlocked(), false);
+            assert.deepEqual(snapshot(ctx), disk);
+        }));
+    }
+    // Freeze only the durable storage image. Never dispose/flush the live tracker
+    // before the copy: doing so would repair the interrupted publication and hide it.
+    function crashImage(ctx) {
+        const storage = file('keep-crash-storage');
+        fs.cpSync(ctx.storage, storage, { recursive: true });
+        return storage;
+    }
+    async function readCrashImage(ctx, storage, check) {
+        const recovered = new DiffTracker(Uri.file(storage));
+        const live = [{ ...ctx.b, headName: git(ctx.workspace, 'symbolic-ref', '--short', 'HEAD') }];
+        recovered.setGitContextProvider(() => live);
+        try {
+            const result = await recovered.restorePersistedState();
+            assert.ok(['restored', 'recovered'].includes(result), `crash recovery must restore an actionable session, got ${result}`);
+            recovered.reconcileRestoredGitContexts(live);
+            await check(recovered);
+        } finally { await recovered.dispose(); }
+    }
+    for (const action of ['file', 'block', 'batch']) {
+        test(`CROSS-BRANCH-KEEP CRASH ${action} after unsaved deletion restores the pre-Keep session`, () => fixture(async ctx => {
+            const { tracker, target } = ctx;
+            const unsaved = path.join(ctx.storage, 'session-state.unsaved');
+            const originalDelete = vscode.workspace.fs.delete;
+            const originalUnlink = fs.unlinkSync;
+            let image;
+            const interrupt = () => {
+                if (image) return;
+                assert.notEqual(saved(ctx.storage).fileSnapshots.find(([p]) => p === target)?.[1], before);
+                assert.equal(fs.existsSync(unsaved), false);
+                image = crashImage(ctx);
+                throw new Error('simulated crash after removing unsaved, before durable Keep commit');
+            };
+            // The old implementation yields through VS Code delete; the fixed
+            // implementation must keep the final guard/deletions synchronous.
+            vscode.workspace.fs.delete = async (uri, ...args) => {
+                const result = await originalDelete(uri, ...args);
+                if (uri.fsPath === unsaved) interrupt();
+                return result;
+            };
+            fs.unlinkSync = (targetPath, ...args) => {
+                const result = originalUnlink(targetPath, ...args);
+                if (String(targetPath) === unsaved) interrupt();
+                return result;
+            };
+            try {
+                if (action === 'file') await tracker.keepAllChangesInFile(target, tracker.getReviewToken(target));
+                else if (action === 'block') await tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target));
+                else await tracker.keepAllChanges(tracker.getReviewTokens());
+            } finally {
+                vscode.workspace.fs.delete = originalDelete;
+                fs.unlinkSync = originalUnlink;
+            }
+            assert.ok(image, 'the interrupted candidate must have reached durable marker deletion');
+            git(ctx.workspace, 'checkout', 'branch-c');
+            ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
+            await readCrashImage(ctx, image, async recovered => {
+                for (const p of ctx.targets) {
+                    assert.equal(recovered.getOriginalContent(p), before, 'an uncommitted Keep must never be accepted on restart');
+                    assert.ok(pending(recovered, p));
+                }
+                assert.ok(recovered.getGitPauseReason(target));
+                assert.deepEqual(saved(image).gitContexts, [ctx.a]);
+            });
+        }));
+    }
+    for (const phase of ['before candidate', 'after candidate']) {
+        for (const action of ['file', 'block', 'batch']) {
+            test(`CROSS-BRANCH-KEEP CRASH ${action} ${phase} restores all prior evidence`, () => fixture(async ctx => {
+                const { tracker, target } = ctx;
+                const gate = phase === 'before candidate'
+                    ? pause(path.join(ctx.storage, 'session-state.tmp.json'), 'write')
+                    : pause(path.join(ctx.storage, 'session-state.json'), 'copy');
+                const operation = action === 'file' ? tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                    : action === 'block' ? tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                    : tracker.keepAllChanges(tracker.getReviewTokens());
+                let image;
+                try {
+                    await Promise.race([gate.entered, operation.then(result => { throw new Error(`Keep ended before crash barrier: ${JSON.stringify(result)}`); })]);
+                    const candidate = saved(ctx.storage).fileSnapshots.find(([p]) => p === target)?.[1];
+                    if (phase === 'before candidate') assert.equal(candidate, before);
+                    else assert.notEqual(candidate, before);
+                    image = crashImage(ctx);
+                    git(ctx.workspace, 'checkout', 'branch-c');
+                    ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
+                } finally { gate.release(); }
+                await operation;
+                await readCrashImage(ctx, image, async recovered => {
+                    for (const p of ctx.targets) {
+                        assert.equal(recovered.getOriginalContent(p), before);
+                        assert.ok(pending(recovered, p));
+                    }
+                    assert.equal(pending(recovered, ctx.unknown)?.reviewKind, 'unknown');
+                    assert.ok(pending(recovered, ctx.unknown)?.unavailableReason);
+                    assert.equal(pending(recovered, ctx.opaque)?.reviewKind, 'opaque');
+                    assert.deepEqual(saved(image).gitContexts, [ctx.a]);
+                    assert.ok(recovered.getGitPauseReason(target));
+                    assert.equal(recovered.isRecoveryBlocked(), false);
+                });
+            }, { mixed: true }));
+        }
+    }
+    for (const action of ['file', 'block', 'batch']) {
+        test(`CROSS-BRANCH-KEEP CRASH committed ${action} restart keeps accepted baseline and permits later Keep`, () => fixture(async ctx => {
+            const { tracker, target } = ctx;
+            const result = action === 'file' ? await tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                : action === 'block' ? await tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                : await tracker.keepAllChanges(tracker.getReviewTokens());
+            if (action === 'batch') assert.equal(result.succeeded, 2);
+            else assert.equal(result.status, 'success');
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), false);
+            const image = crashImage(ctx);
+            git(ctx.workspace, 'checkout', 'branch-c');
+            ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
+            const disk = snapshot(ctx);
+            await readCrashImage(ctx, image, async recovered => {
+                assert.equal(recovered.getOriginalContent(target), action === 'block' ? before.replace('old first', 'new first') : after);
+                assert.equal(recovered.isRecoveryBlocked(), false);
+                const p = ctx.targets[1];
+                fs.writeFileSync(p, `${after}later reviewed work\n`);
+                await recovered.readFileAndUpdate(p, Uri.file(p));
+                assert.equal((await recovered.keepAllChangesInFile(p, recovered.getReviewToken(p))).status, 'success',
+                    'a completed commit must not leave an inert recovery intent blocking later Keep');
+            });
+            fs.writeFileSync(ctx.targets[1], after);
+            assert.deepEqual(snapshot(ctx), disk);
+        }));
+    }
+    for (const fault of ['pre-Keep backup write', 'intent write', 'unsaved delete', 'intent delete']) {
+        for (const action of ['file', 'block', 'batch']) {
+            test(`CROSS-BRANCH-KEEP DURABILITY ${action} ${fault} failure cannot accept the candidate`, () => fixture(async ctx => {
+                const { tracker, target } = ctx;
+                const fileName = fault === 'pre-Keep backup write' ? 'session-state.pre-keep.json'
+                    : fault === 'unsaved delete' ? 'session-state.unsaved' : 'session-state.keep-in-progress.json';
+                const faultPath = path.join(ctx.storage, fileName);
+                const originalWrite = vscode.workspace.fs.writeFile;
+                const originalDelete = vscode.workspace.fs.delete;
+                const originalUnlink = fs.unlinkSync;
+                let injected = 0;
+                const fail = () => { injected++; throw Object.assign(new Error(`injected ${fault} failure`), { code: 'EACCES' }); };
+                vscode.workspace.fs.writeFile = async (uri, ...args) => {
+                    if (fault.endsWith('write') && uri.fsPath === faultPath) fail();
+                    return originalWrite(uri, ...args);
+                };
+                vscode.workspace.fs.delete = async (uri, ...args) => {
+                    if (fault.endsWith('delete') && uri.fsPath === faultPath) fail();
+                    return originalDelete(uri, ...args);
+                };
+                fs.unlinkSync = (targetPath, ...args) => {
+                    if (fault.endsWith('delete') && String(targetPath) === faultPath) fail();
+                    return originalUnlink(targetPath, ...args);
+                };
+                const disk = snapshot(ctx);
+                let result, image;
+                try {
+                    result = action === 'file' ? await tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                        : action === 'block' ? await tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                        : await tracker.keepAllChanges(tracker.getReviewTokens());
+                    image = crashImage(ctx);
+                } finally {
+                    vscode.workspace.fs.writeFile = originalWrite;
+                    vscode.workspace.fs.delete = originalDelete;
+                    fs.unlinkSync = originalUnlink;
+                }
+                assert.ok(injected, 'the production durability boundary must actually be exercised');
+                if (action === 'batch') { assert.equal(result.succeeded, 0); assert.equal(result.failed, 2); }
+                else assert.notEqual(result.status, 'success');
+                for (const p of ctx.targets) {
+                    assert.equal(tracker.getOriginalContent(p), before);
+                    assert.ok(pending(tracker, p));
+                }
+                assert.deepEqual(snapshot(ctx), disk);
+                await readCrashImage(ctx, image, async recovered => {
+                    for (const p of ctx.targets) {
+                        assert.equal(recovered.getOriginalContent(p), before);
+                        assert.ok(pending(recovered, p));
+                    }
+                    assert.equal(recovered.isRecoveryBlocked(), false);
+                    assert.deepEqual(saved(image).gitContexts, [ctx.a]);
+                });
+            }));
+        }
+    }
+    test('CROSS-BRANCH-KEEP CRASH restores preexisting pending-scope Unknown evidence', () => fixture(async ctx => {
+        const { tracker, target } = ctx;
+        const excluded = ctx.targets[1];
+        const requested = validateAndCanonicalizeScope({ mode: 'rules', includes: [],
+            excludes: [{ scope: 'all', pattern: path.basename(excluded) }] }, tracker.currentWorkspaceRootIdentities());
+        assert.equal(requested.ok, true);
+        tracker.setPendingMonitoringScope(requested.scope);
+        assert.equal(pending(tracker, excluded)?.reviewKind, 'unknown');
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const gate = pause(path.join(ctx.storage, 'session-state.json'), 'copy');
+        const operation = tracker.keepAllChangesInFile(target, tracker.getReviewToken(target));
+        let image;
+        try {
+            await Promise.race([gate.entered, operation.then(result => { throw new Error(`Keep ended before pending-scope crash: ${JSON.stringify(result)}`); })]);
+            image = crashImage(ctx);
+            git(ctx.workspace, 'checkout', 'branch-c');
+            ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
+        } finally { gate.release(); }
+        await operation;
+        await readCrashImage(ctx, image, async recovered => {
+            assert.equal(recovered.getOriginalContent(target), before);
+            assert.equal(recovered.getOriginalContent(excluded), before);
+            assert.equal(pending(recovered, excluded)?.reviewKind, 'unknown');
+            assert.ok(pending(recovered, excluded)?.unavailableReason);
+            // Pending settings are not reapplied on startup. Recovery retains
+            // their uncertainty as a durable gap requiring explicit review.
+            assert.equal(recovered.coverageGaps.get(excluded)?.file?.reasonCode, 'pending-scope-gap');
+            assert.equal(recovered.getReviewToken(excluded), undefined);
+        });
+    }));
     for (const action of ['file', 'block', 'batch']) {
         test(`CROSS-BRANCH-KEEP ${action} only changes the reviewed baseline and preserves pause through reload`, () => fixture(async ctx => {
             const { tracker, target } = ctx;
