@@ -243,13 +243,24 @@ for (const linked of [false, true]) for (const operation of [
     const { monitor } = await createMonitor(root, linked ? 'worktree' : 'repository');
     const gitDir = git(root, 'rev-parse', '--absolute-git-dir');
     const headPath = path.join(gitDir, 'HEAD');
+    // Git can return a different spelling of the same temp path on Windows
+    // (casing/short-name aliases). Match file identity, not the original spelling.
+    const canonicalPath = file => {
+        const resolved = path.normalize(fs.realpathSync.native(file));
+        return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    };
+    const canonicalHeadPath = canonicalPath(headPath);
     const originalCommit = git(root, 'rev-parse', 'HEAD');
     const markerPath = path.join(gitDir, operation);
     const openSync = fs.openSync;
-    let reads = 0;
+    let reads = 0, injections = 0;
+    const observedHeadPaths = [];
     try {
         fs.openSync = function(file, ...args) {
-            if (file === headPath && ++reads === 2) {
+            const isHead = typeof file === 'string' && path.basename(file) === 'HEAD';
+            if (isHead) observedHeadPaths.push(file);
+            if (isHead && canonicalPath(file) === canonicalHeadPath && ++reads === 2) {
+                injections++;
                 if (operation === 'MERGE_HEAD') git(root, 'merge', '--no-ff', '--no-commit', 'topic');
                 else if (['rebase-merge', 'rebase-apply', 'sequencer'].includes(operation)) mkdirSync(markerPath);
                 else writeFileSync(markerPath, originalCommit + '\n');
@@ -257,12 +268,14 @@ for (const linked of [false, true]) for (const operation of [
             return openSync.call(this, file, ...args);
         };
         const current = monitor.getVerifiedSnapshots()[0];
+        assert.equal(injections, 1, `must inject exactly once during the second HEAD read: ${JSON.stringify({ headPath, observedHeadPaths })}`);
+        assert.equal(reads, 2, 'injection must target the final of the two HEAD samples');
         assert.equal(current.headCommit, originalCommit, 'operation leaves HEAD unchanged');
         assert.equal(git(root, 'rev-parse', 'HEAD'), originalCommit);
         assert.equal(current.inProgress, true, 'late operation marker must fail closed');
     } finally {
         fs.openSync = openSync;
-        if (operation === 'MERGE_HEAD') git(root, 'merge', '--abort');
+        if (operation === 'MERGE_HEAD' && fs.existsSync(markerPath)) git(root, 'merge', '--abort');
         else rmSync(markerPath, { recursive: true, force: true });
         assert.equal(monitor.getVerifiedSnapshots()[0].inProgress, false, 'abort/cleanup restores eligibility');
         monitor.dispose();
