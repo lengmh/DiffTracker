@@ -1,3 +1,4 @@
+import { registerKeepCountSnapshot } from './keep-count-snapshot.mjs';
 import { registerCrossBranchKeep } from './cross-branch-keep.mjs';
 import { registerArchivedGitReview } from './archived-git-review.mjs';
 import { registerPR12BoundedInvariants } from './pr12-bounded-invariants.mjs';
@@ -5685,6 +5686,8 @@ registerPR12BoundedInvariants({
         affectsConfiguration: name => name === key
     })
 });
+
+registerKeepCountSnapshot({ test, root, file, seed, scan, getTracker: () => tracker });
 
 registerCrossBranchKeep({
     test, Uri, DiffTracker, vscode, file, document, pause,

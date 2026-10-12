@@ -163,7 +163,7 @@ export function registerCrossBranchKeep(h) {
             if (action === 'batch') assert.equal(result.succeeded, 0);
             else assert.notEqual(result.status, 'success');
             assert.equal(await discard, true);
-            for (const name of ['session-state.json', 'session-state.last-good.json', 'session-state.unsaved', 'session-state.keep-in-progress.json']) {
+            for (const name of ['session-state.json', 'session-state.last-good.json', 'session-state.unsaved', 'session-state.keep-in-progress.json', 'session-state.pre-keep.json']) {
                 assert.equal(fs.existsSync(path.join(ctx.storage, name)), false, `${name} must stay discarded after late writes settle`);
             }
             const image = crashImage(ctx);
@@ -220,6 +220,8 @@ export function registerCrossBranchKeep(h) {
         try {
             const result = await recovered.restorePersistedState();
             assert.ok(['restored', 'recovered'].includes(result), `crash recovery must restore an actionable session, got ${result}`);
+            assert.equal(fs.existsSync(path.join(storage, 'session-state.pre-keep.json')), false,
+                'successful recovery must remove its obsolete pre-Keep backup');
             recovered.reconcileRestoredGitContexts(live);
             await check(recovered);
         } finally { await recovered.dispose(); }
@@ -287,6 +289,8 @@ export function registerCrossBranchKeep(h) {
                     const candidate = saved(ctx.storage).fileSnapshots.find(([p]) => p === target)?.[1];
                     if (phase === 'before candidate') assert.equal(candidate, before);
                     else assert.notEqual(candidate, before);
+                    assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.pre-keep.json')), true,
+                        'an uncommitted intent must retain its recovery backup');
                     image = crashImage(ctx);
                     git(ctx.workspace, 'checkout', 'branch-c');
                     ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
@@ -317,6 +321,8 @@ export function registerCrossBranchKeep(h) {
             else assert.equal(result.status, 'success');
             assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), false);
             assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.unsaved')), false);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.pre-keep.json')), false,
+                'committed Keep must remove the no-longer-needed before-image backup');
             const image = crashImage(ctx);
             git(ctx.workspace, 'checkout', 'branch-c');
             ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
@@ -417,6 +423,92 @@ export function registerCrossBranchKeep(h) {
             // their uncertainty as a durable gap requiring explicit review.
             assert.equal(recovered.coverageGaps.get(excluded)?.file?.reasonCode, 'pending-scope-gap');
             assert.equal(recovered.getReviewToken(excluded), undefined);
+        });
+    }));
+    for (const action of ['file', 'block', 'batch']) {
+        test(`CROSS-BRANCH-KEEP BACKUP ${action} cleanup failure cannot undo durable success`, () => fixture(async ctx => {
+            const { tracker, target } = ctx;
+            const backup = path.join(ctx.storage, 'session-state.pre-keep.json');
+            const originalDelete = vscode.workspace.fs.delete;
+            const originalUnlink = fs.unlinkSync;
+            let injected = 0;
+            const fail = () => { injected++; throw Object.assign(new Error('injected obsolete backup cleanup failure'), { code: 'EACCES' }); };
+            vscode.workspace.fs.delete = async (uri, ...args) => {
+                if (uri.fsPath === backup) fail();
+                return originalDelete(uri, ...args);
+            };
+            fs.unlinkSync = (targetPath, ...args) => {
+                if (String(targetPath) === backup) fail();
+                return originalUnlink(targetPath, ...args);
+            };
+            let result, image;
+            const disk = snapshot(ctx);
+            try {
+                result = action === 'file' ? await tracker.keepAllChangesInFile(target, tracker.getReviewToken(target))
+                    : action === 'block' ? await tracker.keepBlock(target, tracker.getChangeBlocks(target)[0].blockId, tracker.getReviewToken(target))
+                    : await tracker.keepAllChanges(tracker.getReviewTokens());
+                image = crashImage(ctx);
+            } finally {
+                vscode.workspace.fs.delete = originalDelete;
+                fs.unlinkSync = originalUnlink;
+            }
+            assert.ok(injected, 'successful Keep must attempt to remove the obsolete backup');
+            if (action === 'batch') { assert.equal(result.succeeded, 2); assert.equal(result.failed, 0); }
+            else assert.equal(result.status, 'success', result.reason);
+            assert.equal(tracker.isRecoveryBlocked(), false);
+            const accepted = action === 'block' ? before.replace('old first', 'new first') : after;
+            assert.equal(tracker.getOriginalContent(target), accepted);
+            assert.equal(saved(ctx.storage).fileSnapshots.find(([p]) => p === target)?.[1], accepted);
+            assert.equal(fs.existsSync(path.join(ctx.storage, 'session-state.keep-in-progress.json')), false);
+            assert.equal(fs.existsSync(backup), true, 'cleanup failure may leave only an inert backup');
+            const recovered = new DiffTracker(Uri.file(image));
+            recovered.setGitContextProvider(() => [ctx.b]);
+            try {
+                assert.equal(await recovered.restorePersistedState(), 'restored');
+                assert.equal(recovered.getOriginalContent(target), accepted, 'inert leftover backup must never revert a committed baseline');
+                assert.equal(recovered.isRecoveryBlocked(), false);
+                assert.equal(fs.existsSync(path.join(image, 'session-state.pre-keep.json')), false,
+                    'startup must retry cleanup after a transient obsolete-backup deletion failure');
+            } finally { await recovered.dispose(); }
+            assert.deepEqual(snapshot(ctx), disk);
+        }));
+    }
+    test('CROSS-BRANCH-KEEP BACKUP failed recovery retains complete before-images until a successful retry', () => fixture(async ctx => {
+        const { tracker, target } = ctx;
+        const gate = pause(path.join(ctx.storage, 'session-state.json'), 'copy');
+        const operation = tracker.keepAllChangesInFile(target, tracker.getReviewToken(target));
+        let image;
+        try {
+            await Promise.race([gate.entered, operation.then(result => { throw new Error(`Keep ended before recovery-failure setup: ${JSON.stringify(result)}`); })]);
+            image = crashImage(ctx);
+            git(ctx.workspace, 'checkout', 'branch-c');
+            ctx.setLive([{ ...ctx.b, headName: 'branch-c' }]);
+        } finally { gate.release(); }
+        await operation;
+        const backup = path.join(image, 'session-state.pre-keep.json');
+        const intent = path.join(image, 'session-state.keep-in-progress.json');
+        const beforeBackup = fs.readFileSync(backup);
+        const beforeIntent = fs.readFileSync(intent);
+        const originalWrite = vscode.workspace.fs.writeFile;
+        vscode.workspace.fs.writeFile = async (uri, ...args) => {
+            if (uri.fsPath === path.join(image, 'session-state.tmp.json')) throw new Error('injected recovery persistence failure');
+            return originalWrite(uri, ...args);
+        };
+        const recovered = new DiffTracker(Uri.file(image));
+        recovered.setGitContextProvider(() => [{ ...ctx.b, headName: 'branch-c' }]);
+        try {
+            assert.equal(await recovered.restorePersistedState(), 'blocked');
+            assert.equal(recovered.isRecoveryBlocked(), true);
+            assert.deepEqual(fs.readFileSync(backup), beforeBackup);
+            assert.deepEqual(fs.readFileSync(intent), beforeIntent);
+        } finally {
+            vscode.workspace.fs.writeFile = originalWrite;
+            await recovered.dispose();
+        }
+        assert.deepEqual(fs.readFileSync(backup), beforeBackup, 'blocked shutdown must preserve the recovery backup');
+        await readCrashImage(ctx, image, async retried => {
+            assert.equal(retried.getOriginalContent(target), before);
+            assert.ok(pending(retried, target));
         });
     }));
     for (const action of ['file', 'block', 'batch']) {

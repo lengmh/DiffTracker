@@ -927,6 +927,7 @@ export class DiffTracker {
                 this.persistenceIssue = 'Multiple interrupted baseline operations require preserving extension storage before recovery.';
                 return 'blocked';
             }
+            if (keepInterrupted.kind === 'absent') { this.cleanupResolvedKeepBackup(); }
             const recoveringKeep = keepInterrupted.kind !== 'absent';
             const interrupted = recoveringKeep ? keepInterrupted : archiveInterrupted;
             if (interrupted.kind === 'invalid') {
@@ -942,6 +943,7 @@ export class DiffTracker {
                     return 'blocked';
                 }
                 await this.deletePersistedFile(this.getPersistedStateUri(recoveringKeep ? this.keepIntentFileName : this.archiveRestoreIntentFileName)!);
+                if (recoveringKeep) { this.cleanupResolvedKeepBackup(); }
                 this.persistenceIssue = recoveringKeep
                     ? 'An interrupted text Keep was rolled back to its saved before-images; review remains pending.'
                     : 'An interrupted archived review restore was rolled back to the pre-restore session. The original archive is unchanged.';
@@ -5736,7 +5738,7 @@ export class DiffTracker {
             return true;
         }
         try {
-            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName, this.persistenceFailureFileName, this.archiveRestoreIntentFileName, this.keepIntentFileName]) {
+            for (const name of [this.persistedStateFileName, this.persistedStateTempFileName, this.persistedStateBackupFileName, this.persistenceFailureFileName, this.archiveRestoreIntentFileName, this.keepIntentFileName, this.preKeepFileName]) {
                 const uri = this.getPersistedStateUri(name);
                 if (uri) { await this.deletePersistedFile(uri); }
             }
@@ -9181,10 +9183,12 @@ export class DiffTracker {
         return JSON.stringify({ owner, current: owner ? this.latestGitContexts.get(owner) : undefined, available: true });
     }
 
-    private captureKeepGitContext(filePath: string): { signature: string; error?: string; crossBranch: boolean } {
+    private captureKeepGitContext(filePath: string, verified?: { contexts: GitContextSnapshot[] | undefined }): { signature: string; error?: string; crossBranch: boolean } {
         const owner = this.getRepositoryOwner(filePath);
-        let contexts: GitContextSnapshot[] | undefined;
-        try { contexts = this.gitContextProvider?.(); } catch { /* Unknown is not permission. */ }
+        let contexts = verified?.contexts;
+        if (!verified) {
+            try { contexts = this.gitContextProvider?.(); } catch { /* Unknown is not permission. */ }
+        }
         const current = contexts?.filter(context => this.pathBelongsToRoot(filePath, context.repoRoot))
             .sort((a, b) => b.repoRoot.length - a.repoRoot.length)[0];
         const baseline = owner ? this.baselineGitContexts.get(owner) : undefined;
@@ -9213,18 +9217,25 @@ export class DiffTracker {
     }
 
     public getCrossBranchKeepCount(tokens: ReviewToken[]): number {
-        return new Set(tokens.filter(token => this.matchesReview(token) &&
-            !this.validateKeepTarget(token.filePath, token.keepGitContextSignature) && this.captureKeepGitContext(token.filePath).crossBranch)
-            .map(token => token.filePath)).size;
+        // This synchronous confirmation count shares one verified observation.
+        // No snapshot is retained for an action or across an asynchronous wait.
+        let contexts: GitContextSnapshot[] | undefined;
+        try { contexts = this.gitContextProvider?.(); } catch { /* Fail closed. */ }
+        const verified = { contexts };
+        return new Set(tokens.filter(token => {
+            if (!this.matchesReview(token)) { return false; }
+            const context = this.captureKeepGitContext(token.filePath, verified);
+            return context.crossBranch && !this.validateKeepTarget(token.filePath, token.keepGitContextSignature, false, context);
+        }).map(token => token.filePath)).size;
     }
 
     /** Keep changes only saved text before-images. Do not use this for workspace writes or snapshots. */
-    private validateKeepTarget(filePath: string, signature?: string, committing = false): string | undefined {
+    private validateKeepTarget(filePath: string, signature?: string, committing = false, verified?: { signature: string; error?: string; crossBranch: boolean }): string | undefined {
         const readiness = committing ? undefined : this.validateActionReadiness();
         if (readiness) { return readiness; }
         if (this.recoveryBlocked || this.disposed || this.workspaceContextChanged || this.archiveRestoreTask ||
             this.restoringEpoch !== undefined || this.persistenceFailed) { return 'Review session is unavailable'; }
-        const context = this.captureKeepGitContext(filePath);
+        const context = verified ?? this.captureKeepGitContext(filePath);
         if (context.error) { return `Keep refused: ${context.error}`; }
         if (signature !== undefined && context.signature !== signature) {
             return 'Keep refused because review, disk, or Git context became stale';
@@ -9369,6 +9380,21 @@ export class DiffTracker {
         return [...this.pausedGitRepositories.entries()]
             .map(([repoRoot, reason]) => ({ repoRoot, reason }))
             .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot));
+    }
+
+    private cleanupResolvedKeepBackup(): void {
+        const intent = this.getPersistedStateUri(this.keepIntentFileName);
+        const backup = this.getPersistedStateUri(this.preKeepFileName);
+        if (!intent || !backup || intent.scheme !== 'file' || backup.scheme !== 'file') { return; }
+        try {
+            try { fs.statSync(intent.fsPath); return; }
+            catch (error) { if (!this.isFileNotFound(error)) { return; } }
+            fs.unlinkSync(backup.fsPath);
+        } catch (error) {
+            // Cleanup is not part of the durable commit. An orphan without an
+            // intent is inert and retried at startup; never undo a saved Keep.
+            if (!this.isFileNotFound(error)) { console.warn('Could not remove resolved text Keep backup.', error); }
+        }
     }
 
     private readKeepIntent() {
@@ -11299,6 +11325,7 @@ export class DiffTracker {
             if (!(transaction.valid?.() ?? true)) { return false; }
             fs.unlinkSync(intentUri.fsPath);
             transaction.durablyCommitted = true;
+            this.cleanupResolvedKeepBackup();
             this.persistenceIssue = undefined;
             this.persistenceFailed = false;
             return true;
@@ -11327,7 +11354,10 @@ export class DiffTracker {
             if (!committed && (invalidTarget || transaction.keepRecovery?.prepared)) {
                 const rolledBack = await this.flushPendingPersistence();
                 if (rolledBack && transaction.keepRecovery?.prepared && this.isCurrentEpoch(epoch)) {
-                    try { await this.deletePersistedFile(this.getPersistedStateUri(this.keepIntentFileName)!); }
+                    try {
+                        await this.deletePersistedFile(this.getPersistedStateUri(this.keepIntentFileName)!);
+                        this.cleanupResolvedKeepBackup();
+                    }
                     catch (error) {
                         this.recoveryBlocked = true;
                         this.reportPersistenceIssue('Keep rollback was saved but its recovery intent could not be cleared; reload before further review.', error);

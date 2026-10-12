@@ -259,7 +259,14 @@ module.exports = async function nativeReviewCheckpoint() {
         assert.equal(keptThroughMenu.clicked, true);
         assert.ok(keptThroughMenu.before.contextMenus.some(menu => menu.some(action =>
             action.enabled && action.label === 'Keep Selected Whole Block')));
-        await until('real editor/context Keep to commit its reviewed block', async () => (await original(A)) === KEPT_A);
+        // A physical menu click does not await the async command. Keep stages
+        // its snapshot before persistence, then refreshes the review projection.
+        await until('real editor/context Keep to commit and refresh its reviewed block', async () => {
+            const current = await state();
+            const change = current.trackedChanges.find(item => item.filePath === uri(A).fsPath);
+            return current.baselineState === 'ready' && (await original(A)) === KEPT_A &&
+                change?.originalContent === KEPT_A && change.currentContent === CURRENT_A;
+        });
         assert.equal(await original(A), KEPT_A);
         assert.equal((await review(A, CURRENT_A)).change.originalContent, KEPT_A);
         assert.equal(editor.document.getText(), CURRENT_A, 'Keep cannot rewrite the immutable displayed snapshot');
