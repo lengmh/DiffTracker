@@ -1,7 +1,7 @@
 // Test-only UI driver. Run with the launcher's Node 22+, not VS Code 1.80's
 // embedded Node. CDP is confined to the disposable Host's loopback renderer.
 // No workbench internals, extension commands, review tokens, or ranges are
-// injected: the actions below use the rendered controls and real mouse input.
+// injected: the actions below use the rendered controls and real mouse/keyboard input.
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -179,10 +179,15 @@ function inspectWorkbench(request) {
             .filter(element => visible(element) && enabled(element) && actionMatches(element));
         if (matches.length === 1) { result.contextActionPoint = point(matches[0]); }
     }
-    if (request.kind === 'provider' || request.kind === 'action') {
-        if (widgets.length !== 1) { return result; }
+    if (request.kind === 'provider' || request.kind === 'provider-element' || request.kind === 'action') {
+        if (widgets.length !== 1) { return request.kind === 'provider-element' ? undefined : result; }
         const widget = widgets[0];
         const select = widget.querySelector('select[aria-label="Switch quick diff base"]');
+        if (request.kind === 'provider-element') {
+            const candidates = [...widget.querySelectorAll('select[aria-label="Switch quick diff base"]')]
+                .filter(element => visible(element) && !element.disabled && point(element));
+            return candidates.length === 1 ? candidates[0] : undefined;
+        }
         if (request.kind === 'provider') {
             result.providerPoint = select && visible(select) ? point(select) : undefined;
         } else {
@@ -359,7 +364,7 @@ export async function runNativeUiDriver(portText, operation, argument) {
             return matches[0];
         });
         cdp = await connect(validateWebSocketUrl(target.webSocketDebuggerUrl, port), deadline);
-        if (operation === 'focus-multi-diff' || operation === 'click-native-action') {
+        if (operation === 'focus-multi-diff' || operation === 'click-native-action' || operation === 'click-quick-diff') {
             await cdp.send('Runtime.evaluate', { expression: `(${installInputProbe.toString()})()`, returnByValue: true });
         }
         const inspect = async kind => {
@@ -450,11 +455,33 @@ export async function runNativeUiDriver(portText, operation, argument) {
                 return state.quickDiff.length === 1 ? state : undefined;
             });
             const widget = initial.quickDiff[0];
-            if (initial.providerPoint && widget.provider !== PROVIDER) {
+            const providerAlreadySelected = widget.provider === PROVIDER ||
+                (!widget.provider && widget.title.includes(PROVIDER));
+            if (!providerAlreadySelected) {
                 if (!widget.providers.includes(PROVIDER)) {
                     throw new Error(`Quick Diff has no ${PROVIDER} provider`);
                 }
-                await click(initial.providerPoint);
+                // VS Code's SelectBoxCustom opens its real dropdown on Enter.
+                // Focus the unique rendered semantic control instead of reusing
+                // coordinates captured while the Quick Diff view zone lays out.
+                // https://github.com/microsoft/vscode/blob/1.141.0/src/vs/base/browser/ui/selectBox/selectBoxCustom.ts
+                const control = await cdp.send('Runtime.evaluate', {
+                    expression: `(${inspectWorkbench.toString()})(${JSON.stringify({ kind: 'provider-element' })})`,
+                    returnByValue: false
+                });
+                if (control.exceptionDetails || control.result?.subtype !== 'node' || !control.result.objectId) {
+                    throw new Error('Quick Diff provider control is no longer uniquely visible and enabled');
+                }
+                try { await cdp.send('DOM.focus', { objectId: control.result.objectId }); }
+                finally { await cdp.send('Runtime.releaseObject', { objectId: control.result.objectId }); }
+                const focused = await inspect('provider');
+                if (focused.activeElement?.tag !== 'SELECT' ||
+                    focused.activeElement.label !== 'Switch quick diff base') {
+                    throw new Error('Quick Diff provider control did not retain keyboard focus');
+                }
+                for (const type of ['keyDown', 'keyUp']) {
+                    await cdp.send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                }
                 const option = await until('the real Quick Diff provider dropdown option', async () => {
                     const state = await inspect('provider-option');
                     return state.optionPoint;
