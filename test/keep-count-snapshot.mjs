@@ -4,7 +4,7 @@ import fs from 'node:fs';
 
 export function registerKeepCountSnapshot(h) {
     const { test, root, file, seed, scan, getTracker } = h;
-    async function fixture(run) {
+    async function fixture(run, { crossBranch = true } = {}) {
         const tracker = getTracker();
         const a = { repoRoot: root, kind: 'repository', headName: 'count-a',
             headCommit: 'a'.repeat(40), detached: false, inProgress: false };
@@ -12,8 +12,8 @@ export function registerKeepCountSnapshot(h) {
         tracker.setBaselineGitContexts([a]);
         const paths = [file('count-first.txt'), file('count-second.txt'), file('count-third.txt')];
         for (const target of paths) { seed(target, 'before\n', 'reviewed current\n'); await scan(target); }
-        tracker.observeGitContext(b);
-        let live = [b];
+        if (crossBranch) tracker.observeGitContext(b);
+        let live = [crossBranch ? b : a];
         let calls = 0;
         tracker.setGitContextProvider(() => { calls++; return live; });
         const tokens = tracker.getReviewTokens();
@@ -54,6 +54,42 @@ export function registerKeepCountSnapshot(h) {
         assert.equal(ctx.tracker.getCrossBranchKeepCount(reviewedOnC), 3);
         assert.equal(ctx.calls(), 1);
     }));
+
+    for (const paused of [false, true]) {
+        test(`KEEP-COUNT-SNAPSHOT ${paused ? 'paused cross-branch' : 'compatible same-branch'} commit refreshes tokens once without altering review`, () => fixture(async ctx => {
+            const { tracker } = ctx;
+            const target = ctx.paths[0];
+            const oldToken = tracker.getReviewToken(target);
+            const priorPause = tracker.getGitPauseReason(target);
+            assert.equal(!!priorPause, paused);
+            const disk = ctx.paths.map(p => [fs.readFileSync(p).toString('base64'), fs.statSync(p).mode]);
+            const baseline = ctx.paths.map(p => tracker.getOriginalContent(p));
+            const next = { ...(paused ? ctx.b : ctx.a), headCommit: 'b'.repeat(40) };
+            const events = [];
+            const subscription = tracker.onDidTrackChanges(event => events.push(event));
+            try {
+                ctx.setLive([next]);
+                tracker.observeGitContext(next);
+                assert.equal(events.length, 1, 'changed commit context must notify an open review exactly once');
+                assert.equal(events[0].fullRefresh, true);
+                assert.equal(events[0].baselineChanged, false, 'Git metadata refresh must not imply text acceptance');
+                assert.deepEqual(ctx.paths.map(p => tracker.getOriginalContent(p)), baseline);
+                assert.deepEqual(ctx.paths.map(p => [fs.readFileSync(p).toString('base64'), fs.statSync(p).mode]), disk);
+                assert.equal(tracker.getGitPauseReason(target), priorPause);
+                tracker.observeGitContext({ ...next });
+                assert.equal(events.length, 1, 'identical Git context must not trigger an extra refresh');
+                assert.notEqual((await tracker.keepAllChangesInFile(target, oldToken)).status, 'success',
+                    'refresh must not weaken stale commit-token rejection');
+                assert.equal(tracker.getOriginalContent(target), 'before\n');
+                const freshToken = tracker.getReviewToken(target);
+                assert.notEqual(freshToken.keepGitContextSignature, oldToken.keepGitContextSignature);
+                assert.equal((await tracker.keepAllChangesInFile(target, freshToken)).status, 'success');
+                assert.equal(tracker.getOriginalContent(target), 'reviewed current\n');
+                assert.equal(tracker.getGitPauseReason(target), priorPause);
+                assert.deepEqual(ctx.paths.map(p => [fs.readFileSync(p).toString('base64'), fs.statSync(p).mode]), disk);
+            } finally { subscription.dispose(); }
+        }, { crossBranch: paused }));
+    }
 
     for (const action of ['file', 'block', 'batch']) {
         test(`KEEP-COUNT-SNAPSHOT ${action} action verifies fresh Git state after a successful count`, () => fixture(async ctx => {

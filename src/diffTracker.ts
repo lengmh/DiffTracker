@@ -9323,6 +9323,8 @@ export class DiffTracker {
     }
 
     public observeGitContext(context: GitContextSnapshot): string | undefined {
+        const previous = this.latestGitContexts.get(context.repoRoot);
+        const tokenContextChanged = JSON.stringify(previous) !== JSON.stringify(context);
         this.latestGitContexts.set(context.repoRoot, { ...context });
         const baseline = this.baselineGitContexts.get(context.repoRoot);
         if (!baseline) {
@@ -9333,6 +9335,7 @@ export class DiffTracker {
             return reason;
         }
         if (this.pausedGitRepositories.has(context.repoRoot)) {
+            if (tokenContextChanged) { this.emitTrackChangesEvent({ fullRefresh: true }); }
             return undefined;
         }
         const comparison = compareGitContexts(baseline, context);
@@ -9343,9 +9346,11 @@ export class DiffTracker {
             this.schedulePersistState();
             return reason;
         }
-        // Commit movement on the same named branch is informational, not a reset.
+        // Commit movement remains compatible, but token-bearing views must
+        // refresh because action signatures intentionally pin the exact HEAD.
         this.baselineGitContexts.set(context.repoRoot, { ...context });
         this.schedulePersistState();
+        if (tokenContextChanged) { this.emitTrackChangesEvent({ fullRefresh: true }); }
         return undefined;
     }
 

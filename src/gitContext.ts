@@ -93,13 +93,18 @@ function validBranchRef(ref: string): boolean {
         && ref.split('/').every(part => !!part && !part.startsWith('.') && !part.endsWith('.lock'));
 }
 
-function readDiskHead(repoRoot: string): { headName?: string; headCommit: string; identity: string } {
+function resolveGitMetadata(repoRoot: string): { gitDir: string; commonDir: string; identity: string } {
     const gitDir = resolveGitDirectory(repoRoot);
     const common = optionalGitMetadata(path.join(gitDir, 'commondir'));
     if (common !== undefined && !/^.+?(?:\r?\n)?$/.test(common)) { throw new Error('Invalid commondir'); }
     const commonDir = common === undefined ? gitDir : path.resolve(gitDir, common.replace(/\r?\n$/, ''));
     if (!fs.statSync(commonDir).isDirectory()) { throw new Error('Missing common directory'); }
     const identity = JSON.stringify([fs.realpathSync(gitDir), fs.realpathSync(commonDir)]);
+    return { gitDir, commonDir, identity };
+}
+
+function readDiskHead(repoRoot: string): { headName?: string; headCommit: string; identity: string } {
+    const { gitDir, commonDir, identity } = resolveGitMetadata(repoRoot);
     const head = readGitMetadata(path.join(gitDir, 'HEAD')).replace(/\r?\n$/, '');
     const oid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
     if (oid.test(head)) { return { headCommit: head, identity }; }
@@ -126,9 +131,11 @@ function readDiskHead(repoRoot: string): { headName?: string; headCommit: string
     return { headName: ref.slice('refs/heads/'.length), headCommit: commit, identity };
 }
 
-function hasUnfinishedGitOperation(repoRoot: string): boolean {
+function hasUnfinishedGitOperation(repoRoot: string, expectedIdentity?: string): boolean {
     try {
-        const gitDir = resolveGitDirectory(repoRoot);
+        const metadata = expectedIdentity === undefined ? undefined : resolveGitMetadata(repoRoot);
+        if (metadata && metadata.identity !== expectedIdentity) { return true; }
+        const gitDir = metadata?.gitDir ?? resolveGitDirectory(repoRoot);
         // These belong to the worktree gitdir, never its shared commondir.
         // mergeChanges only contains conflicts, not a clean --no-commit merge.
         for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer']) {
@@ -330,7 +337,8 @@ export class GitContextMonitor implements vscode.Disposable {
 
     /** Fail closed until the extension's cached HEAD agrees with current on-disk Git metadata.
      * No async Git status/event can substitute for this synchronous final transaction guard.
-     * Read twice around operation detection to reject mixed observations during checkout.
+     * Sample HEAD and operation markers twice to reject changes during metadata reads.
+     * This is a bounded stability check, not an atomic lock against external Git processes.
      */
     public getVerifiedSnapshots(): GitContextSnapshot[] | undefined {
         if (!this.isReady()) { return undefined; }
@@ -346,7 +354,10 @@ export class GitContextMonitor implements vscode.Disposable {
                 const before = readDiskHead(repository.rootUri.fsPath);
                 snapshot = snapshotGitRepository(repository);
                 const after = readDiskHead(repository.rootUri.fsPath);
-                if (before.identity !== after.identity
+                // An operation can start during the second HEAD read without changing
+                // HEAD (e.g. merge --no-commit). Close that sampling gap at the same gitdir.
+                const operationAfter = hasUnfinishedGitOperation(repository.rootUri.fsPath, after.identity);
+                if (operationAfter || before.identity !== after.identity
                     || before.headName !== after.headName || before.headCommit !== after.headCommit
                     || snapshot.headName !== after.headName || snapshot.headCommit !== after.headCommit
                     || snapshot.detached !== !after.headName) { snapshot.inProgress = true; }

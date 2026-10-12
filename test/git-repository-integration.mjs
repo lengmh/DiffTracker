@@ -231,6 +231,70 @@ test('Keep rejects HEAD changing within a synchronous verification read', async 
     } finally { monitor.dispose(); }
 });
 
+for (const linked of [false, true]) for (const operation of [
+    'MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer'
+]) test(`Keep rejects operation starting during final HEAD read (${operation}, worktree=${linked})`, async () => {
+    const main = path.join(tempRoot, `late-operation-${operation}-${linked}`); initRepo(main);
+    git(main, 'switch', '-c', 'topic');
+    writeFileSync(path.join(main, 'topic.txt'), 'topic\n');
+    git(main, 'add', '.'); git(main, 'commit', '-m', 'topic'); git(main, 'switch', 'main');
+    const root = linked ? `${main}-linked` : main;
+    if (linked) git(main, 'worktree', 'add', '-b', 'linked', root);
+    const { monitor } = await createMonitor(root, linked ? 'worktree' : 'repository');
+    const gitDir = git(root, 'rev-parse', '--absolute-git-dir');
+    const headPath = path.join(gitDir, 'HEAD');
+    const originalCommit = git(root, 'rev-parse', 'HEAD');
+    const markerPath = path.join(gitDir, operation);
+    const openSync = fs.openSync;
+    let reads = 0;
+    try {
+        fs.openSync = function(file, ...args) {
+            if (file === headPath && ++reads === 2) {
+                if (operation === 'MERGE_HEAD') git(root, 'merge', '--no-ff', '--no-commit', 'topic');
+                else if (['rebase-merge', 'rebase-apply', 'sequencer'].includes(operation)) mkdirSync(markerPath);
+                else writeFileSync(markerPath, originalCommit + '\n');
+            }
+            return openSync.call(this, file, ...args);
+        };
+        const current = monitor.getVerifiedSnapshots()[0];
+        assert.equal(current.headCommit, originalCommit, 'operation leaves HEAD unchanged');
+        assert.equal(git(root, 'rev-parse', 'HEAD'), originalCommit);
+        assert.equal(current.inProgress, true, 'late operation marker must fail closed');
+    } finally {
+        fs.openSync = openSync;
+        if (operation === 'MERGE_HEAD') git(root, 'merge', '--abort');
+        else rmSync(markerPath, { recursive: true, force: true });
+        assert.equal(monitor.getVerifiedSnapshots()[0].inProgress, false, 'abort/cleanup restores eligibility');
+        monitor.dispose();
+    }
+});
+
+test('final operation scan rejects metadata identity changing during the second HEAD read', async () => {
+    const root = path.join(tempRoot, 'late-metadata-identity'); initRepo(root);
+    const other = `${root}-clone`; git(tempRoot, 'clone', root, other);
+    const { monitor } = await createMonitor(root);
+    const gitDir = path.join(root, '.git');
+    const headPath = path.join(gitDir, 'HEAD');
+    const commonPath = path.join(gitDir, 'commondir');
+    const openSync = fs.openSync;
+    let reads = 0;
+    try {
+        fs.openSync = function(file, ...args) {
+            if (file === headPath && ++reads === 2) {
+                writeFileSync(commonPath, path.relative(gitDir, path.join(other, '.git')) + '\n');
+            }
+            return openSync.call(this, file, ...args);
+        };
+        assert.equal(monitor.getVerifiedSnapshots()[0].inProgress, true,
+            'final marker scan must refer to the same metadata identity as HEAD verification');
+    } finally {
+        fs.openSync = openSync;
+        rmSync(commonPath, { force: true });
+        assert.equal(monitor.getVerifiedSnapshots()[0].inProgress, false);
+        monitor.dispose();
+    }
+});
+
 test('Keep fails closed for missing, unreadable or invalid authoritative metadata and recovers', async () => {
     const root = path.join(tempRoot, 'verified-invalid'); initRepo(root);
     const { monitor, repository } = await createMonitor(root);
