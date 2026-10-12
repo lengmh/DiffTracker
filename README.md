@@ -11,7 +11,7 @@ Review changes as they happen, then keep or safely revert them by block, file, o
 
 [中文说明](./README_CN.md)
 
-This README describes the `0.8.3` source, adding the missing right-click alternatives for coverage and file review actions. The version in source does not announce a new published package; see the [release gates](docs/releasing.md) for final-VSIX checks.
+For version-specific changes, see the [release notes](CHANGELOG.md).
 
 This repository is the `lengmh/DiffTracker` continuation of the DiffTracker fork lineage:
 [`wizyoung/DiffTracker`](https://github.com/wizyoung/DiffTracker) →
@@ -73,7 +73,7 @@ The project retains the MIT license and upstream attribution. The Marketplace ex
 
 **Clear Diffs** resets the baseline to the current workspace while recording. When recording is stopped, it clears the saved baseline and Undo history and remains stopped, including after reload. It does not modify workspace files or dirty buffers.
 
-**Recheck Observation Coverage** is available in the Command Palette and Settings → Tools. For an active, ready configured scope, it reinstalls failed observation coverage and performs one bounded comparison against the original review baselines. Pending text/opaque reviews and unknown before-images are preserved. It refuses while recording is stopped, scope changes or recovery are pending, or editors have unsaved changes. Activity, unsupported coverage or resource limits may leave a visible coverage gap; retry after resolving the cause. It does not accept changes, rebuild the baseline or modify workspace files. See the [bounded recovery contract](docs/recheck-observation-coverage-checkpoint.md).
+**Recheck Observation Coverage** is available in the Command Palette and Settings → Tools. For an active, ready configured scope, it reinstalls failed observation coverage and performs one bounded comparison against the original review baselines. Pending text/opaque reviews and unknown before-images are preserved. It refuses while recording is stopped, scope changes or recovery are pending, or editors have unsaved changes. Activity, unsupported coverage or resource limits may leave a visible coverage gap; retry after resolving the cause. It does not accept changes, rebuild the baseline or modify workspace files.
 
 ## Monitoring Scope and File Types
 
@@ -109,13 +109,13 @@ When recording starts, Code Diff Tracker:
 
 ### Optional Native Review
 
-Choose **Native Review** in **Settings → Display → Default open mode**, or set `diffTracker.defaultOpenMode` to `nativeReview` in VS Code settings. Clicking a changed file then uses the existing guarded Native Review adapter. The original target and URI provenance are preserved; opaque and unknown resources use the WebView fallback. The default remains `webview`, and all five existing mode values remain available.
+Choose **Native Review** in **Settings → Display → Default open mode**, or set `diffTracker.defaultOpenMode` to `nativeReview` in VS Code settings. Clicking a changed text file then opens a read-only Native Review snapshot. Opaque and unknown resources use the WebView fallback. The default remains `webview`; other review modes remain available.
 
 You can also run **Open Native Review Snapshot** for the active changed file, or **Review Text Changes Natively** for a multi-file view. Both sides are read-only, version-bound snapshots. VS Code 1.80 and hosts without Multi Diff use an explicit file picker and single-file Diff; more than 50 text changes also use this bounded fallback. This limit applies to one Multi Diff view, not the monitoring capacity.
 
 Right-click inside the snapshot's current side to **Keep Reviewed File**, **Revert Reviewed File**, or act on one exactly selected whole block. Partial selections, deleted-line blocks, stale snapshots, and ambiguous editor targets are refused. Use file-level review when a block cannot be mapped safely. Block Revert retains the existing unsaved-buffer behavior; save the real file when required, then open a fresh snapshot.
 
-The separate `diffTracker.nativeQuickDiff` setting remains `false` by default; selecting Native Review does not enable it. Enable it explicitly to use the **Code Diff Tracker Review** gutter provider. Its **Open Native Review Snapshot** menu opens a fresh review; it does not directly apply unversioned Quick Diff hunks. Read-only/unknown resources remain in the existing Changes view. See the [S5 checkpoint](docs/s5-native-review-checkpoint.md) for the supported boundaries and verification status.
+The separate `diffTracker.nativeQuickDiff` setting remains `false` by default; selecting Native Review does not enable it. Enable it explicitly to use the **Code Diff Tracker Review** gutter provider. Its **Open Native Review Snapshot** menu opens a fresh review; it does not directly apply unversioned Quick Diff hunks. Read-only/unknown resources remain in the existing Changes view.
 
 ### Review consistency and persistence
 
@@ -131,11 +131,11 @@ Ordinary commits on the same named branch do not invalidate the review context.
 
 Use **Code Diff Tracker: Restore Archived Git Review** from the Command Palette to restore the latest review saved by Archive and Rebuild. Preview the repository, branch/HEAD, workspace root and saved baseline evidence, then confirm replacement of the current DiffTracker review state. Return to the archived branch yourself before restoring; the command never switches branches or changes Git history or workspace files.
 
-The first version supports one workspace root and one repository, with matching root identities and monitoring scope. A missing/incompatible archive, unverified Git state, merge/rebase, dirty editor or pending scope/recovery operation blocks restoration. A sticky pause from returning to the archived branch can be cleared only after the archived context is validated. Current disk content is reconciled against the archived before-images; unknown before-images stay unknown.
+Restoration supports one workspace root and one repository, with matching root identities and monitoring scope. A missing/incompatible archive, unverified Git state, merge/rebase, dirty editor or pending scope/recovery operation blocks restoration. A sticky pause from returning to the archived branch can be cleared only after the archived context is validated. Current disk content is reconciled against the archived before-images; unknown before-images stay unknown.
 
 Restoration preserves the archive's recording state. Active archives resume tracking; stopped archives receive one bounded reconciliation, including later-added files, and remain stopped. Temporary watchers verify the restore transaction and are released for a stopped session. A stopped current session can still restore an active archive. **Start Recording** creates a fresh baseline from current files; it does not resume an archived baseline.
 
-Only the latest archive is available: each Archive and Rebuild replaces `session-state.archive.json`. Before Restore replaces the live session, it saves the entire current session separately as `session-state.pre-restore.json`. These are extension-host workspace-storage files, not files in the project. In Remote-WSL, they belong to the WSL extension host; do not swap Windows-side JSON files. Interrupted restoration recovers the validated pre-restore session or blocks with the preserved evidence intact. See [archived review recovery](docs/archived-git-review-checkpoint.md) for the safety boundary and verification notes.
+Only the latest archive is available: each Archive and Rebuild replaces `session-state.archive.json`. Before Restore replaces the live session, it saves the entire current session separately as `session-state.pre-restore.json`. These are extension-host workspace-storage files, not files in the project. In Remote-WSL, they belong to the WSL extension host; do not swap Windows-side JSON files. Interrupted restoration recovers the validated pre-restore session or blocks with the preserved evidence intact.
 
 ### Created and deleted files
 
@@ -176,13 +176,6 @@ code --install-extension lengmh.code-diff-tracker
 3. Open Extensions (`Cmd+Shift+X` / `Ctrl+Shift+X`).
 4. Open the Extensions menu and select **Install from VSIX...**.
 5. Select the downloaded file.
-
-### Development
-
-1. Clone the repository.
-2. Run `npm install`.
-3. Run `npm run compile`.
-4. Press `F5` to launch the Extension Development Host.
 
 ## Requirements
 
@@ -240,9 +233,11 @@ try {
 
 When upgrading from older DiffTracker builds, saved review sessions remain associated with the extension ID that created them. Sessions from `TinyTigerPan.diff-tracker` or earlier `lengmh.diff-tracker` test builds are not migrated automatically to `lengmh.code-diff-tracker`.
 
-Since `0.8.0`, the source writes **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
+Since `0.8.0`, Code Diff Tracker saves review sessions as **Session V4** and supports migration of valid V1/V2/V3 sessions. V4 preserves effective scope and durable gap evidence; observation coverage is re-established after activation. Restored older sessions remain in scope-compatibility mode until explicit rule migration and scope preparation succeed. Cancelled or failed migration retains the existing review state.
 
-Released `0.7.2` already supports opaque existence and content identity. Upgrade checks must preserve whatever the actual saved format contains; an upgrade must not invent a historical fingerprint from the current file. If an older session lacks current scan provenance or a known before-image, uncertainty remains visible. The installed-VSIX checks proved actual released V3→V4 text/session migration with ordered legacy rules preserved, plus separate candidate-created opaque recovery across process restarts. Released-asset opaque migration remains unproven; process restarts do not prove a physical **Reload Window** click. The [RC checkpoint](docs/bounded-rc-checkpoint.md) records these boundaries separately from source-level compatibility checks.
+Version `0.7.2` already stores existence and content identity for opaque files. Upgrading preserves the evidence available in the saved session; it cannot reconstruct a missing historical fingerprint from the current file. Paths without a known before-image or reliable baseline scan remain visibly unknown.
+
+Text review sessions and ordered legacy rules have been verified when upgrading from released `0.7.2` to V4. Migration of opaque-file state from that release has not been verified. Recovery of opaque state newly created by the candidate build has been checked across process restarts; this does not verify recovery of older opaque state or behavior after **Reload Window**. Preserve the workspace and extension storage before upgrading, especially when opaque changes are pending.
 
 V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rather than silently discard scope or review data. Preserve the workspace and extension storage before changing versions. Do not delete recovery markers or saved state merely to bypass a compatibility warning.
 
@@ -254,7 +249,11 @@ V4 is incompatible with released `0.7.2`; downgrade recovery must be blocked rat
 
 ## Release Notes
 
-Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md). The `0.8.3` entry is prepared for release; publication is a separate step. A final release VSIX must be verified with its checksum, version, source commit and run provenance before upload, tagging or release, as described in [Releasing](docs/releasing.md).
+Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md).
+
+## Contributing
+
+See the [development guide](docs/development.md) for local setup, checks and packaging.
 
 ## License
 

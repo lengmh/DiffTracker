@@ -6,7 +6,7 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 [English](./README.md)
 
-本文描述 `0.8.3` 源码，补齐覆盖目录和文件审阅操作的右键入口。源码版本不代表新版本已发布；最终 VSIX 的核验要求见[发布门禁](docs/releasing.md)。
+各版本的功能变化见[更新记录](CHANGELOG.md)。
 
 > 本 fork 的扩展 ID 为 `lengmh.code-diff-tracker`。安装前，请禁用或卸载上游
 > `TinyTigerPan.diff-tracker`，以及此前用于测试的 `lengmh.diff-tracker` VSIX。
@@ -62,17 +62,17 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 6. 在 WebView Diff 中，可对每个变更块执行 `Undo / Keep`，或在文件级执行 `Keep All / Reject All`。
 7. `Code Diff Tracker: Clear Diffs` 在录制中会以当前工作区状态重建基线；停止录制后会清除已保存的基线和 Undo 历史，重载后仍保持停止。该命令不会修改工作区文件或未保存的缓冲区。
 
-`Code Diff Tracker: Recheck Observation Coverage` 可从命令面板或 Settings → Tools 执行。它适用于正在录制、基线已就绪的已配置范围：重装失效监听，并按原审阅基线进行一次有界核对，保留文本、不透明和未知待审状态。停止录制、存在待处理范围或恢复操作、编辑器有未保存修改时会拒绝执行。核对期间有文件活动、覆盖不受支持或资源超限时，覆盖缺口继续可见；解决原因后可重试。该命令不接受修改、不重建基线，也不写回工作区文件。限制见 [Recheck checkpoint](docs/recheck-observation-coverage-checkpoint.md)。
+`Code Diff Tracker: Recheck Observation Coverage` 可从命令面板或 Settings → Tools 执行。它适用于正在录制、基线已就绪的已配置范围：重装失效监听，并按原审阅基线进行一次有界核对，保留文本、不透明和未知待审状态。停止录制、存在待处理范围或恢复操作、编辑器有未保存修改时会拒绝执行。核对期间有文件活动、覆盖不受支持或资源超限时，覆盖缺口继续可见；解决原因后可重试。该命令不接受修改、不重建基线，也不写回工作区文件。
 
 ### 可选的 Native Review
 
-在 **Settings → Display → Default open mode** 中选择 **Native Review**，或在 VS Code 设置中将 `diffTracker.defaultOpenMode` 设为 `nativeReview`。点击变化文件后，原始目标及 URI 来源信息会交给已有的安全适配器；不透明和未知资源回退到 WebView。默认值仍为 `webview`，原有五个取值继续保留。
+在 **Settings → Display → Default open mode** 中选择 **Native Review**，或在 VS Code 设置中将 `diffTracker.defaultOpenMode` 设为 `nativeReview`。点击变化文本文件后会打开只读 Native Review 快照；不透明和未知资源回退到 WebView。默认值仍为 `webview`，其他查看方式仍可使用。
 
 也可以对当前变化文件运行 **Open Native Review Snapshot**，或通过 **Review Text Changes Natively** 打开多文件视图。两侧均为绑定审阅版本的只读快照。VS Code 1.80、不提供 Multi Diff 的宿主以及超过 50 个待审文本的情况，使用明确的文件选择器和单文件 Diff 回退。50 只限制一次 Multi Diff 展示，不改变监控容量。
 
 在快照 **current 侧编辑器内右键**，可执行 **Keep Reviewed File**、**Revert Reviewed File**，或对准确选中的一个完整块执行 Keep/Revert。部分选区、含删除行的块、过期快照或目标不明确时会拒绝；块无法安全映射时使用文件级审阅。块级 Revert 沿用未保存缓冲区语义，必要时保存真实文件后重新打开快照。
 
-`diffTracker.nativeQuickDiff` 是独立开关，默认仍为 `false`；选择 Native Review 不会自动启用它。显式启用后可使用 **Code Diff Tracker Review** gutter provider。它的 **Open Native Review Snapshot** 菜单只打开新审阅，不直接应用缺少版本信息的 Quick Diff hunk。非文本和未知资源继续保留在原有 Changes 视图。支持边界和验证状态见 [S5 检查点](docs/s5-native-review-checkpoint.md)。
+`diffTracker.nativeQuickDiff` 是独立开关，默认仍为 `false`；选择 Native Review 不会自动启用它。显式启用后可使用 **Code Diff Tracker Review** gutter provider。它的 **Open Native Review Snapshot** 菜单只打开新审阅，不直接应用缺少版本信息的 Quick Diff hunk。非文本和未知资源继续保留在原有 Changes 视图。
 
 ## 监控范围与文件类型
 
@@ -131,11 +131,11 @@ Revert 基线中不存在的新文件也采用相同规则：人工检查并删�
 
 运行命令面板中的 `Code Diff Tracker: Restore Archived Git Review`，可恢复最近一次 Archive and Rebuild 保存的审阅会话。命令先展示仓库、分支或 HEAD、工作区根及基线证据，再要求确认替换当前 DiffTracker 审阅状态。恢复前需要自行切回归档对应的分支；命令不切换分支，不修改 Git 历史，也不写入、删除或接受工作区文件。
 
-首版仅支持单工作区根、单仓库，要求工作区根身份及监控范围一致。归档缺失或不兼容、Git 状态无法核验、合并或变基进行中、编辑器尚未保存、范围或恢复操作未完成时，命令会拒绝恢复。切回原分支后仍保留的 Git 暂停状态，只有在归档上下文验证通过后才可清除。恢复以当前磁盘内容核对归档中的审阅基线；未知的 before-image 仍保持未知。
+归档恢复仅支持单工作区根、单仓库，要求工作区根身份及监控范围一致。归档缺失或不兼容、Git 状态无法核验、合并或变基进行中、编辑器尚未保存、范围或恢复操作未完成时，命令会拒绝恢复。切回原分支后仍保留的 Git 暂停状态，只有在归档上下文验证通过后才可清除。恢复以当前磁盘内容核对归档中的审阅基线；未知的 before-image 仍保持未知。
 
 恢复保留归档中的录制状态。正在录制的归档恢复后继续跟踪；已停止录制的归档只执行一次有界核对，包括发现归档后新增的文件，完成后仍保持停止。临时监听器只用于核验恢复事务，停止会话恢复完成后即释放。当前会话已停止，不影响恢复正在录制的归档。**Start Recording** 会以当前文件建立新基线，不会继续沿用归档基线。
 
-每次 Archive and Rebuild 都会覆盖 `session-state.archive.json`，因此只能恢复最近一份归档，不提供逐分支历史。替换当前会话前，Restore 会将完整当前会话保存到独立的 `session-state.pre-restore.json`。这些文件位于扩展宿主的工作区存储中，不在项目目录中。Remote-WSL 使用 WSL 侧扩展宿主存储，无需手工替换 Windows 侧 JSON 文件。恢复中断后，扩展会核验并恢复操作前的会话；若无法安全核验，则阻塞恢复并保留证据。验证范围见[归档审阅恢复说明](docs/archived-git-review-checkpoint.md)。
+每次 Archive and Rebuild 都会覆盖 `session-state.archive.json`，因此只能恢复最近一份归档，不提供逐分支历史。替换当前会话前，Restore 会将完整当前会话保存到独立的 `session-state.pre-restore.json`。这些文件位于扩展宿主的工作区存储中，不在项目目录中。Remote-WSL 使用 WSL 侧扩展宿主存储，无需手工替换 Windows 侧 JSON 文件。恢复中断后，扩展会核验并恢复操作前的会话；若无法安全核验，则阻塞恢复并保留证据。
 
 ## 安装
 
@@ -156,32 +156,10 @@ code --install-extension lengmh.code-diff-tracker
 5. 选择 `Install from VSIX...`
 6. 选中下载的 `.vsix` 文件
 
-### 本地开发
-
-```bash
-npm install
-npm run compile
-```
-
-然后在 VS Code 中按 `F5` 启动 Extension Development Host。
-
-## 开发脚本
-
-```bash
-npm run compile
-npm run build:webview
-npm run watch
-npm run lint
-npm run test:webview-anchors
-npm run test:similarity-pairing
-npm run package
-```
-
 ## 环境要求
 
 - VS Code `^1.80.0`
 - 已核验的本地 Host 组合：Windows Stable 1.140.0、Ubuntu Stable 1.140.0 和 Ubuntu 1.80.2。支持范围有限，不代表所有平台、文件系统或后续 Stable 版本均已验证；最低版本使用原生单文件 Diff 回退。
-- Node.js 与 npm（用于本地开发和打包）
 
 ## 配置项
 
@@ -270,9 +248,11 @@ try {
 
 已保存的 session 仍归属于创建它的扩展 ID。`TinyTigerPan.diff-tracker` 和早期 `lengmh.diff-tracker` 测试版的 session 不会自动迁移到 `lengmh.code-diff-tracker`。
 
-从 `0.8.0` 起，源码写入 **Session V4**，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
+从 `0.8.0` 起，审阅会话以 **Session V4** 格式保存，支持迁移有效的 V1/V2/V3 状态。V4 保存有效范围和需要跨重启保留的缺口证据；每次激活重新建立和核对监听覆盖。旧 session 恢复后保留范围兼容模式，直到显式规则迁移与范围准备成功。取消或失败不能清除原待审状态。
 
-已发布 `0.7.2` 已支持不透明文件的存在性和内容身份。升级必须保留实际保存格式中的证据，不能读取当前文件来倒推出过去的指纹。缺少有效扫描证明或已知 before-image 时，新发现路径保持未知，不伪装成新增或未变化。安装版验收已证明从已发布 `0.7.2` 的 V3 状态升级到 V4 时，文本审阅状态和有序旧规则保持不变，并单独证明候选版新建不透明状态的跨进程恢复。已发布资产的不透明状态迁移仍未证明；进程重启不等于实际点击 **Reload Window**。这些证据与源码级兼容检查分别记录在 [RC 检查点](docs/bounded-rc-checkpoint.md)。
+`0.7.2` 已保存不透明文件的存在性和内容身份。升级会保留会话中已有的依据，不会根据当前文件推测过去的指纹。缺少可靠的基线扫描记录或已知原始内容时，新发现的路径仍显示为未知，不会被当作新增或未变化的文件。
+
+从已发布的 `0.7.2` 升级到 V4 时，文本审阅状态和有序旧规则的保留已通过验证；不透明文件状态的迁移尚未验证。候选版中新建的不透明状态已通过进程重启恢复检查；该检查不能证明旧版不透明状态的恢复，也不能证明执行 **Reload Window** 后的行为。升级前请保留工作区和扩展存储，尤其是在仍有不透明变化待审时。
 
 V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢弃范围或审阅数据。切换版本前保留工作区和扩展存储；不要通过删除恢复标记或保存状态来绕过兼容性警告。
 
@@ -283,10 +263,9 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 
 ## 版本更新摘要
 
-### 0.8.3（发布准备）
+### 0.8.3
 
 - 为覆盖目录排除、文本 Accept/Revert、只读 Acknowledge 和 Unknown Reset Baseline 补齐右键入口；保留现有行内图标、类别限制和安全校验。
-- 分别验证行内按钮与右键菜单贡献，纠正行内按钮会自动出现在右键菜单中的错误测试假设。
 
 ### 0.8.2
 
@@ -303,9 +282,6 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 
 - 文件级只读审阅、Acknowledge、监控范围管理、Session V4 和独立 Recheck
 - 可选 Native Review 与 `nativeReview` 打开模式；WebView 仍为默认，Quick Diff 独立启用且默认关闭
-- 已合并功能候选完成有界安装升级、激活/重启恢复和混合资源验证；确切主线 #551 首次运行 8/8 成功
-
-完整记录见 [CHANGELOG.md](./CHANGELOG.md)。发布准备不代表已发布；最终发布 VSIX 必须在上传、创建 tag 或 release 前单独核验，并保留校验值、版本、源码提交和运行来源，见[发布门禁](docs/releasing.md)。
 
 ### 0.7.0
 
@@ -314,7 +290,6 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 - 增加 session 原子持久化、上一有效副本恢复、严格迁移和损坏阻断
 - 增加文件/块/创建/删除/批量 Revert 的有界恢复
 - Git 上下文变化时保留待审数据、暂停写回并提供显式归档重建
-- 增加 Linux/Windows CI、真实 VS Code Stable Extension Host 与性能验证
 
 ### 0.6.0
 
@@ -338,6 +313,12 @@ V4 与已发布 `0.7.2` 不兼容，降级恢复必须阻断，不能静默丢�
 - 完善块级 `Keep / Revert`
 - 增加词级高亮和设置面板
 - 从基础变更录制逐步演进为多视图、多粒度的 Diff 审阅工具
+
+完整记录见 [CHANGELOG.md](./CHANGELOG.md)。
+
+## 参与开发
+
+本地开发、检查与打包方式见[开发指南](docs/development.md)。
 
 ## License
 
