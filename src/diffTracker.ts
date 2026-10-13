@@ -8005,6 +8005,22 @@ export class DiffTracker {
         } finally { await descriptor.close(); }
     }
 
+    private recheckLargeFileMetadata(filePath: string, observedSize: number): CurrentFileState {
+        try {
+            // The first stat or descriptor close may have yielded. Recheck
+            // existence/type/size without another await before publishing a
+            // quiet metadata observation. mtime-only changes are intentional.
+            const current = fs.lstatSync(filePath);
+            if (!current.isFile() || current.size !== observedSize) {
+                return { kind: 'unavailable', reason: 'File changed while being observed; refresh before review' };
+            }
+            return this.largeFileState(current.size);
+        } catch (error) {
+            return this.isFileNotFound(error) ? { kind: 'missing' }
+                : { kind: 'unavailable', reason: 'File cannot be read (access or provider error)' };
+        }
+    }
+
     private async readFileSnapshot(uri: vscode.Uri): Promise<CurrentFileState> {
         const targetError = this.validateResourceTarget(uri.fsPath);
         if (uri.scheme !== 'file' || targetError) {
@@ -8020,7 +8036,7 @@ export class DiffTracker {
                     reason: 'Resource is a directory'
                 };
             }
-            if (stat.size > this.maxFullContentBytes) { return this.largeFileState(stat.size); }
+            if (stat.size > this.maxFullContentBytes) { return this.recheckLargeFileMetadata(uri.fsPath, stat.size); }
             if (stat.size > 5 * 1024 * 1024) {
                 const fingerprint = await this.fingerprintLocalFile(uri.fsPath);
                 const afterStat = await vscode.workspace.fs.stat(uri);
@@ -8060,7 +8076,7 @@ export class DiffTracker {
             }
         } catch (error) {
             const largeSize = (error as { largeFileSize?: number })?.largeFileSize;
-            if (largeSize !== undefined) { return this.largeFileState(largeSize); }
+            if (largeSize !== undefined) { return this.recheckLargeFileMetadata(uri.fsPath, largeSize); }
             return this.isFileNotFound(error)
                 ? { kind: 'missing' }
                 : { kind: 'unavailable', reason: 'File cannot be read (access or provider error)' };

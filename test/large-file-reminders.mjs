@@ -417,4 +417,71 @@ export function registerLargeFileReminders(h) {
         });
     }
 
+    for (const mutation of ['size', 'mtime', 'deleted', 'small', 'directory']) {
+        test(`LARGE-REMINDER initial oversized metadata rechecks ${mutation} before establishing a quiet observation`, async () => {
+            const tracker = getTracker(), target = file('initial-large-race.dat');
+            fs.writeFileSync(target, ''); fs.truncateSync(target, limit + 1);
+            tracker.snapshotInitialized = false;
+            const stat = vscode.workspace.fs.stat;
+            let mutated = false, contentReads = 0;
+            tracker.readLocalFileBytesBounded = async () => { contentReads++; throw new Error('No content reads for oversized metadata'); };
+            tracker.fingerprintLocalFile = async () => { contentReads++; throw new Error('No fingerprints for oversized metadata'); };
+            vscode.workspace.fs.stat = async uri => {
+                const result = await stat(uri);
+                if (uri.fsPath === target && !mutated) {
+                    mutated = true;
+                    if (mutation === 'size') fs.truncateSync(target, limit + 2);
+                    if (mutation === 'mtime') fs.utimesSync(target, new Date(), new Date(result.mtime + 1000));
+                    if (mutation === 'deleted') fs.unlinkSync(target);
+                    if (mutation === 'small') fs.truncateSync(target, 4);
+                    if (mutation === 'directory') { fs.unlinkSync(target); fs.mkdirSync(target); }
+                }
+                return result;
+            };
+            try {
+                const state = await tracker.readFileSnapshot(Uri.file(target));
+                tracker.recordScannedBaseline(target, state, 'workspace');
+                if (mutation === 'mtime') {
+                    assert.equal(pending(tracker, target), undefined, 'mtime alone is intentionally ignored');
+                    assert.equal(tracker.largeFileReminders.get(target)?.observed.size, limit + 1);
+                } else {
+                    assert.ok(pending(tracker, target), 'a raced initial observation must not silently establish a quiet stale baseline');
+                    assert.equal(tracker.largeFileReminders.has(target), false);
+                    assert.equal(pending(tracker, target)?.reviewKind, 'unknown');
+                }
+                assert.equal(contentReads, 0);
+                assert.equal(tracker.fileSnapshots.has(target), false);
+                assert.equal(tracker.opaqueBaselineFiles.has(target), false);
+            } finally { vscode.workspace.fs.stat = stat; }
+        });
+    }
+    test('LARGE-REMINDER descriptor close cannot publish a stale oversized metadata observation', async () => {
+        const tracker = getTracker(), target = file('descriptor-large-race.dat');
+        fs.writeFileSync(target, 'small'); tracker.snapshotInitialized = false;
+        const stat = vscode.workspace.fs.stat, open = fs.promises.open;
+        let grew = false, reads = 0;
+        vscode.workspace.fs.stat = async uri => {
+            const result = await stat(uri);
+            if (uri.fsPath === target && !grew) { grew = true; fs.truncateSync(target, limit + 1); }
+            return result;
+        };
+        fs.promises.open = async (...args) => {
+            const descriptor = await open(...args);
+            if (String(args[0]) === target) {
+                const close = descriptor.close.bind(descriptor), read = descriptor.read.bind(descriptor);
+                descriptor.read = async (...args) => { reads++; return read(...args); };
+                descriptor.close = async () => { await close(); fs.truncateSync(target, limit + 2); };
+            }
+            return descriptor;
+        };
+        try {
+            const state = await tracker.readFileSnapshot(Uri.file(target));
+            tracker.recordScannedBaseline(target, state, 'workspace');
+            assert.match(state.reason ?? '', /changed while being observed/);
+            assert.equal(tracker.largeFileReminders.has(target), false);
+            assert.equal(pending(tracker, target)?.reviewKind, 'unknown');
+            assert.equal(reads, 0);
+        } finally { vscode.workspace.fs.stat = stat; fs.promises.open = open; }
+    });
+
 }
