@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.5
 
 - Revalidate compatible Git returns without reloading or rebuilding review baselines; retain pending reviews and Undo, and keep in-flight writes blocked after an incompatible transition.
 - Allow explicitly selected single-file opaque Acknowledge across verified stable named branches while leaving folder/batch opaque actions, Unknown Reset and Revert guards strict.
