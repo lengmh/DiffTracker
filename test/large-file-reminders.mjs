@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 export function registerLargeFileReminders(h) {
     const { test, Uri, DiffTracker, vscode, file, document, pause, getTracker, setTracker, setListedFiles } = h;
@@ -483,5 +484,53 @@ export function registerLargeFileReminders(h) {
             assert.equal(reads, 0);
         } finally { vscode.workspace.fs.stat = stat; fs.promises.open = open; }
     });
+
+    for (const entry of ['initial-open', 'document-change']) {
+        for (const linkKind of ['file', 'parent']) {
+            test(`LARGE-REMINDER ${entry} rejects an external ${linkKind} symlink before observing metadata`, async () => {
+                const tracker = getTracker(), parent = file('document-parent');
+                fs.mkdirSync(parent);
+                const target = path.join(parent, 'document.dat');
+                fs.writeFileSync(target, 'before');
+                const doc = document(target);
+                const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-large-external-'));
+                const externalTarget = path.join(outside, 'document.dat');
+                fs.writeFileSync(externalTarget, ''); fs.truncateSync(externalTarget, limit + 1);
+                if (entry === 'document-change') {
+                    tracker.fileSnapshots.set(target, 'before'); tracker.baselineExistingFiles.add(target);
+                    tracker.updateTrackedDiff(target, 'pending text');
+                } else tracker.snapshotInitialized = false;
+                fs.unlinkSync(target);
+                if (linkKind === 'file') fs.symlinkSync(externalTarget, target, 'file');
+                else { fs.rmdirSync(parent); fs.symlinkSync(outside, parent, 'dir'); }
+                let textReads = 0, contentReads = 0, followingStats = 0;
+                const stat = fs.statSync;
+                fs.statSync = (p, ...args) => {
+                    if (String(p) === target) followingStats++;
+                    return stat(p, ...args);
+                };
+                doc.getText = () => { textReads++; throw new Error('Rejected symlink document must not be read'); };
+                tracker.readLocalFileBytesBounded = async () => { contentReads++; throw new Error('Rejected symlink content must not be read'); };
+                tracker.fingerprintLocalFile = async () => { contentReads++; throw new Error('Rejected symlink content must not be hashed'); };
+                try {
+                    if (entry === 'initial-open') tracker.ensureSnapshotForDocument(doc, true);
+                    else tracker.processDocumentChange(doc);
+                    assert.equal(tracker.largeFileReminders.has(target), false, 'external metadata must not become a reminder');
+                    assert.equal(tracker.opaqueBaselineFiles.has(target), false);
+                    assert.equal(tracker.getLargeFileReminderToken(target), undefined);
+                    assert.equal(pending(tracker, target)?.currentSize, undefined);
+                    assert.equal(pending(tracker, target)?.largeFileReminder, undefined);
+                    assert.equal(tracker.fileSnapshots.get(target), entry === 'document-change' ? 'before' : undefined);
+                    assert.equal(textReads, 0); assert.equal(contentReads, 0); assert.equal(followingStats, 0);
+                    assert.match(pending(tracker, target)?.unavailableReason ?? '', /symbolic link/i);
+                    assert.deepEqual(tracker.buildPersistedState()?.largeFileReminders ?? [], []);
+                } finally {
+                    fs.statSync = stat;
+                    fs.unlinkSync(linkKind === 'file' ? target : parent);
+                    fs.rmSync(outside, { recursive: true, force: true });
+                }
+            });
+        }
+    }
 
 }

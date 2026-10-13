@@ -7904,6 +7904,12 @@ export class DiffTracker {
     }
 
     private observeLargeDocument(filePath: string, initialScan = false, budget?: CandidatePersistenceBudget): boolean {
+        const targetError = this.validateResourceTarget(filePath);
+        if (targetError) {
+            this.markFileUnavailable(filePath, targetError);
+            // Handled: callers must not fall through to editor text or disk reads.
+            return true;
+        }
         try {
             const stat = fs.statSync(filePath);
             if (stat.isFile() && stat.size > this.maxFullContentBytes) {
