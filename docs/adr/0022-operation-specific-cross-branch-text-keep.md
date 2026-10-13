@@ -20,7 +20,15 @@ Revert, Undo, snapshot capture, archive rebuild, and archive restore keep their 
 
 The bounded verifier reads loose/packed refs, not reftable storage; unsupported ref storage fails closed. Manual replacement or repointing of `.git` or linked-worktree metadata at an unchanged path is outside ordinary branch-switch continuity and requires explicit archive/rebuild after the repository is stable. An unborn repository without an initial commit is refused even for same-branch Keep. Restored sessions carrying recorded Git provenance also refuse Keep if the Git monitor is unavailable; they cannot silently fall back to the non-Git Keep path.
 
-## Explicit follow-ups
+## Issue #41 amendment
+
+Compatible Git returns are revalidated against the authoritative monitor and current disk metadata before clearing only the affected repository pause. Recovery actions retain the pause until they settle, so a return cannot revive a write that observed an incompatible context. No before-image or Undo history is replaced by resumption. Existing Session V4 contexts remain supported; this does not extend the documented manual same-path Git metadata replacement boundary.
+
+Only the explicit single-file Acknowledge route opts into the named-branch baseline-only policy. Its displayed token pins Git context, validated again after reads and during durable publication. Folder/mixed opaque batches stay strict. Unknown Reset remains a separately confirmed, strict-context operation. Shared Acknowledge/Unknown transactions reuse the existing pre-acceptance payload and intent storage format; final approved-identity checks use bounded-memory hashing and do not depend on the candidate’s transient pending projection. No automatic retry adopts new file contents.
+
+Ordinary single-file acceptance has no routine modal or success toast. Failed actions preserve their evidence and report a concrete nonmodal reason.
+
+## Original follow-ups (superseded for selected Acknowledge by #41)
 
 Read-only Acknowledge and Reset Unknown Baseline retain their existing Git-pause policy. Extending either requires separate targeted coverage of opaque identity, Unknown evidence, dirty-editor, and durable rollback guards. This change does not classify detached, missing, initializing, merging/rebasing, conflicting, or inconsistent Git state as a safe branch switch.
 

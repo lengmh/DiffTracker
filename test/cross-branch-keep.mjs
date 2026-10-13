@@ -773,21 +773,19 @@ export function registerCrossBranchKeep(h) {
         assert.deepEqual(saved(ctx.storage).gitContexts, [ctx.a]);
         assert.deepEqual(snapshot(ctx), disk);
     }));
-    test('CROSS-BRANCH-KEEP returning to branch A permits Keep but preserves sticky pause and strict Revert', () => fixture(async ctx => {
+    test('CROSS-BRANCH-KEEP returning to branch A revalidates pause and preserves Keep baselines', () => fixture(async ctx => {
         const { tracker, target } = ctx;
-        const reason = tracker.getGitPauseReason(target);
         git(ctx.workspace, 'checkout', 'branch-a');
         ctx.setLive([ctx.a]);
         tracker.observeGitContext(ctx.a);
-        assert.equal(tracker.getGitPauseReason(target), reason);
+        assert.equal(tracker.getGitPauseReason(target), undefined);
         const disk = snapshot(ctx);
-        assert.notEqual((await tracker.revertFile(target)).status, 'success');
         assert.equal((await tracker.keepAllChangesInFile(target)).status, 'success');
         assert.equal(tracker.getOriginalContent(target), after);
-        assert.equal(tracker.getGitPauseReason(target), reason);
+        assert.equal(tracker.getGitPauseReason(target), undefined);
         assert.deepEqual(saved(ctx.storage).gitContexts, [ctx.a]);
-        assert.notEqual((await tracker.revertFile(ctx.targets[1])).status, 'success');
         assert.deepEqual(snapshot(ctx), disk);
+        assert.equal((await tracker.revertFile(ctx.targets[1])).status, 'success');
         const reloaded = await ctx.restart();
         assert.equal(reloaded.getOriginalContent(target), after);
         assert.deepEqual(saved(ctx.storage).gitContexts, [ctx.a]);

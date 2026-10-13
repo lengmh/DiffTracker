@@ -1,3 +1,6 @@
+import { registerIssue41SelectedOpaque } from './issue41-selected-opaque.mjs';
+import { registerIssue41GitResume } from './issue41-git-resume.mjs';
+import { registerIssue41AckRecovery } from './issue41-ack-recovery.mjs';
 import { registerKeepCountSnapshot } from './keep-count-snapshot.mjs';
 import { registerCrossBranchKeep } from './cross-branch-keep.mjs';
 import { registerArchivedGitReview } from './archived-git-review.mjs';
@@ -5688,6 +5691,16 @@ registerPR12BoundedInvariants({
 });
 
 registerKeepCountSnapshot({ test, root, file, seed, scan, getTracker: () => tracker });
+
+registerIssue41AckRecovery({
+    test, Uri, DiffTracker, vscode, file, document, pause,
+    getTracker: () => tracker, setTracker: value => { tracker = value; },
+    setListedFiles: value => { listedFiles = value; }
+});
+
+registerIssue41GitResume({ test, file, seed, scan, Uri, pause, getTracker: () => tracker });
+
+registerIssue41SelectedOpaque({ test, file, Uri, DiffTracker, pause, getTracker: () => tracker, setTracker: value => { tracker = value; }, setListedFiles: value => { listedFiles = value; } });
 
 registerCrossBranchKeep({
     test, Uri, DiffTracker, vscode, file, document, pause,

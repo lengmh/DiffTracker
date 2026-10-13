@@ -252,8 +252,10 @@ interface ImportedDirectoryRollbackState {
 interface BaselineTransaction {
     epoch: number;
     valid?: () => boolean;
+    // Authoritative identity check only at the synchronous durable commit barrier.
+    commitValid?: () => boolean;
     observedEvents?: Map<string, StartupEvent>;
-    keepRecovery?: { payload: Uint8Array; digest: string; prepared: boolean };
+    baselineRecovery?: { payload: Uint8Array; digest: string; prepared: boolean };
     durablyCommitted?: boolean;
     rollback: () => void;
     done: Promise<void>;
@@ -355,6 +357,8 @@ export interface OpaqueReviewToken {
     filePath: string;
     epoch: number;
     reviewRevision: string;
+    /** Only the explicit selected-file route may use this observed context. */
+    gitContextSignature?: string;
 }
 
 export interface UnknownReviewToken {
@@ -455,8 +459,22 @@ export class DiffTracker {
     private mayAdoptLegacyGitContexts = false;
     private gitContextPending = false;
 
+    private recoveryActionRunning = false;
+
     private queueRecoveryAction<T>(action: () => Promise<T>): Promise<T> {
-        const operation = this.recoveryActionQueue.then(action);
+        const operation = this.recoveryActionQueue.then(async () => {
+            this.recoveryActionRunning = true;
+            try { return await action(); }
+            finally {
+                this.recoveryActionRunning = false;
+                // A→B→A must not revive a write that already observed B. Only
+                // re-enable future actions after the in-flight action has settled.
+                for (const root of [...this.pausedGitRepositories.keys()]) {
+                    const current = this.latestGitContexts.get(root);
+                    if (current) { this.observeGitContext(current); }
+                }
+            }
+        });
         this.recoveryActionQueue = operation.then(() => undefined, () => undefined);
         return operation;
     }
@@ -487,11 +505,11 @@ export class DiffTracker {
     }
 
     private advanceEpoch(): number {
-        if (this.baselineTransaction?.keepRecovery?.prepared && !this.baselineTransaction.durablyCommitted) {
+        if (this.baselineTransaction?.baselineRecovery?.prepared && !this.baselineTransaction.durablyCommitted) {
             // An in-flight intent write may still finish after cancellation. Do
             // not let a new baseline overwrite its recovery source before reload.
             this.recoveryBlocked = true;
-            this.persistenceIssue = 'Text Keep was interrupted during durable preparation; reload to recover the saved review before starting a new baseline.';
+            this.persistenceIssue = 'Baseline acceptance was interrupted during durable preparation; reload to recover the saved review before starting a new baseline.';
         }
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
         this.restoringEpoch = undefined;
@@ -559,7 +577,9 @@ export class DiffTracker {
         const change = this.trackedChanges.get(filePath);
         if (!change || change.reviewKind !== 'opaque' || change.unavailableReason ||
             !!this.coverageGaps.get(filePath)?.file || this.disposed) { return undefined; }
-        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change) };
+        return { filePath, epoch: this.sessionEpoch, reviewRevision: this.opaqueReviewRevision(change),
+            ...(this.gitContextProvider && this.getRepositoryOwner(filePath)
+                ? { gitContextSignature: this.observedKeepGitSignature(filePath) } : {}) };
     }
 
     public getOpaqueReviewTokens(): OpaqueReviewToken[] {
@@ -919,7 +939,7 @@ export class DiffTracker {
         const epoch = this.advanceEpoch();
         this.restoringEpoch = epoch;
         try {
-            const keepInterrupted = await this.readKeepIntent();
+            const keepInterrupted = await this.readBaselineAcceptanceIntent();
             const archiveInterrupted = await this.readArchiveRestoreIntent();
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
             if (keepInterrupted.kind !== 'absent' && archiveInterrupted.kind !== 'absent') {
@@ -927,7 +947,7 @@ export class DiffTracker {
                 this.persistenceIssue = 'Multiple interrupted baseline operations require preserving extension storage before recovery.';
                 return 'blocked';
             }
-            if (keepInterrupted.kind === 'absent') { this.cleanupResolvedKeepBackup(); }
+            if (keepInterrupted.kind === 'absent') { this.cleanupResolvedBaselineBackup(); }
             const recoveringKeep = keepInterrupted.kind !== 'absent';
             const interrupted = recoveringKeep ? keepInterrupted : archiveInterrupted;
             if (interrupted.kind === 'invalid') {
@@ -943,9 +963,9 @@ export class DiffTracker {
                     return 'blocked';
                 }
                 await this.deletePersistedFile(this.getPersistedStateUri(recoveringKeep ? this.keepIntentFileName : this.archiveRestoreIntentFileName)!);
-                if (recoveringKeep) { this.cleanupResolvedKeepBackup(); }
+                if (recoveringKeep) { this.cleanupResolvedBaselineBackup(); }
                 this.persistenceIssue = recoveringKeep
-                    ? 'An interrupted text Keep was rolled back to its saved before-images; review remains pending.'
+                    ? 'An interrupted baseline acceptance was rolled back to its saved before-images; review remains pending.'
                     : 'An interrupted archived review restore was rolled back to the pre-restore session. The original archive is unchanged.';
                 return outcome === 'incomplete' ? 'incomplete' : 'recovered';
             }
@@ -1381,7 +1401,7 @@ export class DiffTracker {
 
     public startRecording(): boolean {
         if (this.disposed || this.recoveryBlocked || this.archiveRestoreTask ||
-            (this.baselineTransaction?.keepRecovery?.prepared && !this.baselineTransaction.durablyCommitted)) { return false; }
+            (this.baselineTransaction?.baselineRecovery?.prepared && !this.baselineTransaction.durablyCommitted)) { return false; }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) {
             vscode.window.showWarningMessage(`Code Diff Tracker: ${identityIssue}. Recording remains paused.`);
@@ -3167,7 +3187,7 @@ export class DiffTracker {
         retainFailureMarker = false
     ): Promise<boolean> {
         const epoch = this.sessionEpoch;
-        retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch || !!transaction?.keepRecovery;
+        retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch || !!transaction?.baselineRecovery;
         if (this.archiveRestoreStaging && !transaction) { return true; }
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
@@ -7704,7 +7724,10 @@ export class DiffTracker {
             evidenceChangedDuringFlush = projectionBefore !== projectionAfter;
         } while (version !== this.baselineCompletionVersion || evidenceChangedDuringFlush);
         if (transaction?.valid && !transaction.valid()) { return false; }
-        if (transaction?.keepRecovery && !this.commitPreparedKeepPersistence(transaction)) { return false; }
+        if (transaction?.baselineRecovery) {
+            if (!this.commitPreparedBaselineAcceptancePersistence(transaction)) { return false; }
+        } else if (transaction?.commitValid &&
+            (!transaction.commitValid() || (transaction.valid && !transaction.valid()))) { return false; }
         this.baselineBuilding = false;
         this._onDidChangeBaselineState.fire('ready');
         return true;
@@ -9336,8 +9359,25 @@ export class DiffTracker {
             return reason;
         }
         if (this.pausedGitRepositories.has(context.repoRoot)) {
-            if (tokenContextChanged) { this.emitTrackChangesEvent({ fullRefresh: true }); }
-            return undefined;
+            // Events alone are not authority to resume. Recheck current disk HEAD
+            // and operation markers through the existing verified Git boundary.
+            // This retains the documented unsupported same-path manual .git
+            // replacement boundary; it does not invent historical identity proof.
+            let verified: GitContextSnapshot | undefined;
+            if (!this.recoveryActionRunning && !this.baselineTransaction &&
+                !this.archiveRestoreTask && this.restoringEpoch === undefined &&
+                !this.gitContextPending && !this.recoveryBlocked && !this.persistenceFailed &&
+                this.snapshotInitialized && !this.baselineBuilding && !this.workspaceContextChanged) {
+                try { verified = this.gitContextProvider?.()?.find(item => item.repoRoot === context.repoRoot); }
+                catch { /* Unverified state remains paused. */ }
+            }
+            if (!verified || JSON.stringify(verified) !== JSON.stringify(context) ||
+                !compareGitContexts(baseline, verified).compatible) {
+                if (tokenContextChanged) { this.emitTrackChangesEvent({ fullRefresh: true }); }
+                return undefined;
+            }
+            this.pausedGitRepositories.delete(context.repoRoot);
+            this.emitTrackChangesEvent({ fullRefresh: true });
         }
         const comparison = compareGitContexts(baseline, context);
         if (!comparison.compatible) {
@@ -9388,7 +9428,7 @@ export class DiffTracker {
             .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot));
     }
 
-    private cleanupResolvedKeepBackup(): void {
+    private cleanupResolvedBaselineBackup(): void {
         const intent = this.getPersistedStateUri(this.keepIntentFileName);
         const backup = this.getPersistedStateUri(this.preKeepFileName);
         if (!intent || !backup || intent.scheme !== 'file' || backup.scheme !== 'file') { return; }
@@ -9399,12 +9439,12 @@ export class DiffTracker {
         } catch (error) {
             // Cleanup is not part of the durable commit. An orphan without an
             // intent is inert and retried at startup; never undo a saved Keep.
-            if (!this.isFileNotFound(error)) { console.warn('Could not remove resolved text Keep backup.', error); }
+            if (!this.isFileNotFound(error)) { console.warn('Could not remove resolved baseline acceptance backup.', error); }
         }
     }
 
-    private readKeepIntent() {
-        return this.readBaselineRollbackIntent(this.keepIntentFileName, this.preKeepFileName, 'Text Keep');
+    private readBaselineAcceptanceIntent() {
+        return this.readBaselineRollbackIntent(this.keepIntentFileName, this.preKeepFileName, 'Baseline acceptance');
     }
 
     private readArchiveRestoreIntent() {
@@ -10175,8 +10215,12 @@ export class DiffTracker {
     }
 
     private beginAcknowledgeTransaction(
-        filePath: string, review: OpaqueReviewToken | UnknownReviewToken, kind: 'opaque' | 'unknown' = 'opaque'
+        filePath: string, review: OpaqueReviewToken | UnknownReviewToken, approved: CurrentFileState,
+        kind: 'opaque' | 'unknown' = 'opaque',
+        targetGuard: () => boolean = () => !this.validateSnapshotTarget(filePath)
     ): BaselineTransaction {
+        const recovery = this.captureBaselineAcceptanceRecovery(!!this.storageUri);
+        const approvedChange = this.trackedChanges.get(filePath);
         const previous = {
             snapshotPresent: this.fileSnapshots.has(filePath),
             snapshot: this.fileSnapshots.get(filePath),
@@ -10207,16 +10251,71 @@ export class DiffTracker {
             this.baselineBuilding = previous.baselineBuilding;
             this.snapshotInitialized = previous.snapshotInitialized;
         });
-        // Editor events are debounced, and live ignore policy publishes before
-        // review pruning. Neither transition necessarily changes the token yet.
-        transaction.valid = () => !this.validateSnapshotTarget(filePath) && (kind === 'unknown'
-            ? this.matchesUnknownReview(review) && !this.hasUnknownResetCoverageGap(filePath) &&
-                !this.hasDirtyDocument(filePath) && !this.isPathIgnored(vscode.Uri.file(filePath))
-            : this.matchesOpaqueReview(review));
+        transaction.baselineRecovery = recovery;
+        // Reconciliation against the candidate can clear its pending projection.
+        // Approval pins the reviewed identity, not that temporary list entry.
+        // Still reject newly observed uncertainty and relevant editor/scope loss.
+        transaction.valid = () => {
+            if (!this.isCurrentEpoch(review.epoch) || !targetGuard() || this.hasDirtyDocument(filePath)) { return false; }
+            if (kind === 'unknown' && (this.hasUnknownResetCoverageGap(filePath) || this.isPathIgnored(vscode.Uri.file(filePath)))) { return false; }
+            const latest = this.trackedChanges.get(filePath);
+            if (!latest || latest === approvedChange) { return true; }
+            if (latest.reviewKind === 'unknown' || latest.unavailableReason) { return false; }
+            return latest.reviewKind === 'opaque'
+                ? this.currentStateMatchesOpaqueReview(latest, approved)
+                : approved.kind === 'text' && !latest.isDeleted && latest.currentContent === approved.content;
+        };
+        transaction.commitValid = () => this.acknowledgedIdentityStillCurrent(filePath, approved);
         this.revertHistory = previous.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
         return transaction;
+    }
+
+    private acknowledgedIdentityStillCurrent(filePath: string, approved: CurrentFileState, metadataRetries = 1): boolean {
+        if (this.hasDirtyDocument(filePath) || this.validateResourceTarget(filePath)) { return false; }
+        // No await separates this authoritative read from intent deletion. Hash
+        // in fixed-size chunks, at most the approved byte count; never adopt a
+        // newer identity or retry indefinitely when notifications keep arriving.
+        const size = this.getCurrentStateSize(approved);
+        const fingerprint = approved.kind === 'text'
+            ? createHash('sha256').update(approved.content, 'utf8').digest('hex')
+            : approved.kind === 'unavailable' ? approved.fingerprint : undefined;
+        let descriptor: number | undefined;
+        try {
+            const before = fs.statSync(filePath);
+            if (approved.kind === 'missing' || !before.isFile() || size === undefined ||
+                !fingerprint || before.size !== size) { return false; }
+            if (approved.kind === 'text' && approved.mode !== undefined && (before.mode & 0o777) !== approved.mode) { return false; }
+            descriptor = fs.openSync(filePath, 'r');
+            const opened = fs.fstatSync(descriptor);
+            if (!opened.isFile() || opened.size !== size || opened.dev !== before.dev || opened.ino !== before.ino) { return false; }
+            const hash = createHash('sha256');
+            const buffer = Buffer.alloc(Math.min(64 * 1024, Math.max(1, size)));
+            let position = 0;
+            while (position < size) {
+                const read = fs.readSync(descriptor, buffer, 0, Math.min(buffer.length, size - position), position);
+                if (read === 0) { return false; }
+                hash.update(buffer.subarray(0, read));
+                position += read;
+            }
+            const after = fs.fstatSync(descriptor);
+            const current = fs.statSync(filePath);
+            if (hash.digest('hex') !== fingerprint || after.size !== size || current.size !== size ||
+                current.dev !== after.dev || current.ino !== after.ino) { return false; }
+            const stableMetadata = opened.mtimeMs === after.mtimeMs && opened.ctimeMs === after.ctimeMs &&
+                current.mtimeMs === after.mtimeMs && current.ctimeMs === after.ctimeMs;
+            if (stableMetadata || metadataRetries === 0) { return stableMetadata; }
+            // A touch may move metadata without changing the approved bytes.
+            // Retry that same identity once, never recapture or accept new bytes.
+            fs.closeSync(descriptor);
+            descriptor = undefined;
+            return this.acknowledgedIdentityStillCurrent(filePath, approved, metadataRetries - 1);
+        } catch (error) {
+            return approved.kind === 'missing' && this.isFileNotFound(error);
+        } finally {
+            if (descriptor !== undefined) { fs.closeSync(descriptor); }
+        }
     }
 
     private applyAcknowledgedStateAsBaseline(filePath: string, state: CurrentFileState): boolean {
@@ -10254,8 +10353,10 @@ export class DiffTracker {
     private async commitAcknowledgeTransaction(filePath: string, epoch: number, transaction: BaselineTransaction): Promise<boolean> {
         let committed = false;
         try {
-            committed = await this.completeBaseline(epoch, transaction) &&
-                this.baselineTransaction === transaction && this.isCurrentEpoch(epoch);
+            if (!await this.prepareBaselineAcceptancePersistence(transaction)) { return false; }
+            const completed = await this.completeBaseline(epoch, transaction);
+            committed = !!transaction.durablyCommitted || (completed &&
+                this.baselineTransaction === transaction && this.isCurrentEpoch(epoch));
             return committed;
         } catch (error) {
             if (this.isCurrentEpoch(epoch)) {
@@ -10265,7 +10366,7 @@ export class DiffTracker {
         } finally {
             const invalidTarget = this.isCurrentEpoch(epoch) && transaction.valid && !transaction.valid();
             this.endBaselineTransaction(transaction, committed);
-            if (!committed && invalidTarget) { await this.flushPendingPersistence(); }
+            if (!committed) { await this.rollbackBaselineAcceptancePersistence(transaction, epoch, !!invalidTarget); }
             if (!committed && this.isCurrentEpoch(epoch)) {
                 await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
             }
@@ -10274,22 +10375,42 @@ export class DiffTracker {
 
     public acknowledgeOpaqueChange(
         filePath: string,
-        token = this.getOpaqueReviewToken(filePath)
+        token = this.getOpaqueReviewToken(filePath),
+        options?: { allowCrossBranch?: boolean }
     ): Promise<ActionResult> {
         filePath = this.canonicalTrackingPath(filePath);
+        // Folder and mixed batches omit this opt-in and retain strict Git guards.
+        const targetGuard = options?.allowCrossBranch
+            ? () => this.validateSelectedOpaqueTarget(filePath, token?.gitContextSignature)
+            : () => this.validateSnapshotTarget(filePath);
         return this.queueRecoveryAction(() => this.queueOpaqueFileAction(
             filePath,
             token,
-            (review, state) => this.acknowledgeOpaqueReviewed(filePath, review, state)
+            (review, state) => this.acknowledgeOpaqueReviewed(filePath, review, state, targetGuard)
         ));
+    }
+
+    private validateSelectedOpaqueTarget(filePath: string, signature?: string): string | undefined {
+        // Candidate publication temporarily marks the baseline as building;
+        // action readiness is checked before creating that transaction.
+        if (this.recoveryBlocked || this.disposed || this.workspaceContextChanged || this.archiveRestoreTask ||
+            this.restoringEpoch !== undefined || this.persistenceFailed) { return 'Review session is unavailable'; }
+        const context = this.captureKeepGitContext(filePath);
+        if (context.error) { return `Acknowledge refused: ${context.error}`; }
+        if (this.gitContextProvider && this.getRepositoryOwner(filePath) &&
+            (signature === undefined || signature !== context.signature)) {
+            return 'Acknowledge refused because the reviewed Git context changed; review again';
+        }
+        return this.validateResourceTarget(filePath);
     }
 
     private async acknowledgeOpaqueReviewed(
         filePath: string,
         review: OpaqueReviewToken,
-        state: CurrentFileState
+        state: CurrentFileState,
+        targetGuard: () => string | undefined
     ): Promise<ActionResult> {
-        const targetError = this.validateActionTarget(filePath);
+        const targetError = this.validateActionReadiness() ?? targetGuard();
         if (targetError) { return this.actionResult(filePath, 'conflict', targetError); }
         if (!this.matchesOpaqueReview(review)) {
             return this.actionResult(filePath, 'conflict', 'Read-only review changed during Acknowledge');
@@ -10303,10 +10424,10 @@ export class DiffTracker {
         // Prefer the second authoritative read. The first state exists only to
         // prove the queued action targeted the same review before entering here.
         void state;
-        const finalTargetError = this.validateActionTarget(filePath);
+        const finalTargetError = targetGuard();
         if (finalTargetError) { return this.actionResult(filePath, 'conflict', finalTargetError); }
         const epoch = this.sessionEpoch;
-        const transaction = this.beginAcknowledgeTransaction(filePath, review);
+        const transaction = this.beginAcknowledgeTransaction(filePath, review, current, 'opaque', () => !targetGuard());
         if (!this.applyAcknowledgedStateAsBaseline(filePath, current)) {
             this.endBaselineTransaction(transaction, false);
             return this.actionResult(filePath, 'conflict', 'Current resource identity is not reliable enough to acknowledge');
@@ -10401,7 +10522,7 @@ export class DiffTracker {
             return this.actionResult(filePath, 'conflict', 'Monitoring coverage changed during the reset; Unknown was preserved');
         }
 
-        const transaction = this.beginAcknowledgeTransaction(filePath, token, 'unknown');
+        const transaction = this.beginAcknowledgeTransaction(filePath, token, second, 'unknown');
         if (!this.applyAcknowledgedStateAsBaseline(filePath, second)) {
             this.endBaselineTransaction(transaction, false);
             return this.actionResult(filePath, 'needsAttention', 'No reliable current file state was available');
@@ -11245,10 +11366,7 @@ export class DiffTracker {
 
     private beginKeepTransaction(filePath: string, review: ReviewToken, signature: string): BaselineTransaction {
         const needsRecovery = !!(this.storageUri && this.gitContextProvider && this.getRepositoryOwner(filePath));
-        const previousState = needsRecovery ? this.buildPersistedState() : undefined;
-        if (needsRecovery && (!previousState || !this.parsePersistedState(previousState))) {
-            throw new Error('The complete pre-Keep session cannot be verified');
-        }
+        const recovery = this.captureBaselineAcceptanceRecovery(needsRecovery);
         const content = this.fileSnapshots.get(filePath)!;
         const mode = this.fileModes.get(filePath);
         const exists = this.baselineExistingFiles.has(filePath);
@@ -11270,10 +11388,7 @@ export class DiffTracker {
             this.updateTrackedDiff(filePath, currentContent, { baselineChanged: true, currentExists });
             if (latest?.unavailableReason) { this.markFileUnavailable(filePath, latest.unavailableReason); }
         });
-        if (previousState) {
-            const payload = new TextEncoder().encode(JSON.stringify(previousState));
-            transaction.keepRecovery = { payload, digest: createHash('sha256').update(payload).digest('hex'), prepared: false };
-        }
+        transaction.baselineRecovery = recovery;
         const branchTolerant = this.captureKeepGitContext(filePath).crossBranch || !!this.getGitPauseReason(filePath);
         transaction.valid = () => !this.validateKeepTarget(filePath, signature, true) &&
             (!branchTolerant || this.keepReviewStillCurrent(review, signature, true));
@@ -11285,8 +11400,36 @@ export class DiffTracker {
         return transaction;
     }
 
-    private async prepareKeepPersistence(transaction: BaselineTransaction): Promise<boolean> {
-        const recovery = transaction.keepRecovery;
+    private captureBaselineAcceptanceRecovery(required: boolean): BaselineTransaction['baselineRecovery'] {
+        if (!required) { return undefined; }
+        const previous = this.buildPersistedState();
+        if (!previous || !this.parsePersistedState(previous)) {
+            throw new Error('The complete pre-acceptance session cannot be verified');
+        }
+        const payload = new TextEncoder().encode(JSON.stringify(previous));
+        if (payload.byteLength > this.maxPersistedBytes) {
+            throw new Error('The complete pre-acceptance session exceeds recovery limits');
+        }
+        return { payload, digest: createHash('sha256').update(payload).digest('hex'), prepared: false };
+    }
+
+    private async rollbackBaselineAcceptancePersistence(transaction: BaselineTransaction, epoch: number, invalidTarget: boolean): Promise<void> {
+        // Both normal copies may already contain the candidate. Keep the full
+        // rollback source until the old baseline has itself been durably saved.
+        if (!invalidTarget && !transaction.baselineRecovery?.prepared) { return; }
+        const rolledBack = await this.flushPendingPersistence();
+        if (!rolledBack || !transaction.baselineRecovery?.prepared || !this.isCurrentEpoch(epoch)) { return; }
+        try {
+            await this.deletePersistedFile(this.getPersistedStateUri(this.keepIntentFileName)!);
+            this.cleanupResolvedBaselineBackup();
+        } catch (error) {
+            this.recoveryBlocked = true;
+            this.reportPersistenceIssue('Baseline rollback was saved but its recovery intent could not be cleared; reload before further review.', error);
+        }
+    }
+
+    private async prepareBaselineAcceptancePersistence(transaction: BaselineTransaction): Promise<boolean> {
+        const recovery = transaction.baselineRecovery;
         if (!recovery) { return true; }
         const backupUri = this.getPersistedStateUri(this.preKeepFileName);
         const intentUri = this.getPersistedStateUri(this.keepIntentFileName);
@@ -11295,9 +11438,9 @@ export class DiffTracker {
             (transaction.valid?.() ?? true);
         try {
             // Never overwrite an unresolved rollback record from an earlier action.
-            if ((await this.readKeepIntent()).kind !== 'absent') {
+            if ((await this.readBaselineAcceptanceIntent()).kind !== 'absent') {
                 this.recoveryBlocked = true;
-                this.persistenceIssue = 'An earlier text Keep requires recovery; reload before further review.';
+                this.persistenceIssue = 'An earlier baseline acceptance requires recovery; reload before further review.';
                 return false;
             }
             if (!current() || recovery.payload.byteLength > this.maxPersistedBytes) { return false; }
@@ -11311,13 +11454,13 @@ export class DiffTracker {
             await vscode.workspace.fs.writeFile(intentUri, new TextEncoder().encode(JSON.stringify({ version: 1, backupSha256: recovery.digest })));
             return current();
         } catch (error) {
-            this.reportPersistenceIssue('Cannot preserve the pre-Keep session; the reviewed before-images were not accepted.', error);
+            this.reportPersistenceIssue('Cannot preserve the pre-acceptance session; the reviewed before-images were not accepted.', error);
             return false;
         }
     }
 
-    private commitPreparedKeepPersistence(transaction: BaselineTransaction): boolean {
-        if (!transaction.keepRecovery?.prepared || this.baselineTransaction !== transaction ||
+    private commitPreparedBaselineAcceptancePersistence(transaction: BaselineTransaction): boolean {
+        if (!transaction.baselineRecovery?.prepared || this.baselineTransaction !== transaction ||
             !this.isCurrentEpoch(transaction.epoch) || !(transaction.valid?.() ?? true)) { return false; }
         const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
         const intentUri = this.getPersistedStateUri(this.keepIntentFileName);
@@ -11328,15 +11471,17 @@ export class DiffTracker {
             // Git/content check from the durable commit point (intent deletion).
             try { fs.unlinkSync(failureUri.fsPath); }
             catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
-            if (!(transaction.valid?.() ?? true)) { return false; }
+            // Content hashing can take time even without yielding to JavaScript.
+            // Recheck live Git after that work; external Git is not event-loop locked.
+            if (!(transaction.commitValid?.() ?? true) || !(transaction.valid?.() ?? true)) { return false; }
             fs.unlinkSync(intentUri.fsPath);
             transaction.durablyCommitted = true;
-            this.cleanupResolvedKeepBackup();
+            this.cleanupResolvedBaselineBackup();
             this.persistenceIssue = undefined;
             this.persistenceFailed = false;
             return true;
         } catch (error) {
-            this.reportPersistenceIssue('Text Keep was not committed; its rollback intent was retained for recovery.', error);
+            this.reportPersistenceIssue('Baseline acceptance was not committed; its rollback intent was retained for recovery.', error);
             return false;
         }
     }
@@ -11344,7 +11489,7 @@ export class DiffTracker {
     private async commitKeepTransaction(filePath: string, epoch: number, transaction: BaselineTransaction): Promise<boolean> {
         let committed = false;
         try {
-            if (!await this.prepareKeepPersistence(transaction)) { return false; }
+            if (!await this.prepareBaselineAcceptancePersistence(transaction)) { return false; }
             const completed = await this.completeBaseline(epoch, transaction);
             committed = !!transaction.durablyCommitted || (completed &&
                 this.baselineTransaction === transaction && this.isCurrentEpoch(epoch));
@@ -11355,21 +11500,7 @@ export class DiffTracker {
         } finally {
             const invalidTarget = this.isCurrentEpoch(epoch) && transaction.valid && !transaction.valid();
             this.endBaselineTransaction(transaction, committed);
-            // A candidate may already have reached disk before target validation
-            // failed. Publish the rolled-back baseline before returning failure.
-            if (!committed && (invalidTarget || transaction.keepRecovery?.prepared)) {
-                const rolledBack = await this.flushPendingPersistence();
-                if (rolledBack && transaction.keepRecovery?.prepared && this.isCurrentEpoch(epoch)) {
-                    try {
-                        await this.deletePersistedFile(this.getPersistedStateUri(this.keepIntentFileName)!);
-                        this.cleanupResolvedKeepBackup();
-                    }
-                    catch (error) {
-                        this.recoveryBlocked = true;
-                        this.reportPersistenceIssue('Keep rollback was saved but its recovery intent could not be cleared; reload before further review.', error);
-                    }
-                }
-            }
+            if (!committed) { await this.rollbackBaselineAcceptancePersistence(transaction, epoch, !!invalidTarget); }
             if (!committed && this.isCurrentEpoch(epoch) && !this.keepHasUnverifiedEvidence(filePath)) {
                 // Also cover edits with no delivered callback. A dirty buffer
                 // remains unavailable, with its latest contents visible.

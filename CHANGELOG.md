@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Revalidate compatible Git returns without reloading or rebuilding review baselines; retain pending reviews and Undo, and keep in-flight writes blocked after an incompatible transition.
+- Allow explicitly selected single-file opaque Acknowledge across verified stable named branches while leaving folder/batch opaque actions, Unknown Reset and Revert guards strict.
+- Make shared Acknowledge/Unknown baseline updates recoverable after late persistence failure; reject unobserved content changes and tolerate unchanged notifications during publication.
+- Execute ordinary single-file Accept/Acknowledge directly, without routine confirmation dialogs or success notifications.
+
 ## 0.8.4
 
 - Allow selected text Keep across stable named branches in the same verified repository and worktree, including file, whole-block, folder and batch actions. Keep updates only the selected DiffTracker review baselines; it does not write workspace files, change Git state or clear the recorded Git pause.
