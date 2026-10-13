@@ -837,7 +837,7 @@ export function registerPR11ReviewRegressions(h) {
         const previousFolders=vscode.workspace.workspaceFolders;
         const previousGetWorkspaceFolder=vscode.workspace.getWorkspaceFolder;
         const previousFindFiles=vscode.workspace.findFiles;
-        const original=vscode.workspace.fs.readFile;
+        const original=DiffTracker.prototype.readLocalFileBytesBounded;
         // Configured Rules discovers ignore policy on disk before reading the
         // listed target. Do not scan every earlier test's retained fixtures.
         const workspaceRoot=file('stopped-workspace');
@@ -862,7 +862,7 @@ export function registerPR11ReviewRegressions(h) {
             const target=path.join(dir,'new.txt');fs.writeFileSync(target,'not yet recorded');
             const requested=scope([{scope:'all',path:path.relative(workspaceRoot,dir).split(path.sep).join('/')}]);
             let reads=0;
-            vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===target)reads++;return original(uri);};
+            DiffTracker.prototype.readLocalFileBytesBounded=async function(uri,maxBytes){if(uri.fsPath===target)reads++;return original.call(this,uri,maxBytes);};
             const result=await t.applyConfiguredMonitoringScope(requested);
             assert.equal(result.status,'applied',JSON.stringify(result));assert.equal(result.capturedBaselines,0);
             assert.equal(reads,0);assert.equal(t.getOriginalContent(target),undefined);
@@ -881,7 +881,7 @@ export function registerPR11ReviewRegressions(h) {
             assert.equal(t.getOriginalContent(target),'not yet recorded');
         } finally {
             await h.getTracker().dispose();
-            vscode.workspace.fs.readFile=original;
+            DiffTracker.prototype.readLocalFileBytesBounded=original;
             vscode.workspace.findFiles=previousFindFiles;
             vscode.workspace.workspaceFolders=previousFolders;
             vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -1250,8 +1250,8 @@ export function registerPR11ReviewRegressions(h) {
         t=new DiffTracker(Uri.file(storage));h.setTracker(t);
         const restoredIdentify=t.workspaceRootIdentityForFolder;
         t.workspaceRootIdentityForFolder=folder=>({...restoredIdentify.call(t,folder),caseSensitive:undefined});
-        const read=vscode.workspace.fs.readFile;let unsafeReads=0;
-        vscode.workspace.fs.readFile=async uri=>{if(uri.fsPath===p)unsafeReads++;return read(uri);};
+        const read=t.readLocalFileBytesBounded;let unsafeReads=0;
+        t.readLocalFileBytesBounded=async function(uri,maxBytes){if(uri.fsPath===p)unsafeReads++;return read.call(this,uri,maxBytes);};
         try{
             assert.equal(await t.restorePersistedState(),'restored');
             assert.ok(pending(p));assert.equal(pending(p).reviewKind,'unknown');assert.equal(unsafeReads,0);
@@ -1259,7 +1259,7 @@ export function registerPR11ReviewRegressions(h) {
             await t.refreshIgnoreMatchers();assert.equal(t.getPolicyFingerprint(),fingerprint);
             assert.ok(pending(p));assert.equal(pending(p).reviewKind,kind);
             assert.equal(t.getOriginalContent(p),'baseline');
-        }finally{vscode.workspace.fs.readFile=read;}
+        }finally{t.readLocalFileBytesBounded=read;}
     });
 
     test('PR11 migrated Save keeps committed Workspace legacy protection until configured Apply',async()=>{

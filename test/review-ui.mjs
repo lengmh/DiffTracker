@@ -12,6 +12,7 @@ const filePath = '/workspace/研究 folder/empty.m';
 const reviewToken={filePath,epoch:1,baselineRevision:'base',currentRevision:'current'};
 const opaqueReviewToken={filePath,epoch:1,reviewRevision:'opaque-current'};
 const unknownReviewToken={filePath,epoch:1,reviewRevision:'unknown-current'};
+const largeFileReminderToken={filePath,epoch:1,reviewRevision:'large-reminder-current'};
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
@@ -96,6 +97,8 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
             return change?.reviewKind==='unknown' ? {...unknownReviewToken,filePath:target} : undefined;
         },getUnknownReviewTokens:()=> state.changes.filter(x=>x.reviewKind==='unknown')
             .map(x=>({...unknownReviewToken,filePath:x.filePath})),
+        getLargeFileReminderToken:target=>state.changes.find(change=>change.filePath===target)?.largeFileReminder?.pending
+            ? {...largeFileReminderToken,filePath:target} : undefined,
         getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
         getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
@@ -324,6 +327,7 @@ for (const [command, contextValue] of [
     ['diffTracker.acceptFile', 'changedFile'],
     ['diffTracker.revertFile', 'changedFile'],
     ['diffTracker.acknowledgeOpaqueChange', 'opaqueFile'],
+    ['diffTracker.acknowledgeLargeFileReminder', 'largeFileReminder'],
     ['diffTracker.resetUnknownBaseline', 'unknownFile']
 ]) {
     await test(`${command} has distinct scoped hover and right-click contributions`, () => {
@@ -933,6 +937,305 @@ await test('review tree exposes versioned Unknown Reset, text Accept and bounded
         assert.ok(menus.some(item=>item.command==='diffTracker.acceptFile'&&item.group==='inline'));
         assert.ok(menus.some(item=>item.command==='diffTracker.resetUnknownBaseline'&&item.group==='inline'));
     }finally{h.vscode.workspace.getWorkspaceFolder=originalGetFolder;}
+});
+
+function largeReminderHarness({ reviewKind = 'unknown', pending = true, retainedReview = false, currentExists = true } = {}) {
+    const h = harness({
+        filePath, fileName: 'large.bin', originalContent: 'retained baseline', currentContent: 'retained review',
+        isDeleted: !currentExists, reviewKind, reviewReason: 'Prior review evidence is retained',
+        unavailableReason: 'Too large for content review', changes: [],
+        largeFileReminder: { pending, retainedReview, currentExists, currentSize: currentExists ? 80 * 1024 * 1024 : undefined }
+    });
+    // The backend owns capability policy. A metadata reminder cannot supply
+    // content-review tokens, even when an older underlying review is retained.
+    h.tracker.getReviewToken = h.tracker.getOpaqueReviewToken = h.tracker.getUnknownReviewToken = () => undefined;
+    h.tracker.getReviewTokens = h.tracker.getOpaqueReviewTokens = h.tracker.getUnknownReviewTokens = () => [];
+    return h;
+}
+
+for (const reviewKind of ['text', 'opaque', 'unknown']) {
+    await test(`${reviewKind} large-file reminder gets a distinct metadata-only tree action`, async () => {
+        const h = largeReminderHarness({ reviewKind, retainedReview: true });
+        const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+        const root = await tree.getChildren();
+        const leaf = root.find(item => item.filePath === filePath);
+        assert.equal(leaf.contextValue, 'largeFileReminder');
+        assert.match(leaf.description, /Large-file reminder/);
+        assert.match(leaf.description, /80\.0 MiB/);
+        assert.match(leaf.tooltip, /content.*not.*compared/i);
+        assert.match(leaf.tooltip, /prior review.*Undo/i);
+        assert.doesNotMatch(leaf.tooltip, /SHA-256|new baseline|Renamed/);
+        assert.deepEqual(JSON.parse(JSON.stringify(leaf.largeFileReminderToken)), largeFileReminderToken);
+        assert.equal(leaf.command.command, 'diffTracker.showWebviewDiff');
+        assert.equal(leaf.reviewToken, undefined);
+        assert.equal(leaf.opaqueReviewToken, undefined);
+        assert.equal(leaf.unknownReviewToken, undefined);
+        assert.equal(root.some(item => item.command?.command === 'diffTracker.resetAllUnknownBaselines'), false);
+        assert.equal(root.some(item => item.command?.command === 'diffTracker.keepAllChanges'), false);
+        assert.match(root.find(item => item.label === 'Pending Review').description, /1 large-file reminder/);
+    });
+}
+await test('acknowledged large-file reminder retains an old-review row without another acknowledgement', async () => {
+    const h = largeReminderHarness({ pending: false, retainedReview: true });
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const root = await tree.getChildren();
+    const leaf = root.find(item => item.filePath === filePath);
+    assert.equal(leaf.contextValue, 'retainedLargeFileReview');
+    assert.match(leaf.description, /Prior review retained/);
+    assert.match(leaf.tooltip, /reminder.*acknowledged/i);
+    assert.equal(leaf.largeFileReminderToken, undefined);
+    assert.match(root.find(item => item.label === 'Pending Review').description, /1 retained review/);
+});
+
+await test('large-file reminders expose only reminder dismissal and inspection; retained rows are inspect-only', () => {
+    const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    const entries = manifest.contributes.menus['view/item/context'];
+    for (const [contextValue, expected] of [
+        ['largeFileReminder', ['diffTracker.acknowledgeLargeFileReminder', 'diffTracker.showWebviewDiff']],
+        ['retainedLargeFileReview', ['diffTracker.showWebviewDiff']]
+    ]) {
+        const commands = entries.filter(item => (item.when ?? '').includes(`viewItem == ${contextValue}`)).map(item => item.command);
+        assert.deepEqual([...new Set(commands)].sort(), expected.sort());
+    }
+});
+
+await test('large-file Webview is metadata-only and permits reminder dismissal even with retained Unknown evidence', () => {
+    const h = largeReminderHarness({ retainedReview: true });
+    h.tracker.getOriginalContent = () => { throw new Error('Reminder must not read baseline text'); };
+    h.tracker.getChangeBlocks = () => { throw new Error('Reminder must not build content diff blocks'); };
+    h.vscode.workspace.textDocuments = [{ uri: { scheme: 'file', fsPath: filePath }, getText: () => { throw new Error('Reminder must not read editor text'); } }];
+    h.panel.sendDataUpdate();
+    const payload = h.messages[0];
+    assert.deepEqual(payload.largeFileReminder, h.state.changes[0].largeFileReminder);
+    assert.deepEqual(JSON.parse(JSON.stringify(payload.largeFileReminderToken)), largeFileReminderToken);
+    assert.equal(payload.oldContents, '');
+    assert.equal(payload.newContents, '');
+    assert.deepEqual(Array.from(payload.changeBlocks), []);
+    const ui = runInline(h.panel.getHtmlContent());
+    assert.match(ui.notice(), /Large-file metadata reminder/);
+    assert.match(ui.notice(), /80\.0 MiB/);
+    assert.match(ui.notice(), /content.*not.*compared/i);
+    assert.match(ui.notice(), /prior review.*Undo/i);
+    assert.doesNotMatch(ui.notice(), /SHA-256|Baseline: exists/);
+    assert.equal(ui.rendererCalls(), 0);
+    assert.equal(ui.elements.get('btn-keep-all').textContent, 'Acknowledge Reminder');
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+    ui.click('btn-keep-all');
+    assert.equal(ui.sent[0].command, 'acknowledgeReminder');
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[0].largeFileReminderToken)), largeFileReminderToken);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+});
+
+await test('large-file Webview routes its captured reminder token through the independent command', async () => {
+    const h = largeReminderHarness();
+    await h.panel.handleMessage({ command: 'acknowledgeReminder', filePath, requestId: 'reminder-ack',
+        largeFileReminderToken, viewGeneration: 0 });
+    assert.equal(h.commands.length, 1);
+    assert.equal(h.commands[0][0], 'diffTracker.acknowledgeLargeFileReminder');
+    assert.equal(h.commands[0][1], filePath);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.commands[0][2])), largeFileReminderToken);
+    assert.deepEqual(h.messages.map(message => message.command), ['actionAck', 'updateData']);
+    assert.equal(h.messages[0].ok, true);
+});
+
+await test('deleted large-file reminders describe missing metadata without inventing a rename or content identity', async () => {
+    const h = largeReminderHarness({ currentExists: false });
+    const tree = new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const leaf = (await tree.getChildren()).find(item => item.filePath === filePath);
+    assert.match(leaf.description, /Large-file reminder · Deleted/);
+    assert.doesNotMatch(leaf.tooltip, /SHA-256|Renamed/);
+    const ui = runInline(h.panel.getHtmlContent());
+    assert.match(ui.notice(), /Current: deleted/);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+});
+
+await test('large-file reminder success preserves the retained review notice and removes the repeated action', () => {
+    const h = largeReminderHarness({ retainedReview: true });
+    const ui = runInline(h.panel.getHtmlContent());
+    ui.click('btn-keep-all');
+    const request = ui.sent[0];
+    ui.receive({ command: 'actionAck', requestId: request.requestId, ok: true, filePath, viewGeneration: 0 });
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true, 'wait for authoritative refresh');
+    h.state.changes[0].largeFileReminder.pending = false;
+    h.panel.sendDataUpdate();
+    ui.receive(h.messages.at(-1));
+    assert.match(ui.notice(), /reminder acknowledged/i);
+    assert.match(ui.notice(), /prior review remains pending/i);
+    assert.equal(ui.elements.get('btn-keep-all').hidden, true);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-reject-all').hidden, true);
+    ui.click('btn-keep-all');
+    assert.equal(ui.sent.length, 1, 'an acknowledged reminder cannot be sent again');
+
+    const nextToken = { ...largeFileReminderToken, reviewRevision: 'new-size-reminder' };
+    h.state.changes[0].largeFileReminder = { pending: true, retainedReview: true, currentExists: true, currentSize: 90 * 1024 * 1024 };
+    h.tracker.getLargeFileReminderToken = () => nextToken;
+    h.panel.sendDataUpdate();
+    ui.receive(h.messages.at(-1));
+    assert.match(ui.notice(), /90\.0 MiB/);
+    assert.equal(ui.elements.get('btn-keep-all').hidden, false);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    ui.click('btn-keep-all');
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[1].largeFileReminderToken)), nextToken);
+    ui.receive({ command: 'actionAck', requestId: request.requestId, ok: true, filePath, viewGeneration: 0 });
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true, 'an old acknowledgement cannot unlock a newer request');
+});
+
+await test('large-file reminder refresh can remove a dismissed-only row or return to ordinary opaque review', () => {
+    for (const next of ['removed', 'opaque']) {
+        const h = largeReminderHarness();
+        const ui = runInline(h.panel.getHtmlContent());
+        h.state.changes = next === 'removed' ? [] : [{
+            filePath, fileName: 'image.png', originalContent: '', currentContent: '', isDeleted: false,
+            reviewKind: 'opaque', currentSize: 20, currentExists: true, changes: []
+        }];
+        h.tracker.getOpaqueReviewToken = () => next === 'opaque' ? opaqueReviewToken : undefined;
+        h.panel.sendDataUpdate();
+        ui.receive(h.messages.at(-1));
+        assert.doesNotMatch(ui.notice(), /Large-file/);
+        if (next === 'removed') {
+            assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+            ui.click('btn-keep-all');
+            assert.deepEqual(ui.sent, []);
+        } else {
+            assert.equal(ui.elements.get('btn-keep-all').textContent, 'Acknowledge');
+            assert.equal(ui.elements.get('btn-keep-all').hidden, false);
+            assert.equal(ui.elements.get('btn-reject-all').hidden, false, 'restore ordinary opaque toolbar presentation');
+            ui.click('btn-keep-all');
+            assert.equal(ui.sent[0].command, 'acknowledge');
+            assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[0].opaqueReviewToken)), opaqueReviewToken);
+            assert.equal(ui.sent[0].largeFileReminderToken, undefined);
+        }
+    }
+});
+
+await test('successful large-file reminder dismissal never reads an open large editor after removing its review row', async () => {
+    const h = largeReminderHarness();
+    const ui = runInline(h.panel.getHtmlContent());
+    let textReads = 0;
+    h.vscode.workspace.textDocuments = [{ uri: { scheme: 'file', fsPath: filePath }, getText() {
+        textReads++;
+        throw new Error('Do not read the large editor after reminder dismissal');
+    } }];
+    h.tracker.getOriginalContent = () => 'unreviewed baseline content';
+    ui.click('btn-keep-all');
+    const pending = h.panel.handleMessage(ui.sent[0]);
+    h.state.changes = []; // The independent ledger remains; only the pending projection disappears.
+    await pending;
+    assert.equal(textReads, 0);
+    assert.equal(h.messages[0].ok, true);
+    const payload = h.messages.at(-1);
+    assert.equal(payload.hasFileChange, false);
+    assert.equal(payload.oldContents, '');
+    assert.equal(payload.newContents, '');
+    assert.deepEqual(Array.from(payload.changeBlocks), []);
+    for (const message of h.messages) { ui.receive(message); }
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+    assert.equal(ui.rendererCalls(), 0);
+});
+
+await test('an ordinary file without an authoritative review renders an empty disabled view without reading text', () => {
+    const h = harness(null);
+    let textReads = 0;
+    const unexpectedRead = () => { textReads++; throw new Error('No review means no text to display'); };
+    h.tracker.getOriginalContent = unexpectedRead;
+    h.tracker.getChangeBlocks = unexpectedRead;
+    h.vscode.workspace.textDocuments = [{ uri: { scheme: 'file', fsPath: filePath }, getText: unexpectedRead }];
+    const ui = runInline(h.panel.getHtmlContent());
+    h.panel.sendDataUpdate();
+    const payload = h.messages.at(-1);
+    ui.receive(payload);
+    assert.equal(textReads, 0);
+    assert.equal(payload.hasFileChange, false);
+    assert.equal(payload.oldContents, '');
+    assert.equal(payload.newContents, '');
+    assert.deepEqual(Array.from(payload.changeBlocks), []);
+    assert.equal(ui.rendererCalls(), 0);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+    assert.equal(ui.elements.get('btn-reject-all').disabled, true);
+});
+
+await test('large-file reminder request locking rejects duplicates and never substitutes another token', async () => {
+    const h = largeReminderHarness();
+    const gate = deferred();
+    h.state.gate = gate.promise;
+    const request = { command: 'acknowledgeReminder', filePath, requestId: 'reminder-busy', largeFileReminderToken, viewGeneration: 0 };
+    const pending = h.panel.handleMessage(request);
+    try {
+        assert.equal(h.commands.length, 1);
+        await h.panel.handleMessage(request);
+        await h.panel.handleMessage({ ...request, requestId: 'other-reminder' });
+        assert.equal(h.commands.length, 1);
+        assert.match(h.messages[0].error, /Another review action is in progress/);
+        assert.deepEqual(JSON.parse(JSON.stringify(h.commands[0][2])), largeFileReminderToken);
+    } finally {
+        gate.resolve();
+        await pending;
+    }
+    assert.equal(h.messages.at(-2).requestId, request.requestId);
+    assert.equal(h.messages.at(-2).ok, true);
+});
+
+for (const issue of ['missing-token', 'wrong-token-kind', 'wrong-path', 'old-view']) {
+    await test(`large-file reminder ${issue} never executes a mutation`, async () => {
+        const h = largeReminderHarness();
+        await h.panel.handleMessage({ command: 'acknowledgeReminder', filePath: issue === 'wrong-path' ? '/other.bin' : filePath,
+            requestId: issue, viewGeneration: issue === 'old-view' ? -1 : 0,
+            largeFileReminderToken: ['missing-token', 'wrong-token-kind'].includes(issue) ? undefined : largeFileReminderToken,
+            opaqueReviewToken: issue === 'wrong-token-kind' ? opaqueReviewToken : undefined });
+        assert.deepEqual(h.commands, []);
+        if (['missing-token', 'wrong-token-kind'].includes(issue)) {
+            assert.equal(h.messages[0].ok, false);
+            assert.match(h.messages[0].error, /Review target is unavailable/);
+        }
+    });
+}
+
+await test('failed large-file reminder dismissal remains visible and actionable after the current-state refresh', async () => {
+    const h = largeReminderHarness();
+    const ui = runInline(h.panel.getHtmlContent());
+    h.state.result = { filePath, status: 'conflict', reason: 'Size changed; reminder retained' };
+    ui.click('btn-keep-all');
+    await h.panel.handleMessage(ui.sent[0]);
+    assert.equal(h.messages[0].ok, false);
+    assert.equal(h.messages[0].error, h.state.result.reason);
+    for (const message of h.messages) { ui.receive(message); }
+    assert.match(ui.notice(), /Large-file metadata reminder/);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+});
+
+await test('a size update during reminder dismissal stays locked and requires a new explicit click with the new token', async () => {
+    const h = largeReminderHarness();
+    const ui = runInline(h.panel.getHtmlContent());
+    const gate = deferred();
+    h.state.gate = gate.promise;
+    ui.click('btn-keep-all');
+    const pending = h.panel.handleMessage(ui.sent[0]);
+    const nextToken = { ...largeFileReminderToken, reviewRevision: 'concurrent-size-change' };
+    try {
+        h.state.changes[0].largeFileReminder.currentSize = 96 * 1024 * 1024;
+        h.tracker.getLargeFileReminderToken = () => nextToken;
+        h.panel.sendDataUpdate();
+        assert.equal(h.messages.at(-1).mutationBusy, true);
+        ui.receive(h.messages.at(-1));
+        assert.equal(ui.elements.get('btn-keep-all').disabled, true);
+        ui.click('btn-keep-all');
+        assert.equal(ui.sent.length, 1);
+        assert.deepEqual(JSON.parse(JSON.stringify(h.commands[0][2])), largeFileReminderToken);
+        h.state.result = { filePath, status: 'conflict', reason: 'Size changed; reminder retained' };
+    } finally {
+        gate.resolve();
+        await pending;
+    }
+    assert.equal(h.commands.length, 1, 'do not retry an old approval against the new metadata');
+    for (const message of h.messages.slice(1)) { ui.receive(message); }
+    assert.match(ui.notice(), /96\.0 MiB/);
+    assert.equal(ui.elements.get('btn-keep-all').disabled, false);
+    ui.click('btn-keep-all');
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.sent[1].largeFileReminderToken)), nextToken);
 });
 
 await test('opaque file review is visible, read-only and carries identity metadata', async () => {

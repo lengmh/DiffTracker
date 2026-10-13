@@ -7,7 +7,7 @@ import ts from 'typescript';
 // tracker results are stubbed. Token safety itself is covered by tracker tests.
 const source = ts.createSourceFile('extension.ts', fs.readFileSync('src/extension.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const names = ['keepAllChanges', 'acceptFolderText', 'acceptFile', 'keepBlock', 'keepAllBlocksInFile',
-    'acknowledgeOpaqueChange', 'acknowledgeFolderOpaque', 'resetUnknownBaseline'];
+    'acknowledgeOpaqueChange', 'acknowledgeFolderOpaque', 'resetUnknownBaseline', 'acknowledgeLargeFileReminder'];
 const callbacks = [];
 const helpers = [];
 function visit(node) {
@@ -27,6 +27,7 @@ function harness({ cross = 1, mixed = false, cancel = false, onConfirm, result, 
     const tokens = [token];
     const opaqueToken = { filePath: '/repo/image.png', epoch: 1, reviewRevision: 'opaque' };
     const unknownToken = { filePath: '/repo/unknown', epoch: 1, reviewRevision: 'unknown' };
+    const reminderToken = { filePath: '/repo/large.bin', epoch: 1, reviewRevision: 'metadata-reminder' };
     const opaque = mixed ? [opaqueToken] : [];
     const unknown = mixed ? ['/repo/unknown'] : [];
     const state = { prompts: [], calls: [], operations: [], warnings: [], info: [], reads: [], refreshes: 0 };
@@ -41,6 +42,7 @@ function harness({ cross = 1, mixed = false, cancel = false, onConfirm, result, 
         getReviewToken: () => { state.reads.push('text'); return token; },
         getOpaqueReviewToken: () => { state.reads.push('opaque'); return opaqueToken; },
         getUnknownReviewToken: () => { state.reads.push('unknown'); return unknownToken; },
+        getLargeFileReminderToken: () => { state.reads.push('reminder'); return reminderToken; },
         getOpaqueReviewTokens: () => opaque,
         getUnknownReviewPaths: () => unknown,
         getCrossBranchKeepCount: captured => { state.counted = captured; return cross; },
@@ -49,7 +51,8 @@ function harness({ cross = 1, mixed = false, cancel = false, onConfirm, result, 
         keepAllChangesInFile: action('keepAllChangesInFile'),
         keepBlock: action('keepBlock'),
         acknowledgeOpaqueChange: action('acknowledgeOpaqueChange'),
-        resetUnknownBaseline: action('resetUnknownBaseline')
+        resetUnknownBaseline: action('resetUnknownBaseline'),
+        acknowledgeLargeFileReminder: action('acknowledgeLargeFileReminder')
     };
     const sandbox = {
         diffTracker, displayFileName: value => value, refreshReview: () => { state.refreshes++; },
@@ -67,7 +70,7 @@ function harness({ cross = 1, mixed = false, cancel = false, onConfirm, result, 
     vm.runInNewContext(ts.transpileModule(`${helpers.join('\n')}globalThis.callbacks = {${callbacks.join(',')}};`, {
         compilerOptions: { target: ts.ScriptTarget.ES2022 }
     }).outputText, sandbox);
-    return { token, tokens, opaqueToken, unknownToken, state, run: (name, ...args) => sandbox.callbacks[`diffTracker.${name}`](...args) };
+    return { token, tokens, opaqueToken, unknownToken, reminderToken, state, run: (name, ...args) => sandbox.callbacks[`diffTracker.${name}`](...args) };
 }
 for (const mode of ['explicit', 'global', 'mixed', 'folder']) {
     const run = h => mode === 'folder'
@@ -169,10 +172,11 @@ for (const command of ['acceptFile', 'acknowledgeOpaqueChange']) {
 }
 console.log('PASS single-file failures: nonmodal concrete reasons, refresh, original tokens, and no retry/recapture');
 
-for (const command of ['acceptFile', 'acknowledgeOpaqueChange']) {
+for (const [command, tokenKey] of [['acceptFile', 'token'], ['acknowledgeOpaqueChange', 'opaqueToken'],
+    ['acknowledgeLargeFileReminder', 'reminderToken']]) {
     let release;
     const h = harness({ gate: new Promise(resolve => { release = resolve; }) });
-    const token = command === 'acceptFile' ? h.token : h.opaqueToken;
+    const token = h[tokenKey];
     let finished = false;
     const pending = h.run(command, token.filePath, token).then(value => { finished = true; return value; });
     await Promise.resolve();
@@ -214,6 +218,33 @@ for (const command of ['acceptFolderText', 'acknowledgeFolderOpaque']) for (cons
     }
 }
 console.log('PASS Unknown Reset and one-file folder selections retain confirmation and cancellation semantics');
+
+for (const route of ['tree', 'explicit', 'path']) {
+    for (const status of ['success', 'conflict', 'failed']) {
+        const result = { filePath: '/repo/large.bin', status, reason: status === 'success' ? undefined : 'Reminder changed; prior review retained' };
+        const h = harness({ result });
+        const args = route === 'tree' ? [{ filePath: result.filePath, largeFileReminderToken: h.reminderToken }]
+            : route === 'explicit' ? [result.filePath, h.reminderToken] : [result.filePath];
+        assert.equal(await h.run('acknowledgeLargeFileReminder', ...args), result);
+        assert.deepEqual(h.state.operations, ['acknowledgeLargeFileReminder'], 'never dispatch through baseline acceptance/reset');
+        assert.equal(h.state.calls.length, 1);
+        assert.equal(h.state.calls[0].length, 2);
+        assert.equal(h.state.calls[0][1], h.reminderToken);
+        assert.deepEqual(h.state.reads, route === 'path' ? ['reminder'] : []);
+        assert.equal(h.state.refreshes, 1);
+        assert.deepEqual(h.state.prompts, []);
+        assert.deepEqual(h.state.info, [], 'no reminder success notification');
+        assert.deepEqual(h.state.warnings, status === 'success' ? [] : [`${result.filePath}: ${result.reason}`]);
+    }
+}
+{
+    const h = harness();
+    const result = await h.run('acknowledgeLargeFileReminder', { filePath: '/repo/large.bin' });
+    assert.equal(result.status, 'conflict');
+    assert.deepEqual(h.state.calls, []);
+    assert.deepEqual(h.state.reads, [], 'an acknowledged or stale row cannot recapture a new reminder');
+}
+console.log('PASS large-file reminder command: independent token-bound dismissal, no baseline action or routine popup');
 
 // The activation installs a live provider, rather than retaining the initial
 // snapshots or treating an unavailable monitor as an empty repository set.

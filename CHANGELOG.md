@@ -6,6 +6,7 @@
 - Allow explicitly selected single-file opaque Acknowledge across verified stable named branches while leaving folder/batch opaque actions, Unknown Reset and Revert guards strict.
 - Make shared Acknowledge/Unknown baseline updates recoverable after late persistence failure; reject unobserved content changes and tolerate unchanged notifications during publication.
 - Execute ordinary single-file Accept/Acknowledge directly, without routine confirmation dialogs or success notifications.
+- Use path/existence/size reminders for files larger than 64 MiB without reading or fingerprinting their contents. Acknowledging a reminder only marks that state as seen; preserve prior review and Undo evidence, and intentionally ignore same-size content or timestamp-only changes.
 
 ## 0.8.4
 

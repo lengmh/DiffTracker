@@ -1,3 +1,4 @@
+import { registerLargeFileReminders } from './large-file-reminders.mjs';
 import { registerIssue41SelectedOpaque } from './issue41-selected-opaque.mjs';
 import { registerIssue41GitResume } from './issue41-git-resume.mjs';
 import { registerIssue41AckRecovery } from './issue41-ack-recovery.mjs';
@@ -245,6 +246,17 @@ try {
         mod._compile(code,mod.id); DiffTracker=mod.exports.DiffTracker;
     } else ({DiffTracker}=require('../out/diffTracker.js'));
 } finally { Module._load=originalLoad; }
+// Preserve the modeled read failure/completion boundary around the real local
+// bounded reader; do not replace its byte-limit or descriptor implementation.
+const realBoundedFileRead = DiffTracker.prototype.readLocalFileBytesBounded;
+if (realBoundedFileRead) {
+    DiffTracker.prototype.readLocalFileBytesBounded = async function(uri, maxBytes) {
+        fault(uri.fsPath, 'read');
+        const bytes = await realBoundedFileRead.call(this, uri, maxBytes);
+        await boundary(uri.fsPath, 'read');
+        return bytes;
+    };
+}
 const tests=[];
 function test(name,run) { tests.push({name,run}); }
 const succeeded = r => r===true || r?.status==='success';
@@ -908,12 +920,12 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
     const beforeBytes=Buffer.byteLength(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'),'utf8');
     tracker.maxPersistedBytes=beforeBytes+1700;
     const originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
-    const originalReadFile=vscode.workspace.fs.readFile;
+    const originalReadFile=DiffTracker.prototype.readLocalFileBytesBounded;
     let candidateReads=0;
     tracker.findScopeFilesUnderDirectory=async()=>candidates.map(Uri.file);
-    vscode.workspace.fs.readFile=async uri=>{
+    DiffTracker.prototype.readLocalFileBytesBounded=async function(uri,maxBytes){
         if(candidates.includes(uri.fsPath)) candidateReads++;
-        return originalReadFile(uri);
+        return originalReadFile.call(this,uri,maxBytes);
     };
     try{
         assert.equal(await tracker.rebuildRepositoryBaseline(repoDir,current),false);
@@ -927,7 +939,7 @@ test('S4-A repository rebuild enforces persisted-byte budget before durable publ
         assert.ok(Buffer.byteLength(JSON.stringify(state),'utf8')<=tracker.maxPersistedBytes,
             'rebuild candidate must not retain content beyond the persistence byte budget');
     } finally {
-        vscode.workspace.fs.readFile=originalReadFile;
+        DiffTracker.prototype.readLocalFileBytesBounded=originalReadFile;
         tracker.findScopeFilesUnderDirectory=originalFind;
     }
 });
@@ -3872,7 +3884,7 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
         ) ? folder : undefined;
     };
     let originalFind;
-    const originalReadFile=vscode.workspace.fs.readFile;
+    const originalReadFile=DiffTracker.prototype.readLocalFileBytesBounded;
     let candidateReads=0;
     try{
         vscode.workspace.workspaceFolders=[folder];
@@ -3896,9 +3908,9 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
         tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(state),'utf8')+1500;
         originalFind=tracker.findScopeFilesUnderDirectory.bind(tracker);
         tracker.findScopeFilesUnderDirectory=async()=>files.map(Uri.file);
-        vscode.workspace.fs.readFile=async uri=>{
+        DiffTracker.prototype.readLocalFileBytesBounded=async function(uri,maxBytes){
             if(files.includes(uri.fsPath)) candidateReads++;
-            return originalReadFile(uri);
+            return originalReadFile.call(this,uri,maxBytes);
         };
 
         await assert.rejects(
@@ -3914,7 +3926,7 @@ test('S4-A Whole Workspace Start enforces persisted-byte budget during scan',asy
             'Start must stop retaining baselines before the durable byte limit is exceeded');
         assert.equal(tracker.getBaselineState(),'building');
     } finally {
-        vscode.workspace.fs.readFile=originalReadFile;
+        DiffTracker.prototype.readLocalFileBytesBounded=originalReadFile;
         if(originalFind) tracker.findScopeFilesUnderDirectory=originalFind;
         vscode.workspace.workspaceFolders=previousFolders;
         vscode.workspace.getWorkspaceFolder=previousGetWorkspaceFolder;
@@ -5691,6 +5703,9 @@ registerPR12BoundedInvariants({
 });
 
 registerKeepCountSnapshot({ test, root, file, seed, scan, getTracker: () => tracker });
+
+registerLargeFileReminders({ test, Uri, DiffTracker, vscode, file, document, pause, getTracker: () => tracker,
+    setTracker: value => { tracker = value; }, setListedFiles: value => { listedFiles = value; } });
 
 registerIssue41AckRecovery({
     test, Uri, DiffTracker, vscode, file, document, pause,

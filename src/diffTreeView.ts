@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { displayFileName, workspaceDisplayParts } from './utils/displayPath';
-import { DiffTracker, FileDiff, OpaqueReviewToken, ReviewKind, ReviewToken, UnknownReviewToken, SubtreeCoverageDiagnostic } from './diffTracker';
+import { DiffTracker, FileDiff, LargeFileReminderToken, OpaqueReviewToken, ReviewKind, ReviewToken, UnknownReviewToken, SubtreeCoverageDiagnostic } from './diffTracker';
 
 interface DirNode {
     name: string;
@@ -46,8 +46,13 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const counts = this.countReviewKinds(changes);
             const summary = new TreeItem('Pending Review', vscode.TreeItemCollapsibleState.None);
             summary.iconPath = new vscode.ThemeIcon('list-tree');
-            summary.description = `${counts.text} text · ${counts.opaque} read-only · ${counts.unknown} unknown`;
-            summary.tooltip = `${changes.length} pending file(s): ${counts.text} text-reviewable, ${counts.opaque} read-only opaque, ${counts.unknown} unknown`;
+            const reminders = [
+                counts.reminder ? `${counts.reminder} large-file reminder(s)` : '',
+                counts.retained ? `${counts.retained} retained review(s)` : ''
+            ].filter(Boolean);
+            summary.description = [`${counts.text} text · ${counts.opaque} read-only · ${counts.unknown} unknown`, ...reminders].join(' · ');
+            summary.tooltip = `${changes.length} pending file(s): ${counts.text} text-reviewable, ${counts.opaque} read-only opaque, ${counts.unknown} unknown` +
+                (reminders.length ? `; ${reminders.join('; ')}` : '');
             items.push(summary);
 
             if (reviewTokens.length > 0) {
@@ -171,7 +176,25 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         item.resourceUri = vscode.Uri.file(fileDiff.filePath);
         item.tooltip = fileDiff.filePath;
 
-        if (reviewKind === 'opaque') {
+        if (fileDiff.largeFileReminder) {
+            const reminder = fileDiff.largeFileReminder;
+            item.largeFileReminderToken = this.diffTracker.getLargeFileReminderToken(fileDiff.filePath);
+            item.description = reminder.pending
+                ? `Large-file reminder · ${reminder.currentExists ? 'Metadata' : 'Deleted'}${reminder.currentSize !== undefined ? ` · ${this.formatBytes(reminder.currentSize)}` : ''}`
+                : 'Prior review retained · Reminder acknowledged';
+            item.iconPath = new vscode.ThemeIcon('info');
+            item.contextValue = reminder.pending ? 'largeFileReminder' : 'retainedLargeFileReview';
+            item.tooltip += '\nLarge-file metadata only; content was not compared. Same-size content edits are not detected.';
+            item.tooltip += reminder.pending
+                ? '\nAcknowledge dismisses this reminder only. It preserves prior review evidence and Undo.'
+                : '\nThe reminder was acknowledged. Prior review evidence and Undo are still retained.';
+            if (reminder.retainedReview) { item.tooltip += '\nThe prior review remains pending; no content baseline was accepted.'; }
+            item.command = {
+                command: 'diffTracker.showWebviewDiff',
+                title: 'Inspect Large-file Reminder',
+                arguments: [item]
+            };
+        } else if (reviewKind === 'opaque') {
             const state = fileDiff.isDeleted ? 'Deleted' : fileDiff.baselineExists === false ? 'Added' : 'Changed';
             item.description = `Read-only · ${state}${fileDiff.currentSize !== undefined ? ` · ${this.formatBytes(fileDiff.currentSize)}` : ''}`;
             item.iconPath = new vscode.ThemeIcon('file-binary');
@@ -214,9 +237,12 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
         return fileDiff.reviewKind ?? (fileDiff.unavailableReason ? 'unknown' : 'text');
     }
 
-    private countReviewKinds(changes: FileDiff[]): Record<ReviewKind, number> {
-        const counts: Record<ReviewKind, number> = { text: 0, opaque: 0, unknown: 0 };
-        for (const change of changes) { counts[this.reviewKindOf(change)]++; }
+    private countReviewKinds(changes: FileDiff[]): Record<ReviewKind | 'reminder' | 'retained', number> {
+        const counts = { text: 0, opaque: 0, unknown: 0, reminder: 0, retained: 0 };
+        for (const change of changes) {
+            if (change.largeFileReminder) { counts[change.largeFileReminder.pending ? 'reminder' : 'retained']++; }
+            else { counts[this.reviewKindOf(change)]++; }
+        }
         return counts;
     }
 
@@ -338,6 +364,7 @@ class TreeItem extends vscode.TreeItem {
     public reviewToken?: ReviewToken;
     public opaqueReviewToken?: OpaqueReviewToken;
     public unknownReviewToken?: UnknownReviewToken;
+    public largeFileReminderToken?: LargeFileReminderToken;
     public reviewEntries?: Array<{ filePath: string; reviewToken?: ReviewToken; opaqueReviewToken?: OpaqueReviewToken }>;
 
     constructor(

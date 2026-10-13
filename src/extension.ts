@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, BatchActionResult, DiffTracker, MixedBatchActionResult, OpaqueReviewToken, ReviewToken, UnknownReviewToken, TrackChangesEvent } from './diffTracker';
+import { ActionResult, BatchActionResult, DiffTracker, LargeFileReminderToken, MixedBatchActionResult, OpaqueReviewToken, ReviewToken, UnknownReviewToken, TrackChangesEvent } from './diffTracker';
 import { DecorationManager } from './decorationManager';
 import { DiffTreeDataProvider } from './diffTreeView';
 import { DiffHoverProvider } from './hoverProvider';
@@ -810,6 +810,20 @@ export async function activate(context: vscode.ExtensionContext) {
                 : filePathOrItem?.opaqueReviewToken);
             if (!token) { return missingReview(filePath); }
             return reportAction(await diffTracker.acknowledgeOpaqueChange(filePath, token, { allowCrossBranch: true }));
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.acknowledgeLargeFileReminder', async (
+            filePathOrItem: string | { filePath?: string; largeFileReminderToken?: LargeFileReminderToken },
+            reminderToken?: LargeFileReminderToken
+        ) => {
+            const filePath = extractFilePath(filePathOrItem);
+            if (!filePath) { return; }
+            const token = reminderToken ?? (typeof filePathOrItem === 'string'
+                ? diffTracker.getLargeFileReminderToken(filePath) : filePathOrItem?.largeFileReminderToken);
+            if (!token) { return missingReview(filePath); }
+            return reportAction(await diffTracker.acknowledgeLargeFileReminder(filePath, token));
         })
     );
 

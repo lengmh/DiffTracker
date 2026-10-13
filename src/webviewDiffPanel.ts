@@ -1,6 +1,6 @@
 import { displayFileName } from './utils/displayPath';
 import * as vscode from 'vscode';
-import { ActionResult, ChangeBlock, DiffTracker, OpaqueReviewToken, ReviewToken, TrackChangesEvent } from './diffTracker';
+import { ActionResult, ChangeBlock, DiffTracker, LargeFileReminderToken, OpaqueReviewToken, ReviewToken, TrackChangesEvent } from './diffTracker';
 
 type WebviewChangeBlockPayload = {
     blockId: string;
@@ -20,6 +20,7 @@ type WebviewInboundMessage = {
     filePath?: string;
     reviewToken?: ReviewToken;
     opaqueReviewToken?: OpaqueReviewToken;
+    largeFileReminderToken?: LargeFileReminderToken;
     viewGeneration?: number;
     blockIndex?: number;
     lineNumber?: number;
@@ -179,19 +180,21 @@ export class WebviewDiffPanel {
         if (this.disposed) { return; }
         const trackedChanges = this.diffTracker.getTrackedChanges();
         const fileChange = trackedChanges.find(c => c.filePath === this.filePath);
-        const originalContent =
+        const largeFileReminder = fileChange?.largeFileReminder;
+        // A dismissed review is empty, not permission to read an open editor.
+        const originalContent = !fileChange || largeFileReminder ? '' :
             fileChange?.originalContent ??
             this.diffTracker.getOriginalContent(this.filePath) ??
             '';
         // Try to get current content from: tracked changes > open document > original
-        let currentContent = fileChange?.currentContent;
+        let currentContent = !fileChange || largeFileReminder ? '' : fileChange.currentContent;
         if (currentContent === undefined) {
             const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && d.uri.fsPath === this.filePath);
             currentContent = doc?.getText() ?? originalContent;
         }
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
-        const changeBlocks = this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
+        const changeBlocks = !fileChange || largeFileReminder ? [] : this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
         const fileName = displayFileName(this.filePath);
         const lang = this.getLangForFileName(fileName);
 
@@ -201,6 +204,8 @@ export class WebviewDiffPanel {
             viewGeneration: this.viewGeneration,
             reviewToken: this.diffTracker.getReviewToken(this.filePath),
             opaqueReviewToken: this.diffTracker.getOpaqueReviewToken(this.filePath),
+            largeFileReminder,
+            largeFileReminderToken: largeFileReminder ? this.diffTracker.getLargeFileReminderToken(this.filePath) : undefined,
             mutationBusy: !!this.activeRequest,
             fileName,
             hasFileChange: !!fileChange,
@@ -232,7 +237,8 @@ export class WebviewDiffPanel {
             keepBlock: 'diffTracker.keepBlock',
             keepAll: 'diffTracker.keepAllBlocksInFile',
             revertAll: 'diffTracker.revertAllBlocksInFile',
-            acknowledge: 'diffTracker.acknowledgeOpaqueChange'
+            acknowledge: 'diffTracker.acknowledgeOpaqueChange',
+            acknowledgeReminder: 'diffTracker.acknowledgeLargeFileReminder'
         };
         const actionCommand = mutationCommands[message.command];
         if (Object.prototype.hasOwnProperty.call(mutationCommands, message.command)) {
@@ -248,7 +254,8 @@ export class WebviewDiffPanel {
             }
             const blockRef = message.changeBlockId ?? message.changeBlockIndex;
             const isBlock = message.command === 'revertBlock' || message.command === 'keepBlock';
-            const actionToken = message.command === 'acknowledge' ? message.opaqueReviewToken : message.reviewToken;
+            const actionToken = message.command === 'acknowledgeReminder' ? message.largeFileReminderToken
+                : message.command === 'acknowledge' ? message.opaqueReviewToken : message.reviewToken;
             if (!actionToken ||
                 !this.diffTracker.getTrackedChanges().some(change => change.filePath === this.filePath) ||
                 (isBlock && typeof blockRef !== 'string' && typeof blockRef !== 'number')) {
@@ -353,17 +360,18 @@ export class WebviewDiffPanel {
 
     private getHtmlContent(): string {
         const webview = this.panel.webview;
-        const originalContent = this.diffTracker.getOriginalContent(this.filePath) || '';
         const trackedChanges = this.diffTracker.getTrackedChanges();
         const fileChange = trackedChanges.find(c => c.filePath === this.filePath);
-        const currentContent = fileChange?.currentContent ?? originalContent;
+        const largeFileReminder = fileChange?.largeFileReminder;
+        const originalContent = !fileChange || largeFileReminder ? '' : this.diffTracker.getOriginalContent(this.filePath) || '';
+        const currentContent = !fileChange || largeFileReminder ? '' : fileChange.currentContent ?? originalContent;
         const logicalOriginalContent = this.toLogicalDiffContent(originalContent);
         const logicalCurrentContent = this.toLogicalDiffContent(currentContent);
         const fileName = displayFileName(this.filePath);
         const escapedFileName = this.escapeHtml(fileName);
 
         // Get change blocks from diffTracker - this is the source of truth for block indexing
-        const changeBlocks = this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
+        const changeBlocks = !fileChange || largeFileReminder ? [] : this.diffTracker.getChangeBlocks(this.filePath).map(block => this.serializeChangeBlock(block));
 
         // Detect language from file extension
         const lang = this.getLangForFileName(fileName);
@@ -580,6 +588,8 @@ export class WebviewDiffPanel {
         let viewGeneration = ${this.viewGeneration};
         let reviewToken = ${this.serializeForInlineScript(this.diffTracker.getReviewToken(this.filePath) ?? null)};
         let opaqueReviewToken = ${this.serializeForInlineScript(this.diffTracker.getOpaqueReviewToken(this.filePath) ?? null)};
+        let largeFileReminder = ${this.serializeForInlineScript(largeFileReminder ?? null)};
+        let largeFileReminderToken = ${this.serializeForInlineScript(largeFileReminder ? this.diffTracker.getLargeFileReminderToken(this.filePath) ?? null : null)};
         let hasFileChange = ${!!fileChange};
         let isDeleted = ${fileChange?.isDeleted ?? false};
         let reviewKind = ${this.serializeForInlineScript(fileChange?.reviewKind ?? (fileChange?.unavailableReason ? 'unknown' : 'text'))};
@@ -654,13 +664,18 @@ export class WebviewDiffPanel {
 
         function updateToolbarMutationState() {
             const locked = isMutationLocked() || !hasFileChange;
-            const textReady = !locked && reviewKind === 'text' && !!reviewToken && !unavailableReason;
-            const opaqueReady = !locked && reviewKind === 'opaque' && !!opaqueReviewToken && !unavailableReason;
-            btnKeepAll.textContent = reviewKind === 'opaque' ? 'Acknowledge' : 'Keep All';
-            btnKeepAll.title = reviewKind === 'opaque'
+            const textReady = !locked && !largeFileReminder && reviewKind === 'text' && !!reviewToken && !unavailableReason;
+            const opaqueReady = !locked && !largeFileReminder && reviewKind === 'opaque' && !!opaqueReviewToken && !unavailableReason;
+            const reminderReady = !locked && largeFileReminder?.pending && !!largeFileReminderToken;
+            btnKeepAll.hidden = !!largeFileReminder && !largeFileReminder.pending;
+            btnRejectAll.hidden = !!largeFileReminder;
+            btnKeepAll.textContent = largeFileReminder ? 'Acknowledge Reminder' : reviewKind === 'opaque' ? 'Acknowledge' : 'Keep All';
+            btnKeepAll.title = largeFileReminder
+                ? 'Dismiss this metadata reminder only; preserve prior review evidence and Undo'
+                : reviewKind === 'opaque'
                 ? 'Acknowledge this read-only file identity without modifying the workspace file'
                 : 'Accept all text changes in this file';
-            btnKeepAll.disabled = !(textReady || opaqueReady);
+            btnKeepAll.disabled = !(textReady || opaqueReady || reminderReady);
             btnRejectAll.disabled = !textReady;
         }
 
@@ -973,6 +988,7 @@ export class WebviewDiffPanel {
                 viewGeneration,
                 reviewToken,
                 opaqueReviewToken,
+                largeFileReminderToken,
                 requestId
             });
         }
@@ -1014,6 +1030,22 @@ export class WebviewDiffPanel {
             sourceNotice.hidden = !sourceNote;
             currentStyle = style;
             container.innerHTML = '';
+
+            if (largeFileReminder) {
+                const notice = document.createElement('div');
+                notice.className = 'no-changes';
+                const current = largeFileReminder.currentExists
+                    ? 'Current: exists' + (Number.isFinite(largeFileReminder.currentSize) ? ' (' + formatBytes(largeFileReminder.currentSize) + ')' : '')
+                    : 'Current: deleted';
+                notice.textContent = (largeFileReminder.pending ? 'Large-file metadata reminder' : 'Large-file reminder acknowledged') +
+                    ' · ' + current + '. Content was not compared; same-size content edits are not detected. ' +
+                    (largeFileReminder.pending ? 'Acknowledge dismisses only this reminder and preserves prior review evidence and Undo.'
+                        : 'Prior review evidence and Undo are still retained.') +
+                    (largeFileReminder.retainedReview ? ' The prior review remains pending; no content baseline was accepted.' : '');
+                container.appendChild(notice);
+                updateToolbarMutationState();
+                return;
+            }
 
             if (reviewKind === 'opaque') {
                 const notice = document.createElement('div');
@@ -1109,7 +1141,8 @@ export class WebviewDiffPanel {
             vscode.postMessage({ command: 'setExpandAll', expandAll: currentExpandAll });
         });
         btnKeepAll.addEventListener('click', () => {
-            sendGlobalMutation(reviewKind === 'opaque' ? 'acknowledge' : 'keepAll');
+            if (btnKeepAll.disabled || btnKeepAll.hidden) { return; }
+            sendGlobalMutation(largeFileReminder ? 'acknowledgeReminder' : reviewKind === 'opaque' ? 'acknowledge' : 'keepAll');
         });
         btnRejectAll.addEventListener('click', () => {
             sendGlobalMutation('revertAll');
@@ -1170,6 +1203,8 @@ export class WebviewDiffPanel {
                 viewGeneration = message.viewGeneration;
                 reviewToken = message.reviewToken;
                 opaqueReviewToken = message.opaqueReviewToken;
+                largeFileReminder = message.largeFileReminder;
+                largeFileReminderToken = message.largeFileReminderToken;
                 serverMutationBusy = message.mutationBusy === true;
                 // Update data and re-render with current style
                 if (typeof message.filePath === 'string') {

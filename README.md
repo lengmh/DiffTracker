@@ -105,6 +105,15 @@ When recording starts, Code Diff Tracker:
 5. Keeps the tree, decorations, CodeLens, and WebView synchronized.
 6. Verifies review version, file state, persistence state, and Git context before mutating reviewed files.
 
+## Storage and Cleanup
+
+- Review state lives in VS Code's workspace-scoped extension storage on the extension host. In Remote-WSL, that host is in WSL. Supported text baselines store full original content, including unchanged files in the captured scope; opaque files store identity metadata, not binary copies. This is not an unlimited copy of every edit. Undo retains up to 10 operations, each potentially covering several files.
+- The 50 MiB limit applies to one serialized session, **not the whole storage directory**. The primary state and last-good copy can use roughly twice that session's size; a temporary write can add another copy. The latest archive and recovery backups can add more.
+- To reduce future baseline size, exclude unneeded build output, dependencies or logs through **Manage Monitoring Scope**, then review and explicitly apply the proposed scope. Exclusion is not a guarantee that all historical or recovery copies are deleted.
+- When the current review is no longer needed, stop recording, then run **Clear Diffs** and confirm to clear its saved baseline, pending review and Undo. This loses review evidence but does not change workspace files; it does not guarantee removal of every backup or secure erasure. While recording, Clear Diffs instead captures a new baseline and may not reduce storage. **Archive and Rebuild** keeps the latest previous archive, so it is not a space-cleanup shortcut.
+
+Do not delete individual session JSON files, recovery intents or failure markers to free space or bypass a recovery warning. Preserve the workspace and extension storage before troubleshooting an interrupted save.
+
 ## Safety and Recovery Behavior
 
 ### Optional Native Review
@@ -134,6 +143,10 @@ This applies to file, block, folder and batch text Keep. Batch confirmation show
 The single-file **Acknowledge Read-only Change** action can accept a verified current identity across stable named branches under the same Git checks as text Keep. It advances only that file’s baseline, leaves other reviews and the repository pause unchanged, and removes only that file’s obsolete Undo entries. It does not save binary before-images or provide binary Revert. Different file content after returning to the original branch becomes pending again. Ordinary single-file Accept/Acknowledge runs directly; conflicts remain visible without accepting a newer version automatically.
 
 Acknowledge and explicit Unknown Reset preserve a complete pre-action session before publication. Interrupted saves recover the prior review rather than relying on an in-memory rollback; unchanged watcher notifications do not invalidate an approved file identity.
+
+Files larger than **64 MiB** use reminders only: the extension does not read their full contents or compute content fingerprints. Reminders compare path, existence and size; same-size content edits and timestamp-only changes are intentionally ignored. Files already present when the baseline is established do not produce an initial reminder. Later additions, size changes and deletions do; renames can appear as deletion of the old path and addition of the new path.
+
+Acknowledging a large-file reminder marks that observed path/size state as seen. It does not verify or accept file contents, replace an earlier text baseline, remove earlier Undo evidence, or provide binary Revert. An earlier review remains preserved when a small file grows beyond the limit. If the file becomes small again, normal review resumes against any preserved before-image; missing original content remains Unknown. Use your own Git or software backups for recovery; the extension does not check that those backups exist.
 
 Ordinary commits on the same named branch do not invalidate the review context.
 

@@ -313,6 +313,12 @@
         "icon": "$(check)"
       },
       {
+        "command": "diffTracker.acknowledgeLargeFileReminder",
+        "title": "Acknowledge Large-file Reminder",
+        "category": "Code Diff Tracker",
+        "icon": "$(check)"
+      },
+      {
         "command": "diffTracker.acceptFile",
         "title": "Accept File Changes",
         "category": "Code Diff Tracker",
@@ -585,6 +591,21 @@
         {
           "command": "diffTracker.showWebviewDiff",
           "when": "view == diffTracker.changesView && viewItem == opaqueFile",
+          "group": "2_review@1"
+        },
+        {
+          "command": "diffTracker.acknowledgeLargeFileReminder",
+          "when": "view == diffTracker.changesView && viewItem == largeFileReminder",
+          "group": "inline"
+        },
+        {
+          "command": "diffTracker.acknowledgeLargeFileReminder",
+          "when": "view == diffTracker.changesView && viewItem == largeFileReminder",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "diffTracker.showWebviewDiff",
+          "when": "view == diffTracker.changesView && (viewItem == largeFileReminder || viewItem == retainedLargeFileReview)",
           "group": "2_review@1"
         },
         {
