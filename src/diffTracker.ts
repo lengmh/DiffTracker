@@ -469,10 +469,7 @@ export class DiffTracker {
                 this.recoveryActionRunning = false;
                 // A→B→A must not revive a write that already observed B. Only
                 // re-enable future actions after the in-flight action has settled.
-                for (const root of [...this.pausedGitRepositories.keys()]) {
-                    const current = this.latestGitContexts.get(root);
-                    if (current) { this.observeGitContext(current); }
-                }
+                this.revalidatePausedGitContexts();
             }
         });
         this.recoveryActionQueue = operation.then(() => undefined, () => undefined);
@@ -5279,7 +5276,10 @@ export class DiffTracker {
         try {
             return await this.performConfiguredMonitoringScopeApply(scope, discardExplicitlyExcludedReviews,
                 requestStillCurrent, expectedAffectedReviewRevision);
-        } finally { this.activeScopeApplications--; }
+        } finally {
+            this.activeScopeApplications--;
+            this.revalidatePausedGitContexts();
+        }
     }
 
     private async performConfiguredMonitoringScopeApply(
@@ -9314,7 +9314,21 @@ export class DiffTracker {
     public setGitContextPending(pending: boolean): void {
         if (this.disposed || this.gitContextPending === pending) { return; }
         this.gitContextPending = pending;
+        if (!pending) {
+            // Ready handlers reconcile while the global initialization gate is
+            // still closed. Recheck any pause observed in that window now,
+            // without requiring another Git event or weakening live validation.
+            this.revalidatePausedGitContexts();
+        }
         this.emitTrackChangesEvent({ fullRefresh: true });
+    }
+
+    private revalidatePausedGitContexts(): void {
+        if (this.disposed) { return; }
+        for (const root of [...this.pausedGitRepositories.keys()]) {
+            const context = this.latestGitContexts.get(root);
+            if (context) { this.observeGitContext(context); }
+        }
     }
 
     public setBaselineGitContexts(contexts: GitContextSnapshot[]): void {
@@ -9364,7 +9378,7 @@ export class DiffTracker {
             // This retains the documented unsupported same-path manual .git
             // replacement boundary; it does not invent historical identity proof.
             let verified: GitContextSnapshot | undefined;
-            if (!this.recoveryActionRunning && !this.baselineTransaction &&
+            if (!this.recoveryActionRunning && !this.baselineTransaction && this.activeScopeApplications === 0 &&
                 !this.archiveRestoreTask && this.restoringEpoch === undefined &&
                 !this.gitContextPending && !this.recoveryBlocked && !this.persistenceFailed &&
                 this.snapshotInitialized && !this.baselineBuilding && !this.workspaceContextChanged) {
@@ -9582,6 +9596,7 @@ export class DiffTracker {
                 this.archiveRestoreStopRequested = false;
                 this.stopRecording();
             }
+            this.revalidatePausedGitContexts();
         });
     }
 

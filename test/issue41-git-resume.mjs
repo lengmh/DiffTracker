@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 /** Production tracker with a controlled authoritative Git boundary; no copied policy. */
 export function registerIssue41GitResume(h) {
@@ -55,6 +56,116 @@ export function registerIssue41GitResume(h) {
             assert.equal(ctx.tracker.getOriginalContent(ctx.target), 'before\n');
             assert.equal(fs.readFileSync(ctx.target, 'utf8'), 'pending\n');
         }));
+    }
+    for (const available of [true, false]) {
+        test(`ISSUE41-GIT initialization release revalidates an observed pause (verified=${available})`, () => fixture(async ctx => {
+            const { tracker, target, a, b, observe } = ctx;
+            const before = tracker.getOriginalContent(target);
+            tracker.revertHistory = [{ id: 'initialization-history', createdAt: new Date().toISOString(), items: [tracker.createFileRevertItem(target)] }];
+            const history = JSON.stringify(tracker.revertHistory);
+            tracker.setGitContextPending(true);
+            observe(b);
+            ctx.setLive(available ? [a] : undefined);
+            // Both production ready paths reconcile before releasing the gate.
+            tracker.reconcileRestoredGitContexts([a]);
+            assert.match(tracker.getGitPauseReason(target), /initialization/);
+            assert.notEqual((await tracker.revertFile(target)).status, 'success');
+            tracker.setGitContextPending(false);
+            assert.equal(!!tracker.getGitPauseReason(target), !available);
+            assert.equal(tracker.getOriginalContent(target), before);
+            assert.equal(tracker.getTrackedChange(target).currentContent, 'pending\n');
+            assert.equal(JSON.stringify(tracker.revertHistory), history);
+            assert.equal(fs.readFileSync(target, 'utf8'), 'pending\n');
+        }));
+    }
+    for (const gateKind of ['archive restore', 'configured scope']) {
+        for (const available of [true, false]) {
+            test(`ISSUE41-GIT outer gate release ${gateKind} revalidates an observed pause (verified=${available})`, () => fixture(async ctx => {
+                const { tracker, target, a, b, observe } = ctx;
+                tracker.revertHistory = [{ id: 'outer-gate-history', createdAt: new Date().toISOString(), items: [tracker.createFileRevertItem(target)] }];
+                const before = {
+                    baseline: tracker.getOriginalContent(target),
+                    pending: JSON.stringify(tracker.getTrackedChange(target)),
+                    history: JSON.stringify(tracker.revertHistory),
+                    bytes: fs.readFileSync(target)
+                };
+                let entered, release, transactionEnded, finish;
+                const transactionEndedPromise = new Promise(resolve => { transactionEnded = resolve; });
+                const finishPromise = new Promise(resolve => { finish = resolve; });
+                const enteredPromise = new Promise(resolve => { entered = resolve; });
+                const releasePromise = new Promise(resolve => { release = resolve; });
+                const method = gateKind === 'archive restore'
+                    ? 'performArchivedGitReviewRestore' : 'performConfiguredMonitoringScopeApply';
+                const original = tracker[method];
+                let rollbacks = 0;
+                tracker[method] = async () => {
+                    // Exercise the real public wrapper and transaction gates;
+                    // only the inner operation is held and conservatively refused.
+                    const transaction = gateKind === 'configured scope'
+                        ? tracker.beginBaselineTransaction(() => { rollbacks++; }) : undefined;
+                    try {
+                        entered();
+                        await releasePromise;
+                        return gateKind === 'archive restore'
+                            ? { status: 'refused', reason: 'Controlled restore refusal' }
+                            : { status: 'conflict', reason: 'Controlled scope refusal', retainedReviews: 0,
+                                discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0 };
+                    } finally {
+                        if (transaction) {
+                            tracker.endBaselineTransaction(transaction, false);
+                            transactionEnded();
+                            await finishPromise;
+                        }
+                    }
+                };
+                const scope = validateAndCanonicalizeScope({ mode: 'wholeWorkspace', includes: [], excludes: [] },
+                    tracker.currentWorkspaceRootIdentities());
+                assert.equal(scope.ok, true);
+                const action = gateKind === 'archive restore'
+                    ? tracker.restoreArchivedGitReview('controlled-restore-token')
+                    : tracker.applyConfiguredMonitoringScope(scope.scope);
+                try {
+                    await Promise.race([enteredPromise, action.then(() => { throw new Error('Operation ended before the outer-gate barrier'); })]);
+                    if (gateKind === 'archive restore') {
+                        assert.ok(tracker.archiveRestoreTask);
+                        assert.equal(tracker.recoveryActionRunning, true);
+                    } else {
+                        assert.ok(tracker.baselineTransaction);
+                        assert.equal(tracker.activeScopeApplications, 1);
+                    }
+                    observe(b); observe(a);
+                    assert.ok(tracker.getGitPauseReason(target), 'compatible return must remain paused while the outer operation is active');
+                    if (!available) ctx.setLive(undefined);
+                    release();
+                    if (gateKind === 'configured scope') {
+                        await transactionEndedPromise;
+                        assert.equal(tracker.baselineTransaction, undefined);
+                        assert.equal(tracker.activeScopeApplications, 1);
+                        observe(a);
+                        assert.ok(tracker.getGitPauseReason(target),
+                            'ending the transaction alone cannot resume while the scope wrapper still owns cleanup');
+                        if (!available) ctx.setLive(undefined);
+                        finish();
+                    }
+                    assert.equal((await action).status, gateKind === 'archive restore' ? 'refused' : 'conflict');
+                    assert.equal(tracker.archiveRestoreTask, undefined);
+                    assert.equal(tracker.recoveryActionRunning, false);
+                    assert.equal(tracker.baselineTransaction, undefined);
+                    assert.equal(tracker.activeScopeApplications, 0);
+                    assert.equal(!!tracker.getGitPauseReason(target), !available,
+                        'releasing the last gate revalidates the live provider without needing another Git event');
+                    assert.equal(rollbacks, gateKind === 'configured scope' ? 1 : 0);
+                    assert.equal(tracker.getOriginalContent(target), before.baseline);
+                    assert.equal(JSON.stringify(tracker.getTrackedChange(target)), before.pending);
+                    assert.equal(JSON.stringify(tracker.revertHistory), before.history);
+                    assert.deepEqual(fs.readFileSync(target), before.bytes);
+                } finally {
+                    release(); finish();
+                    await action;
+                    tracker[method] = original;
+                }
+            }));
+        }
     }
     test('ISSUE41-GIT return during Revert cannot revive the in-flight write', () => fixture(async ctx => {
         const { tracker, target, a, b, observe } = ctx;
