@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.8.6
 
-- Keep folderless windows idle and ignore Git repositories outside the workspace when establishing or updating review baselines. Preserve Git safety checks for parent and nested workspace repositories.
+- Keep windows without workspace folders idle, including restoration of recording sessions saved by older versions.
+- Ignore Git repositories outside the workspace when establishing or updating review baselines, preventing unrelated repository recovery prompts. Preserve Git safety checks for parent and nested workspace repositories.
 
 ## 0.8.5
 

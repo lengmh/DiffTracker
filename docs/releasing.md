@@ -5,7 +5,7 @@ validates its exact bytes through installed acceptance, and only then may publis
 the tag, GitHub Release, VSIX and checksum. Marketplace publication remains a
 separate manual maintainer step.
 
-The source is prepared for **0.8.5**. Version preparation alone does not publish a
+The source is prepared for **0.8.6**. Version preparation alone does not publish a
 tag, GitHub Release or Marketplace package. Review and verify the exact release
 commit and its final VSIX through the gates below before publication.
 
@@ -19,7 +19,7 @@ commit and its final VSIX through the gates below before publication.
    still defaults to **false**; never omit or assume it when a dry run is intended.
 
 The workflow refuses other branches or commits without a successful main push
-Verification run. The 0.8.5 preparation preserves default review behavior:
+Verification run. The 0.8.6 preparation preserves default review behavior:
 WebView remains the factory default, Native Review is selectable and Quick Diff
 remains a separate opt-in.
 
@@ -60,7 +60,7 @@ opaque migration, Marketplace installation or a wider platform matrix. See the
 
 Open **GitHub → Actions → Release → Run workflow**, select `main`, and explicitly
 set the source version and `dry_run: true`. For this preparation the version is
-`0.8.5`. An existing release tag does not block a dry run because it does not
+`0.8.6`. An existing release tag does not block a dry run because it does not
 modify release state.
 
 A dry run executes the full exact-VSIX installed gate and uploads validated build
