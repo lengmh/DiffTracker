@@ -5714,7 +5714,7 @@ registerIssue41AckRecovery({
     setListedFiles: value => { listedFiles = value; }
 });
 
-registerEmptyWindowGit({ test, vscode, Uri, file, seed, scan, getTracker: () => tracker, setListedFiles: value => { listedFiles = value; } });
+registerEmptyWindowGit({ test, vscode, Uri, DiffTracker, file, seed, scan, getTracker: () => tracker, setTracker: value => { tracker = value; }, setListedFiles: value => { listedFiles = value; } });
 registerIssue41GitResume({ test, file, seed, scan, Uri, pause, getTracker: () => tracker });
 
 registerIssue41SelectedOpaque({ test, file, Uri, DiffTracker, pause, getTracker: () => tracker, setTracker: value => { tracker = value; }, setListedFiles: value => { listedFiles = value; } });

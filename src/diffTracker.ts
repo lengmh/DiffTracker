@@ -1082,7 +1082,9 @@ export class DiffTracker {
         const watcherCoverageNeedsS4 = restoreSupplementalPlan?.issue;
         const incomplete = state.baselineState === 'building' || !rootsMatch || !scopeRootsMatch ||
             configuredScopeNeedsReconciliation || !!watcherCoverageNeedsS4;
-        this.isRecording = incomplete ? false : state.isRecording;
+        // Older versions could persist an active session with no folders.
+        // Restoration bypasses Start, so enforce the same idle boundary here.
+        this.isRecording = !incomplete && currentRoots.length > 0 && state.isRecording;
         // An explicit archive restore promises a current-filesystem review even
         // when the saved session was stopped. Observe just this transaction;
         // never change its recording intent or emit a recording-start event.

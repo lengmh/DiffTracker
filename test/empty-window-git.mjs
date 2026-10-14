@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
+import { createLegacyEffectiveScope, validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 // Execute production command/event wiring with the real tracker. Only UI and
 // Git discovery are mocked; this is not an installed VS Code host test.
@@ -33,8 +34,40 @@ function wiring(tracker, vscode, snapshot) {
 }
 
 export function registerEmptyWindowGit(h) {
-    const { test, vscode, Uri, file, seed, scan, getTracker, setListedFiles } = h;
+    const { test, vscode, Uri, DiffTracker, file, seed, scan, getTracker, setTracker, setListedFiles } = h;
     const context = repoRoot => ({ repoRoot, kind: 'repository', headName: 'main', headCommit: 'a'.repeat(40), detached: false, inProgress: false });
+    for (const scope of ['legacy', 'configured']) {
+        for (const recording of [true, false]) {
+            test(`EMPTY-WINDOW persisted zero-root ${scope} recording=${recording} restores stopped across reloads`, async () => {
+                const previousFolders = vscode.workspace.workspaceFolders;
+                const storage = file(`empty-saved-${scope}-${recording}`);
+                fs.mkdirSync(storage);
+                const configured = validateAndCanonicalizeScope({ mode: 'rules', includes: [], excludes: [] }, []);
+                assert.equal(configured.ok, true);
+                const state = {
+                    version: 4, isRecording: recording, baselineState: 'ready', workspaceRoots: [],
+                    fileSnapshots: [], fileModes: [], baselineExistingFiles: [], unresolvedBaselineFiles: [],
+                    opaqueBaselineFiles: [], revertHistory: [], gitContexts: [],
+                    effectiveMonitoringScope: scope === 'legacy' ? createLegacyEffectiveScope([], [])
+                        : { kind: 'configured', ...configured.scope },
+                    retainedReviewPaths: [], coverageGaps: [], legacyWatchExcludeByRoot: []
+                };
+                fs.writeFileSync(path.join(storage, 'session-state.json'), JSON.stringify(state));
+                vscode.workspace.workspaceFolders = [];
+                try {
+                    for (let reload = 0; reload < 2; reload++) {
+                        await getTracker().dispose();
+                        const tracker = new DiffTracker(Uri.file(storage)); setTracker(tracker);
+                        assert.equal(await tracker.restorePersistedState(), 'restored');
+                        assert.equal(tracker.getIsRecording(), false);
+                        assert.equal(tracker.externalWatcherEnabled, false);
+                        assert.equal(await tracker.flushPendingPersistence(), true);
+                        assert.equal(JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'))).isRecording, false);
+                    }
+                } finally { vscode.workspace.workspaceFolders = previousFolders; }
+            });
+        }
+    }
     for (const state of ['fresh', 'reopened', 'restored']) {
         test(`EMPTY-WINDOW ${state} ignores Git events and stays quiet before recording`, async () => {
             const tracker = getTracker(), previousFolders = vscode.workspace.workspaceFolders;
