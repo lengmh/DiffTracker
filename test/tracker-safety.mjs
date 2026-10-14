@@ -1,3 +1,4 @@
+import { registerEmptyWindowGit } from './empty-window-git.mjs';
 import { registerLargeFileReminders } from './large-file-reminders.mjs';
 import { registerIssue41SelectedOpaque } from './issue41-selected-opaque.mjs';
 import { registerIssue41GitResume } from './issue41-git-resume.mjs';
@@ -5713,6 +5714,7 @@ registerIssue41AckRecovery({
     setListedFiles: value => { listedFiles = value; }
 });
 
+registerEmptyWindowGit({ test, vscode, Uri, file, seed, scan, getTracker: () => tracker, setListedFiles: value => { listedFiles = value; } });
 registerIssue41GitResume({ test, file, seed, scan, Uri, pause, getTracker: () => tracker });
 
 registerIssue41SelectedOpaque({ test, file, Uri, DiffTracker, pause, getTracker: () => tracker, setTracker: value => { tracker = value; }, setListedFiles: value => { listedFiles = value; } });

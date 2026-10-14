@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keep folderless windows idle and ignore Git repositories outside the workspace when establishing or updating review baselines. Preserve Git safety checks for parent and nested workspace repositories.
+
 ## 0.8.5
 
 - Revalidate compatible Git returns without reloading or rebuilding review baselines; retain pending reviews and Undo, and keep in-flight writes blocked after an incompatible transition.

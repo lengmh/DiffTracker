@@ -211,7 +211,7 @@ test('production start blocks invalid monitoring scope configuration',async()=>{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
-        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+        vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
@@ -241,7 +241,7 @@ test('production start revalidates scope after rebuild confirmation',async()=>{
             discardRecoveryState:async()=>{calls.push('discard');return true;},
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
-        vscode:{commands:{executeCommand:async()=>{}},window:{
+        vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{
             showWarningMessage:async()=>undefined,
             showErrorMessage:async()=>{
                 status={
@@ -281,7 +281,7 @@ test('production start blocks reset Workspace scope when configured effective di
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
-        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+        vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
@@ -309,7 +309,7 @@ test('production start blocks an unapplied configured scope revision',async()=>{
             isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
-        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
+        vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
     };
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
@@ -336,7 +336,7 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
             expansionReasons:[],
             consented:true
         })},
-        vscode:{commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
+        vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}};
     vm.createContext(sandbox);vm.runInContext(ts.transpileModule(`let recordingRequest=0,testRecordingContext;${declarations.join('\n')}globalThis.flows={startRecordingFlow,stopRecordingFlow,handleGitContextEvent};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     let start;if(scenario!=='restored'){start=sandbox.flows.startRecordingFlow();await Promise.resolve();assert.deepEqual(calls,[]);}
     if(scenario==='stopped')sandbox.flows.stopRecordingFlow();

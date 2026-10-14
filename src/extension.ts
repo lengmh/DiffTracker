@@ -138,6 +138,8 @@ export async function activate(context: vscode.ExtensionContext) {
     let recordingRequest = 0;
     const startRecordingFlow = async (): Promise<boolean> => {
         const request = ++recordingRequest;
+        // Empty windows have no supported monitoring scope or baseline to recover.
+        if (!vscode.workspace.workspaceFolders?.some(folder => folder.uri.scheme === 'file')) { return false; }
         // Establish Git identity before capturing a fresh baseline; never adopt
         // a late context onto snapshots that might predate a checkout.
         if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
@@ -1360,7 +1362,8 @@ export async function activate(context: vscode.ExtensionContext) {
     } else if (!gitContextAvailable) {
         diffTracker.setGitContextPending(false);
     }
-    if (!gitContextAvailable && !runningExtensionTests) {
+    if (!gitContextAvailable && !runningExtensionTests &&
+        vscode.workspace.workspaceFolders?.some(folder => folder.uri.scheme === 'file')) {
         void vscode.window.showWarningMessage(
             'Code Diff Tracker: Git context monitoring is unavailable. Ordinary review continues, but branch/worktree safety detection is disabled.'
         );
