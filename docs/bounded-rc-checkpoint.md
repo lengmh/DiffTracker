@@ -4,7 +4,7 @@
 - 前置基线：已合并的 [PR #20](https://github.com/lengmh/DiffTracker/pull/20)，`main@52c209533b2ca65e3f6531a1dd903e8706466b7e`。
 - 前置验证：[Verification #543](https://github.com/lengmh/DiffTracker/actions/runs/37593362839)，attempt 1、7/7 成功。该轮 tracker 1070、Native Review 38、review UI 35；Windows/Ubuntu Stable 1.140.0 和 Ubuntu 1.80.2 各有 12 条实际 Native PASS。详见 [上一检查点](./s5-native-review-checkpoint.md)。
 - 当前核验主线：[`ef41d2c496875a1de0d894df5f0973df01676f1e`](https://github.com/lengmh/DiffTracker/commit/ef41d2c496875a1de0d894df5f0973df01676f1e)，tree `7808593414f0935cff3d3f6c4bae9416d9cadbf1`；[Verification #551](https://github.com/lengmh/DiffTracker/actions/runs/37620008513) attempt 1，8/8 成功。
-- 发布边界：当前另行准备 `0.8.0` 源码版本、说明与最终 VSIX 门禁；PR #21 的通过不等于发布准备 PR 的 CI 或最终发布包已通过。未创建发布 tag、GitHub release 或 Marketplace 包，实际发布仍需单独授权及[发布门禁](./releasing.md)。
+- 发布边界：本检查点不包含发布 tag、GitHub release 或 Marketplace 包；PR #21 的通过不等于 `0.8.0` 发布准备 PR 的 CI 或最终发布包已通过。最终发布包须另行完成[发布门禁](./releasing.md)。
 
 ## 1. 交付范围与保留契约
 
@@ -76,7 +76,7 @@
 
 失败必须保留最初日志与修正范围；尚未返回、跳过或仅包装成功均不能记为验收通过。本批结论只覆盖下述确切提交和约定的有限场景。已可靠拒绝的范围外场景不自动扩成新开发批次；支持范围内的实质安全问题必须修复或可靠阻断。
 
-以下按首次观测顺序保留历史记录；其中「待核对」「下一次」描述当时状态，最终结论见第 6 节。
+以下保留历史失败、诊断与修正，最终结论见第 6 节。
 
 ## 首次 CI 启动检查
 
@@ -135,4 +135,4 @@
 - #549 的 Whole Workspace→Rules durable-preparation 失败原因仍未确定。独立诊断捕获的是更早的设置事件引发的 Whole Workspace Apply 拒绝；夹具修正只移除了这一已证实来源。最终两轮通过不能追溯改写为已确定或全面修复 #549 的根因。
 - WebView 仍是出厂默认；Native Review 是可选入口，Quick Diff 独立选择且默认关闭。支持平台、资源预算、Session V4 和后端安全语义不变。
 
-当前 `0.8.0` 发布准备仅整理版本元数据、用户说明和发布门禁，不新增功能，不切换默认入口，也不执行发布。最终发布 VSIX 必须在上传、创建 tag 或 GitHub release 前，以实际待发布字节完成门禁，并关联校验值、包版本、源码提交、验证 run 和 attempt；详见 [Releasing](./releasing.md)。#550/#551 的内部候选验证不能替代这一步，也不表示本次发布准备 PR 的 CI 或未来 release dry-run 已通过。
+`0.8.0` 发布准备仅涉及版本元数据、用户说明和发布门禁；设置选择与有界 RC 的功能验证见上述证据。最终发布 VSIX 必须在上传、创建 tag 或 GitHub release 前，以实际待发布字节完成门禁，并关联校验值、包版本、源码提交、验证 run 和 attempt；详见 [Releasing](./releasing.md)。#550/#551 的内部候选验证不能替代这一步，也不表示发布准备 PR 的 CI 或 release dry-run 已通过。

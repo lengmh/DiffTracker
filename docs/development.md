@@ -21,3 +21,7 @@ This guide is for contributors building Code Diff Tracker from source. For insta
 - `npm run package`: build a VSIX for local installation.
 
 For focused tests, see the scripts in [`package.json`](../package.json). For publishing requirements, see [Releasing](releasing.md).
+
+## Public documentation
+
+Keep personal paths, private task or conversation logs, and raw user workspace data out of public commits. Retain product plans, ADRs, test boundaries, failure evidence, and reproducible verification links; summarize task coordination without changing the provenance or limits of real measurements.
