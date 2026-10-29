@@ -4,7 +4,7 @@
 - 总问题：[Issue #55](https://github.com/lengmh/DiffTracker/issues/55)
 - 核查基线：`main` / `ce4faf39ac66ef5f1ba8093fced0b9251146f060`，package `0.8.10`
 - 执行分支：`fix/55-coverage-scope-single-action`
-- 状态：**已开始实现；首批覆盖目录 `change` 的自动协调与定向回归，A0/A1 尚未全部验收，A2–A5 待继续。保持 Draft。**
+- 状态：**已实现受控完整排除复现链，以及 A1/A2 的核心目录协调和排除收尾；A3–A5 与完整 33 项验收待继续。保持 Draft。**
 - 交付形式：一个总 issue、一个 Draft PR。该 PR 初始只承载本计划，后续实现继续沿用它；不能仅合并计划就关闭 issue。
 
 ## 1. 要解决的完整问题
@@ -288,8 +288,13 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 | 定向测试 | 新增 9 项 tracker 回归。旧代码确定性复现 directory-change gap 残留；另复现补充遍历进入已排除孩子目录。首轮全量 tracker 为 1575/1576，修正并发残留后本地 `npm test` 通过（tracker 1577/1577）。随后补充保护已排除旧证据、pending-scope 控制证据与保存失败回滚；最终代码定向 9/9、S4-B 46/46、lint、编译和 VSIX 检查通过。最终 exact-head 全量 CI 结果见 PR #56 |
 | 真实 Host | 新增真实目录元数据通知与恢复后持续子文件观察的 Host 用例；本地缺少 Xvfb，未执行真实 Host。初始 head `04ea7d1e33390dd50b0fb1dabd0709cbaeb02ca9` 的 [Verification #677](https://github.com/lengmh/DiffTracker/actions/runs/40927049234) 中 Windows Stable Host、installed RC、降级拒绝通过；Linux Stable/1.80 因用例假定通知必须为 `change` 而超时。本地原生探针确认 Linux 报告 `rename`；用例已改为接受并原样转发平台真实通知，确定性测试继续单独覆盖 `change`。修正提交的完整 CI 结果见 PR #56 |
 | 完整 CI 与修复自动 review | 本批次 exact SHA、Verification URL 和实际结果记录在 PR #56。A0–A5 完整 diff 尚未就绪，未请求修复自动 review；后续完成整体实现后再请求一次 |
+| 第二批 A0/A1 | 固定 `82b9d2882f9dc3c967b9aff95a523472ed092fc6` 源码，受控保留 directory-change gap 后，复现 Apply 残留、手动 Recheck 清除的完整链，同时保留不相关真实失败、待审与 Unknown。目录 native rename 已不再冒充子文件创建证据；明确 create 的身份绑定来源随 runtime 协调任务保留。create/change/native rename 共用有界运行入口，父/子 create 逆序通知在安装独立 owner 前合并；底层独立 handoff 原语及原有并发 owner 回归保留。补齐父通知发现身份替换、核验中写入/替换、持续忙碌有限退出及稳定后的持续观察 |
+| 第二批 A2 | 已知目录诊断按实际根和完整排除子树投影为 dormant，保留持久证据；排除孩子时释放其 owner，保留上级与其他根。排除通知在登记覆盖版本前过滤；owner 身份失效、无文件名事件和祖先真实失败保留。范围判断先证明最早排除祖先，避免为深层旧 gap 枚举排除区；Recheck 不再把未扫描的排除子树证据当作已核验。补齐多类 reason、排除噪声、Reload、重新纳入新基线及后续观察回归 |
+| 第二批验证 | 最终代码 Issue #55 定向 22/22、原 S4-B 46/46、原 S4-C 40/40 通过。本地完整 `npm test` 通过（tracker 1590/1590，发生在最后的排除文件通知守卫及逆序创建新增用例之前）；最终代码定向已覆盖新增守卫。真实 Host 增加 Apply 当次诊断/owner 收尾及排除区继续建目录后兄弟观察用例；本批 exact SHA、完整 CI 和 Host 实际结果记录在 PR #56 |
 | 合并与发布 | 未执行 |
 
 后续每个 checkpoint 更新此表并记录 exact head、实际通过/失败项目与下一批范围。计划文档不是修复完成证据。
 
-首批仍未完成：A0 的完整 exclusion → Apply → Recheck 链及全部混合证据；A1 的 create/rename 与 change 全入口统一、目录替换/父通知及持久化故障矩阵；A2 的旧 gap 活动投影、排除后新事件过滤与 owner 资源收尾；A3/A4 的命令、面板、Restore 编排及部分完成反馈；A5 的 33 项矩阵、完整 Host/CI、自审和自动 review。不得据本批次关闭 #55 或将 PR 改为 Ready。
+第二批复现使用 dirty editor 守卫受控保留自动核验前的 gap，再在移除该阻碍后执行排除与 Recheck。它证明了固定源码中的排除收尾机制，不代表现场由 dirty editor 导致；现场安装版本、完整规则和事件顺序仍未独立取得。
+
+仍未完成：A3/A4 的普通资源与告警入口统一、Save and Apply、Restore、必要的定向核验编排、取消/并发/部分完成反馈及 README/ADR 同步；A5 的完整 33 项矩阵、最终 exact-head Host/CI、整体独立自审和一次自动 review。底层 Apply 后重新纳入的覆盖核验已经由独立原语回归验证，自动接续属于 A3；不能把该底层多步测试当成高层单次操作已经完成。不得据本批次关闭 #55 或将 PR 改为 Ready。

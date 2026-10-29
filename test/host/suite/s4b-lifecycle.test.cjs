@@ -22,6 +22,7 @@ async function directoryChangeHost(workspace) {
     const root = vscode.Uri.file(path.join(workspace, 's4b-change-owner')).fsPath;
     const child = path.join(root, 'existing');
     const target = path.join(child, 'tracked.txt');
+    const sibling = path.join(root, 'sibling.txt');
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
     let observedNotification = false;
@@ -38,6 +39,7 @@ async function directoryChangeHost(workspace) {
     try {
         fs.mkdirSync(child, {recursive:true});
         fs.writeFileSync(target, 'known before\n');
+        fs.writeFileSync(sibling, 'sibling before\n');
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(root));
         const requested = validateAndCanonicalizeScope({mode:'rules',
             includes:[{scope:'folder',folder:folder.name,path:'s4b-change-owner'}], excludes:[]
@@ -50,6 +52,8 @@ async function directoryChangeHost(workspace) {
         tracker.snapshotInitialized = true;
         tracker.fileSnapshots.set(target, 'known before\n');
         tracker.baselineExistingFiles.add(target);
+        tracker.fileSnapshots.set(sibling, 'sibling before\n');
+        tracker.baselineExistingFiles.add(sibling);
         await tracker.installSupplementalCoverageTargets([root], tracker.sessionEpoch, true);
         tracker.commitSupplementalCoverageTargets([root]);
         assert.equal(tracker.fileWatchers.length, 0, 'only native observation may deliver this scenario');
@@ -66,6 +70,25 @@ async function directoryChangeHost(workspace) {
             tracker.getTrackedChange(target)?.currentContent === 'later observed edit\n');
         assert.equal(tracker.getOriginalContent(target), 'known before\n');
         console.log('PASS HOST-ISSUE-55 real directory notification reconciles automatically and keeps observing child edits');
+        const excluded = validateAndCanonicalizeScope({mode:'rules', includes:requested.scope.includes,
+            excludes:[{scope:'folder',folder:folder.name,pattern:'/s4b-change-owner/existing/'}]
+        }, tracker.currentWorkspaceRootIdentities());
+        assert.equal(excluded.ok, true);
+        tracker.setSubtreeCoverageGap(child, 'supplemental-watcher-directory-change-gap', 'Earlier directory uncertainty');
+        const result = await tracker.applyConfiguredMonitoringScope(excluded.scope, true);
+        assert.equal(result.status, 'applied', JSON.stringify(result));
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), [], 'Apply completes excluded diagnostics without Recheck');
+        assert.equal(tracker.supplementalDirectoryWatchers.has(child), false);
+        assert.ok(tracker.coverageGaps.get(child)?.subtree, 'unscanned excluded evidence remains durable');
+        fs.mkdirSync(path.join(child, 'excluded-new-directory'));
+        fs.writeFileSync(path.join(child, 'excluded-new-directory', 'ignored.txt'), 'excluded contents\n');
+        await delay(300);
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+        fs.writeFileSync(sibling, 'sibling observed after exclusion\n');
+        await until('continued sibling observation after child exclusion', () =>
+            tracker.getTrackedChange(sibling)?.currentContent === 'sibling observed after exclusion\n');
+        assert.equal(tracker.getOriginalContent(sibling), 'sibling before\n');
+        console.log('PASS HOST-ISSUE-55 Apply retires excluded diagnostics and owners while native sibling observation continues');
     } finally {
         fs.watch = nativeWatch;
         await tracker.dispose();
