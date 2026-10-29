@@ -1120,6 +1120,58 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.equal(tracker.getTrackedChange(target)?.currentContent, 'still observed');
     }, 'rules'));
 
+    test('Issue #55 excluded directory delete and recreate cannot dirty its parent verification', () => fixture(async ({tracker,dir}) => {
+        const {blind,child,scope}=await lifecycleFixture(tracker,dir);
+        const sibling=path.join(blind,'sibling.txt');fs.writeFileSync(sibling,'before');
+        const excluded=configuredScope(tracker,scope.mode,scope.includes,[{scope:'all',pattern:'/lifecycle-blind/child/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(excluded,true)).status,'applied');
+        const parent=activeNativeWatcher(nativeDirectoryWatchers,blind);
+        const revision=tracker.supplementalDirectoryWatchers.get(blind).eventRevision??0;
+        const prepare=tracker.prepareImportedCoverageHandoff;
+        let excludedDeletes=0;
+        tracker.prepareImportedCoverageHandoff=async function(...args){
+            const result=await prepare.apply(this,args);
+            if(excludedDeletes<2){
+                excludedDeletes++;fs.rmSync(child,{recursive:true});parent.listener('rename','child');fs.mkdirSync(child);
+            }
+            return result;
+        };
+        try{
+            await tracker.onExternalFileChanged(Uri.file(blind));
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'excluded churn must not consume both verification passes');
+            await tracker.onExternalFileChanged(Uri.file(blind));
+        }finally{tracker.prepareImportedCoverageHandoff=prepare;}
+        assert.equal(excludedDeletes,2);
+        assert.equal(tracker.directoryObservations.size,0);
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+        assert.equal(tracker.supplementalDirectoryWatchers.get(blind).eventRevision??0,revision);
+        assert.equal(tracker.getOriginalContent(sibling),'before');
+        fs.writeFileSync(sibling,'after excluded churn');parent.listener('change','sibling.txt');await settle(tracker);
+        assert.equal(tracker.getTrackedChange(sibling)?.currentContent,'after excluded churn');
+        assert.equal(tracker.getOriginalContent(sibling),'before');
+    },'rules'));
+
+    test('Issue #55 a formerly excluded directory becoming a regular file remains observable', () => fixture(async ({tracker,dir}) => {
+        const {blind,child,scope}=await lifecycleFixture(tracker,dir);
+        const excluded=configuredScope(tracker,scope.mode,scope.includes,[{scope:'all',pattern:'/lifecycle-blind/child/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(excluded,true)).status,'applied');
+        const parent=activeNativeWatcher(nativeDirectoryWatchers,blind);
+        fs.rmSync(child,{recursive:true});parent.listener('rename','child');
+        fs.writeFileSync(child,'replacement regular file');parent.listener('rename','child');await settle(tracker);
+        assert.equal(tracker.getTrackedChange(child)?.currentContent,'replacement regular file');
+        // This explicit test-user approval establishes the file before-image;
+        // directory exclusion itself must never accept the replacement file.
+        if(tracker.getTrackedChange(child)?.reviewKind==='unknown'){
+            assert.equal((await tracker.resetUnknownBaseline(child)).status,'success');
+        }else{assert.equal((await tracker.keepAllChangesInFile(child)).status,'success');}
+        assert.equal(tracker.getOriginalContent(child),'replacement regular file');
+        const revision=tracker.supplementalDirectoryWatchers.get(blind).eventRevision??0;
+        fs.unlinkSync(child);parent.listener('rename','child');await settle(tracker);
+        assert.ok((tracker.supplementalDirectoryWatchers.get(blind).eventRevision??0)>revision,'a known file deletion must be registered');
+        assert.equal(tracker.getTrackedChange(child)?.isDeleted,true);
+        assert.equal(tracker.getOriginalContent(child),'replacement regular file');
+    },'rules'));
+
     test('Issue #55 excluded evidence stays dormant after Reload and reinclude gets a fresh baseline and live observation', () => fixture(async ({tracker,dir}) => {
         const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
         fs.writeFileSync(target, 'pending before exclusion');

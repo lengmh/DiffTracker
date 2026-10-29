@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import Module, { createRequire } from 'node:module';
+import { registerScopeSingleActionAcceptance } from './scope-single-action-acceptance.mjs';
 const require = createRequire(import.meta.url);
 
 // Exercise the production tracker through the normal pause/withdraw/recheck
@@ -184,7 +185,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 };
             }
             const outcome=await controller.restoreEffectiveScopeConfiguration();
-            assert.equal(outcome.status,situation==='stopped'?'restored':'partial',JSON.stringify(outcome));
+            assert.equal(outcome.status,situation==='external-settings'?'partial':'restored',JSON.stringify(outcome));
             assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
             assert.equal(tracker.getIsRecording(),situation!=='stopped');
             assert.equal(tracker.getOriginalContent(files.changed),'original');
@@ -192,7 +193,8 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 assert.equal(outcome.coverageStatus,'deferred');
                 assert.equal(tracker.getTrackedChange(files.changed)?.reviewKind,'unknown');
             } else if (situation === 'real-failure') {
-                assert.equal(outcome.coverageStatus,'limited');
+                assert.equal(outcome.coverageStatus,'verified');
+                assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===files.other));
                 assert.deepEqual(config.watchExclude,[]);
                 assert.equal(tracker.coverageGaps.get(files.other)?.file?.reasonCode,'file-read-failed');
             } else {
@@ -236,7 +238,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         });
     },'rules'));
 
-    for (const situation of ['cancel','settings-failure','external-settings','verification-failure'])
+    for (const situation of ['cancel','settings-failure','external-settings','unrelated-failure'])
     test(`SCOPE-RECOVERY Save and Apply ${situation} reports only durable, owned results`, () => fixture(async ({tracker,dir,scope}) => {
         const removed=path.join(dir,'remove'); fs.mkdirSync(removed);
         const target=path.join(removed,'pending.txt'), other=path.join(dir,'other.txt');
@@ -244,7 +246,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
         fs.writeFileSync(target,'pending'); await tracker.readFileAndUpdate(target,Uri.file(target));
         const token=tracker.getReviewToken(target);
-        if (situation === 'verification-failure') {
+        if (situation === 'unrelated-failure') {
             tracker.setFileCoverageGap(other,'file-read-failed','Independent read failure');
             tracker.markFileUnavailable(other,'Independent read failure');
         }
@@ -259,8 +261,8 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             const proposal={mode:'wholeWorkspace',includes:[{scope:'all',path:'new-inc'}],excludes:[{scope:'all',pattern:'/remove/'}]};
             let confirmations=0;
             const outcome=await controller.saveAndApplyScope(proposal,async()=>{confirmations++;return situation!=='cancel';});
-            const committed=situation==='verification-failure';
-            assert.equal(outcome.status,situation==='cancel'?'cancelled':situation==='settings-failure'?'failed':'partial',JSON.stringify(outcome));
+            const committed=situation==='unrelated-failure';
+            assert.equal(outcome.status,situation==='cancel'?'cancelled':situation==='settings-failure'?'failed':situation==='unrelated-failure'?'applied':'partial',JSON.stringify(outcome));
             assert.equal(outcome.scopeCommitted,committed);
             assert.equal(confirmations,1);
             if (situation==='cancel' || situation==='settings-failure') {
@@ -273,11 +275,12 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 assert.equal(writes.length,1);
             } else {
                 assert.ok(config.watchExclude.some(rule=>rule.pattern==='/remove/'));
-                assert.equal(outcome.coverageStatus,'limited');
+                assert.equal(outcome.coverageStatus,'verified');
+                assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===other));
                 assert.equal(tracker.getTrackedChange(target),undefined);
                 assert.equal(tracker.coverageGaps.get(other)?.file?.reasonCode,'file-read-failed');
                 const retried=await controller.saveAndApplyScope(proposal,async()=>{throw new Error('Retry must not discard the same review again');});
-                assert.equal(retried.status,'partial');
+                assert.equal(retried.status,'applied');
                 assert.ok(config.watchExclude.some(rule=>rule.pattern==='/remove/'));
             }
             assert.equal(fs.readFileSync(target,'utf8'),'pending');
@@ -617,4 +620,5 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         });
     }));
 
+    registerScopeSingleActionAcceptance(h,fixture,scopeFor,withController);
 }

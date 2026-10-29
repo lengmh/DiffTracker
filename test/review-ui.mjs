@@ -481,6 +481,11 @@ function coverageExclusionHarness(){
         getCommittedLegacyCompatibilityPolicy:()=>[],
         getExplicitlyExcludedPendingReviewPaths:()=>[],
         getExplicitlyExcludedReviewRevision:()=> 'stable-empty-review',
+        getScopeOperationRecoveryTargets:()=>h.state.scopeRecoveryTargets??[],
+        getScopeOperationCoverageGaps:()=>({related:h.state.relatedScopeCoverageGaps??[],
+            unrelated:h.state.unrelatedScopeCoverageGaps??h.tracker.getCoverageGaps?.()??[]}),
+        retainScopeOperationRecovery:async()=>true,
+        recheckScopeOperationCoverage:(...args)=>h.tracker.recheckObservationCoverage(...args),
         applyConfiguredMonitoringScope:async(scope,discard,current)=>{
             assert.equal(current(),true,'the applied request must still be current');
             effective={kind:'configured',...scope};
@@ -2471,8 +2476,10 @@ for(const scenario of ['cancel','partial','newer-draft'])await test(`scope edito
     const raw='[ { "scope": "all", "pattern": "**/*.tmp" }, { "scope": "all", "pattern": "/a/" } ]';
     ui.input('excludes',raw);
     if(scenario==='partial'){
-        h.tracker.getCoverageGaps=()=>[['independent','Independent observation failure']];
-        h.tracker.recheckObservationCoverage=async()=>({status:'limited',reason:'Independent observation failure'});
+        h.state.scopeRecoveryTargets=[{path:h.targets[1],kind:'subtree',workspaceRoot:h.tracker.getEffectiveMonitoringScope().roots[0].uri}];
+        h.state.relatedScopeCoverageGaps=[[h.targets[1],'Required operation observation failure']];
+        h.tracker.getCoverageGaps=()=>h.state.relatedScopeCoverageGaps;
+        h.tracker.recheckObservationCoverage=async()=>({status:'limited',reason:'Required operation observation failure'});
     }
     if(scenario==='newer-draft')h.state.duringConfirmation=()=>ui.input('excludes','[ newer queued draft');
     ui.click('save-apply');await ui.action();

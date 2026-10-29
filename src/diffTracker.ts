@@ -17,6 +17,12 @@ export interface ObservationCoverageRecheckResult {
     reason?: string;
 }
 
+export interface ScopeCoverageTarget {
+    path: string;
+    kind: 'file' | 'subtree';
+    workspaceRoot: string;
+}
+
 export type ArchivedGitReviewPreview = {
     status: 'ready';
     token: string;
@@ -307,6 +313,7 @@ interface CoverageGapEvidence {
     targetKind: 'file' | 'subtree';
     reasonCode: string;
     reason: string;
+    scopeOperationRevision?: string;
 }
 
 interface CoverageGapRecord {
@@ -843,6 +850,8 @@ export class DiffTracker {
     private supplementalIdentityTimer?: NodeJS.Timeout;
     private supplementalIdentitySweepRunning = false;
     private supplementalCoverageRoots = new Set<string>();
+    // Historical kind only; never coverage proof or child absence provenance.
+    private excludedDirectoryKinds = new Map<string, {epoch:number; workspaceRoot:string; parent:fs.BigIntStats}>();
     private directoryObservations = new Map<string, {
         directory: string; workspaceRoot: string; dirty: boolean; done: Promise<void>;
         creations: Map<string, fs.BigIntStats>; current: () => boolean;
@@ -1325,6 +1334,18 @@ export class DiffTracker {
     }
 
     public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        return this.queueObservationCoverageRecheck();
+    }
+
+    public recheckScopeOperationCoverage(targets: readonly ScopeCoverageTarget[], revision: string): Promise<ObservationCoverageRecheckResult> {
+        if (this.getEffectiveMonitoringScope().scopeRevision !== revision || targets.length === 0 ||
+            targets.some(target => this.coverageGaps.get(target.path)?.[target.kind]?.scopeOperationRevision !== revision)) {
+            return Promise.resolve({status:'conflict',reason:'The operation recovery scope changed before verification.'});
+        }
+        return this.queueObservationCoverageRecheck(targets.map(target => ({...target})));
+    }
+
+    private queueObservationCoverageRecheck(targets?: readonly ScopeCoverageTarget[]): Promise<ObservationCoverageRecheckResult> {
         const epoch = this.sessionEpoch;
         if (this.coverageRecheckEpoch !== undefined) {
             return Promise.resolve({ status: 'conflict', reason: 'Observation coverage is already being rechecked.' });
@@ -1334,7 +1355,7 @@ export class DiffTracker {
         return this.queueRecoveryAction(async () => {
             const completion: { failureReason?: string } = {};
             try {
-                const result = await this.performObservationCoverageRecheck(epoch, completion);
+                const result = await this.performObservationCoverageRecheck(epoch, completion, targets);
                 // Our own safe pause advances epoch too. Keep its failure local
                 // to this invocation rather than inspecting a newer session.
                 if (completion.failureReason) { return { status: 'failed', reason: completion.failureReason }; }
@@ -1351,17 +1372,22 @@ export class DiffTracker {
 
     private async performObservationCoverageRecheck(
         epoch: number,
-        completion: { failureReason?: string }
+        completion: { failureReason?: string },
+        targets?: readonly ScopeCoverageTarget[]
     ): Promise<ObservationCoverageRecheckResult> {
+        const selected = (filePath: string) => !targets || targets.some(target => this.scopeCoverageTargetContains(target,filePath));
+        const dirty = () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty && selected(document.uri.fsPath));
+        const gitPaused = () => [...this.pausedGitRepositories.keys()].some(root => !targets || targets.some(target =>
+            this.pathBelongsToRoot(target.path,root) || (target.kind==='subtree' && this.pathBelongsToRoot(root,target.path))));
         const conflict = (reason: string): ObservationCoverageRecheckResult => ({ status: 'conflict', reason });
         if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
             this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
             this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
-            this.pausedGitRepositories.size > 0 || this.workspaceContextChanged || this.pendingMonitoringScope ||
+            gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
             this.effectiveMonitoringScope.kind !== 'configured') {
             return conflict('Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.');
         }
-        if (vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty)) {
+        if (dirty()) {
             return conflict('Save or discard unsaved editor changes before rechecking observation coverage.');
         }
         const scope = this.effectiveMonitoringScope;
@@ -1371,16 +1397,17 @@ export class DiffTracker {
         const current = () => this.isCurrentEpoch(epoch) && this.isRecording &&
             this.coverageRecheckEpoch === epoch && this.activeScopeApplications === 0 &&
             this.effectiveMonitoringScope === scope && !this.pendingMonitoringScope &&
-            !this.workspaceContextChanged && !this.gitContextPending && this.pausedGitRepositories.size === 0 &&
-            !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty) &&
+            !this.workspaceContextChanged && !this.gitContextPending && !gitPaused() &&
+            !dirty() &&
             this.watcherCoverageRevision === watcherRevision && this.ignoreRefreshVersion === ignoreVersion &&
             this.ignorePolicyRevision === policyRevision;
-        if (!await this.drainDeferredScopeApplyEvents(epoch) || !current()) {
+        if ((!targets && !await this.drainDeferredScopeApplyEvents(epoch)) ||
+            (targets && (this.activeExternalOperations.size > 0 || this.activeCreations.size > 0)) || !current()) {
             return conflict('Workspace activity or scope changed before Recheck could begin; retry after it settles.');
         }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) { return conflict(identityIssue); }
-        const plan = this.configuredSupplementalCoveragePlan(scope);
+        const plan = targets ? {targets:[] as string[],issue:undefined} : this.configuredSupplementalCoveragePlan(scope);
         if (plan.issue) { return conflict(`Observation coverage cannot be safely reinstalled at ${plan.issue}. Existing review is preserved.`); }
 
         // Saved manual exclusions pause reads before Apply. Withdrawing them
@@ -1390,6 +1417,7 @@ export class DiffTracker {
         const controlGaps: Array<[string, CoverageGapEvidence]> = [];
         const importedDirectoryGaps: Array<[string, CoverageGapEvidence]> = [];
         for (const [target, record] of this.coverageGaps) {
+            if (!selected(target)) { continue; }
             if (record.subtree && this.isImportedDirectoryCoverageGap(record) &&
                 !this.scopeExplicitlyExcludesDirectory(target) &&
                 !this.isPathIgnored(vscode.Uri.file(target), true, false, false)) {
@@ -1408,7 +1436,9 @@ export class DiffTracker {
         const markers = new Map<string, CoverageGapEvidence>();
         const budget = this.createCandidatePersistenceBudget();
         try {
-            for (const root of this.sessionWorkspaceRoots) {
+            // Scoped recovery retains its exact revision-bound evidence first.
+            // Only explicit full Recheck needs a new workspace-root marker.
+            for (const root of targets ? [] : this.sessionWorkspaceRoots) {
                 const previous = this.coverageGaps.get(root)?.subtree;
                 if (previous) {
                     if (previous.reasonCode === 'coverage-recheck-incomplete') { markers.set(root, previous); }
@@ -1423,13 +1453,16 @@ export class DiffTracker {
             return { status: 'failed', reason: `Recheck cannot reserve durable coverage evidence: ${String(error)}` };
         }
         for (const [root, evidence] of markers) {
-            if (!this.coverageGaps.get(root)?.subtree) {
+            if (!this.coverageGaps.get(root)?.[evidence.targetKind]) {
                 this.setCoverageGap(root, evidence, false);
             }
         }
         this.restoringEpoch = epoch;
         this.coverageRecheckOverflow = false;
         this.emitTrackChangesEvent({ fullRefresh: true });
+        const handoffs: ImportedCoverageHandoff[] = [];
+        const hostParents = new Map<string, fs.BigIntStats>();
+        const hostWatchers = this.fileWatchers;
         try {
             const initialSaved = await this.flushPendingPersistence();
             // False also means the writer was superseded by Stop/Start or
@@ -1440,27 +1473,86 @@ export class DiffTracker {
                 return { status: 'failed', reason: this.persistenceIssue };
             }
             if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
-            this.activateExternalWatchers(this.createExternalWatchers(epoch));
+            const preparationBudget = {remainingEntries:this.maxScopePreflightEntries};
+            const requiredFileCoverage = targets?.some(target => target.kind === 'file')
+                ? this.configuredSupplementalCoveragePlan(scope) : undefined;
+            if (!targets) { this.activateExternalWatchers(this.createExternalWatchers(epoch)); }
             const generation = this.coverageGeneration;
-            const install = await this.installSupplementalCoverageTargets(plan.targets, epoch, true, current);
+            const install = targets
+                ? {desiredRoots:[] as string[],successfulRoots:[] as string[],acquired:new Map<string,SupplementalDirectoryWatch>(),reconciliationGaps:new Map<string,CoverageGapEvidence>()}
+                : await this.installSupplementalCoverageTargets(plan.targets, epoch, true, current);
+            if (targets) {
+                for (const target of targets) {
+                    if (!current() || this.owningWorkspaceFolderForTraversal(target.path)?.uri.toString() !== target.workspaceRoot ||
+                        this.isPathIgnored(vscode.Uri.file(target.path),target.kind==='subtree',false,false)) {
+                        return conflict('The operation recovery target is no longer in the authorized scope.');
+                    }
+                    if (target.kind === 'subtree') {
+                        await this.watchImportedTree(target.path,epoch,false,preparationBudget);
+                        handoffs.push(await this.prepareImportedCoverageHandoff(target.path,epoch,preparationBudget,current));
+                    } else {
+                        // A file proof needs its actual parent owner, never a walk
+                        // of siblings. Retain that owner durably for future events.
+                        const parent=path.dirname(target.path);
+                        const folder=this.owningWorkspaceFolderForTraversal(target.path)!;
+                        if (this.fileWatchers.length > 0 && requiredFileCoverage && !requiredFileCoverage.issue &&
+                            !requiredFileCoverage.targets.some(root => this.pathBelongsToRoot(target.path,root))) {
+                            // Reuse existing host coverage when this file has no
+                            // supplemental obligation. No new native owner needed.
+                            const identity = fs.lstatSync(parent, {bigint:true});
+                            if (!identity.isDirectory() || identity.isSymbolicLink()) { return conflict('The file parent identity is unverified.'); }
+                            hostParents.set(parent,identity);
+                        } else {
+                            if (path.resolve(parent) === path.resolve(folder.uri.fsPath)) {
+                                return conflict('The required file has no verified parent observation owner. Existing review is preserved.');
+                            }
+                            const root = [...this.supplementalCoverageRoots].find(root =>
+                                this.pathBelongsToRoot(parent,root) && this.workspaceFolderOwnsTraversalPath(folder,root)) ?? parent;
+                            this.watchSupplementalDirectory(parent,root,epoch);
+                            this.supplementalCoverageRoots.add(root);
+                            this.importedCoverageObligations.add(root);
+                        }
+                    }
+                }
+            }
             if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
-            this.commitSupplementalCoverageTargets(plan.targets);
-            const owners = new Map([...this.supplementalDirectoryWatchers].map(([directory, owner]) =>
+            if (!targets) { this.commitSupplementalCoverageTargets(plan.targets); }
+            const relevantOwner=(directory:string) => selected(directory) || !!targets?.some(target => target.kind==='file' && path.dirname(target.path)===directory);
+            const owners = new Map([...this.supplementalDirectoryWatchers].filter(([directory])=>relevantOwner(directory)).map(([directory, owner]) =>
                 [directory, { owner, revision: owner.eventRevision ?? 0 }]));
             const ownerCoverageCurrent = () => current() && this.coverageGeneration === generation &&
-                !this.coverageRecheckOverflow && this.restoreEvents.size === 0 &&
-                this.supplementalDirectoryWatchers.size === owners.size &&
+                (hostParents.size === 0 || (this.fileWatchers === hostWatchers && this.fileWatchers.length > 0)) &&
+                [...hostParents].every(([directory,identity]) => {
+                    try { return this.supplementalIdentityMatches(fs.lstatSync(directory,{bigint:true}),identity); }
+                    catch { return false; }
+                }) &&
+                !this.coverageRecheckOverflow && ![...this.restoreEvents.keys()].some(selected) &&
+                [...this.supplementalDirectoryWatchers.keys()].filter(relevantOwner).length === owners.size &&
                 [...owners].every(([directory, { owner, revision }]) => {
                     if (this.supplementalDirectoryWatchers.get(directory) !== owner || owner.epoch !== epoch ||
                         (owner.eventRevision ?? 0) !== revision) { return false; }
                     try { return this.supplementalIdentityMatches(fs.lstatSync(directory, { bigint: true }), owner.identity); }
                     catch { return false; }
                 });
-            await this.discoverRestoredFiles(epoch, current);
+            if (targets) {
+                const candidates=new Set<string>();
+                for (const target of targets) {
+                    if (target.kind==='file') { candidates.add(target.path); }
+                    else {
+                        for (const file of await this.enumerateConfiguredCandidateFiles(scope,epoch,target.path,undefined,preparationBudget,current)) { candidates.add(file); }
+                    }
+                }
+                for (const file of candidates) {
+                    if (preparationBudget.remainingEntries-- <= 0) { throw new Error('Operation coverage reconciliation budget exceeded'); }
+                    await this.readFileAndUpdate(file,vscode.Uri.file(file),current);
+                }
+            } else { await this.discoverRestoredFiles(epoch, current); }
             if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
             for (const filePath of new Set([
                 ...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys(), ...this.largeFileReminders.keys(), ...this.unresolvedBaselineFiles.keys()
             ])) {
+                if (!selected(filePath)) { continue; }
+                if (targets && preparationBudget.remainingEntries-- <= 0) { throw new Error('Operation coverage reconciliation budget exceeded'); }
                 if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
                 await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath), current);
             }
@@ -1480,7 +1572,7 @@ export class DiffTracker {
                 }
                 recoverableControls.push([target, evidence]);
             }
-            if (!ownerCoverageCurrent()) {
+            if (!ownerCoverageCurrent() || handoffs.some(handoff => !handoff.stillCurrent())) {
                 return { status: 'limited', reason: 'Files, settings or watcher ownership changed during Recheck. Coverage remains unverified; retry after activity settles.' };
             }
 
@@ -1497,7 +1589,7 @@ export class DiffTracker {
             let committed = false;
             try {
                 const before = new Map([...this.coverageGaps].map(([target, record]) => [target, record.subtree]));
-                this.reconcileSupplementalCoverageAfterSuccessfulScan(install);
+                if (!targets) { this.reconcileSupplementalCoverageAfterSuccessfulScan(install); }
                 const successfulRoots = new Set(install.successfulRoots);
                 for (const [target, evidence] of importedDirectoryGaps) {
                     const owner = owners.get(target)?.owner;
@@ -1507,13 +1599,20 @@ export class DiffTracker {
                     // durable transaction, not the general supplemental predicate.
                     if (this.coverageGaps.get(target)?.subtree !== evidence || !owner || !folder ||
                         this.supplementalDirectoryWatchers.get(target) !== owner || owner.epoch !== epoch ||
-                        !successfulRoots.has(owner.coverageRoot) ||
+                        (!targets && !successfulRoots.has(owner.coverageRoot)) ||
                         !this.workspaceFolderOwnsTraversalPath(folder, owner.coverageRoot) ||
                         !this.pathBelongsToRoot(target, owner.coverageRoot) ||
                         this.scopeExplicitlyExcludesDirectory(target) ||
                         this.isPathIgnored(vscode.Uri.file(target), true, false, false)) { continue; }
                     this.clearCoverageGap(target, 'subtree', false);
                     removed.set(target, evidence);
+                }
+                for (const handoff of handoffs) {
+                    for (const [target,evidence] of handoff.gaps) {
+                        if (!evidence || this.coverageGaps.get(target)?.subtree!==evidence ||
+                            !this.isSupplementalCoverageGap({subtree:evidence}) || this.isPathIgnored(vscode.Uri.file(target),true,false,false)) { continue; }
+                        this.clearCoverageGap(target,'subtree',false);removed.set(target,evidence);
+                    }
                 }
                 const blockingSubtrees = this.getSubtreeCoverageGaps().filter(gap =>
                     !this.isPendingScopeRecoveryEvidence(this.coverageGaps.get(gap.targetPath)?.subtree) &&
@@ -1545,6 +1644,7 @@ export class DiffTracker {
             } finally {
                 if (this.baselineTransaction === transaction) { this.endBaselineTransaction(transaction, false); }
             }
+            for (const handoff of handoffs) { this.releaseImportedCoverageBridges(handoff); }
             // Certification is durable before exposing normal file reviews.
             // Re-read against the original before-image, never accept current
             // bytes as a baseline. A missing before-image remains Unknown and
@@ -1555,7 +1655,7 @@ export class DiffTracker {
                 await this.readFileAndUpdate(target, vscode.Uri.file(target), current);
             }
             for (const target of removed.keys()) { this.pendingScopeSuspendedPaths.delete(target); }
-            return this.getCoverageGaps().length > 0 || this.getSubtreeCoverageGaps().length > 0
+            return (targets ? this.getScopeOperationCoverageGaps(targets).related.length > 0 : this.getCoverageGaps().length > 0 || this.getSubtreeCoverageGaps().length > 0)
                 ? { status: 'limited', reason: 'Recheck completed against the original baselines, but some coverage remains unverified. See Monitoring Scope diagnostics.' }
                 : { status: 'rechecked' };
         } catch (error) {
@@ -2436,6 +2536,7 @@ export class DiffTracker {
             record?.subtree?.reasonCode.startsWith('pending-scope-') ? record.subtree : {
                 targetKind: 'subtree',
                 reasonCode: this.importedCoverageRestartCode,
+                ...(record?.subtree?.scopeOperationRevision ? {scopeOperationRevision:record.subtree.scopeOperationRevision} : {}),
                 reason: record?.subtree?.reason ??
                     this.importedCoverageRestartReason
             }
@@ -2719,6 +2820,22 @@ export class DiffTracker {
             try { observedDirectory = fs.lstatSync(filePath).isDirectory(); }
             catch { /* The ordinary reader retains missing/unreadable evidence. */ }
         }
+        if (exists && !observedDirectory) { this.excludedDirectoryKinds.delete(filePath); }
+        if (!exists && this.scopeExplicitlyExcludesDirectory(filePath)) {
+            const known = this.excludedDirectoryKinds.get(filePath);
+            const folder = this.owningWorkspaceFolderForTraversal(filePath);
+            // A directory-only rule is not permission to discard a same-name
+            // file's deletion. Use a prior directory observation under this
+            // exact parent identity, and prefer all known file evidence.
+            const canonical = known ? this.canonicalTrackingPath(filePath) : filePath;
+            const fileEvidence = this.fileSnapshots.has(canonical) || this.opaqueBaselineFiles.has(canonical) ||
+                this.unresolvedBaselineFiles.has(canonical) || this.largeFileReminders.has(canonical) || this.trackedChanges.has(canonical);
+            if (known && known.epoch === epoch && folder?.uri.toString() === known.workspaceRoot && !fileEvidence) {
+                try {
+                    if (this.supplementalIdentityMatches(fs.lstatSync(directory,{bigint:true}),known.parent)) { return; }
+                } catch { /* Missing or replaced parent cannot supply directory-kind evidence. */ }
+            }
+        }
         if (!observedDirectory && (path.basename(filePath) !== '.gitignore' || !this.ordinaryIgnorePolicyAffectsCoverage())) {
             const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
             const folder = this.owningWorkspaceFolderForTraversal(filePath);
@@ -2729,7 +2846,10 @@ export class DiffTracker {
             }
         }
         if (observedDirectory) {
-            if (this.scopeExplicitlyExcludesDirectory(filePath)) { return; }
+            if (this.scopeExplicitlyExcludesDirectory(filePath)) {
+                this.rememberExcludedDirectoryKind(filePath);
+                return;
+            }
             const folder = this.owningWorkspaceFolderForTraversal(filePath);
             if (folder && isHardUnmonitorableRelativePath(this.toPosixPath(path.relative(folder.uri.fsPath, filePath)),
                 this.workspaceRootIdentityForFolder(folder), true)) { return; }
@@ -2744,6 +2864,22 @@ export class DiffTracker {
         }
         this.dispatchExternalEvent(vscode.Uri.file(filePath), observedDirectory || kind === 'change'
             ? 'change' : exists ? 'create' : 'delete', epoch);
+    }
+
+    private rememberExcludedDirectoryKind(directory: string): void {
+        const folder = this.owningWorkspaceFolderForTraversal(directory);
+        const parent = path.dirname(directory);
+        if (!folder || !this.workspaceFolderOwnsTraversalPath(folder,parent) ||
+            !this.scopeExplicitlyExcludesDirectory(directory,this.effectiveMonitoringScope) ||
+            this.scopeExplicitlyExcludesDirectory(parent,this.effectiveMonitoringScope)) { return; }
+        try {
+            const identity = fs.lstatSync(parent,{bigint:true});
+            if (!identity.isDirectory() || identity.isSymbolicLink()) { return; }
+            if (!this.excludedDirectoryKinds.has(directory) && this.excludedDirectoryKinds.size >= this.maxImportedDirectoryWatchers) {
+                this.excludedDirectoryKinds.delete(this.excludedDirectoryKinds.keys().next().value!);
+            }
+            this.excludedDirectoryKinds.set(directory,{epoch:this.sessionEpoch,workspaceRoot:folder.uri.toString(),parent:identity});
+        } catch { /* A missing or unreadable parent supplies no filtering proof. */ }
     }
 
     private async watchSupplementalTree(
@@ -2793,7 +2929,9 @@ export class DiffTracker {
                         }
                         preparationBudget.remainingEntries--;
                         if (this.classifyDirectoryEntry(directory, entry) === 'directory') {
-                            pending.push(path.join(directory, entry.name));
+                            const child = path.join(directory, entry.name);
+                            this.rememberExcludedDirectoryKind(child);
+                            pending.push(child);
                         }
                     }
                 } finally {
@@ -2915,6 +3053,9 @@ export class DiffTracker {
             // retain an owner whose own coverage obligation was removed.
             if (this.supplementalCoverageRoots.has(entry.coverageRoot) &&
                 !this.scopeExplicitlyExcludesDirectory(directory, this.effectiveMonitoringScope)) { continue; }
+            if (this.scopeExplicitlyExcludesDirectory(directory, this.effectiveMonitoringScope)) {
+                this.rememberExcludedDirectoryKind(directory);
+            }
             entry.watcher.dispose();
             this.supplementalDirectoryWatchers.delete(directory);
         }
@@ -3175,7 +3316,7 @@ export class DiffTracker {
         if (typeof rootIdentity.caseSensitive !== 'boolean') { return false; }
         const relative = this.toPosixPath(path.relative(folder.uri.fsPath, uri.fsPath)) + (directory ? '/' : '');
         const matcher = this.ignoreMatchers.get(folder.uri.fsPath);
-        const ordinaryIgnored = matcher?.ignores(relative) ?? false;
+        const ordinaryIgnored = relative && relative !== '/' ? matcher?.ignores(relative) ?? false : false;
         return evaluateConfiguredScope(scope, rootIdentity, relative, ordinaryIgnored, directory).monitored;
     }
 
@@ -3983,10 +4124,14 @@ export class DiffTracker {
             const value = rawEvidence as Partial<CoverageGapEvidence>;
             if (value.targetKind !== expectedKind ||
                 typeof value.reasonCode !== 'string' || value.reasonCode.length === 0 || value.reasonCode.length > 100 ||
-                typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 1000) {
+                typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 1000 ||
+                (value.scopeOperationRevision !== undefined &&
+                    (typeof value.scopeOperationRevision !== 'string' || !/^[a-f0-9]{64}$/.test(value.scopeOperationRevision)))) {
                 return undefined;
             }
-            return { targetKind: expectedKind, reasonCode: value.reasonCode, reason: value.reason };
+            return { targetKind: expectedKind, reasonCode: value.reasonCode, reason: value.reason,
+                ...(typeof value.scopeOperationRevision === 'string' && /^[a-f0-9]{64}$/.test(value.scopeOperationRevision)
+                    ? {scopeOperationRevision:value.scopeOperationRevision} : {}) };
         };
         const coverageGaps: Array<[string, PersistedCoverageGapRecord]> = [];
         const gapPaths = new Set<string>();
@@ -6250,6 +6395,69 @@ export class DiffTracker {
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
         );
+    }
+
+    public getScopeOperationRecoveryTargets(
+        previous: EffectiveMonitoringScope,
+        requested?: CanonicalMonitoringScope,
+        restoring = false
+    ): ScopeCoverageTarget[] {
+        const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
+        if (scope.kind !== 'configured') { return []; }
+        const targets: ScopeCoverageTarget[] = [];
+        for (const [target, record] of this.coverageGaps) {
+            const folder = this.owningWorkspaceFolderForTraversal(target);
+            if (!folder) { continue; }
+            for (const evidence of [record.file, record.subtree]) {
+                if (!evidence || this.isDormantCoverageGap(target, evidence)) { continue; }
+                const directory = evidence.targetKind === 'subtree';
+                const uri = vscode.Uri.file(target);
+                if (this.scopeExplicitlyExcludesDirectory(directory ? target : path.dirname(target), scope) ||
+                    !this.configuredScopeMonitorsPath(scope, uri, directory)) { continue; }
+                const exposed = previous.kind === 'configured' && !this.configuredScopeMonitorsPath(previous, uri, directory);
+                const withdrawn = !!requested && !this.configuredScopeMonitorsPath(requested, uri, directory);
+                if (exposed || withdrawn || (restoring && this.isPendingScopeRecoveryEvidence(evidence)) ||
+                    evidence.scopeOperationRevision === scope.scopeRevision) {
+                    targets.push({path:target, kind:evidence.targetKind, workspaceRoot:folder.uri.toString()});
+                }
+            }
+        }
+        return targets.filter((target, index) => !targets.some((other, otherIndex) => otherIndex !== index &&
+            other.workspaceRoot === target.workspaceRoot && other.kind === 'subtree' &&
+            this.pathBelongsToRoot(target.path, other.path) && (target.path !== other.path || target.kind !== 'subtree')));
+    }
+
+    private scopeCoverageTargetContains(target: ScopeCoverageTarget, filePath: string): boolean {
+        const folder = this.owningWorkspaceFolderForTraversal(filePath);
+        return folder?.uri.toString() === target.workspaceRoot && (target.kind === 'file'
+            ? path.resolve(target.path) === path.resolve(filePath) : this.pathBelongsToRoot(filePath, target.path));
+    }
+
+    public getScopeOperationCoverageGaps(targets: readonly ScopeCoverageTarget[]): {
+        related: Array<[string, string]>; unrelated: Array<[string, string]>;
+    } {
+        const related: Array<[string, string]> = [], unrelated: Array<[string, string]> = [];
+        for (const gap of this.getCoverageGaps()) {
+            (targets.some(target => this.scopeCoverageTargetContains(target, gap[0])) ? related : unrelated).push(gap);
+        }
+        return {related, unrelated};
+    }
+
+    public async retainScopeOperationRecovery(targets: readonly ScopeCoverageTarget[], revision: string): Promise<boolean> {
+        if (this.getEffectiveMonitoringScope().scopeRevision !== revision) { return false; }
+        const budget = this.createCandidatePersistenceBudget();
+        const updates: Array<[string, CoverageGapEvidence]> = [];
+        for (const [target, record] of this.coverageGaps) {
+            if (!targets.some(region => this.scopeCoverageTargetContains(region, target))) { continue; }
+            for (const evidence of [record.file, record.subtree]) {
+                if (!evidence || this.isDormantCoverageGap(target, evidence) || evidence.scopeOperationRevision === revision) { continue; }
+                const next = {...evidence, scopeOperationRevision:revision};
+                this.reserveCandidateCoverageGap(target, next, budget);
+                updates.push([target, next]);
+            }
+        }
+        for (const [target, evidence] of updates) { this.setCoverageGap(target, evidence, false); }
+        return this.flushPendingPersistence();
     }
 
     public getSubtreeCoverageGaps(): SubtreeCoverageDiagnostic[] {
