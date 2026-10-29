@@ -233,4 +233,66 @@ export function registerScopeSingleActionAcceptance(h,fixture,scopeFor,withContr
         });
     }));
 
+    for(const fault of ['persisted-rejection','compensation-failure'])
+    test(`A5 SCOPE three-key save handles ${fault} without overwriting review`,()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'tracked.txt');fs.writeFileSync(target,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        assert.equal(tracker.getOriginalContent(target),'original');
+        const before=structuredClone(tracker.getTrackedChanges()),revision=tracker.getEffectiveMonitoringScope().scopeRevision;
+        await withController(tracker,scope,async({controller,config,hooks})=>{
+            const settings=structuredClone(config);let failed=false;
+            if(fault==='persisted-rejection')hooks.afterWrite=key=>{if(key==='monitoringScope'&&!failed){failed=true;throw new Error('Settings persisted before rejecting');}};
+            else hooks.beforeWrite=(key,value)=>{
+                if(key==='watchInclude'){failed=true;throw new Error('Include write refused');}
+                if(key==='monitoringScope'&&failed&&value===settings.monitoringScope)throw new Error('Compensation refused');
+            };
+            const outcome=await controller.saveAndApplyScope({mode:'rules',includes:[],excludes:[]},async()=>true);
+            assert.equal(outcome.status,fault==='persisted-rejection'?'failed':'partial',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,false);
+            if(fault==='persisted-rejection'){assert.deepEqual(config,settings);assert.equal(outcome.settingsStatus,'restored');}
+            else{assert.equal(outcome.settingsStatus,'partial');assert.equal(config.monitoringScope,'rules');}
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,revision);
+            assert.deepEqual(tracker.getTrackedChanges(),before);
+            assert.equal(fs.readFileSync(target,'utf8'),'pending');assert.equal(tracker.getOriginalContent(target),'original');
+        });
+    }));
+
+    test('A5 SCOPE regional Restore respects nested roots with duplicate names',()=>fixture(async({tracker,dir,folder})=>{
+        const needed=path.join(dir,'needed'),nested=path.join(needed,'nested');fs.mkdirSync(nested,{recursive:true});
+        const target=path.join(needed,'tracked.txt'),other=path.join(nested,'tracked.txt');
+        fs.writeFileSync(target,'parent original');fs.writeFileSync(other,'nested original');
+        const oldFolders=h.vscode.workspace.workspaceFolders,oldGet=h.vscode.workspace.getWorkspaceFolder;
+        const parentFolder={...folder,name:'same'},nestedFolder={uri:Uri.file(nested),name:'same',index:1};
+        h.vscode.workspace.workspaceFolders=[parentFolder,nestedFolder];
+        h.vscode.workspace.getWorkspaceFolder=uri=>[nestedFolder,parentFolder].find(item=>{
+            const relative=path.relative(item.uri.fsPath,uri.fsPath);
+            return relative===''||relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative);
+        });
+        const open=fs.promises.opendir;
+        try{
+            const scope=scopeFor(tracker);
+            assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+            tracker.setPendingMonitoringScope(scopeFor(tracker,'wholeWorkspace',[{scope:'all',pattern:'/needed/'}]));
+            fs.writeFileSync(target,'parent paused');tracker.setPendingMonitoringScope(undefined);
+            fs.writeFileSync(other,'nested pending');await tracker.readFileAndUpdate(other,Uri.file(other));
+            tracker.setSubtreeCoverageGap(needed,'pending-scope-gap','Required parent interval');
+            const token=tracker.getReviewToken(other);assert.ok(token);
+            fs.promises.opendir=async(directory,...args)=>{
+                assert.notEqual(path.resolve(String(directory)),nested,'parent recovery cannot enumerate a different workspace owner');
+                return open(directory,...args);
+            };
+            await withController(tracker,scope,async({controller})=>{
+                const outcome=await controller.restoreEffectiveScopeConfiguration();
+                assert.equal(outcome.status,'restored',JSON.stringify(outcome));
+                assert.equal(tracker.getOriginalContent(target),'parent original');
+                assert.equal(tracker.getTrackedChange(target)?.currentContent,'parent paused');
+                assert.deepEqual(tracker.getReviewToken(other),token);
+                assert.equal(tracker.getOriginalContent(other),'nested original');
+                assert.equal(tracker.getTrackedChange(other)?.currentContent,'nested pending');
+                assert.equal(tracker.importedDirectoryWatchers.has(nested),false);
+            });
+        }finally{fs.promises.opendir=open;h.vscode.workspace.workspaceFolders=oldFolders;h.vscode.workspace.getWorkspaceFolder=oldGet;}
+    }));
+
 }

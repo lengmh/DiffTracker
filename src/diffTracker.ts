@@ -1488,7 +1488,7 @@ export class DiffTracker {
                         return conflict('The operation recovery target is no longer in the authorized scope.');
                     }
                     if (target.kind === 'subtree') {
-                        await this.watchImportedTree(target.path,epoch,false,preparationBudget);
+                        await this.watchImportedTree(target.path,epoch,false,preparationBudget,this.owningWorkspaceFolderForTraversal(target.path));
                         handoffs.push(await this.prepareImportedCoverageHandoff(target.path,epoch,preparationBudget,current));
                     } else {
                         // A file proof needs its actual parent owner, never a walk
@@ -3132,13 +3132,15 @@ export class DiffTracker {
         root: string,
         epoch: number,
         inheritedAbsence = false,
-        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries }
+        preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries },
+        traversalOwner?: vscode.WorkspaceFolder
     ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: ImportedDirectoryWatch; previous?: ImportedDirectoryWatch }>();
         try {
             while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
                 const directory = pending.pop()!;
+                if (traversalOwner && !this.workspaceFolderOwnsTraversalPath(traversalOwner, directory)) { continue; }
                 if (this.isPathIgnored(vscode.Uri.file(directory), true)) { continue; }
                 // Watch before enumeration so later children cannot fall into the
                 // discovery gap. Empty and ignored-file-only directories count too.
