@@ -5776,7 +5776,8 @@ registerPR11ReviewRegressions({
         Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
         try {
             const { WatchExcludePanel }=require('../out/watchExcludePanel.js');
-            return Object.assign(Object.create(WatchExcludePanel.prototype),{scopeController:controller});
+            return Object.assign(Object.create(WatchExcludePanel.prototype),{scopeController:controller,diffTracker:tracker,
+                draftRevision:0,panel:{webview:{postMessage:async()=>true}}});
         } finally {Module._load=originalLoad;}
     },
     setVsCodeExcludes: value => { vscodeExcludes = value; },

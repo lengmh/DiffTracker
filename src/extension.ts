@@ -531,6 +531,12 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.commands.registerCommand('diffTracker._testApplyMonitoringScope', (options?: { grantConsent?: boolean; discardExplicitlyExcludedReviews?: boolean }) =>
                 monitoringScopeController.applyPendingScope(options)
             ),
+            vscode.commands.registerCommand('diffTracker._testSaveAndApplyScope', (request: Parameters<MonitoringScopeController['saveAndApplyScope']>[0]) =>
+                monitoringScopeController.saveAndApplyScope(request,async()=>true)
+            ),
+            vscode.commands.registerCommand('diffTracker._testRestoreEffectiveScope', () =>
+                monitoringScopeController.restoreEffectiveScopeConfiguration()
+            ),
             vscode.commands.registerCommand('diffTracker._testMigrateLegacyScope', () =>
                 monitoringScopeController.migrateLegacyWatchRules()
             ),
@@ -1273,63 +1279,73 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('diffTracker.excludeResource', async (item?: vscode.Uri | { filePath?: string; exclusionPath?: string }) => {
-            if (WatchExcludePanel.currentPanel) {
-                void vscode.window.showWarningMessage('Code Diff Tracker: Close Manage Monitoring Scope before using the quick exclusion so its draft is preserved.');
+            const scopePanel = WatchExcludePanel.currentPanel;
+            const lease = scopePanel ? await scopePanel.acquireQuickExclusion() : undefined;
+            if (scopePanel && !lease) {
+                scopePanel.reveal();
+                void vscode.window.showWarningMessage('Code Diff Tracker: The scope editor has an unsaved draft, another operation, or did not respond. Your draft is preserved; review it in Manage Monitoring Scope before excluding this path.');
                 return;
             }
-            const target = item instanceof vscode.Uri ? (item.scheme === 'file' ? item.fsPath : undefined)
-                : item?.exclusionPath ?? item?.filePath;
-            if (!target) { return; }
-            let directory = !!(item && !(item instanceof vscode.Uri) && item.exclusionPath);
-            try { directory = fs.lstatSync(target).isDirectory(); } catch { /* Deleted review files remain valid scope targets. */ }
-            const outcome = await monitoringScopeController.excludeResource(target, directory, async paths => {
-                const answer = await vscode.window.showWarningMessage(
-                    `Stop recording this ${directory ? 'folder' : 'file'} and discard ${paths.length} pending review item(s)?`,
-                    { modal: true, detail: `${target}\n\nWorkspace files will not be modified. Other reviews and baselines are preserved.\n${paths.slice(0, 20).join('\n')}` },
-                    'Discard Reviews and Stop Recording'
-                );
-                return answer === 'Discard Reviews and Stop Recording';
-            });
-            if (outcome.status === 'applied') {
-                void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected path. Workspace files and unrelated reviews are unchanged.'}`);
-            } else if (outcome.status !== 'cancelled') {
-                void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'This path is already excluded by the effective monitoring scope.'}`);
-            }
-            settingsTreeDataProvider.refresh();
-            return outcome;
+            try {
+                const target = item instanceof vscode.Uri ? (item.scheme === 'file' ? item.fsPath : undefined)
+                    : item?.exclusionPath ?? item?.filePath;
+                if (!target) { return; }
+                let directory = !!(item && !(item instanceof vscode.Uri) && item.exclusionPath);
+                try { directory = fs.lstatSync(target).isDirectory(); } catch { /* Deleted review files remain valid scope targets. */ }
+                const outcome = await monitoringScopeController.excludeResource(target, directory, async paths => {
+                    const answer = await vscode.window.showWarningMessage(
+                        `Stop recording this ${directory ? 'folder' : 'file'} and discard ${paths.length} pending review item(s)?`,
+                        { modal: true, detail: `${target}\n\nWorkspace files will not be modified. Other reviews and baselines are preserved.\n${paths.slice(0, 20).join('\n')}` },
+                        'Discard Reviews and Stop Recording'
+                    );
+                    return answer === 'Discard Reviews and Stop Recording';
+                }, false, lease?.current);
+                if (outcome.status === 'applied') {
+                    void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected path. Workspace files and unrelated reviews are unchanged.'}`);
+                } else if (outcome.status === 'alreadyExcluded') {
+                    void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'This path is already excluded by the effective monitoring scope.'}`);
+                } else if (outcome.status !== 'cancelled') {
+                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'The exclusion did not complete.'}`);
+                }
+                settingsTreeDataProvider.refresh();
+                return outcome;
+            } finally { await lease?.release(); }
         }),
         vscode.commands.registerCommand('diffTracker.excludeCoverageSubtree', async (item?: string | { coveragePath?: string }) => {
-            // An open scope editor may hold an unsaved JSON draft. Do not
-            // mutate its backing settings behind the editor's current state.
-            if (WatchExcludePanel.currentPanel) {
+            const scopePanel = WatchExcludePanel.currentPanel;
+            const lease = scopePanel ? await scopePanel.acquireQuickExclusion() : undefined;
+            if (scopePanel && !lease) {
+                scopePanel.reveal();
                 void vscode.window.showWarningMessage(
-                    'Code Diff Tracker: Close Manage Monitoring Scope before using the quick exclusion; an unsaved editor draft must not be overwritten.'
+                    'Code Diff Tracker: The scope editor has an unsaved draft, another operation, or did not respond. Your draft is preserved; review it in Manage Monitoring Scope before excluding this folder.'
                 );
                 return;
             }
-            const targetPath = typeof item === 'string' ? item : item?.coveragePath;
-            if (!targetPath) { return; }
-            const outcome = await monitoringScopeController.excludeCoverageSubtree(targetPath, async paths => {
-                const answer = await vscode.window.showWarningMessage(
-                    `Stop recording this folder and discard ${paths.length} pending review item(s)?`,
-                    { modal: true, detail: `${targetPath}\n\nWorkspace files will not be modified. Other reviews and baselines are preserved.\n${paths.slice(0, 20).join('\n')}` },
-                    'Discard Reviews and Stop Recording'
-                );
-                return answer === 'Discard Reviews and Stop Recording';
-            });
-            if (outcome.status === 'applied') {
-                void vscode.window.showInformationMessage(
-                    `Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected folder. Workspace files and unrelated reviews are unchanged.'}`
-                );
-            } else if (outcome.status === 'alreadyExcluded') {
-                void vscode.window.showInformationMessage(
-                    'Code Diff Tracker: This subtree is already excluded by the effective monitoring scope.'
-                );
-            } else if (outcome.status !== 'cancelled') {
-                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Could not apply the exclusion.'}`);
-            }
-            settingsTreeDataProvider.refresh();
-            return outcome;
+            try {
+                const targetPath = typeof item === 'string' ? item : item?.coveragePath;
+                if (!targetPath) { return; }
+                const outcome = await monitoringScopeController.excludeCoverageSubtree(targetPath, async paths => {
+                    const answer = await vscode.window.showWarningMessage(
+                        `Stop recording this folder and discard ${paths.length} pending review item(s)?`,
+                        { modal: true, detail: `${targetPath}\n\nWorkspace files will not be modified. Other reviews and baselines are preserved.\n${paths.slice(0, 20).join('\n')}` },
+                        'Discard Reviews and Stop Recording'
+                    );
+                    return answer === 'Discard Reviews and Stop Recording';
+                }, lease?.current);
+                if (outcome.status === 'applied') {
+                    void vscode.window.showInformationMessage(
+                        `Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected folder. Workspace files and unrelated reviews are unchanged.'}`
+                    );
+                } else if (outcome.status === 'alreadyExcluded') {
+                    void vscode.window.showInformationMessage(
+                        'Code Diff Tracker: This subtree is already excluded by the effective monitoring scope.'
+                    );
+                } else if (outcome.status !== 'cancelled') {
+                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Could not apply the exclusion.'}`);
+                }
+                settingsTreeDataProvider.refresh();
+                return outcome;
+            } finally { await lease?.release(); }
         }),
         vscode.commands.registerCommand('diffTracker.manageMonitoringScope', openMonitoringScopeManager),
         // Compatibility alias retained for existing keybindings/scripts.
@@ -1364,13 +1380,15 @@ export async function activate(context: vscode.ExtensionContext) {
             return outcome;
         }),
         vscode.commands.registerCommand('diffTracker.restoreEffectiveScopeConfiguration', async () => {
+            const expectedRequestVersion = monitoringScopeController.getRequestVersion();
+            const expectedScopeRevision = diffTracker.getEffectiveMonitoringScope().scopeRevision;
             const answer = await vscode.window.showWarningMessage(
                 'Restore Workspace Settings to the currently effective DiffTracker monitoring scope?',
                 { modal: true },
                 'Restore Effective Scope'
             );
             if (answer === 'Restore Effective Scope') {
-                const outcome = await monitoringScopeController.restoreEffectiveScopeConfiguration();
+                const outcome = await monitoringScopeController.restoreEffectiveScopeConfiguration({expectedRequestVersion,expectedScopeRevision});
                 if (outcome.status === 'restored') {
                     void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Effective configuration restored and observation coverage verified.'}`);
                 } else {

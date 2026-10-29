@@ -126,7 +126,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             child.contextValue = 'coverageDiagnosticSubtree';
             child.coveragePath = diagnostic.targetPath;
             child.description = diagnostic.reasonCode;
-            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\nRight-click or use the inline exclude action to stage a narrow explicit exclusion.`;
+            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\nRight-click or use the inline action to save and apply a narrow exclusion. Affected pending reviews require confirmation.`;
             child.command = {
                 command: 'diffTracker.manageMonitoringScope',
                 title: 'Manage Monitoring Scope'

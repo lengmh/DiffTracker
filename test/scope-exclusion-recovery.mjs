@@ -326,6 +326,53 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         }); }finally{tracker.commitPreparedScopePersistence=commit;}
     }));
 
+    test('SCOPE-RECOVERY Save Request Only stops before overwriting an external edit between settings writes', () => fixture(async ({tracker,scope}) => {
+        await withController(tracker,scope,async ({controller,config,hooks,writes}) => {
+            const version=controller.getRequestVersion();
+            hooks.afterWrite=key=>{if(key==='monitoringScope')config.watchExclude=[{scope:'all',pattern:'/external/'}];};
+            const result=await controller.saveRequestedScope({mode:'wholeWorkspace',includes:[],
+                excludes:[{scope:'all',pattern:'/my-draft/'}]},{expectedRequestVersion:version});
+            assert.equal(result.ok,false);
+            assert.equal(writes.length,1);
+            assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/external/'}]);
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+        });
+    }));
+
+    test('SCOPE-RECOVERY Save and Apply reinclude finalizes dormant evidence and observes later native edits', () => fixture(async ({tracker,dir,scope}) => {
+        const blind=path.join(dir,'reinclude');fs.mkdirSync(blind);
+        const target=path.join(blind,'tracked.txt');fs.writeFileSync(target,'old baseline');
+        const other=path.join(dir,'other.txt');fs.writeFileSync(other,'other baseline');
+        h.setVsCodeExcludes({'files.watcherExclude':{'reinclude/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'old pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        fs.writeFileSync(other,'other pending');await tracker.readFileAndUpdate(other,Uri.file(other));
+        const otherToken=tracker.getReviewToken(other);
+        tracker.setSubtreeCoverageGap(blind,'supplemental-watcher-directory-change-gap','Earlier interval');
+        const unknown=path.join(dir,'unseen.txt');fs.writeFileSync(unknown,'unknown before-image');
+        await tracker.readFileAndUpdate(unknown,Uri.file(unknown));
+        await withController(tracker,scope,async ({controller}) => {
+            assert.equal((await controller.excludeCoverageSubtree(blind,async()=>true)).status,'applied');
+            assert.ok(tracker.coverageGaps.get(blind)?.subtree,'excluded evidence is retained without scanning');
+            fs.writeFileSync(target,'fresh authorized baseline');
+            const result=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[]},async()=>true);
+            assert.equal(result.status,'applied',JSON.stringify(result));assert.equal(result.coverageStatus,'verified');
+            assert.equal(tracker.getOriginalContent(target),'fresh authorized baseline');
+            assert.equal(tracker.getTrackedChange(target),undefined);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            assert.deepEqual(tracker.getReviewToken(other),otherToken);
+            // Recheck creates a fresh Unknown observation generation. It must
+            // preserve uncertainty rather than invent an original before-image.
+            assert.equal(tracker.getTrackedChange(unknown)?.reviewKind,'unknown');
+            const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===blind);
+            assert.ok(owner);
+            fs.writeFileSync(target,'native edit after reinclude');owner.listener('change','tracked.txt');
+            await h.waitUntil(()=>tracker.getTrackedChange(target)?.currentContent==='native edit after reinclude');
+            assert.equal(tracker.getOriginalContent(target),'fresh authorized baseline');
+            assert.equal(tracker.getOriginalContent(unknown),undefined);
+        });
+    }));
+
     for (const stopped of [false, true]) test(`SCOPE-RECOVERY real controller quick Cancel preserves clean baselines and actual review (stopped=${stopped})`, () => fixture(async context => {
         const { tracker, dir, scope } = context;
         const subtree = path.join(dir, 'work-turns'); fs.mkdirSync(subtree);

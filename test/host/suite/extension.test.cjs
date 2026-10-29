@@ -706,15 +706,17 @@ module.exports = async function runExtensionHostScenario() {
         fs.writeFileSync(path.join(s4bBlindDir, 'changed.png'), recheckOpaqueBaseline);
         await filesConfig.update('watcherExclude', { 'dist/s4b-blind/**': true },
             vscode.ConfigurationTarget.Workspace);
-        await scopeConfig.update('watchInclude', [
-            privateInclude,
-            { scope: 'folder', folder: primaryFolder.name, path: 'dist/s4b-blind' }
-        ], vscode.ConfigurationTarget.Workspace);
         await untilStable('S4-B baseline ready before scope Apply', async () => (await state()).baselineState === 'ready');
-        const s4bApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
-            grantConsent: true
+        const beforeSingleAction = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+        const s4bApply = await vscode.commands.executeCommand('diffTracker._testSaveAndApplyScope', {
+            ...beforeSingleAction.rawRequested,
+            includes:[privateInclude,{scope:'folder',folder:primaryFolder.name,path:'dist/s4b-blind'}]
         });
-        assert.equal(s4bApply.status, 'applied', JSON.stringify(s4bApply));
+        const afterSingleAction=await state();
+        assert.equal(s4bApply.status,'applied',JSON.stringify({result:s4bApply,
+            gaps:afterSingleAction.coverageGaps.map(([target,reason])=>[path.relative(workspacePath,target),reason]),
+            subtreeGaps:afterSingleAction.subtreeCoverageGaps.map(gap=>({...gap,targetPath:path.relative(workspacePath,gap.targetPath)}))}));
+        assert.equal(s4bApply.coverageStatus,'verified',JSON.stringify(s4bApply));
         assert.equal(
             await vscode.commands.executeCommand('diffTracker._testOriginalContent', uri('dist/s4b-blind/changed.txt').fsPath),
             's4b changed baseline\n'
@@ -807,22 +809,21 @@ module.exports = async function runExtensionHostScenario() {
 
 
         // A saved manual exclusion still embargoes reads until Apply/Restore.
-        // Withdraw it without accepting the captured text or opaque before-image,
-        // then repair the legacy control gaps using the real public Recheck.
+        // Restore the saved request and repair its paused interval in one
+        // controller action, without accepting text or opaque before-images.
         const savedExclude = scopeConfig.inspect('watchExclude')?.workspaceValue;
         const originalReview = projectPending(await state());
         await scopeConfig.update('watchExclude', [...(savedExclude ?? []),
             { scope: 'folder', folder: primaryFolder.name, pattern: '/dist/s4b-blind/' }], vscode.ConfigurationTarget.Workspace);
         await untilStable('manual exclusion pauses existing review', async () =>
             (await state()).trackedChanges.find(item => item.filePath === uri('dist/s4b-blind/changed.txt').fsPath)?.reviewKind === 'unknown');
-        await scopeConfig.update('watchExclude', savedExclude, vscode.ConfigurationTarget.Workspace);
-        await untilStable('manual exclusion withdrawn before recovery', async () => {
-            const status = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
-            return status.requested.ok && status.effective.kind === 'configured' &&
-                status.requested.scope.scopeRevision === status.effective.scopeRevision;
-        });
-        const scopeRecovered = await vscode.commands.executeCommand('diffTracker.recheckObservationCoverage');
-        assert.equal(scopeRecovered?.status, 'rechecked', JSON.stringify(scopeRecovered));
+        const scopeRecovered = await vscode.commands.executeCommand('diffTracker._testRestoreEffectiveScope');
+        const restoredScopeState=await state();
+        assert.equal(scopeRecovered?.status,'restored',JSON.stringify({result:scopeRecovered,
+            gaps:restoredScopeState.coverageGaps.map(([target,reason])=>[path.relative(workspacePath,target),reason]),
+            subtreeGaps:restoredScopeState.subtreeCoverageGaps.map(gap=>({...gap,targetPath:path.relative(workspacePath,gap.targetPath)}))}));
+        assert.equal(scopeRecovered.coverageStatus,'verified');
+        assert.deepEqual(scopeConfig.inspect('watchExclude')?.workspaceValue,savedExclude);
         const afterScopeRecovery = await state();
         assert.deepEqual(projectPending(afterScopeRecovery), originalReview,
             'repairing withdrawn control gaps must not accept or discard original text/opaque review');

@@ -2554,27 +2554,27 @@ export class DiffTracker {
             return {
                 targetKind: 'subtree',
                 reasonCode: 'supplemental-watcher-capacity-gap',
-                reason: 'Supplemental watcher capacity is exhausted; narrow the monitoring scope or reduce direct watcher usage, then rebuild the baseline.'
+                reason: 'Supplemental watcher capacity is exhausted; narrow the monitoring scope or reduce direct watcher usage. Observation coverage remains unverified.'
             };
         }
         if (code === 'ENOSPC' || code === 'EMFILE' || code === 'ENFILE') {
             return {
                 targetKind: 'subtree',
                 reasonCode: 'supplemental-watcher-system-limit-gap',
-                reason: `Supplemental watcher installation hit the system watcher limit (${code}); restore watcher capacity, then rebuild the baseline.`
+                reason: `Supplemental watcher installation hit the system watcher limit (${code}); restore watcher capacity or narrow the monitoring scope. Observation coverage remains unverified.`
             };
         }
         if (code === 'DT_SUPPLEMENTAL_PREPARATION_LIMIT') {
             return {
                 targetKind: 'subtree',
                 reasonCode: 'supplemental-watcher-preparation-gap',
-                reason: 'Supplemental watcher discovery exceeded the bounded preparation allowance; narrow the monitored subtree, then rebuild the baseline.'
+                reason: 'Supplemental watcher discovery exceeded the bounded preparation allowance; narrow the monitored subtree before retrying coverage verification.'
             };
         }
         return {
             targetKind: 'subtree',
             reasonCode: 'supplemental-watcher-installation-gap',
-            reason: `Supplemental watcher coverage could not be established${message ? `: ${message}` : ''}. Narrow the scope or resolve the watcher failure, then rebuild the baseline.`
+            reason: `Supplemental watcher coverage could not be established${message ? `: ${message}` : ''}. Narrow the scope or resolve the watcher failure before retrying coverage verification.`
         };
     }
 
@@ -2590,7 +2590,7 @@ export class DiffTracker {
         this.setSubtreeCoverageGap(
             entry.coverageRoot,
             'supplemental-watcher-identity-gap',
-            'A watched directory was removed or replaced; rebuild the baseline to verify the current subtree and restore direct coverage.'
+            'A watched directory was removed or replaced; observation coverage is unverified. Exclude this path to stop recording it, or restore it and recheck observation coverage.'
         );
     }
 
@@ -2966,7 +2966,7 @@ export class DiffTracker {
             const entry = this.importedDirectoryWatchers.get(directory)!;
             if (!filename) {
                 entry.eventRevision = (entry.eventRevision ?? 0) + 1;
-                reportFailure('Directory watcher returned an unnamed event; rebuild the baseline to reconcile');
+                reportFailure('Directory watcher returned an unnamed event; recheck observation coverage to reconcile the current scope');
                 return;
             }
             this.dispatchNamedDirectoryEvent(directory, directory, kind, filename, epoch, () => {
@@ -2980,7 +2980,7 @@ export class DiffTracker {
             if (this.isCurrentEpoch(epoch) && this.importedDirectoryWatchers.get(directory)?.watcher === watcher &&
                 this.importedDirectoryWatchers.get(directory)?.epoch === epoch) {
                 this.importedDirectoryWatchers.get(directory)!.epoch = -1;
-                reportFailure('Directory watcher failed; rebuild the baseline after resolving the watcher failure');
+                reportFailure('Directory watcher failed; resolve the watcher failure and recheck observation coverage');
             }
         });
         previous?.watcher.dispose();
@@ -9591,9 +9591,9 @@ export class DiffTracker {
             if (!creationIsCurrent()) { return; }
             if (directory) {
                 const watcherFailureReason =
-                    'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit';
+                    'Imported directory watch coverage is incomplete; current files were scanned. Reduce watched directories or resolve the system watcher limit before rechecking observation coverage';
                 const scanFailureReason =
-                    'Created directory could not be scanned; rebuild the baseline after resolving the read failure';
+                    'Created directory could not be scanned; resolve the read failure before rechecking observation coverage';
                 let childPersistenceBudget!: CandidatePersistenceBudget;
                 try {
                     childPersistenceBudget = this.createCandidatePersistenceBudget();

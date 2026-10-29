@@ -65,7 +65,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         const module = { exports: {} };
         cache.set(filename, module.exports);
         vm.runInNewContext(output, {
-            module, exports: module.exports, process, console,
+            module, exports: module.exports, process, console, setTimeout, clearTimeout,
             require: name => name === 'vscode' ? vscode
                 : name.startsWith('.') ? load(path.relative(path.resolve('src'), path.resolve(path.dirname(filename), name + '.ts')))
                 : require(name)
@@ -499,6 +499,56 @@ function coverageExclusionHarness(){
     return {...h,controller,targets};
 }
 
+function scopeEditorScriptHarness(onPost = () => undefined, savedState) {
+    const elements = new Map(), sent = [], listeners = {};
+    let persisted = savedState;
+    const element = id => {
+        if (!elements.has(id)) { elements.set(id,{value:'',textContent:'',disabled:false,listeners:{},
+            addEventListener(event,handler){this.listeners[event]=handler;}}); }
+        return elements.get(id);
+    };
+    const receive = message => listeners.message({data:message});
+    vm.runInNewContext(fs.readFileSync('webview/watchExcludePanel.js','utf8'),{
+        document:{getElementById:element},window:{addEventListener:(event,handler)=>{listeners[event]=handler;}},
+        acquireVsCodeApi:()=>({postMessage:message=>{sent.push(message);return onPost(message);},
+            getState:()=>persisted,setState:value=>{persisted=structuredClone(value);}})
+    });
+    return {elements,sent,receive,state:()=>persisted,
+        input:(id,value)=>{const e=element(id);e.value=value;e.listeners.input?.();e.listeners.change?.();},
+        click:id=>element(id).listeners.click()};
+}
+
+await test('scope editor retains raw invalid JSON when newer scope status arrives', () => {
+    const ui=scopeEditorScriptHarness();
+    ui.receive({command:'scopeStatus',requestVersion:'base',rawRequested:{mode:'rules',includes:[],excludes:[]}});
+    ui.input('excludes','[ unparsed private draft');
+    ui.receive({command:'scopeStatus',requestVersion:'newer',rawRequested:{mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/other/'}]}});
+    assert.equal(ui.elements.get('excludes').value,'[ unparsed private draft');
+    assert.equal(ui.elements.get('mode').value,'rules');
+});
+
+await test('scope editor primary action freezes one version and only its matching completion accepts the draft', () => {
+    const ui=scopeEditorScriptHarness();
+    ui.receive({command:'scopeStatus',requestVersion:'base',rawRequested:{mode:'rules',includes:[],excludes:[]}});
+    const raw='[ { "scope": "all", "pattern": "/a/" } ]';
+    ui.input('excludes',raw);
+    ui.click('save-apply');
+    const action=ui.sent.find(message=>message.command==='saveAndApply');
+    assert.ok(action);assert.equal(action.baseVersion,'base');
+    assert.equal(ui.elements.get('excludes').disabled,true);
+    ui.receive({command:'scopeStatus',requestVersion:'other',rawRequested:{mode:'wholeWorkspace',includes:[],excludes:[]}});
+    assert.equal(ui.elements.get('excludes').value,raw);
+    ui.receive({command:'scopeOperation',actionId:action.actionId-1,draftRevision:action.draftRevision,acceptDraft:true,outcome:{status:'applied'}});
+    assert.equal(ui.elements.get('excludes').disabled,true,'an old completion cannot unlock the current action');
+    ui.receive({command:'scopeOperation',actionId:action.actionId,draftRevision:action.draftRevision,acceptDraft:false,outcome:{status:'cancelled'}});
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    ui.receive({command:'scopeStatus',requestVersion:'other',rawRequested:{mode:'wholeWorkspace',includes:[],excludes:[]}});
+    assert.equal(ui.elements.get('excludes').value,raw,'Cancel preserves the raw draft');
+    const restored=scopeEditorScriptHarness(()=>undefined,ui.state());
+    restored.receive({command:'scopeStatus',requestVersion:'other',rawRequested:{mode:'wholeWorkspace',includes:[],excludes:[]}});
+    assert.equal(restored.elements.get('excludes').value,raw,'webview reload preserves unsaved JSON');
+});
+
 // Run the production activation statements for scope commands unchanged. The
 // controller and panel are real; only the VS Code host and tracker are stubs.
 function monitoringScopeCommandHarness() {
@@ -507,6 +557,7 @@ function monitoringScopeCommandHarness() {
     h.state.warnings = [];
     h.state.info = [];
     h.state.applies = 0;
+    h.state.editorApplies = 0;
     h.vscode.window.showWarningMessage = message => h.state.warnings.push(message);
     h.vscode.window.showInformationMessage = message => h.state.info.push(message);
     h.vscode.commands.registerCommand = (name, callback) => {
@@ -519,10 +570,8 @@ function monitoringScopeCommandHarness() {
         getCoverageGeneration: () => 1,
         getPolicyFingerprint: () => 'test-policy'
     });
-    h.controller.applyPendingScope = async () => {
-        h.state.applies++;
-        return { status: 'applied' };
-    };
+    const saveAndApplyScope=h.controller.saveAndApplyScope.bind(h.controller);
+    h.controller.saveAndApplyScope=async(...args)=>{h.state.editorApplies++;return saveAndApplyScope(...args);};
     const WatchExcludePanel = h.load('watchExcludePanel.ts').WatchExcludePanel;
     const source = ts.createSourceFile('extension.ts', fs.readFileSync('src/extension.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const activation = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'activate');
@@ -552,6 +601,171 @@ function monitoringScopeCommandHarness() {
     return { ...h, WatchExcludePanel, run: (name, ...args) => callbacks.get(`diffTracker.${name}`)(...args) };
 }
 
+function connectScopeEditor(h) {
+    const panel=h.WatchExcludePanel.currentPanel;
+    const waiting=[];
+    let ui,lastAction;
+    h.state.createdPanels.at(-1).webview.postMessage=message=>{
+        h.messages.push(message);
+        if(ui)ui.receive(message);else waiting.push(message);
+        return true;
+    };
+    ui=scopeEditorScriptHarness(message=>{
+        const action=panel.handleMessage(message);
+        if(['saveAndApply','saveRequest','restoreEffective','discardDraft','reviewConflict','apply'].includes(message.command))lastAction=action;
+        return action;
+    });
+    waiting.forEach(message=>ui.receive(message));
+    return {...ui,action:()=>lastAction};
+}
+
+await test('a clean open scope editor allows one quick exclusion and refreshes after its bounded draft lock', async () => {
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const outcome=await h.run('excludeCoverageSubtree',h.targets[0]);
+    assert.equal(outcome?.status,'applied');
+    assert.equal(h.WatchExcludePanel.currentPanel,panel);
+    assert.ok(JSON.parse(ui.elements.get('excludes').value).some(rule=>rule.pattern==='/a/'));
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    assert.equal(h.state.createdPanels.length,1);
+    panel.dispose();
+});
+
+await test('an unsaved raw scope draft blocks quick exclusion and remains visible', async () => {
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes','[ invalid unsaved JSON');
+    assert.equal(await h.run('excludeCoverageSubtree',h.targets[0]),undefined);
+    assert.equal(h.state.updates.length,0);
+    assert.equal(ui.elements.get('excludes').value,'[ invalid unsaved JSON');
+    assert.match(h.state.warnings.at(-1),/draft.*preserved/i);
+    panel.dispose();
+});
+
+await test('a queued draft change during quick settings save invalidates the editor lease and preserves the input', async () => {
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const entered=deferred(),gate=deferred();
+    const before=structuredClone(h.state.workspaceConfiguration);
+    h.state.beforeConfigurationUpdate=async()=>{h.state.beforeConfigurationUpdate=undefined;entered.resolve();await gate.promise;};
+    const operation=h.run('excludeCoverageSubtree',h.targets[0]);
+    try {await entered.promise;ui.input('excludes','[ newer queued input');} finally {gate.resolve();}
+    assert.equal((await operation).status,'conflict');
+    assert.deepEqual(h.state.workspaceConfiguration,before);
+    assert.equal(h.state.quickApplies??0,0);
+    assert.equal(ui.elements.get('excludes').value,'[ newer queued input');
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    panel.dispose();
+});
+
+await test('an unresponsive clean scope editor times out without settings writes and releases the scope action', async () => {
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel;
+    await panel.handleMessage({command:'draftChanged',dirty:false,draftRevision:0});
+    assert.equal(await h.run('excludeCoverageSubtree',h.targets[0]),undefined);
+    assert.equal(h.state.updates.length,0);
+    await panel.handleMessage({command:'saveAndApply',mode:'wholeWorkspace',includes:[],excludes:h.state.workspaceConfiguration.watchExclude,
+        draftRevision:1,actionId:1,baseVersion:h.controller.getRequestVersion()});
+    assert.equal(h.state.quickApplies,1,'the timed-out editor handshake cannot leave the action owned');
+    panel.dispose();
+});
+
+await test('a closed webview transport cannot strand a quick-exclusion editor lock',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel;
+    await panel.handleMessage({command:'draftChanged',dirty:false,draftRevision:0});
+    const webview=h.state.createdPanels.at(-1).webview,post=webview.postMessage;
+    webview.postMessage=()=>{throw new Error('Controlled closed webview transport');};
+    try{assert.equal(await h.run('excludeCoverageSubtree',h.targets[0]),undefined);}
+    finally{webview.postMessage=post;}
+    assert.equal(h.state.updates.length,0);
+    await panel.handleMessage({command:'saveAndApply',mode:'wholeWorkspace',includes:[],excludes:h.state.workspaceConfiguration.watchExclude,
+        draftRevision:1,actionId:1,baseVersion:h.controller.getRequestVersion()});
+    assert.equal(h.state.quickApplies,1);
+    panel.dispose();
+});
+
+for(const answer of [false,true])await test(`scope editor explicit draft discard ${answer?'accepts':'cancels'} without settings or review changes`,async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    h.vscode.window.showWarningMessage=async(_message,_options,...buttons)=>answer?buttons[0]:undefined;
+    const raw='[ unsaved draft';ui.input('excludes',raw);
+    ui.click('discard-draft');await ui.action();
+    assert.equal(h.state.updates.length,0);
+    if(answer)assert.deepEqual(JSON.parse(ui.elements.get('excludes').value),h.state.workspaceConfiguration.watchExclude);
+    else assert.equal(ui.elements.get('excludes').value,raw);
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    panel.dispose();
+});
+
+await test('scope editor Restore preserves an unsaved draft while restoring the saved request',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const initial=structuredClone(h.state.workspaceConfiguration);
+    ui.input('excludes','[ keep this raw draft');
+    h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/external/'});h.controller.reconcileRequestedScope();
+    h.vscode.window.showWarningMessage=async(_message,_options,...buttons)=>buttons[0];
+    ui.click('restore');await ui.action();
+    assert.deepEqual(h.state.workspaceConfiguration,initial);
+    assert.equal(ui.elements.get('excludes').value,'[ keep this raw draft');
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    panel.dispose();
+});
+
+await test('scope editor reviews a settings conflict without overwriting its raw draft or the newer settings',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const raw='[ { "scope": "all", "pattern": "/my-draft/" } ]';ui.input('excludes',raw);
+    h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/external/'});h.controller.reconcileRequestedScope();
+    await panel.handleMessage({command:'reload'});
+    ui.click('save');await ui.action();
+    assert.equal(h.state.updates.length,0,'stale Save Only cannot overwrite external settings');
+    assert.equal(ui.elements.get('excludes').value,raw);
+    h.vscode.window.showWarningMessage=async(_message,_options,...buttons)=>buttons[0];
+    ui.click('review-conflict');await ui.action();
+    assert.equal(h.state.updates.length,0,'reviewing the conflict does not save settings');
+    assert.equal(ui.elements.get('excludes').value,raw);
+    assert.ok(h.state.workspaceConfiguration.watchExclude.some(rule=>rule.pattern==='/external/'));
+    ui.click('save-apply');await ui.action();
+    assert.ok(h.state.workspaceConfiguration.watchExclude.some(rule=>rule.pattern==='/my-draft/'));
+    assert.equal(h.state.quickApplies,1);
+    panel.dispose();
+});
+
+await test('scope editor Save Request Only rejects malformed rules instead of replacing them with empty arrays',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel;
+    await panel.handleMessage({command:'saveRequest',mode:'wholeWorkspace',includes:[],excludes:{invalid:true},
+        baseVersion:h.controller.getRequestVersion(),draftRevision:1,actionId:1});
+    assert.equal(h.state.updates.length,0);
+    assert.equal(h.messages.find(message=>message.command==='scopeOperation').outcome.status,'conflict');
+    panel.dispose();
+});
+
+await test('scope editor refuses an older save message after a newer draft revision arrives',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel;
+    await panel.handleMessage({command:'draftChanged',dirty:true,draftRevision:2});
+    await panel.handleMessage({command:'saveRequest',mode:'wholeWorkspace',includes:[],excludes:[],
+        baseVersion:h.controller.getRequestVersion(),draftRevision:1,actionId:1});
+    assert.equal(h.state.updates.length,0);
+    assert.equal(h.messages.find(message=>message.command==='scopeOperation').outcome.status,'conflict');
+    panel.dispose();
+});
+
+await test('stale Apply Saved Request replaces an older success result with the current conflict',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    assert.equal((await panel.applyInteractively()).status,'applied');
+    h.state.updates.length=0;
+    h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/external/'});h.controller.reconcileRequestedScope();
+    ui.click('apply');await ui.action();
+    assert.equal(h.state.updates.length,0);
+    assert.equal(JSON.parse(ui.elements.get('status').textContent).operationOutcome.status,'conflict');
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    panel.dispose();
+});
+
 function deferred() {
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -580,11 +794,11 @@ for (const command of scopeEditorCommands) {
         await h.run(command);
         const panel = h.WatchExcludePanel.currentPanel;
         assert.ok(panel, 'normal panel opening resumes after the settings save');
-        assert.equal(h.state.applies, /apply|retry/.test(command) ? 1 : 0);
+        assert.equal(h.state.editorApplies, /apply|retry/.test(command) ? 1 : 0);
         await panel.handleMessage({ command: 'reload' });
         const draft = h.messages.at(-1).rawRequested;
         assert.ok(draft.excludes.some(rule => rule.pattern === '/a/'), 'the fresh editor includes the quick exclusion');
-        await panel.handleMessage({ command: 'saveRequest', ...draft });
+        await panel.handleMessage({ command: 'saveRequest', ...draft,baseVersion:h.controller.getRequestVersion() });
         assert.ok(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'),
             'saving the fresh editor must retain the quick exclusion');
         panel.dispose();
@@ -656,7 +870,7 @@ await test('an already open scope editor still prevents quick exclusion commands
     const panel = h.WatchExcludePanel.currentPanel;
     assert.equal(await h.run('excludeCoverageSubtree', h.targets[0]), undefined);
     assert.equal(h.state.updates.length, 0, 'the existing draft must retain exclusive ownership');
-    assert.match(h.state.warnings.at(-1), /Close Manage Monitoring Scope/);
+    assert.match(h.state.warnings.at(-1), /draft.*preserved/i);
     panel.dispose();
     assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'applied');
 });
@@ -673,7 +887,7 @@ await test('closing a saving scope editor blocks quick exclusion until its final
         entered.resolve();
         await gate.promise;
     };
-    const save = panel.handleMessage({ command: 'saveRequest', ...draft });
+    const save = panel.handleMessage({ command: 'saveRequest', ...draft,baseVersion:h.controller.getRequestVersion() });
     panel.dispose();
     const quick = h.run('excludeCoverageSubtree', h.targets[0]);
     try {
@@ -768,7 +982,7 @@ for (const first of ['restore', 'quick']) {
             'quick actions conflict with an active Restore; a later Restore preserves an already applied exclusion');
         assert.deepEqual(h.state.updates.map(([key]) => key), first === 'restore'
             ? ['monitoringScope', 'watchInclude', 'watchExclude']
-            : ['watchExclude', 'monitoringScope', 'watchInclude', 'watchExclude']);
+            : ['watchExclude'], 'a Restore confirmed against a superseded effective scope must not write');
     });
 }
 
@@ -782,7 +996,7 @@ for (const answer of [undefined, 'Restore Effective Scope']) {
         assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
         assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'applied');
         decision.resolve(answer);
-        assert.equal(await restore, !!answer);
+        assert.equal(await restore, false,'a completed quick action invalidates the older Restore confirmation');
         assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
         assert.equal(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'), true,
             'Restore uses the current effective scope, including a completed quick action');
@@ -2231,6 +2445,52 @@ for (const answer of [false, true]) await test(`coverage-row single action ${ans
     assert.equal(h.state.createdPanels.length, 0);
     assert.deepEqual(h.state.changes, answer ? [] : before);
     if (answer) { assert.doesNotMatch(h.state.info.at(-1), /Use Apply Pending|request saved/i); }
+});
+
+await test('scope panel Save and Apply uses one confirmation before saving expansion and exclusions', async () => {
+    const h=quickExclusionHarness();h.state.confirm=true;
+    await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel;
+    h.state.duringConfirmation=()=>{assert.equal(h.state.updates.length,0);assert.equal(h.state.changes[0].reviewKind,'text');};
+    await panel.handleMessage({command:'saveAndApply',mode:'wholeWorkspace',
+        includes:[{scope:'all',path:'additional'}],excludes:[{scope:'all',pattern:'/a/'}],
+        baseVersion:h.controller.getRequestVersion(),draftRevision:1,actionId:1});
+    assert.equal(h.state.applies,1);
+    assert.equal(h.state.dialogs.filter(item=>item.options?.modal).length,1);
+    assert.match(h.state.dialogs.find(item=>item.options?.modal).options.detail,/pending\.txt/);
+    assert.deepEqual(h.state.changes,[]);
+    const ack=h.messages.find(message=>message.command==='scopeOperation');
+    assert.equal(ack.outcome.status,'applied');assert.equal(ack.acceptDraft,true);
+    panel.dispose();
+});
+
+for(const scenario of ['cancel','partial','newer-draft'])await test(`scope editor ${scenario} keeps its draft and effective-result feedback consistent`,async()=>{
+    const h=quickExclusionHarness();h.state.confirm=scenario!=='cancel';
+    await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const raw='[ { "scope": "all", "pattern": "**/*.tmp" }, { "scope": "all", "pattern": "/a/" } ]';
+    ui.input('excludes',raw);
+    if(scenario==='partial'){
+        h.tracker.getCoverageGaps=()=>[['independent','Independent observation failure']];
+        h.tracker.recheckObservationCoverage=async()=>({status:'limited',reason:'Independent observation failure'});
+    }
+    if(scenario==='newer-draft')h.state.duringConfirmation=()=>ui.input('excludes','[ newer queued draft');
+    ui.click('save-apply');await ui.action();
+    const feedback=JSON.parse(ui.elements.get('status').textContent).operationOutcome;
+    assert.equal(feedback.status,scenario==='cancel'?'cancelled':scenario==='partial'?'partial':'conflict');
+    assert.equal(h.state.dialogs.filter(item=>item.options?.modal).length,1);
+    assert.equal(ui.elements.get('excludes').disabled,false);
+    if(scenario==='partial'){
+        assert.equal(feedback.scopeCommitted,true);assert.equal(feedback.settingsStatus,'saved');assert.equal(feedback.coverageStatus,'limited');
+        assert.ok(h.state.workspaceConfiguration.watchExclude.some(rule=>rule.pattern==='/a/'));
+        assert.deepEqual(h.state.changes,[]);
+        assert.match(h.state.dialogs.at(-1).message,/scope applied.*retained.*incomplete/i);
+    }else{
+        assert.equal(h.state.updates.length,0);
+        assert.equal(ui.elements.get('excludes').value,scenario==='cancel'?raw:'[ newer queued draft');
+        assert.equal(h.state.changes[0].reviewKind,'text');
+    }
+    panel.dispose();
 });
 
 await test('coverage-row confirmation owns the scope action before writing settings and releases on Cancel', async () => {
