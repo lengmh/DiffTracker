@@ -1262,9 +1262,9 @@ export async function activate(context: vscode.ExtensionContext) {
     const openMonitoringScopeManager = () => {
         // Do not capture a draft from settings while a queued scope write is
         // pending, even if the editor that started that write has closed.
-        if (monitoringScopeController.hasPendingScopeSettingsWrites()) {
+        if (monitoringScopeController.hasActiveScopeAction()) {
             void vscode.window.showWarningMessage(
-                'Code Diff Tracker: Wait for the monitoring-scope settings save (including quick exclusions) to finish before opening Manage Monitoring Scope.'
+                'Code Diff Tracker: Wait for the monitoring-scope action (including quick exclusion confirmation and settings save) to finish before opening Manage Monitoring Scope.'
             );
             return undefined;
         }
@@ -1309,17 +1309,24 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             const targetPath = typeof item === 'string' ? item : item?.coveragePath;
             if (!targetPath) { return; }
-            const outcome = await monitoringScopeController.requestExcludeCoverageSubtree(targetPath);
-            if (outcome.status === 'saved') {
+            const outcome = await monitoringScopeController.excludeCoverageSubtree(targetPath, async paths => {
+                const answer = await vscode.window.showWarningMessage(
+                    `Stop recording this folder and discard ${paths.length} pending review item(s)?`,
+                    { modal: true, detail: `${targetPath}\n\nWorkspace files will not be modified. Other reviews and baselines are preserved.\n${paths.slice(0, 20).join('\n')}` },
+                    'Discard Reviews and Stop Recording'
+                );
+                return answer === 'Discard Reviews and Stop Recording';
+            });
+            if (outcome.status === 'applied') {
                 void vscode.window.showInformationMessage(
-                    'Code Diff Tracker: Exclusion request saved. Use Apply Pending Scope to make it effective; no review was discarded.'
+                    `Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected folder. Workspace files and unrelated reviews are unchanged.'}`
                 );
             } else if (outcome.status === 'alreadyExcluded') {
                 void vscode.window.showInformationMessage(
-                    'Code Diff Tracker: This subtree is already excluded by the requested monitoring scope.'
+                    'Code Diff Tracker: This subtree is already excluded by the effective monitoring scope.'
                 );
-            } else {
-                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Could not stage exclusion.'}`);
+            } else if (outcome.status !== 'cancelled') {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Could not apply the exclusion.'}`);
             }
             settingsTreeDataProvider.refresh();
             return outcome;

@@ -350,4 +350,40 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         });
     }));
 
+    for (const situation of ['existing', 'missing', 'cancel', 'new-review'])
+    test(`SCOPE-RECOVERY coverage-row single action ${situation} shares the confirmed scope transaction`, () => fixture(async ({tracker,dir,scope}) => {
+        const chosen = path.join(dir, 'warned'); fs.mkdirSync(chosen);
+        const target = path.join(chosen, 'review.txt'); fs.writeFileSync(target, 'original');
+        h.setVsCodeExcludes({'files.watcherExclude': {'warned/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        fs.writeFileSync(target, 'pending'); await tracker.readFileAndUpdate(target, Uri.file(target));
+        if (situation === 'missing') {
+            fs.rmSync(chosen, {recursive:true}); await tracker.onExternalFileDeleted(Uri.file(chosen));
+        } else { tracker.setSubtreeCoverageGap(chosen, 'supplemental-watcher-directory-change-gap', 'Prior interval'); }
+        const token = tracker.getReviewToken(target);
+        await withController(tracker, scope, async ({controller, writes, config}) => {
+            let confirmations = 0;
+            const outcome = await controller.excludeCoverageSubtree(chosen, async paths => {
+                confirmations++;
+                assert.deepEqual(paths, [target]);
+                assert.equal(writes.length, 0, 'coverage-row confirmation must precede settings writes');
+                if (situation === 'new-review') {
+                    fs.writeFileSync(target, 'newer pending'); await tracker.readFileAndUpdate(target, Uri.file(target));
+                }
+                return situation !== 'cancel';
+            });
+            assert.equal(confirmations, 1);
+            const applied = situation === 'existing' || situation === 'missing';
+            assert.equal(outcome.status, applied ? 'applied' : situation === 'cancel' ? 'cancelled' : 'conflict', JSON.stringify(outcome));
+            assert.equal(writes.length, applied ? 1 : 0);
+            assert.equal(config.watchExclude.some(rule => rule.pattern === '/warned/'), applied);
+            if (applied) {
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+                assert.equal(tracker.getOriginalContent(target), undefined);
+                assert.equal(tracker.supplementalDirectoryWatchers.has(chosen), false);
+            } else if (situation === 'cancel') { assert.deepEqual(tracker.getReviewToken(target), token); }
+            assert.equal(fs.existsSync(target), situation !== 'missing');
+        });
+    }));
+
 }

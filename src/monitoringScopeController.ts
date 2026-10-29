@@ -321,6 +321,10 @@ export class MonitoringScopeController implements vscode.Disposable {
         return this.pendingScopeSettingsWrites > 0;
     }
 
+    public hasActiveScopeAction(): boolean {
+        return this.quickExclusionInProgress || this.hasPendingScopeSettingsWrites();
+    }
+
     private enqueueScopeSettingsWrite<T>(write: () => Promise<T>): Promise<T> {
         // Ownership starts before the queue runs and lasts through settlement,
         // including after an editor closes while its settings save is pending.
@@ -345,14 +349,21 @@ export class MonitoringScopeController implements vscode.Disposable {
         return this.enqueueScopeSettingsWrite(() => this.saveCoverageSubtreeExclusion(targetPath, false, directory));
     }
 
+    public excludeCoverageSubtree(
+        targetPath: string, confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>
+    ): ReturnType<MonitoringScopeController['excludeResource']> {
+        return this.excludeResource(targetPath, true, confirm, true);
+    }
+
     /** Confirm a quick exclusion before saving settings or pausing any reads. */
     public async excludeResource(
         targetPath: string,
         directory: boolean,
-        confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>
+        confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>,
+        requireCoverage = false
     ): Promise<MonitoringScopeApplyOutcome | { status: 'cancelled' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
         const conflict = (reason: string): MonitoringScopeApplyOutcome => ({ status: 'conflict', reason });
-        if (this.quickExclusionInProgress || this.hasPendingScopeSettingsWrites()) {
+        if (this.hasActiveScopeAction()) {
             return conflict('Another monitoring-scope action is in progress; retry after it finishes.');
         }
         const initial = this.getStatus();
@@ -360,7 +371,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             initial.requested.scope.scopeRevision !== initial.effective.scopeRevision) {
             return conflict('Apply or restore the existing monitoring-scope request in Manage Monitoring Scope before using a quick exclusion.');
         }
-        const proposal = this.prepareResourceExclusion(targetPath, false, directory);
+        const proposal = this.prepareResourceExclusion(targetPath, requireCoverage, directory);
         if (proposal.status !== 'ready') { return proposal; }
         const scope = proposal.scope;
         const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
@@ -372,7 +383,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             if (affectedReviewPaths.length > 0 && !await confirm(affectedReviewPaths)) { return { status: 'cancelled' }; }
             return await this.enqueueScopeSettingsWrite(async () => {
                 const latest = this.getStatus();
-                const fresh = this.prepareResourceExclusion(targetPath, false, directory);
+                const fresh = this.prepareResourceExclusion(targetPath, requireCoverage, directory);
                 if (latest.effective.kind !== 'configured' || latest.effective.scopeRevision !== initial.effective.scopeRevision ||
                     latest.requested.scope?.scopeRevision !== proposal.current.scopeRevision ||
                     fresh.status !== 'ready' || fresh.scope.scopeRevision !== scope.scopeRevision ||
@@ -382,7 +393,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                 this.confirmedQuickScopeRevision = scope.scopeRevision;
                 let outcome: MonitoringScopeApplyOutcome = { status: 'failed' };
                 try {
-                    const saved = await this.saveCoverageSubtreeExclusion(targetPath, false, directory);
+                    const saved = await this.saveCoverageSubtreeExclusion(targetPath, requireCoverage, directory);
                     if (saved.status !== 'saved') {
                         outcome = conflict(saved.reason ?? 'The exclusion request changed before it could be saved.');
                     } else {

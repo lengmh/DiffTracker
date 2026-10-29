@@ -471,7 +471,7 @@ function coverageExclusionHarness(){
     });
     const roots=[{name:folder.name,uri:folder.uri.toString(),
         caseSensitive:h.load('utils/pathIdentity.ts').detectLocalPathCaseSensitivity(root)}];
-    const effective={kind:'configured',...h.load('monitoringScope.ts').validateAndCanonicalizeScope({
+    let effective={kind:'configured',...h.load('monitoringScope.ts').validateAndCanonicalizeScope({
         mode:h.state.workspaceConfiguration.monitoringScope,
         includes:h.state.workspaceConfiguration.watchInclude,
         excludes:h.state.workspaceConfiguration.watchExclude
@@ -480,6 +480,13 @@ function coverageExclusionHarness(){
         getEffectiveMonitoringScope:()=>effective,
         getCommittedLegacyCompatibilityPolicy:()=>[],
         getExplicitlyExcludedPendingReviewPaths:()=>[],
+        getExplicitlyExcludedReviewRevision:()=> 'stable-empty-review',
+        applyConfiguredMonitoringScope:async(scope,discard,current)=>{
+            assert.equal(current(),true,'the applied request must still be current');
+            effective={kind:'configured',...scope};
+            h.state.quickApplies=(h.state.quickApplies??0)+1;
+            return {status:'applied'};
+        },
         setPendingMonitoringScope:scope=>{h.state.pendingScope=scope;}
     });
     const workspaceState=new Map();
@@ -584,7 +591,7 @@ for (const command of scopeEditorCommands) {
     });
 }
 
-await test('scope editor remains blocked until all queued quick exclusion commands settle', async () => {
+await test('scope editor stays blocked through each applied quick exclusion and concurrent intents must retry', async () => {
     const h = monitoringScopeCommandHarness();
     const entered = [deferred(), deferred()], gates = [deferred(), deferred()];
     let writes = 0;
@@ -602,7 +609,9 @@ await test('scope editor remains blocked until all queued quick exclusion comman
     try {
         await entered[0].promise;
         gates[0].resolve();
-        assert.equal((await first).status, 'saved');
+        assert.equal((await first).status, 'applied');
+        assert.equal((await second).status, 'conflict', 'overlapping confirmed actions must not silently merge');
+        const retry = h.run('excludeCoverageSubtree', h.targets[1]);
         await entered[1].promise;
         for (const command of scopeEditorCommands) {
             await h.run(command);
@@ -610,6 +619,8 @@ await test('scope editor remains blocked until all queued quick exclusion comman
                 'settling the first write cannot release ownership held by a queued request');
         }
         assert.equal(h.state.applies, 0);
+        gates[1].resolve();
+        assert.equal((await retry).status, 'applied');
     } finally {
         gates.forEach(gate => gate.resolve());
         await Promise.all([first, second]);
@@ -629,7 +640,9 @@ for (const failure of ['rejected operation', 'failed settings write']) {
             await assert.rejects(h.run('excludeCoverageSubtree', h.targets[0]), /controlled coverage lookup failure/);
         } else {
             h.state.beforeConfigurationUpdate = async () => { throw new Error('controlled settings failure'); };
-            assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'blocked');
+            const result = await h.run('excludeCoverageSubtree', h.targets[0]);
+            assert.equal(result.status, 'conflict');
+            assert.match(result.reason,/controlled settings failure/);
         }
         await h.run('manageMonitoringScope');
         assert.ok(h.WatchExcludePanel.currentPanel, 'a failed command must not leave the editor locked');
@@ -645,14 +658,14 @@ await test('an already open scope editor still prevents quick exclusion commands
     assert.equal(h.state.updates.length, 0, 'the existing draft must retain exclusive ownership');
     assert.match(h.state.warnings.at(-1), /Close Manage Monitoring Scope/);
     panel.dispose();
-    assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'saved');
+    assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'applied');
 });
 
-await test('closing a saving scope editor preserves ownership and the next quick exclusion merges its final draft', async () => {
+await test('closing a saving scope editor blocks quick exclusion until its final draft is applied', async () => {
     const h = monitoringScopeCommandHarness();
     await h.run('manageMonitoringScope');
     const panel = h.WatchExcludePanel.currentPanel;
-    const draft = { mode: 'rules', includes: [{ scope: 'all', path: 'src' }],
+    const draft = { mode: 'wholeWorkspace', includes: [{ scope: 'all', path: 'src' }],
         excludes: [{ scope: 'all', pattern: '/editor-owned/' }] };
     const entered = deferred(), gate = deferred();
     h.state.beforeConfigurationUpdate = async () => {
@@ -673,7 +686,13 @@ await test('closing a saving scope editor preserves ownership and the next quick
             'the quick exclusion cannot write between the editor’s settings writes');
     } finally { gate.resolve(); }
     await save;
-    assert.equal((await quick).status, 'saved');
+    assert.equal((await quick).status, 'conflict');
+    assert.deepEqual(h.state.updates.map(([key]) => key), ['monitoringScope', 'watchInclude', 'watchExclude']);
+    assert.equal((await h.controller.excludeCoverageSubtree(h.targets[0], async()=>true)).status, 'conflict',
+        'a saved request must be resolved before a fresh quick action');
+    const requested=h.controller.getRequestedScope().scope;
+    await h.tracker.applyConfiguredMonitoringScope(requested,false,()=>true);
+    assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status,'applied');
     assert.equal(h.state.workspaceConfiguration.monitoringScope, draft.mode);
     assert.deepEqual(h.state.workspaceConfiguration.watchInclude, draft.includes);
     assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule => rule.pattern).sort(), ['/a/', '/editor-owned/']);
@@ -745,10 +764,10 @@ for (const first of ['restore', 'quick']) {
         assert.equal(h.state.workspaceConfiguration.monitoringScope, initial.monitoringScope);
         assert.deepEqual(h.state.workspaceConfiguration.watchInclude, initial.watchInclude);
         assert.deepEqual(h.state.workspaceConfiguration.watchExclude.map(rule => rule.pattern).sort(),
-            first === 'restore' ? ['**/*.tmp', '/a/'] : ['**/*.tmp'],
-            'a later confirmed Restore intentionally replaces the request; a later quick action merges it');
+            first === 'restore' ? ['**/*.tmp'] : ['**/*.tmp', '/a/'],
+            'quick actions conflict with an active Restore; a later Restore preserves an already applied exclusion');
         assert.deepEqual(h.state.updates.map(([key]) => key), first === 'restore'
-            ? ['monitoringScope', 'watchInclude', 'watchExclude', 'watchExclude']
+            ? ['monitoringScope', 'watchInclude', 'watchExclude']
             : ['watchExclude', 'monitoringScope', 'watchInclude', 'watchExclude']);
     });
 }
@@ -761,11 +780,12 @@ for (const answer of [undefined, 'Restore Effective Scope']) {
             : h.state.warnings.push(message);
         const restore = h.run('restoreEffectiveScopeConfiguration');
         assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
-        assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'saved');
+        assert.equal((await h.run('excludeCoverageSubtree', h.targets[0])).status, 'applied');
         decision.resolve(answer);
         assert.equal(await restore, !!answer);
         assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
-        assert.equal(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'), !answer);
+        assert.equal(h.state.workspaceConfiguration.watchExclude.some(rule => rule.pattern === '/a/'), true,
+            'Restore uses the current effective scope, including a completed quick action');
     });
 }
 
@@ -2151,7 +2171,7 @@ await test('auto-next cancels after opening and closing an active webview tab',a
 });
 
 
-function quickExclusionHarness() {
+function quickExclusionHarness(coverage = false) {
     const h = monitoringScopeCommandHarness();
     h.vscode.Uri = class {
         constructor(fsPath) { this.fsPath = fsPath; this.scheme = 'file'; }
@@ -2194,8 +2214,43 @@ function quickExclusionHarness() {
         if (options?.modal) { await h.state.duringConfirmation?.(); return h.state.confirm ? buttons[0] : undefined; }
         return undefined;
     };
-    return { ...h, target, exclude: () => h.run('excludeResource', { exclusionPath: target }) };
+    return { ...h, target, exclude: () => coverage
+        ? h.run('excludeCoverageSubtree', { coveragePath: target })
+        : h.run('excludeResource', { exclusionPath: target }) };
 }
+
+for (const answer of [false, true]) await test(`coverage-row single action ${answer ? 'applies' : 'cancels'} one bound review confirmation`, async () => {
+    const h = quickExclusionHarness(true); h.state.confirm = answer;
+    const before = structuredClone(h.state.changes);
+    const result = await h.exclude();
+    assert.equal(result.status, answer ? 'applied' : 'cancelled');
+    assert.equal(h.state.dialogs.filter(item => item.options?.modal).length, 1);
+    assert.equal(h.state.applies, answer ? 1 : 0);
+    assert.equal(h.state.updates.length, answer ? 1 : 0);
+    assert.equal(h.state.pendingScope, undefined);
+    assert.equal(h.state.createdPanels.length, 0);
+    assert.deepEqual(h.state.changes, answer ? [] : before);
+    if (answer) { assert.doesNotMatch(h.state.info.at(-1), /Use Apply Pending|request saved/i); }
+});
+
+await test('coverage-row confirmation owns the scope action before writing settings and releases on Cancel', async () => {
+    const h = quickExclusionHarness(true);
+    const entered = deferred(), gate = deferred();
+    h.state.duringConfirmation = async () => { entered.resolve(); await gate.promise; };
+    const exclusion = h.exclude();
+    try {
+        await entered.promise;
+        assert.equal(h.controller.hasPendingScopeSettingsWrites(),false,'confirmation itself saves nothing');
+        for (const command of scopeEditorCommands) {
+            await h.run(command);
+            assert.equal(h.WatchExcludePanel.currentPanel,undefined,'a draft cannot open behind an active confirmation');
+        }
+        assert.equal(h.state.updates.length,0);
+    } finally { gate.resolve(); await exclusion; h.WatchExcludePanel.currentPanel?.dispose(); }
+    await h.run('manageMonitoringScope');
+    assert.ok(h.WatchExcludePanel.currentPanel,'Cancel releases ownership');
+    h.WatchExcludePanel.currentPanel.dispose();
+});
 
 await test('QUICK-EXCLUSION Cancel does not save settings, pause reads, create Unknown or open a scope editor', async () => {
     const h = quickExclusionHarness();
