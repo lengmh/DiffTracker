@@ -285,8 +285,8 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 | 总 issue 与修复计划 | 已发布/本提交承载 |
 | Draft PR | 本计划提交后创建；保持 Draft |
 | 修复代码与新增回归 | 首批已实现目录 `change` 的有界协调；复用原有 bridge/handoff、扫描与持久化。重复/相邻目录通知合并到所属 coverage root，一次在途、最多两轮、共享条目预算；保留 Unknown before-image 与原始待审，仅退休精确核验的旧证据。补充监听遍历跳过显式排除子树 |
-| 定向测试 | 新增 8 项 tracker 回归。旧代码确定性复现 directory-change gap 残留；另复现补充遍历进入已排除孩子目录。首轮全量 tracker 为 1575/1576，修正并发残留后本地 `npm test` 通过（tracker 1577/1577）。随后补充保护已排除旧证据与 pending-scope 控制证据；最终代码定向 8/8、S4-B 46/46、lint、编译和 VSIX 检查通过。最终 exact-head 全量 CI 结果见 PR #56 |
-| 真实 Host | 新增真实目录元数据 `change` 回调与恢复后持续子文件观察的 Host 用例；本地缺少 Xvfb，未执行真实 Host。Linux/Windows、最低版本与 installed RC 结果须以本批次 exact-head CI 为准 |
+| 定向测试 | 新增 9 项 tracker 回归。旧代码确定性复现 directory-change gap 残留；另复现补充遍历进入已排除孩子目录。首轮全量 tracker 为 1575/1576，修正并发残留后本地 `npm test` 通过（tracker 1577/1577）。随后补充保护已排除旧证据、pending-scope 控制证据与保存失败回滚；最终代码定向 9/9、S4-B 46/46、lint、编译和 VSIX 检查通过。最终 exact-head 全量 CI 结果见 PR #56 |
+| 真实 Host | 新增真实目录元数据通知与恢复后持续子文件观察的 Host 用例；本地缺少 Xvfb，未执行真实 Host。初始 head `04ea7d1e33390dd50b0fb1dabd0709cbaeb02ca9` 的 [Verification #677](https://github.com/lengmh/DiffTracker/actions/runs/40927049234) 中 Windows Stable Host、installed RC、降级拒绝通过；Linux Stable/1.80 因用例假定通知必须为 `change` 而超时。本地原生探针确认 Linux 报告 `rename`；用例已改为接受并原样转发平台真实通知，确定性测试继续单独覆盖 `change`。修正提交的完整 CI 结果见 PR #56 |
 | 完整 CI 与修复自动 review | 本批次 exact SHA、Verification URL 和实际结果记录在 PR #56。A0–A5 完整 diff 尚未就绪，未请求修复自动 review；后续完成整体实现后再请求一次 |
 | 合并与发布 | 未执行 |
 

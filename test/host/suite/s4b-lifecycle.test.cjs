@@ -24,12 +24,12 @@ async function directoryChangeHost(workspace) {
     const target = path.join(child, 'tracked.txt');
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
-    let observedChange = false;
+    let observedNotification = false;
     fs.watch = function(directory, ...args) {
         const listener = args[args.length - 1];
         if (String(directory) === root && typeof listener === 'function') {
             args[args.length - 1] = (kind, filename) => {
-                if (kind === 'change' && String(filename) === 'existing') { observedChange = true; }
+                if (String(filename) === 'existing') { observedNotification = true; }
                 listener(kind, filename);
             };
         }
@@ -54,7 +54,10 @@ async function directoryChangeHost(workspace) {
         tracker.commitSupplementalCoverageTargets([root]);
         assert.equal(tracker.fileWatchers.length, 0, 'only native observation may deliver this scenario');
         fs.utimesSync(child, new Date(), new Date(Date.now() + 2000));
-        await until('a real native directory change callback', () => observedChange);
+        // libuv may classify directory metadata as rename (Linux) or change.
+        // Deterministic tests exercise both callback branches separately; this
+        // scenario must use the platform's real callback without rewriting it.
+        await until('a real native directory notification', () => observedNotification);
         await until('directory verification to finish automatically', () =>
             tracker.directoryObservations.size === 0 && tracker.getSubtreeCoverageGaps().length === 0);
         assert.equal(tracker.getOriginalContent(target), 'known before\n');
@@ -62,7 +65,7 @@ async function directoryChangeHost(workspace) {
         await until('continued native child observation after directory verification', () =>
             tracker.getTrackedChange(target)?.currentContent === 'later observed edit\n');
         assert.equal(tracker.getOriginalContent(target), 'known before\n');
-        console.log('PASS HOST-ISSUE-55 real directory change reconciles automatically and keeps observing child edits');
+        console.log('PASS HOST-ISSUE-55 real directory notification reconciles automatically and keeps observing child edits');
     } finally {
         fs.watch = nativeWatch;
         await tracker.dispose();

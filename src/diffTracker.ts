@@ -9130,7 +9130,7 @@ export class DiffTracker {
     private async reconcileDirectoryObservation(uri: vscode.Uri, epoch: number): Promise<void> {
         const folder = this.owningWorkspaceFolderForTraversal(uri.fsPath);
         const scope = this.effectiveMonitoringScope;
-        if (!folder || scope.kind !== 'configured') { return; }
+        if (!folder || scope.kind !== 'configured' || this.persistenceFailed) { return; }
         if (!this.coverageGaps.get(uri.fsPath)?.subtree) {
             this.setSubtreeCoverageGap(uri.fsPath, 'supplemental-watcher-directory-change-gap',
                 'Directory observation is being verified; if verification cannot complete, recheck observation coverage.');
@@ -9156,7 +9156,7 @@ export class DiffTracker {
             this.coverageGeneration === generation && this.watcherCoverageRevision === policy &&
             this.snapshotInitialized && this.restoringEpoch === undefined &&
             !this.baselineBuilding && !this.baselineTransaction && !this.scopeApplyPreflight && this.activeScopeApplications === 0 &&
-            !this.pendingMonitoringScope && !this.recoveryBlocked && !this.persistenceFailed &&
+            !this.pendingMonitoringScope && !this.recoveryBlocked &&
             !this.gitContextPending && this.pausedGitRepositories.size === 0 && !this.workspaceContextChanged &&
             !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty &&
                 this.pathBelongsToRoot(document.uri.fsPath, job.directory)) &&
@@ -9166,7 +9166,9 @@ export class DiffTracker {
             const observation: DirectoryObservation = { current, budget: { remainingEntries: this.maxScopePreflightEntries } };
             // A finite follow-up covers notifications received during the first
             // pass. Both passes consume one allowance; busy trees remain limited.
-            for (let pass = 0; pass < 2 && current(); pass++) {
+            // A save failure must stop further passes without invalidating the
+            // current pass's rollback/coverage-failure publication.
+            for (let pass = 0; pass < 2 && current() && !this.persistenceFailed; pass++) {
                 job.dirty = false;
                 await this.onExternalFileCreated(vscode.Uri.file(job.directory), false, undefined, false, observation);
                 if (!job.dirty) { break; }

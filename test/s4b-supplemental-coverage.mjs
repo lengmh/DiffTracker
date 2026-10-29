@@ -909,6 +909,28 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.equal(fs.readFileSync(target, 'utf8'), 'before');
     }, 'rules'));
 
+    test('Issue #55 failed observation persistence rolls back tentative discovery and keeps a gap', () => fixture(async ({tracker,dir}) => {
+        const {child, target} = await lifecycleFixture(tracker, dir);
+        const unseen = path.join(child, 'unseen.txt');
+        fs.writeFileSync(unseen, 'unproven history');
+        const write = h.vscode.workspace.fs.writeFile;
+        h.vscode.workspace.fs.writeFile = async (uri, ...args) => {
+            if (uri.fsPath === path.join(tracker.storageUri.fsPath, 'session-state.tmp.json')) {
+                throw new Error('Injected observation persistence failure');
+            }
+            return write(uri, ...args);
+        };
+        try {
+            await tracker.onExternalFileChanged(Uri.file(child));
+            assert.equal(tracker.persistenceFailed, true);
+            assert.equal(tracker.unresolvedBaselineFiles.has(unseen), false,
+                'a failed durable publication must not leave tentative discovery in memory');
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === child));
+            assert.equal(tracker.getOriginalContent(target), 'before');
+            assert.equal(fs.readFileSync(unseen, 'utf8'), 'unproven history');
+        } finally { h.vscode.workspace.fs.writeFile = write; }
+    }, 'rules'));
+
     test('Issue #55 automatic directory verification never enumerates an explicitly excluded child', () => fixture(async ({tracker,dir}) => {
         const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
         const excluded = path.join(child, 'private');
