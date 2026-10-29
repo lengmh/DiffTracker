@@ -1370,9 +1370,14 @@ export async function activate(context: vscode.ExtensionContext) {
                 'Restore Effective Scope'
             );
             if (answer === 'Restore Effective Scope') {
-                await monitoringScopeController.restoreEffectiveScopeConfiguration();
+                const outcome = await monitoringScopeController.restoreEffectiveScopeConfiguration();
+                if (outcome.status === 'restored') {
+                    void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Effective configuration restored and observation coverage verified.'}`);
+                } else {
+                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Configuration Restore did not complete.'}`);
+                }
                 settingsTreeDataProvider.refresh();
-                return true;
+                return outcome.status === 'restored';
             }
             return false;
         })

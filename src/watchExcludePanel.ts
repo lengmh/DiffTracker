@@ -131,7 +131,12 @@ export class WatchExcludePanel {
                 'Restore Effective Scope'
             );
             if (answer === 'Restore Effective Scope') {
-                await this.scopeController.restoreEffectiveScopeConfiguration();
+                const outcome = await this.scopeController.restoreEffectiveScopeConfiguration();
+                if (outcome.status === 'restored') {
+                    void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Effective configuration restored and observation coverage verified.'}`);
+                } else {
+                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Configuration Restore did not complete.'}`);
+                }
             }
             await this.postStatus();
             return;

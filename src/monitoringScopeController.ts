@@ -25,6 +25,8 @@ const CONSENT_KEY = 'diffTracker.monitoringScope.consent.v1';
 const DISMISSED_KEY = 'diffTracker.monitoringScope.dismissedRevision.v1';
 const MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v2';
 const LEGACY_MIGRATION_KEY = 'diffTracker.monitoringScope.legacyMigration.v1';
+const SCOPE_SETTINGS_KEYS = ['monitoringScope', 'watchInclude', 'watchExclude'] as const;
+type ScopeSettings = Record<typeof SCOPE_SETTINGS_KEYS[number], unknown>;
 
 type LegacySourceValueEvidence =
     | { kind: 'unset' }
@@ -59,12 +61,21 @@ export interface MonitoringScopeStatus {
 
 export interface MonitoringScopeApplyOutcome {
     status: 'applied' | 'invalid' | 'needsMigration' | 'needsConsent' |
-        'needsDiscardConfirmation' | 'requiresS4' | 'failed' | 'conflict';
+        'needsDiscardConfirmation' | 'requiresS4' | 'failed' | 'conflict' | 'restored' | 'partial' | 'cancelled';
     reason?: string;
     expansionReasons?: string[];
     affectedReviewPaths?: string[];
     affectedReviewRevision?: string;
     scopeRevision?: string;
+    settingsStatus?: 'unchanged' | 'saved' | 'restored' | 'partial';
+    scopeCommitted?: boolean;
+    coverageStatus?: 'verified' | 'limited' | 'deferred' | 'notRun';
+}
+
+export interface MonitoringScopeConfirmation {
+    scopeRevision: string;
+    expansionReasons: readonly string[];
+    affectedReviewPaths: readonly string[];
 }
 
 export class MonitoringScopeController implements vscode.Disposable {
@@ -73,6 +84,8 @@ export class MonitoringScopeController implements vscode.Disposable {
     private pendingScopeSettingsWrites = 0;
     private quickExclusionInProgress = false;
     private confirmedQuickScopeRevision?: string;
+    private confirmedSettings?: {expected:ScopeSettings; roots:string; effective:string};
+    private disposed = false;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -91,6 +104,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public reconcileRequestedScope(): void {
+        if (this.disposed) { return; }
         const requested = this.getRequestedScope();
         const effective = this.tracker.getEffectiveMonitoringScope();
         const scope = requested.ok ? requested.scope : undefined;
@@ -101,10 +115,15 @@ export class MonitoringScopeController implements vscode.Disposable {
         // It is not a manual, unconfirmed settings edit: keep the old effective
         // observation live instead of manufacturing Unknown before committing.
         if (pending?.scopeRevision === this.confirmedQuickScopeRevision && this.confirmedQuickScopeRevision) { return; }
+        const owned = this.confirmedSettings;
+        if (owned && this.settingsFingerprint() === this.settingsFingerprint(owned.expected) &&
+            JSON.stringify(this.getWorkspaceRoots()) === owned.roots &&
+            createLegacySourceFingerprint(effective) === owned.effective) { return; }
         this.tracker.setPendingMonitoringScope(pending);
     }
 
     public dispose(): void {
+        this.disposed = true;
         for (const disposable of this.disposables.splice(0)) { disposable.dispose(); }
     }
 
@@ -322,7 +341,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public hasActiveScopeAction(): boolean {
-        return this.quickExclusionInProgress || this.hasPendingScopeSettingsWrites();
+        return this.disposed || this.quickExclusionInProgress || this.hasPendingScopeSettingsWrites();
     }
 
     private enqueueScopeSettingsWrite<T>(write: () => Promise<T>): Promise<T> {
@@ -384,7 +403,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             return await this.enqueueScopeSettingsWrite(async () => {
                 const latest = this.getStatus();
                 const fresh = this.prepareResourceExclusion(targetPath, requireCoverage, directory);
-                if (latest.effective.kind !== 'configured' || latest.effective.scopeRevision !== initial.effective.scopeRevision ||
+                if (this.disposed || latest.effective.kind !== 'configured' || latest.effective.scopeRevision !== initial.effective.scopeRevision ||
                     latest.requested.scope?.scopeRevision !== proposal.current.scopeRevision ||
                     fresh.status !== 'ready' || fresh.scope.scopeRevision !== scope.scopeRevision ||
                     this.tracker.getExplicitlyExcludedReviewRevision(scope) !== approvedReviewRevision) {
@@ -555,6 +574,114 @@ export class MonitoringScopeController implements vscode.Disposable {
         return this.enqueueScopeSettingsWrite(() => this.saveRequestedScopeNow(request, options));
     }
 
+    public getRequestVersion(): string {
+        return createLegacySourceFingerprint({settings:this.scopeSettings(),roots:this.getWorkspaceRoots(),
+            legacy:this.getLegacySourceSnapshot()});
+    }
+
+    /** Validate and confirm the complete editor proposal before any settings write. */
+    public async saveAndApplyScope(
+        request: MonitoringScopeRequest,
+        confirm: (proposal: MonitoringScopeConfirmation) => Promise<boolean>,
+        expectedRequestVersion = this.getRequestVersion()
+    ): Promise<MonitoringScopeApplyOutcome> {
+        const conflict = (reason: string): MonitoringScopeApplyOutcome => ({status:'conflict',reason,
+            settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'});
+        if (this.hasActiveScopeAction()) { return conflict('Another monitoring-scope action is in progress.'); }
+        if (expectedRequestVersion !== this.getRequestVersion()) {
+            return conflict('Settings changed after this editor draft was loaded. Your draft is preserved; review the current settings before retrying.');
+        }
+        const checked = validateAndCanonicalizeScope(request,this.getWorkspaceRoots());
+        if (!checked.ok || !checked.scope) {
+            return {status:'invalid',reason:checked.errors.map(error=>error.message).join('; '),settingsStatus:'unchanged',scopeCommitted:false};
+        }
+        const scope = checked.scope;
+        const effective = this.tracker.getEffectiveMonitoringScope();
+        if (effective.kind === 'legacyV3' && this.legacyMigrationRequired() && !this.migrationRecordMatches(scope.scopeRevision)) {
+            return {status:'needsMigration',reason:'Review and complete legacy migration for this exact target before applying it.',settingsStatus:'unchanged',scopeCommitted:false};
+        }
+        const expansionReasons = scopeConsentMatches(this.context.workspaceState.get(CONSENT_KEY),scope) ? []
+            : effective.kind === 'configured' ? detectScopeExpansion(effective,scope).reasons
+                : [...(scope.mode === 'wholeWorkspace' ? ['Whole Workspace mode requires expanded monitoring coverage.'] : []),
+                    ...scope.includes.map(rule=>`Explicit include requires local authorization: ${rule.path}`)];
+        const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
+        const affectedReviewRevision = this.tracker.getExplicitlyExcludedReviewRevision(scope);
+        const before = this.scopeSettings();
+        const expected = this.scopeSettings();
+        const roots = JSON.stringify(this.getWorkspaceRoots());
+        const effectiveFingerprint = createLegacySourceFingerprint(effective);
+        const legacy = this.getLegacySourceSnapshot();
+        const current = () => !this.disposed && this.settingsFingerprint() === this.settingsFingerprint(expected) &&
+            JSON.stringify(this.getWorkspaceRoots()) === roots &&
+            createLegacySourceFingerprint(this.tracker.getEffectiveMonitoringScope()) === effectiveFingerprint &&
+            this.migrationUnaffectedSourcesMatch(legacy,this.getLegacySourceSnapshot());
+        const reviewCurrent = () => this.tracker.getExplicitlyExcludedReviewRevision(scope) === affectedReviewRevision;
+        this.quickExclusionInProgress = true;
+        try {
+            if ((expansionReasons.length > 0 || affectedReviewPaths.length > 0) &&
+                !await confirm({scopeRevision:scope.scopeRevision,expansionReasons:[...expansionReasons],affectedReviewPaths:[...affectedReviewPaths]})) {
+                return {status:'cancelled',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'};
+            }
+            return await this.enqueueScopeSettingsWrite(async () => {
+                if (!current() || !reviewCurrent()) { return conflict('Scope, workspace, settings or affected review changed during confirmation. Your draft is preserved.'); }
+                this.confirmedSettings = {expected,roots,effective:effectiveFingerprint};
+                let outcome: MonitoringScopeApplyOutcome = {status:'failed',scopeCommitted:false,coverageStatus:'notRun'};
+                let attempted = false;
+                try {
+                    const values: ScopeSettings = {monitoringScope:scope.mode,watchInclude:scope.includes,watchExclude:scope.excludes};
+                    const config = vscode.workspace.getConfiguration('diffTracker');
+                    for (const key of SCOPE_SETTINGS_KEYS) {
+                        if (!current() || !reviewCurrent()) { throw new Error('Settings, scope or affected review changed during the save.'); }
+                        const previous = expected[key];
+                        expected[key] = values[key];
+                        attempted = true;
+                        try { await config.update(key,values[key],vscode.ConfigurationTarget.Workspace); }
+                        catch (error) {
+                            // update may reject before changing anything or after
+                            // persisting. Read back before deciding what we own.
+                            const unchanged = {...expected,[key]:previous};
+                            if (this.settingsFingerprint() === this.settingsFingerprint(unchanged)) { expected[key] = previous; }
+                            throw error;
+                        }
+                        if (!current() || !reviewCurrent()) { throw new Error('Settings, scope or affected review changed during the save.'); }
+                    }
+                    outcome = await this.performPendingScopeApply({grantConsent:true,
+                        discardExplicitlyExcludedReviews:affectedReviewPaths.length > 0,
+                        expectedScopeRevision:scope.scopeRevision,expectedAffectedReviewRevision:affectedReviewRevision,
+                        requestGuard:current});
+                    if (outcome.status === 'applied') {
+                        outcome = {...outcome,scopeCommitted:true,settingsStatus:'saved'};
+                    }
+                } catch (error) { outcome = {status:'failed',scopeCommitted:false,coverageStatus:'notRun',reason:String(error)}; }
+                finally {
+                    // A committed scope owns its settings even if later verification fails.
+                    // Compensate only the exact uncommitted request still owned here.
+                    if (outcome.status !== 'applied' && attempted) {
+                        try {
+                            if (!current()) { throw new Error('Newer settings or workspace state must be preserved.'); }
+                            const unchanged = this.settingsFingerprint(expected) === this.settingsFingerprint(before);
+                            const config = vscode.workspace.getConfiguration('diffTracker');
+                            for (const key of [...SCOPE_SETTINGS_KEYS].reverse()) {
+                                if (!current()) { throw new Error('Settings changed during compensation.'); }
+                                if (createLegacySourceFingerprint(expected[key]) === createLegacySourceFingerprint(before[key])) { continue; }
+                                expected[key] = before[key];
+                                await config.update(key,before[key],vscode.ConfigurationTarget.Workspace);
+                                if (!current()) { throw new Error('Settings changed during compensation.'); }
+                            }
+                            outcome = {...outcome,settingsStatus:unchanged ? 'unchanged' : 'restored',scopeCommitted:false};
+                        } catch (error) {
+                            outcome = {...outcome,status:'partial',settingsStatus:'partial',scopeCommitted:false,
+                                reason:`Scope was not applied. Settings could not be fully restored: ${String(error)} ${outcome.reason ?? ''}`};
+                        }
+                    }
+                    this.confirmedSettings = undefined;
+                    this.reconcileRequestedScope();
+                }
+                return outcome.status === 'applied' ? this.finalizeScopeOperation(outcome) : outcome;
+            });
+        } finally { this.quickExclusionInProgress = false; }
+    }
+
     // Migration already owns the queue; its nested save must not enqueue again.
     private async saveRequestedScopeNow(
         request: MonitoringScopeRequest,
@@ -645,9 +772,13 @@ export class MonitoringScopeController implements vscode.Disposable {
         discardExplicitlyExcludedReviews?: boolean;
         expectedScopeRevision?: string;
         expectedAffectedReviewRevision?: string;
+        requestGuard?: () => boolean;
     }): Promise<MonitoringScopeApplyOutcome> {
         const status = this.getStatus();
         const scope = status.requested.scope;
+        if (options?.requestGuard && !options.requestGuard()) {
+            return {status:'conflict',reason:'The confirmed settings or workspace changed before Apply.'};
+        }
         if (!status.requested.ok || !scope) {
             return { status: 'invalid', reason: status.requested.errors.map(error => error.message).join('; ') };
         }
@@ -673,8 +804,8 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
         const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
         const affectedReviewRevision = this.tracker.getExplicitlyExcludedReviewRevision(scope);
-        if (options?.discardExplicitlyExcludedReviews &&
-            options.expectedAffectedReviewRevision !== affectedReviewRevision) {
+        if ((options?.expectedAffectedReviewRevision && options.expectedAffectedReviewRevision !== affectedReviewRevision) ||
+            (options?.discardExplicitlyExcludedReviews && !options.expectedAffectedReviewRevision)) {
             return { status: 'conflict', scopeRevision: scope.scopeRevision,
                 reason: 'Affected review changed or discard approval is unbound; confirm the current review set again.' };
         }
@@ -696,6 +827,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             ? this.getLegacySourceFingerprint()
             : undefined;
         const requestStillCurrent = (): boolean => {
+            if (options?.requestGuard && !options.requestGuard()) { return false; }
             const latest = this.getRequestedScope();
             if (!latest.ok || latest.scope?.scopeRevision !== expectedRevision) { return false; }
             if (!expectedLegacySourceFingerprint) { return true; }
@@ -855,25 +987,80 @@ export class MonitoringScopeController implements vscode.Disposable {
         return { status: 'completed' };
     }
 
-    public restoreEffectiveScopeConfiguration(): Promise<void> {
+    private scopeSettings(): ScopeSettings {
+        return Object.fromEntries(SCOPE_SETTINGS_KEYS.map(key => {
+            const value = this.inspectWorkspaceValue<unknown>(key);
+            return [key, value === undefined ? undefined : JSON.parse(JSON.stringify(value))];
+        })) as ScopeSettings;
+    }
+
+    private settingsFingerprint(settings = this.scopeSettings()): string {
+        return createLegacySourceFingerprint(SCOPE_SETTINGS_KEYS.map(key => this.legacySourceValue(settings[key])));
+    }
+
+    private async finalizeScopeOperation(outcome: MonitoringScopeApplyOutcome): Promise<MonitoringScopeApplyOutcome> {
+        const completed = outcome.status === 'applied' ? 'Monitoring scope applied' : 'Configuration restored';
+        if (!this.tracker.getIsRecording()) {
+            return {...outcome, coverageStatus:'deferred', reason: outcome.reason ??
+                `${completed}. Recording remains stopped; no observation scan was run.`};
+        }
+        if (this.tracker.getEffectiveMonitoringScope().scopeRevision !== outcome.scopeRevision) {
+            return {...outcome, status:'partial', coverageStatus:'notRun',
+                reason:'Configuration completed, but the effective scope changed before observation verification.'};
+        }
+        if (this.tracker.getBaselineState() !== 'ready' || this.tracker.getEffectiveMonitoringScope().kind !== 'configured') {
+            return {...outcome,status:'partial',coverageStatus:'notRun',
+                reason:'Configuration completed. Observation verification requires an active, ready configured scope; existing review is preserved.'};
+        }
+        if (this.tracker.getCoverageGaps().length === 0) { return {...outcome, coverageStatus:'verified'}; }
+        let result: ObservationCoverageRecheckResult;
+        try { result = await this.recheckObservationCoverage(); }
+        catch (error) { result = {status:'failed',reason:String(error)}; }
+        if (this.tracker.getEffectiveMonitoringScope().scopeRevision !== outcome.scopeRevision) {
+            return {...outcome,status:'partial',coverageStatus:'notRun',
+                reason:`${completed}, then the effective scope changed during observation verification. The newer scope is preserved.`};
+        }
+        return result.status === 'rechecked' ? {...outcome, coverageStatus:'verified'}
+            : {...outcome, status:'partial', coverageStatus:'limited',
+                reason:`${completed}; its effective scope is retained. Observation verification is incomplete: ${result.reason ?? result.status}`};
+    }
+
+    public restoreEffectiveScopeConfiguration(): Promise<MonitoringScopeApplyOutcome> {
         return this.enqueueScopeSettingsWrite(() => this.restoreEffectiveScopeConfigurationNow());
     }
 
-    private async restoreEffectiveScopeConfigurationNow(): Promise<void> {
+    private async restoreEffectiveScopeConfigurationNow(): Promise<MonitoringScopeApplyOutcome> {
         const config = vscode.workspace.getConfiguration('diffTracker');
         const effective = this.tracker.getEffectiveMonitoringScope();
-        if (effective.kind === 'configured') {
-            await config.update('monitoringScope', effective.mode, vscode.ConfigurationTarget.Workspace);
-            await config.update('watchInclude', effective.includes, vscode.ConfigurationTarget.Workspace);
-            await config.update('watchExclude', effective.excludes, vscode.ConfigurationTarget.Workspace);
-            return;
+        const roots = JSON.stringify(this.getWorkspaceRoots());
+        const expected = this.scopeSettings();
+        const before = this.settingsFingerprint(expected);
+        const restored: ScopeSettings = effective.kind === 'configured' ? {
+            monitoringScope:effective.mode, watchInclude:effective.includes, watchExclude:effective.excludes
+        } : {monitoringScope:undefined, watchInclude:undefined,
+            watchExclude:this.isLegacyStringArray(expected.watchExclude) ? expected.watchExclude : undefined};
+        const current = () => !this.disposed && createLegacySourceFingerprint(this.tracker.getEffectiveMonitoringScope()) === createLegacySourceFingerprint(effective) &&
+            JSON.stringify(this.getWorkspaceRoots()) === roots && this.settingsFingerprint() === this.settingsFingerprint(expected);
+        try {
+            const keys = effective.kind === 'legacyV3' && this.isLegacyStringArray(expected.watchExclude)
+                ? SCOPE_SETTINGS_KEYS.slice(0,2) : SCOPE_SETTINGS_KEYS;
+            for (const key of keys) {
+                if (!current()) { throw new Error('Workspace, effective scope or settings changed during Restore; newer settings were preserved.'); }
+                expected[key] = restored[key];
+                await config.update(key, restored[key], vscode.ConfigurationTarget.Workspace);
+                if (!current()) { throw new Error('Workspace, effective scope or settings changed during Restore; newer settings were preserved.'); }
+            }
+            if (effective.kind !== 'configured') { await this.clearLegacyMigration(); }
+            if (!current()) { throw new Error('Workspace, effective scope or settings changed before Restore completed.'); }
+            this.reconcileRequestedScope();
+            return this.finalizeScopeOperation({status:'restored',settingsStatus:'restored',scopeCommitted:true,
+                scopeRevision:effective.scopeRevision});
+        } catch (error) {
+            this.reconcileRequestedScope();
+            const changed = this.settingsFingerprint() !== before;
+            return {status:changed ? 'partial' : 'failed',settingsStatus:changed ? 'partial' : 'unchanged',
+                scopeCommitted:false,coverageStatus:'notRun',reason:`Configuration Restore did not complete: ${String(error)}`};
         }
-        await config.update('monitoringScope', undefined, vscode.ConfigurationTarget.Workspace);
-        await config.update('watchInclude', undefined, vscode.ConfigurationTarget.Workspace);
-        if (!this.isLegacyStringArray(this.inspectWorkspaceValue<unknown>('watchExclude'))) {
-            await config.update('watchExclude', undefined, vscode.ConfigurationTarget.Workspace);
-        }
-        await this.clearLegacyMigration();
     }
 
     public async grantConsent(scope: CanonicalMonitoringScope): Promise<void> {

@@ -110,6 +110,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         const handlers = [];
         const config = { monitoringScope: scope.mode, watchInclude: scope.includes, watchExclude: scope.excludes };
         const writes = [];
+        const hooks = {};
         const settings = new Map();
         vscode.workspace.onDidChangeConfiguration = handler => { handlers.push(handler); return { dispose() {} }; };
         vscode.workspace.getConfiguration = (...args) => ({
@@ -118,8 +119,10 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             inspect: key => ({ workspaceValue: config[key] }),
             update: async (key, value) => {
                 writes.push([key, value]);
+                await hooks.beforeWrite?.(key, value);
                 await new Promise(resolve => setImmediate(resolve));
                 config[key] = structuredClone(value);
+                await hooks.afterWrite?.(key, value);
                 h.fireConfigurationChanged(`diffTracker.${key}`);
                 for (const handler of handlers) { handler({ affectsConfiguration: name => name === `diffTracker.${key}` }); }
             }
@@ -133,7 +136,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         const controller = new Controller({ workspaceState: {
             get: key => settings.get(key), update: async (key, value) => { settings.set(key, value); }
         } }, tracker);
-        try { await run({ controller, config, writes }); }
+        try { await run({ controller, config, writes, hooks }); }
         finally {
             controller.dispose();
             await tracker.ignoreRefreshPromise;
@@ -141,6 +144,187 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             vscode.workspace.onDidChangeConfiguration = oldEvent;
         }
     }
+
+    test('SCOPE-RECOVERY Restore completes withdrawn-exclusion observation in one action', () => fixture(async context => {
+        const files = await paused(context);
+        const { tracker, scope } = context;
+        await withController(tracker, scope, async ({controller,config}) => {
+            config.watchExclude = [{scope:'all',pattern:'/work-turns/'}];
+            controller.reconcileRequestedScope();
+            const outcome = await controller.restoreEffectiveScopeConfiguration();
+            assert.equal(outcome?.status,'restored',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,'verified');
+            assert.deepEqual(config.watchExclude,[]);
+            assert.equal(tracker.getOriginalContent(files.changed),'original');
+            assert.equal(tracker.getTrackedChange(files.changed)?.currentContent,'changed during pause');
+            assert.equal(tracker.getTrackedChange(files.changed)?.reviewKind,'text');
+            assert.deepEqual(tracker.getCoverageGaps(),[]);
+            fs.writeFileSync(files.changed,'edit after Restore');
+            await tracker.onExternalFileChanged(Uri.file(files.changed));
+            await h.waitUntil(()=>tracker.getTrackedChange(files.changed)?.currentContent==='edit after Restore');
+            assert.equal(tracker.getOriginalContent(files.changed),'original');
+        });
+    }));
+
+    for (const situation of ['stopped','real-failure','external-settings'])
+    test(`SCOPE-RECOVERY Restore ${situation} preserves scope and reports its actual completion`, () => fixture(async context => {
+        const files = await paused(context);
+        const {tracker,scope} = context;
+        if (situation === 'stopped') { tracker.stopRecording(); }
+        if (situation === 'real-failure') {
+            tracker.setFileCoverageGap(files.other,'file-read-failed','Independent read failure');
+            tracker.markFileUnavailable(files.other,'Independent read failure');
+        }
+        await withController(tracker,scope,async ({controller,config,hooks,writes}) => {
+            config.watchExclude=[{scope:'all',pattern:'/work-turns/'}];
+            controller.reconcileRequestedScope();
+            if (situation === 'external-settings') {
+                hooks.afterWrite = key => {
+                    if (key === 'monitoringScope') { config.watchExclude=[{scope:'all',pattern:'/external/'}]; }
+                };
+            }
+            const outcome=await controller.restoreEffectiveScopeConfiguration();
+            assert.equal(outcome.status,situation==='stopped'?'restored':'partial',JSON.stringify(outcome));
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+            assert.equal(tracker.getIsRecording(),situation!=='stopped');
+            assert.equal(tracker.getOriginalContent(files.changed),'original');
+            if (situation === 'stopped') {
+                assert.equal(outcome.coverageStatus,'deferred');
+                assert.equal(tracker.getTrackedChange(files.changed)?.reviewKind,'unknown');
+            } else if (situation === 'real-failure') {
+                assert.equal(outcome.coverageStatus,'limited');
+                assert.deepEqual(config.watchExclude,[]);
+                assert.equal(tracker.coverageGaps.get(files.other)?.file?.reasonCode,'file-read-failed');
+            } else {
+                assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/external/'}]);
+                assert.equal(writes.length,1,'Restore stops before overwriting the newer exclusion');
+            }
+            assert.equal(fs.readFileSync(files.changed,'utf8'),'changed during pause');
+        });
+    }));
+
+    test('SCOPE-RECOVERY Save and Apply combines expansion and discard before any settings write', () => fixture(async ({tracker,dir,scope}) => {
+        const removed = path.join(dir,'remove'); fs.mkdirSync(removed);
+        const target = path.join(removed,'pending.txt'); fs.writeFileSync(target,'original');
+        const added = path.join(dir,'added.txt'); fs.writeFileSync(added,'new baseline');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scopeFor(tracker))).status,'applied');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending'); await tracker.readFileAndUpdate(target,Uri.file(target));
+        await withController(tracker,scope,async ({controller,writes,config}) => {
+            let confirmations=0;
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],
+                excludes:[{scope:'all',pattern:'/remove/'}]},async proposal => {
+                confirmations++;
+                assert.ok(proposal.expansionReasons.length>0);
+                assert.deepEqual(proposal.affectedReviewPaths,[target]);
+                assert.equal(writes.length,0);
+                assert.equal(tracker.getTrackedChange(target)?.reviewKind,'text');
+                return true;
+            });
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,'verified');
+            assert.equal(confirmations,1);
+            assert.deepEqual(writes.map(([key])=>key),['monitoringScope','watchInclude','watchExclude']);
+            assert.equal(config.monitoringScope,'wholeWorkspace');
+            assert.equal(tracker.getTrackedChange(target),undefined);
+            assert.equal(tracker.getOriginalContent(added),'new baseline');
+            fs.writeFileSync(added,'observed after Save and Apply');
+            await tracker.onExternalFileChanged(Uri.file(added));
+            await h.waitUntil(()=>tracker.getTrackedChange(added)?.currentContent==='observed after Save and Apply');
+            assert.equal(tracker.getOriginalContent(added),'new baseline');
+            assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });
+    },'rules'));
+
+    for (const situation of ['cancel','settings-failure','external-settings','verification-failure'])
+    test(`SCOPE-RECOVERY Save and Apply ${situation} reports only durable, owned results`, () => fixture(async ({tracker,dir,scope}) => {
+        const removed=path.join(dir,'remove'); fs.mkdirSync(removed);
+        const target=path.join(removed,'pending.txt'), other=path.join(dir,'other.txt');
+        fs.writeFileSync(target,'original'); fs.writeFileSync(other,'other original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending'); await tracker.readFileAndUpdate(target,Uri.file(target));
+        const token=tracker.getReviewToken(target);
+        if (situation === 'verification-failure') {
+            tracker.setFileCoverageGap(other,'file-read-failed','Independent read failure');
+            tracker.markFileUnavailable(other,'Independent read failure');
+        }
+        await withController(tracker,scope,async ({controller,config,hooks,writes}) => {
+            const before=structuredClone(config);
+            if (situation === 'settings-failure') {
+                hooks.beforeWrite=key=>{if(key==='watchInclude')throw new Error('Controlled settings write failure');};
+            }
+            if (situation === 'external-settings') {
+                hooks.afterWrite=key=>{if(key==='monitoringScope')config.watchExclude=[{scope:'all',pattern:'/external/'}];};
+            }
+            const proposal={mode:'wholeWorkspace',includes:[{scope:'all',path:'new-inc'}],excludes:[{scope:'all',pattern:'/remove/'}]};
+            let confirmations=0;
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>{confirmations++;return situation!=='cancel';});
+            const committed=situation==='verification-failure';
+            assert.equal(outcome.status,situation==='cancel'?'cancelled':situation==='settings-failure'?'failed':'partial',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,committed);
+            assert.equal(confirmations,1);
+            if (situation==='cancel' || situation==='settings-failure') {
+                assert.deepEqual(config,before);
+                assert.deepEqual(tracker.getReviewToken(target),token);
+                assert.equal(outcome.settingsStatus,'unchanged');
+                if(situation==='cancel')assert.equal(writes.length,0);
+            } else if (situation==='external-settings') {
+                assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/external/'}]);
+                assert.equal(writes.length,1);
+            } else {
+                assert.ok(config.watchExclude.some(rule=>rule.pattern==='/remove/'));
+                assert.equal(outcome.coverageStatus,'limited');
+                assert.equal(tracker.getTrackedChange(target),undefined);
+                assert.equal(tracker.coverageGaps.get(other)?.file?.reasonCode,'file-read-failed');
+                const retried=await controller.saveAndApplyScope(proposal,async()=>{throw new Error('Retry must not discard the same review again');});
+                assert.equal(retried.status,'partial');
+                assert.ok(config.watchExclude.some(rule=>rule.pattern==='/remove/'));
+            }
+            assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });
+    }));
+
+    for (const situation of ['invalid','stale-draft','new-review','stop-during-confirmation','disposed','durability-failure','stopped'])
+    test(`SCOPE-RECOVERY Save and Apply ${situation} keeps confirmation bound to its proposal`, () => fixture(async ({tracker,dir,scope}) => {
+        const removed=path.join(dir,'remove'); fs.mkdirSync(removed);
+        const target=path.join(removed,'pending.txt'); fs.writeFileSync(target,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending'); await tracker.readFileAndUpdate(target,Uri.file(target));
+        if(situation==='stopped')tracker.stopRecording();
+        const token=tracker.getReviewToken(target);
+        const commit=tracker.commitPreparedScopePersistence;
+        if(situation==='durability-failure')tracker.commitPreparedScopePersistence=async()=>false;
+        try { await withController(tracker,scope,async ({controller,config,writes}) => {
+            const version=controller.getRequestVersion();
+            if(situation==='stale-draft'){
+                config.watchExclude=[{scope:'all',pattern:'/external/'}];controller.reconcileRequestedScope();
+            }
+            const before=structuredClone(config);
+            const proposal={mode:'wholeWorkspace',includes:situation==='invalid'?[{scope:'all',path:'../outside'}]:[],
+                excludes:[{scope:'all',pattern:'/remove/'}]};
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>{
+                if(situation==='new-review'){
+                    fs.writeFileSync(target,'newer pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+                }
+                if(situation==='stop-during-confirmation')tracker.stopRecording();
+                if(situation==='disposed')controller.dispose();
+                return true;
+            },version);
+            const expected=situation==='invalid'?'invalid':situation==='durability-failure'?'failed':situation==='stopped'?'applied':'conflict';
+            assert.equal(outcome.status,expected,JSON.stringify(outcome));
+            if(situation==='stopped'){
+                assert.equal(outcome.coverageStatus,'deferred');
+                assert.equal(tracker.getIsRecording(),false);
+                assert.equal(tracker.getTrackedChange(target),undefined);
+            }else{
+                assert.deepEqual(config,before);
+                assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+                if(situation!=='durability-failure')assert.equal(writes.length,0);
+                if(situation!=='new-review'&&situation!=='stop-during-confirmation')assert.deepEqual(tracker.getReviewToken(target),token);
+            }
+            assert.equal(fs.readFileSync(target,'utf8'),situation==='new-review'?'newer pending':'pending');
+        }); }finally{tracker.commitPreparedScopePersistence=commit;}
+    }));
 
     for (const stopped of [false, true]) test(`SCOPE-RECOVERY real controller quick Cancel preserves clean baselines and actual review (stopped=${stopped})`, () => fixture(async context => {
         const { tracker, dir, scope } = context;
