@@ -481,6 +481,7 @@ function coverageExclusionHarness(){
         getCommittedLegacyCompatibilityPolicy:()=>[],
         getExplicitlyExcludedPendingReviewPaths:()=>[],
         getExplicitlyExcludedReviewRevision:()=> 'stable-empty-review',
+        captureScopeOperationObservation:()=>({wasMonitored:()=>undefined,hadGap:()=>false,hadCoverageRoot:()=>false}),
         getScopeOperationRecoveryTargets:()=>h.state.scopeRecoveryTargets??[],
         getScopeOperationCoverageGaps:()=>({related:h.state.relatedScopeCoverageGaps??[],
             unrelated:h.state.unrelatedScopeCoverageGaps??h.tracker.getCoverageGaps?.()??[]}),
@@ -2498,6 +2499,43 @@ for(const scenario of ['cancel','partial','newer-draft'])await test(`scope edito
         assert.equal(h.state.changes[0].reviewKind,'text');
     }
     panel.dispose();
+});
+
+await test('scope completion with unrelated coverage stays consistent across panel tree and status bar',async()=>{
+    const h=quickExclusionHarness();h.state.confirm=true;
+    const [selected,other]=h.targets;
+    h.tracker.getCoverageGaps=()=>h.state.subtreeCoverageGaps.map(gap=>[gap.targetPath,gap.reason]);
+    const apply=h.tracker.applyConfiguredMonitoringScope;
+    h.tracker.applyConfiguredMonitoringScope=async(...args)=>{
+        const outcome=await apply(...args);
+        h.state.subtreeCoverageGaps=h.state.subtreeCoverageGaps.filter(gap=>gap.targetPath!==selected);
+        return outcome;
+    };
+    h.tracker.recheckObservationCoverage=async()=>{throw new Error('An unrelated warning must not cause full Recheck');};
+    const item={show(){},dispose(){}},listeners=[];
+    h.vscode.StatusBarAlignment={Right:2};h.vscode.ThemeColor=class{constructor(id){this.id=id;}};
+    h.vscode.window.createStatusBarItem=()=>item;
+    h.tracker.onDidChangeRecordingState=()=>({dispose(){}});h.tracker.onDidChangeBaselineState=()=>({dispose(){}});
+    h.tracker.onDidTrackChanges=listener=>{listeners.push(listener);return{dispose(){}};};
+    const tree=new(h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const status=new(h.load('statusBarManager.ts').StatusBarManager)(h.tracker);
+    assert.match(item.tooltip,/2 subtree/);
+    await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/a/'}]));
+    ui.click('save-apply');await ui.action();
+    for(const listener of listeners)listener({fullRefresh:true});
+    const shown=JSON.parse(ui.elements.get('status').textContent);
+    assert.equal(shown.operationOutcome.status,'applied');assert.equal(shown.operationOutcome.coverageStatus,'verified');
+    assert.deepEqual(shown.operationOutcome.unrelatedCoverageGaps.map(([file])=>file),[other]);
+    assert.match(shown.operationOutcome.reason,/Related observation work is complete; other coverage problems remain/);
+    assert.deepEqual(shown.coverageGaps.map(([file])=>file),[other]);
+    const diagnostic=(await tree.getChildren()).find(row=>row.label==='Monitoring Coverage Limited');
+    assert.deepEqual(diagnostic.children.map(row=>row.coveragePath),[other]);
+    assert.match(item.text,/Coverage Limited/);assert.match(item.tooltip,/1 subtree/);
+    assert.equal(item.command,'diffTracker.manageMonitoringScope');
+    assert.equal(h.state.dialogs.filter(dialog=>dialog.options?.modal).length,1);
+    panel.dispose();status.dispose();
 });
 
 await test('coverage-row confirmation owns the scope action before writing settings and releases on Cancel', async () => {

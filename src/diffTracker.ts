@@ -17,6 +17,12 @@ export interface ObservationCoverageRecheckResult {
     reason?: string;
 }
 
+export interface ScopeOperationObservation {
+    wasMonitored: (target: string, directory: boolean) => boolean | undefined;
+    hadGap: (target: string, evidence: object) => boolean;
+    hadCoverageRoot: (target: string) => boolean;
+}
+
 export interface ScopeCoverageTarget {
     path: string;
     kind: 'file' | 'subtree';
@@ -5222,6 +5228,7 @@ export class DiffTracker {
         preparationStillCurrent: () => boolean = () => this.isCurrentEpoch(epoch),
         traversalOptions: {
             seedOverlappingWorkspaceRoots?: boolean;
+            respectPendingScope?: boolean;
             skipTraversalPath?: (targetPath: string) => boolean;
             visitedDirectories?: Set<string>;
             identityBudget?: PathIdentityWorkBudget;
@@ -5271,6 +5278,10 @@ export class DiffTracker {
             const { folder, directory } = pending.pop()!;
             if (traversalOptions.skipTraversalPath?.(directory)) { continue; }
             if (!this.workspaceFolderOwnsTraversalPath(folder, directory)) { continue; }
+            if (traversalOptions.respectPendingScope && this.pendingScopeExplicitlyExcludes(vscode.Uri.file(directory), true, identityBudget)) {
+                this.assertPathIdentityBudget(identityBudget);
+                continue;
+            }
             const rootIdentity = this.workspaceRootIdentityForFolder(folder);
             if (typeof rootIdentity.caseSensitive !== 'boolean') {
                 throw new Error('Workspace path case-sensitivity could not be verified during scope preparation');
@@ -5333,6 +5344,10 @@ export class DiffTracker {
                     if (entryKind === 'missing' || entryKind === 'other' || entryKind === 'symlink') { continue; }
                     this.notePhysicalIdentityPath(identityBudget, child);
                     const isDirectory = entryKind === 'directory';
+                    if (traversalOptions.respectPendingScope && this.pendingScopeExplicitlyExcludes(vscode.Uri.file(child), isDirectory, identityBudget)) {
+                        this.assertPathIdentityBudget(identityBudget);
+                        continue;
+                    }
                     if (isDirectory && !this.workspaceFolderOwnsTraversalPath(folder, child)) { continue; }
                     const relative = this.toPosixPath(path.relative(folder.uri.fsPath, child));
                     if (isHardUnmonitorableRelativePath(relative, rootIdentity, isDirectory, identityBudget)) {
@@ -6399,10 +6414,38 @@ export class DiffTracker {
         );
     }
 
+    public captureScopeOperationObservation(): ScopeOperationObservation {
+        // Apply replaces ignore matchers. Keep the committed legacy policy and
+        // exact old evidence for attribution, without reading any target content.
+        const scope = this.getEffectiveMonitoringScope();
+        const matchers = new Map(this.ignoreMatchers);
+        const roots = [...this.supplementalCoverageRoots];
+        const evidence = new Map([...this.coverageGaps].map(([target,record]) => [target,{...record}]));
+        return {
+            wasMonitored: (target, directory) => {
+                const folder = this.owningWorkspaceFolderForTraversal(target);
+                if (!folder || !scope.roots.some(root => root.uri === folder.uri.toString())) { return undefined; }
+                const matcher = matchers.get(folder.uri.fsPath);
+                if (!matcher) { return undefined; }
+                const relative = this.toPosixPath(path.relative(folder.uri.fsPath,target));
+                const ignored = relative ? matcher.ignores(relative + (directory ? '/' : '')) : false;
+                return scope.kind === 'configured'
+                    ? evaluateConfiguredScope(scope,this.workspaceRootIdentityForFolder(folder),relative,ignored,directory).monitored
+                    : !ignored;
+            },
+            hadGap: (target, record) => evidence.get(target)?.file === record || evidence.get(target)?.subtree === record,
+            hadCoverageRoot: target => {
+                const folder = this.owningWorkspaceFolderForTraversal(target);
+                return !!folder && roots.some(root => this.pathBelongsToRoot(target,root) && this.workspaceFolderOwnsTraversalPath(folder,root));
+            }
+        };
+    }
+
     public getScopeOperationRecoveryTargets(
         previous: EffectiveMonitoringScope,
         requested?: CanonicalMonitoringScope,
-        restoring = false
+        restoring = false,
+        observationBefore?: ScopeOperationObservation
     ): ScopeCoverageTarget[] {
         const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
         if (scope.kind !== 'configured') { return []; }
@@ -6416,7 +6459,13 @@ export class DiffTracker {
                 const uri = vscode.Uri.file(target);
                 if (this.scopeExplicitlyExcludesDirectory(directory ? target : path.dirname(target), scope) ||
                     !this.configuredScopeMonitorsPath(scope, uri, directory)) { continue; }
-                const exposed = previous.kind === 'configured' && !this.configuredScopeMonitorsPath(previous, uri, directory);
+                const previouslyMonitored = previous.kind === 'configured'
+                    ? this.configuredScopeMonitorsPath(previous, uri, directory)
+                    : observationBefore?.wasMonitored(target,directory);
+                const newRequiredOwner = directory && this.isSupplementalCoverageGap(record) &&
+                    !observationBefore?.hadGap(target,evidence) &&
+                    (observationBefore ? !observationBefore.hadCoverageRoot(target) : previous.kind === 'legacyV3');
+                const exposed = previouslyMonitored === false || newRequiredOwner;
                 const withdrawn = !!requested && !this.configuredScopeMonitorsPath(requested, uri, directory);
                 if (exposed || withdrawn || (restoring && this.isPendingScopeRecoveryEvidence(evidence)) ||
                     evidence.scopeOperationRevision === scope.scopeRevision) {
@@ -6871,6 +6920,7 @@ export class DiffTracker {
         wholeWorkspaceCapacityGuard?: CandidateCapacityGuard,
         traversalOptions: {
             seedOverlappingWorkspaceRoots?: boolean;
+            respectPendingScope?: boolean;
             skipTraversalPath?: (targetPath: string) => boolean;
             identityBudget?: PathIdentityWorkBudget;
         } = {}
@@ -9098,7 +9148,8 @@ export class DiffTracker {
                 : await this.findScopeFilesUnderDirectory(
                 folder.uri.fsPath,
                 wholeWorkspacePreparationBudget,
-                wholeWorkspaceCapacityGuard
+                wholeWorkspaceCapacityGuard,
+                {respectPendingScope:true}
             );
             if (!this.isCurrentEpoch(epoch) || (recheckCurrent && !recheckCurrent())) { return; }
             for (const uri of files) { candidates.set(uri.fsPath, uri); }

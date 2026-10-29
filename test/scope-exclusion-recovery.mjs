@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import Module, { createRequire } from 'node:module';
+import { registerScopeSingleActionCrashes } from './scope-single-action-crash.mjs';
 import { registerScopeSingleActionAcceptance } from './scope-single-action-acceptance.mjs';
 const require = createRequire(import.meta.url);
 
@@ -105,7 +106,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             assert.equal(tracker.getOriginalContent(files.changed), 'original');
         } finally { if (blocked === 'dirty') { vscode.workspace.textDocuments.pop(); } }
     }));
-    async function withController(tracker, scope, run) {
+    async function withController(tracker, scope, run, options = {}) {
         const oldConfig = vscode.workspace.getConfiguration;
         const oldEvent = vscode.workspace.onDidChangeConfiguration;
         const handlers = [];
@@ -140,7 +141,11 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         try { await run({ controller, config, writes, hooks }); }
         finally {
             controller.dispose();
-            await tracker.ignoreRefreshPromise;
+            try { await tracker.ignoreRefreshPromise; }
+            catch (error) {
+                if (!options.expectBlockedPolicy || !tracker.recoveryBlocked) { throw error; }
+                assert.match(error.message, /Committed resource-scoped legacy watchExclude policy is unavailable/);
+            }
             vscode.workspace.getConfiguration = oldConfig;
             vscode.workspace.onDidChangeConfiguration = oldEvent;
         }
@@ -621,4 +626,5 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
     }));
 
     registerScopeSingleActionAcceptance(h,fixture,scopeFor,withController);
+    registerScopeSingleActionCrashes(h,fixture,scopeFor,withController);
 }

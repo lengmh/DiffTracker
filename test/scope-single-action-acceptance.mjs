@@ -295,4 +295,122 @@ export function registerScopeSingleActionAcceptance(h,fixture,scopeFor,withContr
         }finally{fs.promises.opendir=open;h.vscode.workspace.workspaceFolders=oldFolders;h.vscode.workspace.getWorkspaceFolder=oldGet;}
     }));
 
+    for(const nativeFailure of [false,true])
+    test(`A5 SCOPE legacy expansion classifies its required owner failure (failure=${nativeFailure})`,()=>fixture(async({tracker,dir})=>{
+        const blind=path.join(dir,'.aws');fs.mkdirSync(blind);
+        const target=path.join(blind,'tracked.txt'),other=path.join(dir,'other.txt');
+        fs.writeFileSync(target,'new authorized baseline');fs.writeFileSync(other,'other original');
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        await tracker.refreshIgnoreMatchers();
+        tracker.fileSnapshots.set(other,'other original');tracker.baselineExistingFiles.add(other);
+        tracker.setFileCoverageGap(other,'file-read-failed','Independent old read failure');tracker.markFileUnavailable(other,'Independent old read failure');
+        const otherBefore=structuredClone(tracker.getTrackedChange(other));
+        h.setVsCodeExcludes({'files.watcherExclude':{'.aws/**':true}});
+        const watch=fs.watch;
+        if(nativeFailure)fs.watch=(directory,...args)=>{if(path.resolve(String(directory))===blind)throw Object.assign(new Error('Required new owner ENOSPC'),{code:'ENOSPC'});return watch(directory,...args);};
+        const proposal={mode:'wholeWorkspace',includes:[],excludes:[]};
+        try{await withController(tracker,proposal,async({controller})=>{
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>true);
+            assert.equal(outcome.status,nativeFailure?'partial':'applied',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,nativeFailure?'limited':'verified');
+            assert.equal(outcome.scopeCommitted,true);
+            assert.deepEqual({...tracker.getTrackedChange(other),timestamp:undefined},{...otherBefore,timestamp:undefined});
+            assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===other));
+            if(nativeFailure){
+                assert.ok(tracker.getCoverageGaps().some(([file])=>file===blind));
+                assert.equal(outcome.unrelatedCoverageGaps.some(([file])=>file===blind),false,'new required failure belongs to this expansion');
+            }
+            assert.equal(tracker.getOriginalContent(target),'new authorized baseline');
+            assert.equal(fs.readFileSync(target,'utf8'),'new authorized baseline');
+        });}finally{fs.watch=watch;}
+    }));
+
+    test('A5 SCOPE root change during combined approval rejects every settings write',()=>fixture(async({tracker,dir,scope})=>{
+        const selected=path.join(dir,'selected');fs.mkdirSync(selected);
+        const target=path.join(selected,'tracked.txt');fs.writeFileSync(target,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        const token=tracker.getReviewToken(target),folders=h.vscode.workspace.workspaceFolders;
+        try{await withController(tracker,scope,async({controller,writes})=>{
+            let prompts=0;
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/selected/'}]},async()=>{
+                prompts++;h.vscode.workspace.workspaceFolders=[];return true;
+            });
+            assert.equal(prompts,1);assert.equal(outcome.status,'conflict');assert.deepEqual(writes,[]);
+            assert.equal(tracker.getOriginalContent(target),'original');assert.deepEqual(tracker.getReviewToken(target),token);
+            assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });}finally{h.vscode.workspace.workspaceFolders=folders;}
+    }));
+
+    for(const stopped of [false,true])
+    test(`A5 SCOPE legacy Restore preserves its readiness guard (stopped=${stopped})`,()=>fixture(async({tracker,dir})=>{
+        const target=path.join(dir,'tracked.txt');fs.writeFileSync(target,'current bytes');
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        tracker.fileSnapshots.set(target,'legacy original');tracker.baselineExistingFiles.add(target);
+        if(stopped)tracker.stopRecording();
+        let checks=0;tracker.recheckObservationCoverage=async()=>{checks++;throw new Error('Legacy scope cannot be implicitly verified');};
+        await withController(tracker,{mode:'wholeWorkspace',includes:[],excludes:[]},async({controller})=>{
+            const outcome=await controller.restoreEffectiveScopeConfiguration();
+            assert.equal(outcome.status,stopped?'restored':'partial',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,stopped?'deferred':'notRun');
+            assert.equal(checks,0);assert.equal(tracker.getIsRecording(),!stopped);
+            assert.equal(tracker.getEffectiveMonitoringScope().kind,'legacyV3');
+            assert.equal(tracker.getOriginalContent(target),'legacy original');assert.equal(fs.readFileSync(target,'utf8'),'current bytes');
+        },{expectBlockedPolicy:true});
+    }));
+
+    test('A5 SCOPE quick exclusion refuses a symlink alias without retiring its real target',()=>fixture(async({tracker,dir,scope})=>{
+        const actual=path.join(dir,'actual'),alias=path.join(dir,'alias');fs.mkdirSync(actual);
+        const target=path.join(actual,'tracked.txt');fs.writeFileSync(target,'original');
+        fs.symlinkSync(actual,alias,process.platform==='win32'?'junction':'dir');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.setSubtreeCoverageGap(actual,'supplemental-watcher-directory-change-gap','Real target interval');
+        const evidence=tracker.coverageGaps.get(actual).subtree;
+        await withController(tracker,scope,async({controller,writes})=>{
+            const outcome=await controller.excludeResource(alias,true,async()=>{throw new Error('Unsupported alias must be rejected before approval');});
+            assert.equal(outcome.status,'blocked');assert.deepEqual(writes,[]);
+            assert.equal(tracker.coverageGaps.get(actual)?.subtree,evidence);
+            assert.equal(tracker.getOriginalContent(target),'original');assert.equal(fs.readFileSync(target,'utf8'),'original');
+        });
+    }));
+
+    test('A5 SCOPE physical case alias excludes only its exact directory and keeps prefix siblings observable',()=>fixture(async({tracker,dir,scope})=>{
+        const actual=path.join(dir,'CaseName'),sibling=path.join(dir,'CaseName-sibling');fs.mkdirSync(actual);fs.mkdirSync(sibling);
+        const target=path.join(actual,'tracked.txt'),other=path.join(sibling,'tracked.txt');fs.writeFileSync(target,'original');fs.writeFileSync(other,'sibling original');
+        h.setVsCodeExcludes({'files.watcherExclude':{'CaseName/**':true,'CaseName-sibling/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.setSubtreeCoverageGap(actual,'supplemental-watcher-directory-change-gap','Selected interval');
+        const input=scope.roots[0].caseSensitive?actual:path.join(dir,'casename');
+        await withController(tracker,scope,async({controller})=>{
+            const outcome=await controller.excludeResource(input,true,async()=>true);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(tracker.getCoverageGaps().some(([file])=>file===actual),false);
+            assert.equal(tracker.getOriginalContent(other),'sibling original');
+            const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===sibling);
+            assert.ok(owner);fs.writeFileSync(other,'native sibling edit');owner.listener('change','tracked.txt');
+            await h.waitUntil(()=>tracker.getTrackedChange(other)?.currentContent==='native sibling edit');
+            assert.equal(tracker.getOriginalContent(other),'sibling original');
+        });
+    }));
+
+    for(const guard of ['building','recovery','git-initializing'])
+    test(`A5 SCOPE combined exclusion retains ${guard} protection`,()=>fixture(async({tracker,dir,scope})=>{
+        const selected=path.join(dir,'selected');fs.mkdirSync(selected);
+        const target=path.join(selected,'tracked.txt');fs.writeFileSync(target,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        if(guard==='building')tracker.baselineBuilding=true;
+        if(guard==='recovery')tracker.recoveryBlocked=true;
+        if(guard==='git-initializing')tracker.setGitContextPending(true);
+        try{await withController(tracker,scope,async({controller,config})=>{
+            const settings=structuredClone(config);
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/selected/'}]},async()=>true);
+            assert.notEqual(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,false);assert.deepEqual(config,settings);
+            assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+            assert.equal(tracker.getOriginalContent(target),'original');assert.equal(tracker.getTrackedChange(target)?.currentContent,'pending');
+            assert.equal(tracker.getIsRecording(),true);assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });}finally{tracker.baselineBuilding=false;tracker.recoveryBlocked=false;tracker.setGitContextPending(false);}
+    }));
+
 }
