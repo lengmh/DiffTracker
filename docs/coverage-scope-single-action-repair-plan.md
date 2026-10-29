@@ -4,7 +4,7 @@
 - 总问题：[Issue #55](https://github.com/lengmh/DiffTracker/issues/55)
 - 核查基线：`main` / `ce4faf39ac66ef5f1ba8093fced0b9251146f060`，package `0.8.10`
 - 执行分支：`fix/55-coverage-scope-single-action`
-- 状态：**计划已发布；尚未实现、未新增/执行回归、未完成修复验收。**
+- 状态：**已开始实现；首批覆盖目录 `change` 的自动协调与定向回归，A0/A1 尚未全部验收，A2–A5 待继续。保持 Draft。**
 - 交付形式：一个总 issue、一个 Draft PR。该 PR 初始只承载本计划，后续实现继续沿用它；不能仅合并计划就关闭 issue。
 
 ## 1. 要解决的完整问题
@@ -284,8 +284,12 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 | 相关源码、既有 ADR、CI 配置与重复 issue 检查 | 已核查 |
 | 总 issue 与修复计划 | 已发布/本提交承载 |
 | Draft PR | 本计划提交后创建；保持 Draft |
-| 修复代码与新增回归 | 未开始 |
-| 定向测试、真实 Host、完整 CI 与修复自动 review | 未执行/未验收；计划 PR 自动触发的 CI 不等于问题已修复 |
+| 修复代码与新增回归 | 首批已实现目录 `change` 的有界协调；复用原有 bridge/handoff、扫描与持久化。重复/相邻目录通知合并到所属 coverage root，一次在途、最多两轮、共享条目预算；保留 Unknown before-image 与原始待审，仅退休精确核验的旧证据。补充监听遍历跳过显式排除子树 |
+| 定向测试 | 新增 8 项 tracker 回归。旧代码确定性复现 directory-change gap 残留；另复现补充遍历进入已排除孩子目录。首轮全量 tracker 为 1575/1576，修正并发残留后本地 `npm test` 通过（tracker 1577/1577）。随后补充保护已排除旧证据与 pending-scope 控制证据；最终代码定向 8/8、S4-B 46/46、lint、编译和 VSIX 检查通过。最终 exact-head 全量 CI 结果见 PR #56 |
+| 真实 Host | 新增真实目录元数据 `change` 回调与恢复后持续子文件观察的 Host 用例；本地缺少 Xvfb，未执行真实 Host。Linux/Windows、最低版本与 installed RC 结果须以本批次 exact-head CI 为准 |
+| 完整 CI 与修复自动 review | 本批次 exact SHA、Verification URL 和实际结果记录在 PR #56。A0–A5 完整 diff 尚未就绪，未请求修复自动 review；后续完成整体实现后再请求一次 |
 | 合并与发布 | 未执行 |
 
 后续每个 checkpoint 更新此表并记录 exact head、实际通过/失败项目与下一批范围。计划文档不是修复完成证据。
+
+首批仍未完成：A0 的完整 exclusion → Apply → Recheck 链及全部混合证据；A1 的 create/rename 与 change 全入口统一、目录替换/父通知及持久化故障矩阵；A2 的旧 gap 活动投影、排除后新事件过滤与 owner 资源收尾；A3/A4 的命令、面板、Restore 编排及部分完成反馈；A5 的 33 项矩阵、完整 Host/CI、自审和自动 review。不得据本批次关闭 #55 或将 PR 改为 Ready。

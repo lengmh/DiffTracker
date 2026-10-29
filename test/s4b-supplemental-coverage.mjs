@@ -802,6 +802,144 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         return {blind, child, target, scope};
     }
 
+    test('Issue #55 directory change automatically reconciles without accepting unknown history', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        fs.writeFileSync(target, 'pending review');
+        activeNativeWatcher(nativeDirectoryWatchers, child).listener('change', 'tracked.txt');
+        await settle(tracker);
+        const token = tracker.getReviewToken(target);
+        assert.ok(token);
+        const unseen = path.join(child, 'unseen.txt');
+        fs.writeFileSync(unseen, 'no proven creation event');
+        activeNativeWatcher(nativeDirectoryWatchers, blind).listener('change', 'child');
+        await settle(tracker);
+        assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === child), false,
+            'a directory change must finish its own observation reconciliation');
+        assert.equal(tracker.getOriginalContent(target), 'before');
+        assert.deepEqual(tracker.getReviewToken(target), token);
+        assert.equal(tracker.getTrackedChange(unseen)?.reviewKind, 'unknown');
+        assert.equal(tracker.getOriginalContent(unseen), undefined,
+            'a directory notification is not evidence that all children were absent');
+        const owner = activeNativeWatcher(nativeDirectoryWatchers, child);
+        fs.writeFileSync(target, 'later observed edit');
+        owner.listener('change', 'tracked.txt');
+        await settle(tracker);
+        assert.equal(tracker.getTrackedChange(target)?.currentContent, 'later observed edit');
+        assert.equal(fs.readFileSync(unseen, 'utf8'), 'no proven creation event');
+    }, 'rules'));
+
+    test('Issue #55 repeated sibling directory changes share bounded reconciliation and retain real failures', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        const other = path.join(dir, 'other.txt');
+        fs.writeFileSync(other, 'other original');
+        await tracker.onExternalFileCreated(Uri.file(other));
+        fs.writeFileSync(other, 'unrelated pending');
+        await tracker.onExternalFileChanged(Uri.file(other));
+        await settle(tracker);
+        const token = tracker.getReviewToken(other);
+        const gate = h.pause(target, 'read');
+        const parent = activeNativeWatcher(nativeDirectoryWatchers, blind);
+        parent.listener('change', 'child');
+        try {
+            await gate.entered;
+            for (let i = 0; i < 40; i++) { parent.listener('change', 'child'); }
+            const sibling = path.join(blind, 'sibling');
+            fs.mkdirSync(sibling);
+            fs.writeFileSync(path.join(sibling, 'unseen.txt'), 'unknown history');
+            parent.listener('change', 'sibling');
+        } finally { gate.release(); }
+        await settle(tracker);
+        await h.waitUntil(() => tracker.directoryObservations.size === 0);
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+        assert.equal(tracker.getOriginalContent(target), 'before');
+        assert.deepEqual(tracker.getReviewToken(other), token);
+        assert.equal(tracker.getTrackedChange(path.join(blind, 'sibling', 'unseen.txt'))?.reviewKind, 'unknown');
+        assert.ok(nativeDirectoryWatchers.filter(owner => owner.active).length <= 3,
+            'duplicate notifications must not leak temporary bridge owners');
+        // A later runtime fault belongs to the ancestor, outside a child's
+        // successful proof. Reconciliation must leave it visible and durable.
+        activeNativeWatcher(nativeDirectoryWatchers, child).error(Object.assign(new Error('real native failure'), {code:'EIO'}));
+        parent.listener('change', 'sibling');
+        await settle(tracker);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind));
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+        assert.ok(saved.coverageGaps.some(([root, record]) => root === blind && record.subtree));
+    }, 'rules'));
+
+    for (const interruption of ['stop', 'pending', 'dirty']) test(`Issue #55 directory change respects ${interruption} during reconciliation`, () => fixture(async ({tracker,dir,scope}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        const parent = activeNativeWatcher(nativeDirectoryWatchers, blind);
+        const gate = h.pause(target, 'read');
+        parent.listener('change', 'child');
+        try {
+            await gate.entered;
+            if (interruption === 'stop') { tracker.stopRecording(); }
+            if (interruption === 'pending') {
+                tracker.setPendingMonitoringScope(configuredScope(tracker, scope.mode, [], [{scope:'all',pattern:'/lifecycle-blind/'}]));
+            }
+            if (interruption === 'dirty') { h.vscode.workspace.textDocuments.push({uri:Uri.file(target),isDirty:true}); }
+        } finally { gate.release(); }
+        try {
+            await settle(tracker);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === child));
+            assert.equal(tracker.getOriginalContent(target), 'before');
+            assert.equal(fs.readFileSync(target, 'utf8'), 'before');
+            if (interruption === 'stop') { assert.equal(nativeDirectoryWatchers.some(owner => owner.active), false); }
+        } finally { if (interruption === 'dirty') { h.vscode.workspace.textDocuments.pop(); } }
+    }, 'rules'));
+
+    test('Issue #55 directory observation budget exhaustion retains uncertainty and stops work', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target} = await lifecycleFixture(tracker, dir);
+        tracker.maxScopePreflightEntries = 1;
+        activeNativeWatcher(nativeDirectoryWatchers, blind).listener('change', 'child');
+        await settle(tracker);
+        assert.equal(tracker.directoryObservations.size, 0);
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === child));
+        assert.equal(tracker.getOriginalContent(target), 'before');
+        assert.equal(fs.readFileSync(target, 'utf8'), 'before');
+    }, 'rules'));
+
+    test('Issue #55 directory observation preserves pending control evidence', () => fixture(async ({tracker,dir}) => {
+        const {child, target} = await lifecycleFixture(tracker, dir);
+        tracker.setSubtreeCoverageGap(child, 'pending-scope-gap', 'Earlier scope pause requires control recovery');
+        await tracker.onExternalFileChanged(Uri.file(child));
+        assert.equal(tracker.getSubtreeCoverageGaps().find(gap => gap.targetPath === child)?.reasonCode, 'pending-scope-gap');
+        assert.equal(tracker.getOriginalContent(target), 'before');
+        assert.equal(fs.readFileSync(target, 'utf8'), 'before');
+    }, 'rules'));
+
+    test('Issue #55 automatic directory verification never enumerates an explicitly excluded child', () => fixture(async ({tracker,dir}) => {
+        const {blind, child, target, scope} = await lifecycleFixture(tracker, dir);
+        const excluded = path.join(child, 'private');
+        fs.mkdirSync(excluded);
+        fs.writeFileSync(path.join(excluded, 'secret.txt'), 'excluded content');
+        const requested = configuredScope(tracker, scope.mode, scope.includes,
+            [{scope:'all',pattern:'/lifecycle-blind/child/private/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(requested)).status, 'applied');
+        tracker.setSubtreeCoverageGap(excluded, 'supplemental-watcher-directory-change-gap', 'Earlier excluded interval');
+        const evidence = tracker.coverageGaps.get(excluded).subtree;
+        const opendir = fs.promises.opendir;
+        let excludedReads = 0;
+        fs.promises.opendir = async (directory, ...args) => {
+            if (tracker.pathBelongsToRoot(String(directory), excluded)) { excludedReads++; }
+            return opendir(directory, ...args);
+        };
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers, blind).listener('change', 'child');
+            await settle(tracker);
+            await h.waitUntil(() => tracker.directoryObservations.size === 0);
+            assert.equal(excludedReads, 0);
+            assert.equal(tracker.coverageGaps.get(excluded)?.subtree, evidence,
+                'unscanned excluded history must remain durable for a future re-include');
+            assert.equal(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === child), false);
+            fs.writeFileSync(target, 'still observed');
+            activeNativeWatcher(nativeDirectoryWatchers, child).listener('change', 'tracked.txt');
+            await settle(tracker);
+            assert.equal(tracker.getTrackedChange(target)?.currentContent, 'still observed');
+        } finally { fs.promises.opendir = opendir; }
+    }, 'rules'));
+
     for (const operation of ['reset', 'repository rebuild']) {
         test(`S4-B lifecycle ${operation} renews direct owners and preserves safe review`, () => fixture(async ({tracker,dir}) => {
             const {blind, child, target} = await lifecycleFixture(tracker, dir);
