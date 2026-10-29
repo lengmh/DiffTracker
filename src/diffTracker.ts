@@ -1388,7 +1388,13 @@ export class DiffTracker {
         // evidence before installing owners; a new failure must not be retired
         // under the earlier control record's authority.
         const controlGaps: Array<[string, CoverageGapEvidence]> = [];
+        const importedDirectoryGaps: Array<[string, CoverageGapEvidence]> = [];
         for (const [target, record] of this.coverageGaps) {
+            if (record.subtree && this.isImportedDirectoryCoverageGap(record) &&
+                !this.scopeExplicitlyExcludesDirectory(target) &&
+                !this.isPathIgnored(vscode.Uri.file(target), true, false, false)) {
+                importedDirectoryGaps.push([target, record.subtree]);
+            }
             for (const evidence of [record.file, record.subtree]) {
                 if (evidence && this.isPendingScopeRecoveryEvidence(evidence) &&
                     !this.isPathIgnored(vscode.Uri.file(target), evidence.targetKind === 'subtree', false, false)) {
@@ -1493,6 +1499,22 @@ export class DiffTracker {
                 const before = new Map([...this.coverageGaps].map(([target, record]) => [target, record.subtree]));
                 this.reconcileSupplementalCoverageAfterSuccessfulScan(install);
                 const successfulRoots = new Set(install.successfulRoots);
+                for (const [target, evidence] of importedDirectoryGaps) {
+                    const owner = owners.get(target)?.owner;
+                    const folder = this.owningWorkspaceFolderForTraversal(target);
+                    // Only this explicit, completed Recheck proves an old import
+                    // interval. Reuse its exact owner/identity/event snapshot and
+                    // durable transaction, not the general supplemental predicate.
+                    if (this.coverageGaps.get(target)?.subtree !== evidence || !owner || !folder ||
+                        this.supplementalDirectoryWatchers.get(target) !== owner || owner.epoch !== epoch ||
+                        !successfulRoots.has(owner.coverageRoot) ||
+                        !this.workspaceFolderOwnsTraversalPath(folder, owner.coverageRoot) ||
+                        !this.pathBelongsToRoot(target, owner.coverageRoot) ||
+                        this.scopeExplicitlyExcludesDirectory(target) ||
+                        this.isPathIgnored(vscode.Uri.file(target), true, false, false)) { continue; }
+                    this.clearCoverageGap(target, 'subtree', false);
+                    removed.set(target, evidence);
+                }
                 const blockingSubtrees = this.getSubtreeCoverageGaps().filter(gap =>
                     !this.isPendingScopeRecoveryEvidence(this.coverageGaps.get(gap.targetPath)?.subtree) &&
                     this.coverageGaps.get(gap.targetPath)?.subtree !== markers.get(gap.targetPath));

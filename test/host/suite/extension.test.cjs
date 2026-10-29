@@ -765,8 +765,13 @@ module.exports = async function runExtensionHostScenario() {
         const beforeRecheck = await state();
         const pendingBeforeRecheck = projectPending(beforeRecheck);
         const rechecked = await vscode.commands.executeCommand('diffTracker.recheckObservationCoverage');
-        assert.equal(rechecked?.status, 'rechecked', JSON.stringify(rechecked));
         const afterRecheck = await state();
+        const coverageDiagnostics = current => ({
+            coverageGaps: current.coverageGaps.map(([target, reason]) => [path.relative(workspacePath, target), reason]),
+            subtreeCoverageGaps: current.subtreeCoverageGaps.map(gap => ({...gap, targetPath:path.relative(workspacePath, gap.targetPath)}))
+        });
+        assert.equal(rechecked?.status, 'rechecked', JSON.stringify({result:rechecked,
+            before:coverageDiagnostics(beforeRecheck), after:coverageDiagnostics(afterRecheck)}));
         assert.equal(afterRecheck.isRecording, true, 'Recheck must leave recording active');
         assert.equal(afterRecheck.recordingContext, true, 'Recheck must retain the recording command context');
         assert.equal(afterRecheck.baselineState, 'ready');
