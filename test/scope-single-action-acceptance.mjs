@@ -413,4 +413,32 @@ export function registerScopeSingleActionAcceptance(h,fixture,scopeFor,withContr
         });}finally{tracker.baselineBuilding=false;tracker.recoveryBlocked=false;tracker.setGitContextPending(false);}
     }));
 
+    test('A5 SCOPE unrelated directory failure during approval stays outside this exclusion',()=>fixture(async({tracker,dir,scope})=>{
+        const selected=path.join(dir,'selected');fs.mkdirSync(selected);
+        const target=path.join(selected,'tracked.txt'),other=path.join(dir,'other-import');fs.writeFileSync(target,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        const watch=fs.watch;let failing=false,beforeOther;
+        let recoveryCalls=0;const recovery=tracker.recheckScopeOperationCoverage.bind(tracker);
+        tracker.recheckScopeOperationCoverage=(...args)=>{recoveryCalls++;return recovery(...args);};
+        fs.watch=(directory,...args)=>{if(failing&&path.resolve(String(directory))===other)throw Object.assign(new Error('Independent imported owner failure'),{code:'ENOSPC'});return watch(directory,...args);};
+        try{await withController(tracker,scope,async({controller})=>{
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/selected/'}]},async()=>{
+                fs.mkdirSync(other);fs.writeFileSync(path.join(other,'tracked.txt'),'independent current');
+                await tracker.onExternalFileCreated(Uri.file(other));
+                const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===other);
+                assert.ok(owner);failing=true;owner.error(Object.assign(new Error('Independent runtime owner failure'),{code:'ENOSPC'}));
+                assert.ok(tracker.getCoverageGaps().some(([file])=>file===other));
+                beforeOther={original:tracker.getOriginalContent(path.join(other,'tracked.txt')),change:structuredClone(tracker.getTrackedChange(path.join(other,'tracked.txt')))};
+                return true;
+            });
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===other));
+            assert.equal(recoveryCalls,0);assert.ok(tracker.getCoverageGaps().some(([file])=>file===other));
+            assert.equal(tracker.getOriginalContent(path.join(other,'tracked.txt')),beforeOther.original);
+            assert.deepEqual({...tracker.getTrackedChange(path.join(other,'tracked.txt')),timestamp:undefined},{...beforeOther.change,timestamp:undefined});
+            assert.equal(tracker.getTrackedChange(target),undefined);assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });}finally{fs.watch=watch;}
+    }));
+
 }

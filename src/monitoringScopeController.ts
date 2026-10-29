@@ -389,7 +389,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             return conflict('Another monitoring-scope action is in progress; retry after it finishes.');
         }
         const initial = this.getStatus();
-        const observationBefore = this.tracker.captureScopeOperationObservation();
+        let observationBefore: ScopeOperationObservation | undefined;
         if (!initial.requested.ok || !initial.requested.scope || initial.effective.kind !== 'configured' ||
             initial.requested.scope.scopeRevision !== initial.effective.scopeRevision) {
             return conflict('Apply or restore the existing monitoring-scope request in Manage Monitoring Scope before using a quick exclusion.');
@@ -420,6 +420,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                     if (saved.status !== 'saved') {
                         outcome = conflict(saved.reason ?? 'The exclusion request changed before it could be saved.');
                     } else {
+                        observationBefore = this.tracker.captureScopeOperationObservation();
                         outcome = await this.performPendingScopeApply({
                             discardExplicitlyExcludedReviews: affectedReviewPaths.length > 0,
                             expectedScopeRevision: scope.scopeRevision,
@@ -605,7 +606,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const scope = checked.scope;
         const effective = this.tracker.getEffectiveMonitoringScope();
         const requestedBefore = this.getRequestedScope().scope;
-        const observationBefore = this.tracker.captureScopeOperationObservation();
+        let observationBefore: ScopeOperationObservation | undefined;
         if (effective.kind === 'legacyV3' && this.legacyMigrationRequired() && !this.migrationRecordMatches(scope.scopeRevision)) {
             return {status:'needsMigration',reason:'Review and complete legacy migration for this exact target before applying it.',settingsStatus:'unchanged',scopeCommitted:false};
         }
@@ -654,6 +655,9 @@ export class MonitoringScopeController implements vscode.Disposable {
                         }
                         if (!current() || !reviewCurrent() || !proposalStillCurrent()) { throw new Error('Settings, scope, draft or affected review changed during the save.'); }
                     }
+                    // Approval can outlive independent directory activity. Pin
+                    // attribution at Apply, after owned settings have settled.
+                    observationBefore = this.tracker.captureScopeOperationObservation();
                     outcome = await this.performPendingScopeApply({grantConsent:true,
                         discardExplicitlyExcludedReviews:affectedReviewPaths.length > 0,
                         expectedScopeRevision:scope.scopeRevision,expectedAffectedReviewRevision:affectedReviewRevision,
@@ -1075,7 +1079,6 @@ export class MonitoringScopeController implements vscode.Disposable {
         const config = vscode.workspace.getConfiguration('diffTracker');
         const effective = this.tracker.getEffectiveMonitoringScope();
         const requestedBefore=this.getRequestedScope().scope;
-        const observationBefore = this.tracker.captureScopeOperationObservation();
         if (options && (options.expectedRequestVersion !== this.getRequestVersion() ||
             (options.expectedScopeRevision !== undefined && options.expectedScopeRevision !== effective.scopeRevision))) {
             return {status:'conflict',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun',
@@ -1102,6 +1105,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             if (effective.kind !== 'configured') { await this.clearLegacyMigration(); }
             if (!current()) { throw new Error('Workspace, effective scope or settings changed before Restore completed.'); }
             this.reconcileRequestedScope();
+            const observationBefore = this.tracker.captureScopeOperationObservation();
             return this.finalizeScopeOperation({status:'restored',settingsStatus:'restored',scopeCommitted:true,
                 scopeRevision:effective.scopeRevision},effective,requestedBefore,true,observationBefore);
         } catch (error) {
