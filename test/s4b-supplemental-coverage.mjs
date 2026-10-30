@@ -1625,6 +1625,86 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         }
     },'rules'));
 
+    test('Issue #55 parent coalescing before proof preserves the finite follow-up after a Ready publication', () => fixture(async ({tracker,dir}) => {
+        const {blind}=await lifecycleFixture(tracker,dir);
+        const child=path.join(blind,'incoming');fs.mkdirSync(child);
+        const target=path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven before');
+        const gate=()=>{let enter,release;return {entered:new Promise(resolve=>{enter=resolve;}),
+            released:new Promise(resolve=>{release=resolve;}),enter:()=>enter(),release:()=>release()};};
+        const preparation=gate(),proof=gate(),finished=gate();let heldPreparation=false,heldProof=false;
+        const opendir=fs.promises.opendir,createdFile=tracker.onExternalFileCreated;
+        fs.promises.opendir=async(directory,...args)=>{
+            if(String(directory)===child&&!heldPreparation){heldPreparation=true;preparation.enter();await preparation.released;}
+            if(String(directory)===blind&&new Error().stack.includes('prepareImportedCoverageHandoff')&&!heldProof){
+                heldProof=true;proof.enter();await proof.released;
+            }
+            return opendir(directory,...args);
+        };
+        // Observe completion of the actual pass; never replace its result or
+        // supply another filesystem event to make the coordinator recover.
+        tracker.onExternalFileCreated=async function(uri,...args){
+            try{return await createdFile.call(this,uri,...args);}
+            finally{if(uri.fsPath===blind&&args[3]&&heldProof){finished.enter();}}
+        };
+        let publication,created;
+        try{
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','incoming');
+            await h.waitUntil(()=>heldPreparation);
+            tracker.dispatchExternalEvent(Uri.file(blind),'change',tracker.sessionEpoch);
+            await h.waitUntil(()=>[...tracker.directoryObservations.values()].some(job=>job.directory===blind));
+            preparation.release();await h.waitUntil(()=>heldProof);
+            const other=path.join(dir,'independent.txt');fs.writeFileSync(other,'independent creation');
+            publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            created=tracker.onExternalFileCreated(Uri.file(other));await publication.entered;
+            proof.release();await finished.entered;publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            assert.equal(tracker.getOriginalContent(target),undefined);
+            const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
+            fs.writeFileSync(target,'later observed');activeNativeWatcher(nativeDirectoryWatchers,child).listener('change','tracked.txt');
+            await settle(tracker);assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+        }finally{
+            preparation.release();proof.release();publication?.release();await created;
+            fs.promises.opendir=opendir;tracker.onExternalFileCreated=createdFile;
+        }
+    },'rules'));
+
+    test('Issue #55 finite upward parent preparation completes without spending proof passes', () => fixture(async ({tracker,dir}) => {
+        const {blind,scope}=await lifecycleFixture(tracker,dir);
+        const deepest=path.join(blind,'a','b','c');fs.mkdirSync(deepest,{recursive:true});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const child=path.join(deepest,'incoming');fs.mkdirSync(child);
+        const target=path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven before');
+        const directories=[child,deepest,path.dirname(deepest),path.dirname(path.dirname(deepest))];
+        const gates=directories.map(directory=>{let release;return{directory,held:false,
+            released:new Promise(resolve=>{release=resolve;}),release:()=>release()};});
+        const opendir=fs.promises.opendir;let gateIndex=0;
+        fs.promises.opendir=async(directory,...args)=>{
+            const gate=gates[gateIndex];
+            if(gate&&String(directory)===gate.directory&&!gate.held){gate.held=true;await gate.released;}
+            return opendir(directory,...args);
+        };
+        try{
+            activeNativeWatcher(nativeDirectoryWatchers,deepest).listener('rename','incoming');
+            await h.waitUntil(()=>tracker.directoryObservations.size>0||gates[0].held);
+            for(const gate of gates){
+                await h.waitUntil(()=>gate.held||tracker.directoryObservations.size===0);
+                assert.equal(gate.held,true,'finite ancestor preparation must not end before a proof starts');
+                const parent=path.dirname(gate.directory);
+                if(parent===blind){tracker.dispatchExternalEvent(Uri.file(parent),'change',tracker.sessionEpoch);}
+                else{activeNativeWatcher(nativeDirectoryWatchers,path.dirname(parent)).listener('change',path.basename(parent));}
+                await h.waitUntil(()=>[...tracker.directoryObservations.values()].some(job=>job.directory===parent));
+                gateIndex++;gate.release();
+            }
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
+            assert.equal(tracker.getOriginalContent(target),undefined);
+            fs.writeFileSync(target,'later observed');activeNativeWatcher(nativeDirectoryWatchers,child).listener('change','tracked.txt');
+            await settle(tracker);assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+        }finally{for(const gate of gates){gate.release();}fs.promises.opendir=opendir;}
+    },'rules'));
+
     test('Issue #55 preparation-only publication does not spend the follow-up scan budget', () => fixture(async ({tracker,dir}) => {
         const {blind,target:known}=await lifecycleFixture(tracker,dir);
         const child=path.join(blind,'preparation-budget');fs.mkdirSync(child);

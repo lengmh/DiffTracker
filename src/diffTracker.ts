@@ -9748,23 +9748,31 @@ export class DiffTracker {
                 return publications.every(result => result.status === 'fulfilled' && result.value) &&
                     current() && (directory === undefined || job.directory === directory) && !this.persistenceFailed;
             };
-            // A finite follow-up covers notifications received during the first
-            // pass. Both passes consume one allowance; busy trees remain limited.
+            // Keep two actual proof passes and two preparation interruptions
+            // without progress. Pre-proof coalescing moves strictly upward
+            // within this workspace, so path depth bounds that progress without
+            // consuming proof passes. All passes share the traversal budget.
             // A save failure must stop further passes without invalidating the
             // current pass's rollback/coverage-failure publication.
-            for (let pass = 0; pass < 2 && active() && !this.persistenceFailed; pass++) {
+            for (let proofs=0,preparations=0; proofs<2 && preparations<2 && active() && !this.persistenceFailed;) {
                 // An independent file creation briefly holds the same Ready
                 // publication guard. Wait for that exact finite set of writes;
                 // no proof may run while it is held. Other lifecycle guards
                 // still cancel the job, and new activity cannot add passes.
-                if (!await settlePreparation()) { break; }
+                const beforePreparation=job.directory;
+                if (!await settlePreparation()) {
+                    if(job.directory===beforePreparation){preparations++;}
+                    continue;
+                }
                 job.dirty = false;
                 const directory = job.directory;
                 let publicationVersion = this.baselineCompletionVersion;
+                let proofBegan=false;
                 const observation: DirectoryObservation = { current: () => current() && job.directory === directory,
                     settlePreparation: () => settlePreparation(directory), budget,
                     beginProof: target => {
                         if (target === directory) {
+                            proofBegan=true;
                             // The proof covers notifications and publications
                             // already settled during preparation. Only later
                             // activity can require the bounded follow-up.
@@ -9773,6 +9781,7 @@ export class DiffTracker {
                         }
                     } };
                 await this.onExternalFileCreated(vscode.Uri.file(directory), false, undefined, false, observation);
+                if(proofBegan){proofs++;}else if(job.directory===directory){preparations++;}
                 if (!job.dirty && publicationVersion === this.baselineCompletionVersion) { break; }
             }
         })().finally(() => {

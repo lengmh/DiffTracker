@@ -17,6 +17,31 @@ const NATIVE_ACTIONS = new Set([
 ]);
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+export async function clickStableQuickDiffAction(cdp, inspect, until) {
+    const ready=state=>{
+        const current=state.quickDiff[0];
+        return current && (current.provider===PROVIDER || (!current.provider&&current.title.includes(PROVIDER))) && state.actionPoint;
+    };
+    const before=await until('the stable enabled tracker Quick Diff title action',async()=>{
+        const candidate=await inspect('action');
+        if(!ready(candidate)){return undefined;}
+        await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',...candidate.actionPoint});
+        // Switching the provider relayouts the widget. Hover can also expose
+        // actions. Observe rendered frames and hit test again before any press;
+        // never repeat a command click whose result is uncertain.
+        await cdp.send('Runtime.evaluate',{
+            expression:'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))',
+            awaitPromise:true,returnByValue:true
+        });
+        const settled=await inspect('action');
+        return ready(settled) && settled.actionPoint.x===candidate.actionPoint.x &&
+            settled.actionPoint.y===candidate.actionPoint.y ? settled : undefined;
+    });
+    await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',...before.actionPoint,button:'left',buttons:1,clickCount:1});
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',...before.actionPoint,button:'left',buttons:0,clickCount:1});
+    return before;
+}
+
 // Observation only: no event cancellation, focus, selection or application
 // command changes. Bounded evidence distinguishes delivered input from a
 // renderer acknowledgement when an actual native acceptance assertion fails.
@@ -36,6 +61,7 @@ function installInputProbe() {
                     type, phase: capture ? 'capture' : 'bubble', trusted: event.isTrusted,
                     target: describe(event.target), path: event.composedPath().slice(0, 6).map(describe),
                     button: event.button, buttons: event.buttons, pointerType: event.pointerType,
+                    clientX: event.clientX, clientY: event.clientY,
                     key: event.key, code: event.code, keyCode: event.keyCode,
                     shift: event.shiftKey, ctrl: event.ctrlKey, alt: event.altKey, meta: event.metaKey,
                     defaultPrevented: event.defaultPrevented
@@ -336,7 +362,7 @@ export async function runNativeUiDriver(portText, operation, argument) {
         throw new Error('Run native-ui-driver.mjs with DIFF_TRACKER_HOST_NODE (Node 22+)');
     }
     const deadline = Date.now() + TIMEOUT;
-    let cdp, lastState, lastDiscovery;
+    let cdp, lastState, lastDiscovery, lastQuickDiffClick;
     const until = async (description, predicate) => {
         while (Date.now() < deadline) {
             const value = await predicate();
@@ -488,16 +514,8 @@ export async function runNativeUiDriver(portText, operation, argument) {
                 });
                 await click(option);
             }
-            const before = await until('the enabled tracker Quick Diff title action', async () => {
-                const state = await inspect('action');
-                const current = state.quickDiff[0];
-                // With one changed provider VS Code hides the picker and puts
-                // its name in the title instead. Do not mistake Git's view for it.
-                const correctProvider = current && (current.provider === PROVIDER ||
-                    (!current.provider && current.title.includes(PROVIDER)));
-                return correctProvider && state.actionPoint ? state : undefined;
-            });
-            await click(before.actionPoint);
+            const before = await clickStableQuickDiffAction(cdp,inspect,until);
+            lastQuickDiffClick={point:before.actionPoint,provider:before.quickDiff[0]?.provider};
             // The native action runner closes Quick Diff after the command
             // resolves. Never repeat the click on an uncertain result.
             const after = await until('Quick Diff to close after its real menu action', async () => {
@@ -519,7 +537,7 @@ export async function runNativeUiDriver(portText, operation, argument) {
         return { operation, clicked: true, filename: argument,
             domFocusObserved: !!after.modifiedFocused, before, after };
     } catch (error) {
-        console.error('Native UI diagnostics:', JSON.stringify({ operation, lastDiscovery, lastState }));
+        console.error('Native UI diagnostics:', JSON.stringify({ operation, lastDiscovery, lastState, lastQuickDiffClick }));
         throw error;
     } finally {
         if (cdp) {

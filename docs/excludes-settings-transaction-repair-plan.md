@@ -184,3 +184,24 @@ compensation. Local complete validation passed 1,732 tracker cases, 193 UI
 cases, 28 real temporary Git scenarios and 10 Host fixture tests, plus lint,
 performance and the actual 75-entry VSIX privacy check. Real Host confirmation
 and the remaining R1/R3/R4 matrix are still required.
+
+At the receipt checkpoint, real Windows and Linux Stable Hosts passed stopped
+and active Save and Apply, including continued file observation. Linux Stable
+passed its full Host suite. Windows later failed automatic moved-directory
+observation; the minimum-version Host failed earlier in the native Quick Diff
+driver. These are separate from the repaired settings assertions.
+
+Two deterministic filesystem regressions expose preparation-only parent
+coalescing spending the directory coordinator's proof allowance. The coordinator
+now reserves its two proof passes and bounds preparation interruptions without
+progress separately. Strict upward coalescing is bounded by workspace path
+depth, and all attempts retain the original shared traversal budget. Recovery
+assertions include later native-boundary edits and Unknown before-images.
+The minimum-version input trace shows a click delivered to the editor rather
+than the action. The driver now rechecks its hit target after rendered hover
+layout before one real command click; it never retries an uncertain click.
+
+Local validation for this checkpoint passed 1,734 tracker cases, 193 UI cases,
+28 real temporary Git scenarios, 12 Host fixture/driver tests, lint, performance
+and the 75-entry VSIX privacy inspection. Real Host confirmation of these two
+changes and the remaining settings-failure matrix are still required.
