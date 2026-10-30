@@ -173,6 +173,8 @@ interface ImportedCoverageHandoff {
 
 interface DirectoryObservation {
     current: () => boolean;
+    settlePreparation: () => Promise<boolean>;
+    beginProof: (directory: string) => void;
     budget: { remainingEntries: number };
 }
 
@@ -9628,6 +9630,15 @@ export class DiffTracker {
         this.directoryObservations.set(root, job);
         job.done = (async () => {
             const budget = { remainingEntries: this.maxScopePreflightEntries };
+            const settlePreparation = async (directory?: string): Promise<boolean> => {
+                if (!active() || (directory !== undefined && job.directory !== directory) || this.persistenceFailed) { return false; }
+                // Await only the current finite set, without collecting more
+                // batches here. Later writes must still pass the ordinary
+                // guard; waiting never grants another proof pass.
+                const publications = await Promise.allSettled([...this.runtimeBaselinePublications]);
+                return publications.every(result => result.status === 'fulfilled' && result.value) &&
+                    current() && (directory === undefined || job.directory === directory) && !this.persistenceFailed;
+            };
             // A finite follow-up covers notifications received during the first
             // pass. Both passes consume one allowance; busy trees remain limited.
             // A save failure must stop further passes without invalidating the
@@ -9637,12 +9648,21 @@ export class DiffTracker {
                 // publication guard. Wait for that exact finite set of writes;
                 // no proof may run while it is held. Other lifecycle guards
                 // still cancel the job, and new activity cannot add passes.
-                await Promise.all([...this.runtimeBaselinePublications]);
-                if (!current() || this.persistenceFailed) { break; }
+                if (!await settlePreparation()) { break; }
                 job.dirty = false;
                 const directory = job.directory;
-                const publicationVersion = this.baselineCompletionVersion;
-                const observation: DirectoryObservation = { current: () => current() && job.directory === directory, budget };
+                let publicationVersion = this.baselineCompletionVersion;
+                const observation: DirectoryObservation = { current: () => current() && job.directory === directory,
+                    settlePreparation: () => settlePreparation(directory), budget,
+                    beginProof: target => {
+                        if (target === directory) {
+                            // The proof covers notifications and publications
+                            // already settled during preparation. Only later
+                            // activity can require the bounded follow-up.
+                            publicationVersion = this.baselineCompletionVersion;
+                            job.dirty = false;
+                        }
+                    } };
                 await this.onExternalFileCreated(vscode.Uri.file(directory), false, undefined, false, observation);
                 if (!job.dirty && publicationVersion === this.baselineCompletionVersion) { break; }
             }
@@ -9973,6 +9993,7 @@ export class DiffTracker {
             this.activeCreations.get(filePath) === creation && (!directoryObservation || directoryObservation.current());
         try {
             const directory = await this.isUntrackedDirectory(uri);
+            if (directory && directoryObservation && !await directoryObservation.settlePreparation()) { return; }
             if (!creationIsCurrent()) { return; }
             if (directory) {
                 const watcherFailureReason =
@@ -10031,6 +10052,7 @@ export class DiffTracker {
                 let failureReason = scanFailureReason;
                 try {
                     await this.refreshIgnoreMatchers();
+                    if (directoryObservation && !await directoryObservation.settlePreparation()) { return; }
                     if (!creationIsCurrent()) { return; }
                     const importedPreparationBudget = directoryObservation?.budget ?? { remainingEntries: this.maxScopePreflightEntries };
                     let watchFailed = false;
@@ -10040,10 +10062,12 @@ export class DiffTracker {
                         watchFailed = true;
                         failureReason = watcherFailureReason;
                     }
+                    if (directoryObservation && !await directoryObservation.settlePreparation()) { return; }
                     if (!creationIsCurrent()) { return; }
                     if (!watchFailed && !scanEvent && this.effectiveMonitoringScope.kind === 'configured' &&
                         !this.baselineBuilding && !this.baselineTransaction) {
                         try {
+                            directoryObservation?.beginProof(filePath);
                             handoff = await this.prepareImportedCoverageHandoff(
                                 filePath, epoch, importedPreparationBudget, creationIsCurrent, observeStopped,!!directoryObservation
                             );

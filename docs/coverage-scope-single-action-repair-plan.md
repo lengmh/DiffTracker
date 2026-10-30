@@ -4,8 +4,8 @@
 - 总问题：[Issue #55](https://github.com/lengmh/DiffTracker/issues/55)
 - 核查基线：`main` / `ce4faf39ac66ef5f1ba8093fced0b9251146f060`，package `0.8.10`
 - 执行分支：`fix/55-coverage-scope-single-action`
-- 状态：**已实现受控完整排除复现链，以及 A1/A2 的核心目录协调和排除收尾；A3–A5 与完整 33 项验收待继续。保持 Draft。**
-- 交付形式：一个总 issue、一个 Draft PR。该 PR 初始只承载本计划，后续实现继续沿用它；不能仅合并计划就关闭 issue。
+- 状态：**A0–A4 已实现并补充 A5 组合回归；PR #56 为 Ready。有限突发已有本地红绿修复；最终真实 Windows Host 与同一 head 完整 CI 待复核。**
+- 交付形式：一个总 issue、一个 PR。PR #56 初始为 Draft，后续实现与审查沿用它；不能仅合并计划就关闭 issue。
 
 ## 1. 要解决的完整问题
 
@@ -290,7 +290,7 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 | 目录规则审查修复 | 真实 `.gitignore` 的目录专用规则在协调入口及 native gap 发布前检查；保留显式 include、同名文件和 pending/Apply rollback 事件 |
 | watcher 容量审查修复 | 普通目录核验和操作后的区域恢复均复用通过 epoch、身份及归属校验的健康 owner；130/256 个目录保持原 handle 峰值，仍执行扫描、事件版本和持久化证明，未提高上限 |
 | Windows 定向定位 | `2cdac55863322704fdb5591cf1e3a725c8dcaa8f` 的 [Verification #693](https://github.com/lengmh/DiffTracker/actions/runs/41002789922) 确认真实 native 通知到达、目录识别正确，协调流程等待期间 `baselineBuilding` 变为 true 后退出，未建立所需新 owner。独立文件持久化在通知之前/核验中途的确定性复现均先失败后通过 |
-| 本批续接修复 | 仅等待当前有限的 runtime Ready 持久化任务，再在原两轮/条目预算内继续核验。Stopped、pending、dirty、存储失败仍阻止核验；持续干扰耗尽两轮仍保留真实不确定性，安静后的通知可恢复并持续观察 |
+| 本批续接修复 | 目录分类、ignore 发现及 bridge 准备完成后，仅等待当时已在途的有限 runtime Ready 写入，再核对原守卫。尚未绑定观察区域时允许父通知合并；开始准备后区域改变则退出该轮。证明开始前的稳定事件由本次交接覆盖，不再无条件消耗第二轮；owner 交接、扫描及精确证据退休不放宽，仍最多两轮、共享条目预算。单目录及父通知扩大区域的两次有限写入均先失败后通过，无需额外通知；准备等待期间停止/pending/dirty/Git/存储失败与身份替换仍受保护 |
 | 验证边界 | 本地没有真实 Extension Host 环境；Windows、Linux Stable、最低 VS Code、installed RC、降级拒绝和最终 VSIX 的实际结果以本提交 exact-head Verification 与 PR #56 技术说明为准。自动复审按新 head 去重观察 |
 | 合并与发布 | 未执行 |
 

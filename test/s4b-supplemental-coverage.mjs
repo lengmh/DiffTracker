@@ -1517,7 +1517,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         } finally { release();publication.release();await created;fs.promises.opendir=opendir; }
     },'rules'));
 
-    test('Issue #55 repeated publication interruptions consume only two directory passes', () => fixture(async ({tracker,dir}) => {
+    for (const widen of [false,true]) test(`Issue #55 a finite publication burst completes without another directory notification (widen=${widen})`, () => fixture(async ({tracker,dir}) => {
         const {blind} = await lifecycleFixture(tracker,dir);
         const child = path.join(blind,'publication-burst');fs.mkdirSync(child);
         const target = path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven contents');
@@ -1539,6 +1539,10 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             notify();
             for (let index=0;index<2;index++) {
                 await gates[index].entered;
+                if (widen && index===0) {
+                    tracker.dispatchExternalEvent(Uri.file(blind),'change',tracker.sessionEpoch);
+                    await h.waitUntil(()=>[...tracker.directoryObservations.values()].some(job=>job.directory===blind));
+                }
                 const unrelated = path.join(dir,`independent-${index}.txt`);fs.writeFileSync(unrelated,'independent file');
                 publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
                 created=tracker.onExternalFileCreated(Uri.file(unrelated));await publication.entered;
@@ -1547,10 +1551,8 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             }
             await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
             assert.equal(openings,2);
-            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===child),'busy work remains explicitly unverified');
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'a finite settled burst must not require a fresh notification or Recheck');
             assert.equal(tracker.getOriginalContent(target),undefined);
-            notify();await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
-            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'a later settled notification can make a fresh bounded proof');
             const owner=activeNativeWatcher(nativeDirectoryWatchers,child);assert.ok(owner);
             const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
             fs.writeFileSync(target,'later child edit');owner.listener('change','tracked.txt');await settle(tracker);
@@ -1558,6 +1560,147 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         } finally {
             for (const gate of gates) { gate.release(); }
             publication?.release();await created;fs.promises.opendir=opendir;
+        }
+    },'rules'));
+
+    test('Issue #55 a publication joining the preparation wait completes after parent coalescing', () => fixture(async ({tracker,dir}) => {
+        const {blind}=await lifecycleFixture(tracker,dir);
+        const child=path.join(blind,'joining-publication');fs.mkdirSync(child);
+        const target=path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven contents');
+        let enter,release,held=false;
+        const entered=new Promise(resolve=>{enter=resolve;}),released=new Promise(resolve=>{release=resolve;});
+        const opendir=fs.promises.opendir;
+        fs.promises.opendir=async(directory,...args)=>{
+            if(String(directory)===child&&!held){held=true;enter();await released;}
+            return opendir(directory,...args);
+        };
+        let first,second,createdFirst,createdSecond;
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','joining-publication');await entered;
+            tracker.dispatchExternalEvent(Uri.file(blind),'change',tracker.sessionEpoch);
+            await h.waitUntil(()=>[...tracker.directoryObservations.values()].some(job=>job.directory===blind));
+            const a=path.join(dir,'first.txt');fs.writeFileSync(a,'first independent file');
+            first=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            createdFirst=tracker.onExternalFileCreated(Uri.file(a));await first.entered;
+            release();await delay(20);
+            const b=path.join(dir,'second.txt');fs.writeFileSync(b,'second independent file');
+            second=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            createdSecond=tracker.onExternalFileCreated(Uri.file(b));
+            await h.waitUntil(()=>tracker.runtimeBaselinePublications.size===2);
+            first.release();await second.entered;await delay(20);second.release();
+            await Promise.all([createdFirst,createdSecond]);await settle(tracker);
+            await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
+            fs.writeFileSync(target,'later native edit');activeNativeWatcher(nativeDirectoryWatchers,child).listener('change','tracked.txt');
+            await settle(tracker);assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+        } finally {
+            release();first?.release();second?.release();await Promise.all([createdFirst,createdSecond]);fs.promises.opendir=opendir;
+        }
+    },'rules'));
+
+    test('Issue #55 preparation-only publication does not spend the follow-up scan budget', () => fixture(async ({tracker,dir}) => {
+        const {blind,target:known}=await lifecycleFixture(tracker,dir);
+        const child=path.join(blind,'preparation-budget');fs.mkdirSync(child);
+        const targets=Array.from({length:10},(_,index)=>path.join(child,`unproven-${index}.txt`));
+        for(const target of targets){fs.writeFileSync(target,'unproven contents');}
+        const unrelated=path.join(dir,'independent.txt');fs.writeFileSync(unrelated,'independent file');
+        tracker.maxScopePreflightEntries=40;
+        let enter,release,held=false;
+        const entered=new Promise(resolve=>{enter=resolve;}),released=new Promise(resolve=>{release=resolve;});
+        const opendir=fs.promises.opendir;
+        fs.promises.opendir=async(directory,...args)=>{
+            if(String(directory)===child&&!held){held=true;enter();await released;}
+            return opendir(directory,...args);
+        };
+        let publication,created;
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','preparation-budget');await entered;
+            publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            created=tracker.onExternalFileCreated(Uri.file(unrelated));await publication.entered;
+            release();await delay(20);
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('change','preparation-budget');
+            publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'publication completed before proof must not force an unrelated second scan');
+            for(const target of targets){assert.ok(tracker.getUnknownReviewToken(target));assert.equal(tracker.getOriginalContent(target),undefined);}
+            assert.equal(tracker.getOriginalContent(known),'before');
+            const target=targets[0],unknown=tracker.getUnknownReviewToken(target);
+            fs.writeFileSync(target,'later native edit');activeNativeWatcher(nativeDirectoryWatchers,child).listener('change',path.basename(target));
+            await settle(tracker);assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+        } finally {release();publication?.release();await created;fs.promises.opendir=opendir;}
+    },'rules'));
+
+    test('Issue #55 preparation wait cannot carry creation provenance across an identity replacement', () => fixture(async ({tracker,dir}) => {
+        const {blind,target:known}=await lifecycleFixture(tracker,dir);
+        const child=path.join(blind,'preparation-replaced'),moved=path.join(dir,'old-incarnation');fs.mkdirSync(child);
+        const target=path.join(child,'tracked.txt');fs.writeFileSync(target,'first incarnation');
+        const unrelated=path.join(dir,'independent.txt');fs.writeFileSync(unrelated,'independent file');
+        let enter,release,held=false;
+        const entered=new Promise(resolve=>{enter=resolve;}),released=new Promise(resolve=>{release=resolve;});
+        const opendir=fs.promises.opendir;
+        fs.promises.opendir=async(directory,...args)=>{
+            if(String(directory)===child&&!held){held=true;enter();await released;}
+            return opendir(directory,...args);
+        };
+        let publication,created;
+        try {
+            tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch);
+            await entered;
+            publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            created=tracker.onExternalFileCreated(Uri.file(unrelated));await publication.entered;
+            release();await delay(20);
+            fs.renameSync(child,moved);fs.mkdirSync(child);fs.writeFileSync(target,'replacement incarnation');
+            publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
+            assert.equal(tracker.getOriginalContent(target),undefined);
+            assert.equal(tracker.getOriginalContent(known),'before');
+            const owner=activeNativeWatcher(nativeDirectoryWatchers,child);assert.ok(owner);
+            fs.writeFileSync(target,'later replacement edit');owner.listener('change','tracked.txt');await settle(tracker);
+            assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+            assert.equal(fs.readFileSync(path.join(moved,'tracked.txt'),'utf8'),'first incarnation');
+        } finally {release();publication?.release();await created;fs.promises.opendir=opendir;}
+    },'rules'));
+
+    for (const interruption of ['stop','pending','dirty','git','persistence']) test(`Issue #55 preparation publication wait retains ${interruption} guards`, () => fixture(async ({tracker,dir,scope}) => {
+        const {blind,target:known} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'preparation-guard');fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven contents');
+        const unrelated = path.join(dir,'independent.txt');fs.writeFileSync(unrelated,'independent file');
+        let enter,release,held=false;
+        const entered=new Promise(resolve=>{enter=resolve;}),released=new Promise(resolve=>{release=resolve;});
+        const opendir=fs.promises.opendir,copy=h.vscode.workspace.fs.copy;
+        fs.promises.opendir=async(directory,...args)=>{
+            if(String(directory)===child&&!held){held=true;enter();await released;}
+            return opendir(directory,...args);
+        };
+        let publication,created;
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','preparation-guard');
+            await entered;
+            publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+            created=tracker.onExternalFileCreated(Uri.file(unrelated));await publication.entered;
+            release();await delay(20);
+            if(interruption==='stop'){tracker.stopRecording();}
+            if(interruption==='pending'){tracker.setPendingMonitoringScope(configuredScope(tracker,scope.mode,[],[{scope:'all',pattern:'/lifecycle-blind/'}]));}
+            if(interruption==='dirty'){h.vscode.workspace.textDocuments.push({uri:Uri.file(target),isDirty:true});}
+            if(interruption==='git'){tracker.gitContextPending=true;}
+            if(interruption==='persistence'){h.vscode.workspace.fs.copy=async()=>{throw h.vscode.FileSystemError.NoPermissions();};}
+            publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===child));
+            assert.equal(activeNativeWatcher(nativeDirectoryWatchers,child),undefined);
+            assert.equal(tracker.getTrackedChange(target),undefined);
+            assert.equal(tracker.getOriginalContent(known),'before');
+            assert.equal(fs.readFileSync(target,'utf8'),'unproven contents');
+            if(interruption==='stop'){assert.equal(tracker.getIsRecording(),false);}
+            if(interruption==='persistence'){assert.equal(tracker.persistenceFailed,true);}
+        } finally {
+            release();publication?.release();await created;fs.promises.opendir=opendir;h.vscode.workspace.fs.copy=copy;
+            if(interruption==='dirty'){h.vscode.workspace.textDocuments.pop();}
+            if(interruption==='git'){tracker.gitContextPending=false;}
         }
     },'rules'));
 
