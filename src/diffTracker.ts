@@ -601,6 +601,7 @@ export class DiffTracker {
         for (const creation of this.activeCreations.values()) { creation.cancelled = true; }
         this.activeCreations.clear();
         this.directoryObservations.clear();
+        this.runtimeBaselinePublications.clear();
         this.activeExternalOperations.clear();
         this.pendingImportedDirectoryReconciliation.clear();
         this.importedDirectoryResumePromise = undefined;
@@ -862,8 +863,9 @@ export class DiffTracker {
     private excludedDirectoryKinds = new Map<string, {epoch:number; workspaceRoot:string; parent:fs.BigIntStats}>();
     private directoryObservations = new Map<string, {
         directory: string; workspaceRoot: string; dirty: boolean; done: Promise<void>;
-        creations: Map<string, fs.BigIntStats>; current: () => boolean;
+        creations: Map<string, fs.BigIntStats>; active: () => boolean; current: () => boolean;
     }>();
+    private runtimeBaselinePublications = new Set<Promise<boolean>>();
     // Persisted as restart uncertainty, never as proof that an OS handle lives.
     private importedCoverageObligations = new Set<string>();
     private readonly importedCoverageRestartCode = 'imported-coverage-restart-required';
@@ -1496,8 +1498,8 @@ export class DiffTracker {
                         return conflict('The operation recovery target is no longer in the authorized scope.');
                     }
                     if (target.kind === 'subtree') {
-                        await this.watchImportedTree(target.path,epoch,false,preparationBudget,this.owningWorkspaceFolderForTraversal(target.path));
-                        handoffs.push(await this.prepareImportedCoverageHandoff(target.path,epoch,preparationBudget,current));
+                        await this.watchImportedTree(target.path,epoch,false,preparationBudget,this.owningWorkspaceFolderForTraversal(target.path),true);
+                        handoffs.push(await this.prepareImportedCoverageHandoff(target.path,epoch,preparationBudget,current,false,true));
                     } else {
                         // A file proof needs its actual parent owner, never a walk
                         // of siblings. Retain that owner durably for future events.
@@ -8585,6 +8587,14 @@ export class DiffTracker {
         await this.completeBaseline(epoch, transaction, wholeWorkspacePersistenceBudget);
     }
 
+    private completeRuntimeBaseline(epoch: number, observeStopped = false): Promise<boolean> {
+        const task = this.completeBaseline(epoch, undefined, undefined, observeStopped);
+        this.runtimeBaselinePublications.add(task);
+        const finished = () => { this.runtimeBaselinePublications.delete(task); };
+        void task.then(finished, finished);
+        return task;
+    }
+
     private async completeBaseline(
         epoch: number,
         transaction?: BaselineTransaction,
@@ -9578,13 +9588,13 @@ export class DiffTracker {
             this.setSubtreeCoverageGap(uri.fsPath, 'supplemental-watcher-directory-change-gap',
                 'Directory observation is being verified; if verification cannot complete, recheck observation coverage.');
         }
-        const overlapping = [...this.directoryObservations].find(([, job]) => job.current() &&
+        const overlapping = [...this.directoryObservations].find(([, job]) => job.active() &&
             job.workspaceRoot === folder.uri.toString() &&
             (this.pathBelongsToRoot(uri.fsPath, job.directory) || this.pathBelongsToRoot(job.directory, uri.fsPath)));
         const root = overlapping?.[0] ?? [...this.supplementalCoverageRoots].find(target =>
             this.pathBelongsToRoot(uri.fsPath, target) && this.workspaceFolderOwnsTraversalPath(folder, target)) ?? uri.fsPath;
         const previous = this.directoryObservations.get(root);
-        if (previous?.current()) {
+        if (previous?.active()) {
             if (creationIdentity && (previous.creations.has(uri.fsPath) || previous.creations.size < this.maxImportedDirectoryWatchers)) {
                 previous.creations.set(uri.fsPath, creationIdentity);
             }
@@ -9600,17 +9610,20 @@ export class DiffTracker {
         const generation = this.coverageGeneration;
         const policy = this.watcherCoverageRevision;
         const job = { directory: uri.fsPath, workspaceRoot: folder.uri.toString(), dirty: false, done: Promise.resolve(),
-            creations: new Map<string, fs.BigIntStats>(creationIdentity ? [[uri.fsPath, creationIdentity]] : []), current: () => false };
-        const current = (): boolean => this.isCurrentEpoch(epoch) && this.isRecording && this.externalWatcherEnabled &&
+            creations: new Map<string, fs.BigIntStats>(creationIdentity ? [[uri.fsPath, creationIdentity]] : []),
+            active: () => false, current: () => false };
+        const active = (): boolean => this.isCurrentEpoch(epoch) && this.isRecording && this.externalWatcherEnabled &&
             this.directoryObservations.get(root) === job && this.effectiveMonitoringScope === scope &&
             this.coverageGeneration === generation && this.watcherCoverageRevision === policy &&
             this.snapshotInitialized && this.restoringEpoch === undefined &&
-            !this.baselineBuilding && !this.baselineTransaction && !this.scopeApplyPreflight && this.activeScopeApplications === 0 &&
+            !this.baselineTransaction && !this.scopeApplyPreflight && this.activeScopeApplications === 0 &&
             !this.pendingMonitoringScope && !this.recoveryBlocked &&
             !this.gitContextPending && this.pausedGitRepositories.size === 0 && !this.workspaceContextChanged &&
             !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty &&
                 this.pathBelongsToRoot(document.uri.fsPath, job.directory)) &&
             this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString() === folder.uri.toString();
+        const current = (): boolean => active() && !this.baselineBuilding && this.runtimeBaselinePublications.size === 0;
+        job.active = active;
         job.current = current;
         this.directoryObservations.set(root, job);
         job.done = (async () => {
@@ -9619,12 +9632,19 @@ export class DiffTracker {
             // pass. Both passes consume one allowance; busy trees remain limited.
             // A save failure must stop further passes without invalidating the
             // current pass's rollback/coverage-failure publication.
-            for (let pass = 0; pass < 2 && current() && !this.persistenceFailed; pass++) {
+            for (let pass = 0; pass < 2 && active() && !this.persistenceFailed; pass++) {
+                // An independent file creation briefly holds the same Ready
+                // publication guard. Wait for that exact finite set of writes;
+                // no proof may run while it is held. Other lifecycle guards
+                // still cancel the job, and new activity cannot add passes.
+                await Promise.all([...this.runtimeBaselinePublications]);
+                if (!current() || this.persistenceFailed) { break; }
                 job.dirty = false;
                 const directory = job.directory;
+                const publicationVersion = this.baselineCompletionVersion;
                 const observation: DirectoryObservation = { current: () => current() && job.directory === directory, budget };
                 await this.onExternalFileCreated(vscode.Uri.file(directory), false, undefined, false, observation);
-                if (!job.dirty) { break; }
+                if (!job.dirty && publicationVersion === this.baselineCompletionVersion) { break; }
             }
         })().finally(() => {
             if (this.directoryObservations.get(root) === job) { this.directoryObservations.delete(root); }
@@ -9893,7 +9913,7 @@ export class DiffTracker {
         const filePath = uri.fsPath;
         if (uri.scheme === 'file' && this.isRecording && this.externalWatcherEnabled &&
             this.effectiveMonitoringScope.kind === 'configured' && this.snapshotInitialized &&
-            !this.baselineBuilding && !this.baselineTransaction && !this.scopeApplyPreflight &&
+            (!this.baselineBuilding || this.runtimeBaselinePublications.size > 0) && !this.baselineTransaction && !this.scopeApplyPreflight &&
             !this.pendingMonitoringScope && this.initialIgnoreEpoch !== this.sessionEpoch &&
             this.restoringEpoch === undefined && !this.isPathIgnored(uri, true) &&
             !this.baselineExistingFiles.has(filePath) && !this.opaqueBaselineFiles.has(filePath)) {
@@ -10217,7 +10237,7 @@ export class DiffTracker {
                 this.fileSnapshots.set(filePath, '');
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
-                } else if (!await this.completeBaseline(epoch, undefined, undefined, observeStopped)) {
+                } else if (!await this.completeRuntimeBaseline(epoch, observeStopped)) {
                     return;
                 }
             }
@@ -13628,7 +13648,7 @@ export class DiffTracker {
             this.baselineExistingFiles.delete(filePath);
         }
         if (this.snapshotInitialized && this.storageUri) {
-            void this.completeBaseline(this.sessionEpoch);
+            void this.completeRuntimeBaseline(this.sessionEpoch);
         } else {
             this.schedulePersistState();
         }

@@ -1410,7 +1410,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
     }, 'rules'));
 
-    for (const count of [130,256]) test(`Issue #55 healthy ${count} directory owners reconcile without duplicate bridge capacity`, () => fixture(async ({tracker,dir}) => {
+    for (const proof of ['runtime','regional']) for (const count of [130,256]) test(`Issue #55 ${proof} proof reuses healthy ${count} directory owners without duplicate capacity`, () => fixture(async ({tracker,dir,folder}) => {
         const {blind,child,target,scope} = await lifecycleFixture(tracker,dir);
         for (let index=2;index<count;index++) { fs.mkdirSync(path.join(blind,`covered-${index}`)); }
         assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
@@ -1422,7 +1422,16 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             peak = Math.max(peak,nativeDirectoryWatchers.filter(owner=>owner.active).length);
             return result;
         };
-        try { await tracker.onExternalFileChanged(Uri.file(blind)); }
+        try {
+            if (proof==='runtime') { await tracker.onExternalFileChanged(Uri.file(blind)); }
+            else {
+                tracker.setSubtreeCoverageGap(blind,'directory-runtime-coverage-gap','Earlier observation needs verification');
+                const targets = [{path:blind,kind:'subtree',workspaceRoot:folder.uri.toString()}];
+                assert.equal(await tracker.retainScopeOperationRecovery(targets,scope.scopeRevision),true);
+                const result = await tracker.recheckScopeOperationCoverage(targets,scope.scopeRevision);
+                assert.equal(result.status,'rechecked',JSON.stringify(result));
+            }
+        }
         finally { fs.watch = watch; }
         assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'healthy coverage must not fail at half the configured capacity');
         assert.equal(peak,count,'verified existing owners require no duplicate native handles');
@@ -1455,6 +1464,134 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
             assert.equal(tracker.getOriginalContent(target),undefined);
         } finally { h.vscode.workspace.fs.stat = stat; }
+    },'rules'));
+
+    for (const timing of ['before','during','create']) test(`Issue #55 directory observation survives an unrelated file publication (${timing})`, () => fixture(async ({tracker,dir}) => {
+        const {blind,target:known} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'publication-overlap'); fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt'); fs.writeFileSync(target,'unproven moved contents');
+        const unrelated = path.join(dir,'independent.txt'); fs.writeFileSync(unrelated,'new independent file');
+        const publication = h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const opendir = fs.promises.opendir;
+        let entered,release;
+        const directoryEntered = new Promise(resolve=>{entered=resolve;});
+        const directoryReleased = new Promise(resolve=>{release=resolve;});
+        let held = false;
+        fs.promises.opendir = async (directory,...args) => {
+            if (timing==='during' && String(directory)===child && !held) {
+                held=true;entered();await directoryReleased;
+            }
+            return opendir(directory,...args);
+        };
+        let created;
+        try {
+            const notify = () => timing==='create'
+                ? tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch)
+                : activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','publication-overlap');
+            if (timing==='during') { notify();await directoryEntered; }
+            created=tracker.onExternalFileCreated(Uri.file(unrelated));
+            await publication.entered;
+            assert.equal(tracker.baselineBuilding,true,'the production Ready publication holds its normal guard');
+            if (timing!=='during') { notify(); }
+            release();
+            await delay(30);
+            assert.equal(tracker.getOriginalContent(target),undefined,'no baseline is accepted across the publication guard');
+            assert.equal(tracker.directoryObservations.size,1,'runtime events remain coalesced while publication is in flight');
+            publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'settled publication resumes the bounded proof automatically');
+            const owner = activeNativeWatcher(nativeDirectoryWatchers,child);assert.ok(owner);
+            const unknown = tracker.getUnknownReviewToken(target);
+            if (timing==='create') { assert.equal(tracker.getOriginalContent(target),''); }
+            else { assert.ok(unknown); }
+            assert.equal(tracker.getOriginalContent(known),'before');
+            assert.equal(tracker.getOriginalContent(unrelated),'');
+            fs.writeFileSync(target,'later native child edit');owner.listener('change','tracked.txt');await settle(tracker);
+            if (unknown) {
+                assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+                assert.equal(tracker.getOriginalContent(target),undefined);
+            } else {
+                assert.equal(tracker.getTrackedChange(target)?.currentContent,'later native child edit');
+                assert.equal(tracker.getOriginalContent(target),'');
+            }
+        } finally { release();publication.release();await created;fs.promises.opendir=opendir; }
+    },'rules'));
+
+    test('Issue #55 repeated publication interruptions consume only two directory passes', () => fixture(async ({tracker,dir}) => {
+        const {blind} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'publication-burst');fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven contents');
+        const gates = Array.from({length:2},()=>{
+            let enter,release;
+            return {entered:new Promise(resolve=>{enter=resolve;}),released:new Promise(resolve=>{release=resolve;}),
+                enter:()=>enter(),release:()=>release()};
+        });
+        const opendir = fs.promises.opendir;let openings=0;
+        fs.promises.opendir = async (directory,...args) => {
+            if (String(directory)===child && openings<gates.length) {
+                const gate = gates[openings++];gate.enter();await gate.released;
+            }
+            return opendir(directory,...args);
+        };
+        let publication,created;
+        try {
+            const notify = () => activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','publication-burst');
+            notify();
+            for (let index=0;index<2;index++) {
+                await gates[index].entered;
+                const unrelated = path.join(dir,`independent-${index}.txt`);fs.writeFileSync(unrelated,'independent file');
+                publication=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+                created=tracker.onExternalFileCreated(Uri.file(unrelated));await publication.entered;
+                gates[index].release();await delay(30);
+                publication.release();await created;
+            }
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.equal(openings,2);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===child),'busy work remains explicitly unverified');
+            assert.equal(tracker.getOriginalContent(target),undefined);
+            notify();await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'a later settled notification can make a fresh bounded proof');
+            const owner=activeNativeWatcher(nativeDirectoryWatchers,child);assert.ok(owner);
+            const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
+            fs.writeFileSync(target,'later child edit');owner.listener('change','tracked.txt');await settle(tracker);
+            assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+        } finally {
+            for (const gate of gates) { gate.release(); }
+            publication?.release();await created;fs.promises.opendir=opendir;
+        }
+    },'rules'));
+
+    for (const interruption of ['stop','pending','dirty','persistence']) test(`Issue #55 publication wait retains ${interruption} directory guards`, () => fixture(async ({tracker,dir,scope}) => {
+        const {blind,target:known} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'publication-guard');fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt');fs.writeFileSync(target,'unproven contents');
+        const unrelated = path.join(dir,'independent.txt');fs.writeFileSync(unrelated,'independent file');
+        const publication = h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const copy = h.vscode.workspace.fs.copy;
+        const created = tracker.onExternalFileCreated(Uri.file(unrelated));
+        try {
+            await publication.entered;
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','publication-guard');
+            await delay(20);
+            if (interruption==='stop') { tracker.stopRecording(); }
+            if (interruption==='pending') { tracker.setPendingMonitoringScope(configuredScope(tracker,scope.mode,[],[{scope:'all',pattern:'/lifecycle-blind/'}])); }
+            if (interruption==='dirty') { h.vscode.workspace.textDocuments.push({uri:Uri.file(target),isDirty:true}); }
+            if (interruption==='persistence') {
+                h.vscode.workspace.fs.copy = async () => { throw h.vscode.FileSystemError.NoPermissions(); };
+            }
+            publication.release();await created;
+            await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===child));
+            assert.equal(activeNativeWatcher(nativeDirectoryWatchers,child),undefined);
+            assert.equal(tracker.getTrackedChange(target),undefined);
+            assert.equal(tracker.getOriginalContent(known),'before');
+            assert.equal(fs.readFileSync(target,'utf8'),'unproven contents');
+            if (interruption==='stop') { assert.equal(tracker.getIsRecording(),false); }
+            if (interruption==='persistence') { assert.equal(tracker.persistenceFailed,true); }
+        } finally {
+            publication.release();await created;h.vscode.workspace.fs.copy=copy;
+            if (interruption==='dirty') { h.vscode.workspace.textDocuments.pop(); }
+        }
     },'rules'));
 
     test('Issue #55 directory provider permission failure keeps genuine coverage uncertainty', () => fixture(async ({tracker,dir}) => {

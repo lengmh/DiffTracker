@@ -280,21 +280,20 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 
 | 事项 | 状态 |
 | --- | --- |
-| 用户操作链与最终 Recheck 反馈 | 已记录 |
-| 相关源码、既有 ADR、CI 配置与重复 issue 检查 | 已核查 |
-| 总 issue 与修复计划 | 已发布/本提交承载 |
-| Draft PR | 本计划提交后创建；保持 Draft |
-| 修复代码与新增回归 | 首批已实现目录 `change` 的有界协调；复用原有 bridge/handoff、扫描与持久化。重复/相邻目录通知合并到所属 coverage root，一次在途、最多两轮、共享条目预算；保留 Unknown before-image 与原始待审，仅退休精确核验的旧证据。补充监听遍历跳过显式排除子树 |
-| 定向测试 | 新增 9 项 tracker 回归。旧代码确定性复现 directory-change gap 残留；另复现补充遍历进入已排除孩子目录。首轮全量 tracker 为 1575/1576，修正并发残留后本地 `npm test` 通过（tracker 1577/1577）。随后补充保护已排除旧证据、pending-scope 控制证据与保存失败回滚；最终代码定向 9/9、S4-B 46/46、lint、编译和 VSIX 检查通过。最终 exact-head 全量 CI 结果见 PR #56 |
-| 真实 Host | 新增真实目录元数据通知与恢复后持续子文件观察的 Host 用例；本地缺少 Xvfb，未执行真实 Host。初始 head `04ea7d1e33390dd50b0fb1dabd0709cbaeb02ca9` 的 [Verification #677](https://github.com/lengmh/DiffTracker/actions/runs/40927049234) 中 Windows Stable Host、installed RC、降级拒绝通过；Linux Stable/1.80 因用例假定通知必须为 `change` 而超时。本地原生探针确认 Linux 报告 `rename`；用例已改为接受并原样转发平台真实通知，确定性测试继续单独覆盖 `change`。修正提交的完整 CI 结果见 PR #56 |
-| 完整 CI 与修复自动 review | 本批次 exact SHA、Verification URL 和实际结果记录在 PR #56。A0–A5 完整 diff 尚未就绪，未请求修复自动 review；后续完成整体实现后再请求一次 |
-| 第二批 A0/A1 | 固定 `82b9d2882f9dc3c967b9aff95a523472ed092fc6` 源码，受控保留 directory-change gap 后，复现 Apply 残留、手动 Recheck 清除的完整链，同时保留不相关真实失败、待审与 Unknown。目录 native rename 已不再冒充子文件创建证据；明确 create 的身份绑定来源随 runtime 协调任务保留。create/change/native rename 共用有界运行入口，父/子 create 逆序通知在安装独立 owner 前合并；底层独立 handoff 原语及原有并发 owner 回归保留。补齐父通知发现身份替换、核验中写入/替换、持续忙碌有限退出及稳定后的持续观察 |
-| 第二批 A2 | 已知目录诊断按实际根和完整排除子树投影为 dormant，保留持久证据；排除孩子时释放其 owner，保留上级与其他根。排除通知在登记覆盖版本前过滤；owner 身份失效、无文件名事件和祖先真实失败保留。范围判断先证明最早排除祖先，避免为深层旧 gap 枚举排除区；Recheck 不再把未扫描的排除子树证据当作已核验。补齐多类 reason、排除噪声、Reload、重新纳入新基线及后续观察回归 |
-| 第二批验证 | 最终代码 Issue #55 定向 22/22、原 S4-B 46/46、原 S4-C 40/40 通过。本地完整 `npm test` 通过（tracker 1590/1590，发生在最后的排除文件通知守卫及逆序创建新增用例之前）；最终代码定向已覆盖新增守卫。真实 Host 增加 Apply 当次诊断/owner 收尾及排除区继续建目录后兄弟观察用例；本批 exact SHA、完整 CI 和 Host 实际结果记录在 PR #56 |
+| PR 与版本 | 沿用 PR #56，已转为 Ready for review；未合并、未发布。package 保持 `0.8.10` |
+| A0/A1 | 完整排除/Recheck 复现链、目录 create/change/native rename、父子逆序通知、身份替换及持续子文件观察已有回归；一次在途、最多两轮、共享条目预算 |
+| A2 | 排除诊断投影为 dormant 并保留持久证据；释放排除区 owner，保留父级与兄弟观察；重复删建及同名普通文件替换已有回归 |
+| A3/A4 | 普通资源/Coverage 行排除、Save and Apply、Restore 统一编排；合并待审确认，保留草稿、取消、并发、设置补偿与部分完成反馈。仅核验本次必要区域，无关故障单列 |
+| 恢复归属 | 按实际 scope delta 与 owner 绑定必要义务；相同 proposal 重试、错误证据替换及重启不丢失归属；独立后台导入故障不混入本次操作 |
+| A5 矩阵 | 已补充组合契约、设置/Apply/核验屏障的进程中断恢复、Undo、根与别名、legacy/nonready、跨视图状态以及新故障负向测试。最终退出仍受同一 head 的完整 Host/CI 与自动复审约束 |
+| 清除后的多轮事件 | Excludes → Apply → public Recheck 后，三轮排除区创建/修改/rename/delete-recreate、保留父通知、范围内目录移入及后续真实子文件修改；包含 Reload。核对同一旧 gap 路径、身份、原因和持久内容，不用删除历史证据清告警 |
+| 目录规则审查修复 | 真实 `.gitignore` 的目录专用规则在协调入口及 native gap 发布前检查；保留显式 include、同名文件和 pending/Apply rollback 事件 |
+| watcher 容量审查修复 | 普通目录核验和操作后的区域恢复均复用通过 epoch、身份及归属校验的健康 owner；130/256 个目录保持原 handle 峰值，仍执行扫描、事件版本和持久化证明，未提高上限 |
+| Windows 定向定位 | `2cdac55863322704fdb5591cf1e3a725c8dcaa8f` 的 [Verification #693](https://github.com/lengmh/DiffTracker/actions/runs/41002789922) 确认真实 native 通知到达、目录识别正确，协调流程等待期间 `baselineBuilding` 变为 true 后退出，未建立所需新 owner。独立文件持久化在通知之前/核验中途的确定性复现均先失败后通过 |
+| 本批续接修复 | 仅等待当前有限的 runtime Ready 持久化任务，再在原两轮/条目预算内继续核验。Stopped、pending、dirty、存储失败仍阻止核验；持续干扰耗尽两轮仍保留真实不确定性，安静后的通知可恢复并持续观察 |
+| 验证边界 | 本地没有真实 Extension Host 环境；Windows、Linux Stable、最低 VS Code、installed RC、降级拒绝和最终 VSIX 的实际结果以本提交 exact-head Verification 与 PR #56 技术说明为准。自动复审按新 head 去重观察 |
 | 合并与发布 | 未执行 |
 
-后续每个 checkpoint 更新此表并记录 exact head、实际通过/失败项目与下一批范围。计划文档不是修复完成证据。
+本批确定性回归证明了源码中的并发持久化中断路径；先前 provider FileNotFound 回退是独立已复现修复，不能据此解释全部 Windows 失败。较早最低版本的 Apply conflict 和事件未送达失败，其触发原因尚未确证；后续通过不证明历史失败是假警报。
 
-第二批复现使用 dirty editor 守卫受控保留自动核验前的 gap，再在移除该阻碍后执行排除与 Recheck。它证明了固定源码中的排除收尾机制，不代表现场由 dirty editor 导致；现场安装版本、完整规则和事件顺序仍未独立取得。
-
-仍未完成：A3/A4 的普通资源与告警入口统一、Save and Apply、Restore、必要的定向核验编排、取消/并发/部分完成反馈及 README/ADR 同步；A5 的完整 33 项矩阵、最终 exact-head Host/CI、整体独立自审和一次自动 review。底层 Apply 后重新纳入的覆盖核验已经由独立原语回归验证，自动接续属于 A3；不能把该底层多步测试当成高层单次操作已经完成。不得据本批次关闭 #55 或将 PR 改为 Ready。
+现场安装版本、具体“忽略”操作及再次事件位于排除区还是有效范围，仍未独立取得。现有明确 Excludes 链未复现旧证据回活，不能据此宣称所有现场复发都已解决。本计划不是最终完成证据；最终仍需同一 head 完整 CI、真实 Host 和自动复审结果，且本任务不执行合并或插件发布。

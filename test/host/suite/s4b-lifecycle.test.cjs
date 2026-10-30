@@ -40,6 +40,7 @@ async function directoryChangeHost(workspace) {
         (path.dirname(target)===path.dirname(root) && path.basename(target).startsWith(`${path.basename(root)}-incoming-`)));
     const providerTrace = [];
     const policyTrace = [];
+    const runtimePublicationCallers = {};
     const ignoredPath = tracker.isPathIgnored;
     tracker.isPathIgnored = function(uri,...args) {
         const result = ignoredPath.call(this,uri,...args);
@@ -84,11 +85,23 @@ async function directoryChangeHost(workspace) {
             ({root:relativeTracePath(key),path:relativeTracePath(job.directory),dirty:job.dirty,current:job.current()})),
         dirtyUnderPath:vscode.workspace.textDocuments.filter(doc=>doc.uri.scheme==='file'&&doc.isDirty&&
             tracker.pathBelongsToRoot(doc.uri.fsPath,uri.fsPath)).length});
+    const completeRuntimeBaseline = tracker.completeRuntimeBaseline;
+    tracker.completeRuntimeBaseline = async function(...args) {
+        const caller = new Error().stack.split('\n').find(line=>/onExternalFileCreated|ensureSnapshotForDocument/.test(line))
+            ?.match(/onExternalFileCreated|ensureSnapshotForDocument/)?.[0] ?? 'other';
+        if (traceRecurrence) { runtimePublicationCallers[caller]=(runtimePublicationCallers[caller]??0)+1; }
+        const trace = traceRecurrence && directoryTrace.length<24 ? {method:'completeRuntimeBaseline',
+            caller,pending:true} : undefined;
+        if (trace) { directoryTrace.push(trace); }
+        try { return await completeRuntimeBaseline.apply(this,args); }
+        finally { if (trace) { trace.pending=false; } }
+    };
     for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation']) {
         const original = tracker[method];
         tracker[method] = async function(uri,...args) {
             const trace = traceRecurrence && scopedTracePath(uri.fsPath) && directoryTrace.length<24
                 ? {method,before:traceState(uri),pending:true} : undefined;
+            if (trace && method==='reconcileDirectoryObservation') { trace.creationIdentity=!!args[1]; }
             if (trace) { directoryTrace.push(trace); }
             try {
                 const result = await original.call(this,uri,...args);
@@ -208,7 +221,7 @@ async function directoryChangeHost(workspace) {
                     tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
                     tracker.directoryObservations.size === 0 &&
                     tracker.getTrackedChange(current)?.reviewKind === 'unknown', () => ({
-                        notifications,providerFallbacks,directoryTrace,providerTracing,providerTrace,policyTrace,
+                        notifications,providerFallbacks,directoryTrace,providerTracing,providerTrace,policyTrace,runtimePublicationCallers,
                         epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
                         externalWatcherEnabled:tracker.externalWatcherEnabled,snapshotInitialized:tracker.snapshotInitialized,
                         baselineBuilding:tracker.baselineBuilding,baselineTransaction:!!tracker.baselineTransaction,
@@ -248,6 +261,7 @@ async function directoryChangeHost(workspace) {
             assert.equal(excludedEnumerations, 0);
         } finally { fs.promises.opendir = opendir; diagnostics.dispose(); }
         console.log(`HOST-ISSUE-55 provider fallback metadata: ${JSON.stringify(providerFallbacks)}`);
+        console.log(`HOST-ISSUE-55 runtime Ready publication callers: ${JSON.stringify(runtimePublicationCallers)}`);
         console.log('PASS HOST-ISSUE-55 cleared Limited stays clear through three excluded create/modify/rename/delete-recreate and included move/native-edit rounds');
     } finally {
         fs.watch = nativeWatch;
