@@ -1,6 +1,7 @@
 # Exclusion settings and Apply transaction repair
 
-Status: **Draft; implementation and acceptance are incomplete.**
+Status: **Implementation checkpoint; final acceptance is tracked in
+[PR #58](https://github.com/lengmh/DiffTracker/pull/58).**
 
 Baseline: `454f107a143c41c2c4966e655d189e6c82d08ee2` (0.8.11 source).
 This work addresses exclusion settings saves, Apply, conflict review and
@@ -84,7 +85,8 @@ real Host evidence. Public examples and evidence use synthetic directories only.
 - [x] R0/R1 owned configuration settlement and external-conflict protection.
 - [x] R2 exact settings-file interference reproduction and bounded repair.
 - [x] R3/R4 interaction, lifecycle and failure boundary regressions.
-- [ ] R5 final exact-head real Host, quality, package and automatic review.
+- R5 final exact-head Host, quality, package and automatic review results are
+  recorded in the PR checks and description.
 
 Configuration API response and observable publication now share one deadline.
 Listeners start before each write. The action accepts its exact before/expected
@@ -93,6 +95,12 @@ proposal value. Missing responses and unverified rejection/publication return
 partial results without compensating across uncertainty. A retained write fence
 blocks new writes and Apply until the response and observable state settle, or
 the controller closes. Late completion never resumes Apply or compensation.
+An exact owned value silently published before the deadline is checked once at
+that deadline. After partial feedback, an explicit status/action query may
+observe completion and release only the fence. A competing silent value remains
+a conflict. Late observation also restores the normal pending-request privacy
+projection when its notification was missing. No periodic retry or additional
+write is introduced.
 Save Request Only and Restore use the same settlement, and disposal does not
 wait indefinitely for the API. An unresolved failure explains waiting or
 reloading before reviewing the saved Workspace request. Successful ordinary
@@ -185,3 +193,11 @@ remains required. The extended Host scenario uses the same saved-request Save
 and Apply entry as the public panel and checks the lower-level primitive's
 affected-review guard separately; its refusal of unowned concurrent events is
 preserved.
+
+The `52e899c` checkpoint passed all eight Verification jobs, including the three
+real Hosts, both Quality/performance jobs, installed RC, downgrade and package.
+The following notification-loss slice adds seven deterministic cases: owned or
+foreign silent publication, publication after partial feedback, and a late API
+response after observed publication and withdrawal. The exact final head's
+checks and review are recorded in the PR; the earlier green head does not
+replace them.

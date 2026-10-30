@@ -187,7 +187,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         },{deferConfigurationReadback:key=>key==='watchExclude'});
     },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
 
-    for(const kind of ['save','shortcut']) for(const boundary of ['acknowledgement','publication','rejection'])
+    for(const kind of ['save','shortcut']) for(const boundary of ['acknowledgement','publication','silent-publication','rejection'])
     test(`EXCLUDES uncertain ${kind} ${boundary} preserves settings and fences late writes without applying`,()=>fixture(async({tracker,scope,dir})=>{
         const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
         tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior interval');
@@ -201,7 +201,7 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             try{
                 hooks.update=async(key,value,publish)=>{
                     if(key!=='watchExclude'){await publish();return;}
-                    publishLate=publish;
+                    publishLate=boundary==='silent-publication'?()=>{config[key]=structuredClone(value);}:publish;
                     if(boundary==='acknowledgement'){await response;await publish();}
                     if(boundary==='rejection'){throw new Error('Rejected after an unverified write');}
                 };
@@ -232,6 +232,8 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 assert.equal(controller.hasPendingScopeSettingsWrites(),false);
                 assert.deepEqual(config.watchExclude,proposal.excludes);
                 assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision,'late settlement cannot auto-apply');
+                assert.equal(tracker.pendingMonitoringScope?.scopeRevision,controller.getStatus().requested.scope.scopeRevision,
+                    'observing late saved settings must retain the normal pending-request privacy pause');
                 const applied=await controller.applyPendingScope();
                 assert.equal(applied.status,'applied',JSON.stringify(applied));
                 assert.equal(writes.length,count,'Apply Saved Request consumes the settled request without rewriting it');
@@ -240,6 +242,40 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             }finally{
                 release();globalThis.setTimeout=timer;await action?.catch(()=>{});
             }
+        });
+    }));
+
+    for(const kind of ['save','shortcut']) for(const source of ['owned','foreign'])
+    test(`EXCLUDES ${kind} verifies silently published ${source} settings at its deadline`,()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior interval');
+        await withController(tracker,scope,async({controller,config,hooks,writes})=>{
+            const timer=globalThis.setTimeout;let deadline,publishLate,action;
+            globalThis.setTimeout=(callback,ms,...args)=>{
+                if(ms===2000){deadline=()=>callback(...args);return timer(()=>{},60000);}
+                return timer(callback,ms,...args);
+            };
+            hooks.update=async(key,value,publish)=>{
+                if(key!=='watchExclude'){await publish();return;}
+                publishLate=()=>{config[key]=source==='owned'?structuredClone(value):[{scope:'all',pattern:'/independent-choice/'}];};
+            };
+            try{
+                const proposal={mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+                action=kind==='save'?controller.saveAndApplyScope(proposal,async()=>true):controller.excludeCoverageSubtree(selected,async()=>true);
+                for(let sample=0;sample<10&&!publishLate;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(typeof publishLate,'function');publishLate();deadline();
+                const result=await action;
+                assert.equal(result.status,source==='owned'?'applied':'partial',JSON.stringify(result));
+                assert.equal(result.scopeCommitted,source==='owned');
+                assert.equal(controller.hasPendingScopeSettingsWrites(),false);assert.equal(writes.length,kind==='save'?3:1);
+                if(source==='owned'){
+                    assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
+                }else{
+                    assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/independent-choice/'}]);
+                    assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                    assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected));
+                }
+            }finally{globalThis.setTimeout=timer;await action?.catch(()=>{});}
         });
     }));
 
@@ -254,6 +290,31 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
             assert.equal(result.status,'failed',JSON.stringify(result));assert.equal(result.settingsStatus,'restored');
             assert.deepEqual(config,before);assert.equal(controller.hasPendingScopeSettingsWrites(),false);
+        });
+    }));
+
+    test('EXCLUDES a late response after observed publication and withdrawal releases only the write fence',()=>fixture(async({tracker,scope})=>{
+        await withController(tracker,scope,async({controller,config,writes,hooks,notifyConfiguration})=>{
+            const timer=globalThis.setTimeout;let deadline,release,entered=false,action;
+            const response=new Promise(resolve=>{release=resolve;});
+            globalThis.setTimeout=(callback,ms,...args)=>{
+                if(ms===2000){deadline=()=>callback(...args);return timer(()=>{},60000);}
+                return timer(callback,ms,...args);
+            };
+            hooks.update=async(key,_value,publish)=>{
+                await publish();if(key==='watchExclude'){entered=true;await response;}
+            };
+            try{
+                action=controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+                for(let sample=0;sample<10&&!entered;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(entered,true);deadline();assert.equal((await action).status,'partial');
+                assert.equal(controller.hasPendingScopeSettingsWrites(),true);
+                config.watchExclude=[];notifyConfiguration('watchExclude');release();
+                for(let sample=0;sample<10&&controller.hasPendingScopeSettingsWrites();sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(controller.hasPendingScopeSettingsWrites(),false);
+                assert.deepEqual(config.watchExclude,[]);assert.equal(writes.length,3);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+            }finally{release();globalThis.setTimeout=timer;await action?.catch(()=>{});}
         });
     }));
 

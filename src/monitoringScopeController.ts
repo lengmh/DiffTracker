@@ -86,6 +86,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
     private pendingScopeSettingsWrites = 0;
     private unsettledScopeSetting?: () => void;
+    private inspectUnverifiedScopeSetting?: () => void;
     private unverifiedSettingsWrite = false;
     private scopeActionInProgress = false;
     private confirmedQuickScopeRevision?: string;
@@ -355,6 +356,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public hasPendingScopeSettingsWrites(): boolean {
+        if (this.unverifiedSettingsWrite) { this.inspectUnverifiedScopeSetting?.(); }
         return this.pendingScopeSettingsWrites > 0 || this.unsettledScopeSetting !== undefined;
     }
 
@@ -363,6 +365,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public getScopeSettingsWriteBlocker(): string | undefined {
+        if (this.unverifiedSettingsWrite) { this.inspectUnverifiedScopeSetting?.(); }
         return this.unverifiedSettingsWrite
             ? 'A settings update is still unverified. Current settings and drafts are preserved. Wait for it to settle. If it does not settle, copy any unsaved draft before reloading the window and reviewing the saved Workspace request.'
             : undefined;
@@ -407,6 +410,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             if (timeout) { clearTimeout(timeout); }
             listener?.dispose();
             if (this.unsettledScopeSetting===cancel) { this.unsettledScopeSetting=undefined; }
+            if (this.inspectUnverifiedScopeSetting===inspect) { this.inspectUnverifiedScopeSetting=undefined; }
             this.unverifiedSettingsWrite=false;
         };
         const finish = (error?: Error, uncertain=false) => {
@@ -437,7 +441,13 @@ export class MonitoringScopeController implements vscode.Disposable {
                     // Feedback has already returned. A late response and an
                     // observable saved state release only the write fence;
                     // they never resume Apply or compensation.
-                    if (current!==beforeFingerprint || beforeFingerprint===expectedFingerprint) { cleanup(); }
+                    if (observedExpected || current!==beforeFingerprint || beforeFingerprint===expectedFingerprint) {
+                        cleanup();
+                        // The missing notification may also have skipped the
+                        // ordinary pending-request privacy pause. Restore that
+                        // projection without applying or writing anything.
+                        this.reconcileRequestedScope();
+                    }
                 } else if (conflict) { finish(conflict); }
                 else if (responseError) {
                     if (current===expectedFingerprint || beforeFingerprint===expectedFingerprint) { finish(responseError); }
@@ -452,10 +462,17 @@ export class MonitoringScopeController implements vscode.Disposable {
         // out or rejected ambiguous write retains its listener and write fence
         // until both boundaries settle, or this controller is disposed.
         this.unsettledScopeSetting=cancel;
+        this.inspectUnverifiedScopeSetting=inspect;
         listener=vscode.workspace.onDidChangeConfiguration(event => {
             if (SCOPE_SETTINGS_KEYS.some(setting => event.affectsConfiguration(`diffTracker.${setting}`))) { inspect(); }
         });
-        timeout=setTimeout(()=>finish(uncertain('The settings update did not become verifiable before its deadline.'),true),2000);
+        timeout=setTimeout(()=>{
+            // A cache can publish without a delivered notification. One final
+            // read at the existing deadline proves success when possible;
+            // neither polling nor another settings write is needed.
+            inspect();
+            if (!settled) { finish(uncertain('The settings update did not become verifiable before its deadline.'),true); }
+        },2000);
         const rejected=(error: unknown) => {
             responded=true;responseError=error instanceof Error ? error : new Error(String(error));inspect();
         };
