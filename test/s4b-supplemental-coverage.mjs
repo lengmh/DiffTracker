@@ -1201,6 +1201,85 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.ok(activeNativeWatcher(nativeDirectoryWatchers, blind));
     }, 'rules'));
 
+    for (const relative of ['ignored', 'parent/ignored']) for (const stopped of [false, true])
+    test(`Issue #55 Rules directory ignore skips ${relative} change before observation (stopped=${stopped})`, () => fixture(async ({tracker,dir}) => {
+        const ignored = path.join(dir, relative);
+        fs.mkdirSync(ignored, {recursive:true});
+        const target = path.join(ignored, 'unobserved.txt');
+        fs.writeFileSync(target, 'ignored current bytes');
+        fs.writeFileSync(path.join(dir, '.gitignore'), 'ignored/\n');
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.isPathIgnored(Uri.file(ignored)), false, 'directory-only policy differs from a file probe');
+        assert.equal(tracker.isPathIgnored(Uri.file(ignored), true), true);
+        if (stopped) { tracker.stopRecording(); }
+        const opendir = fs.promises.opendir;
+        let ignoredEnumerations = 0;
+        fs.promises.opendir = async (directory, ...args) => {
+            if (tracker.pathBelongsToRoot(String(directory), ignored)) { ignoredEnumerations++; }
+            return opendir(directory, ...args);
+        };
+        try {
+            await tracker.onExternalFileChanged(Uri.file(ignored));
+            assert.equal(ignoredEnumerations, 0, 'ignored subtrees must not be enumerated to verify an event');
+            assert.equal(tracker.directoryObservations.size, 0);
+            assert.equal(tracker.coverageGaps.has(ignored), false, 'ignored directory notifications create no observation obligation');
+            assert.equal(activeNativeWatcher(nativeDirectoryWatchers, ignored), undefined);
+            assert.equal(tracker.getTrackedChange(target), undefined);
+            assert.equal(tracker.getOriginalContent(target), undefined);
+            assert.equal(fs.readFileSync(target, 'utf8'), 'ignored current bytes');
+            assert.equal(tracker.isRecording, !stopped);
+        } finally { fs.promises.opendir = opendir; }
+    }, 'rules'));
+
+    test('Issue #55 Rules directory ignore preserves included parent and child observation', () => fixture(async ({tracker,dir}) => {
+        const ignored = path.join(dir, 'ignored'), child = path.join(ignored, 'included');
+        const excluded = path.join(ignored, 'other');
+        fs.mkdirSync(child, {recursive:true}); fs.mkdirSync(excluded);
+        const target = path.join(child, 'tracked.txt'); fs.writeFileSync(target, 'before');
+        fs.writeFileSync(path.join(excluded, 'unobserved.txt'), 'ordinary ignored bytes');
+        fs.writeFileSync(path.join(dir, '.gitignore'), 'ignored/\n');
+        const included = configuredScope(tracker, 'rules', [{scope:'all',path:'ignored/included'}],
+            [{scope:'all',pattern:'/ignored/other/'}]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(included)).status, 'applied');
+        assert.equal(tracker.isPathIgnored(Uri.file(ignored), true), false, 'a traversable ancestor of an explicit include remains monitored');
+        assert.equal(tracker.isPathIgnored(Uri.file(child), true), false, 'explicit include overrides ordinary directory ignore');
+        const unseen = path.join(child, 'unseen.txt'); fs.writeFileSync(unseen, 'unknown history');
+        const opendir = fs.promises.opendir;
+        let excludedEnumerations = 0;
+        fs.promises.opendir = async (directory, ...args) => {
+            if (tracker.pathBelongsToRoot(String(directory), excluded)) { excludedEnumerations++; }
+            return opendir(directory, ...args);
+        };
+        try {
+            await tracker.onExternalFileChanged(Uri.file(ignored));
+            await tracker.onExternalFileChanged(Uri.file(child));
+            assert.equal(excludedEnumerations, 0);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+            assert.equal(tracker.getTrackedChange(unseen)?.reviewKind, 'unknown');
+            assert.equal(tracker.getOriginalContent(unseen), undefined);
+            assert.equal(tracker.getOriginalContent(target), 'before');
+            const owner = activeNativeWatcher(nativeDirectoryWatchers, child); assert.ok(owner);
+            fs.writeFileSync(target, 'later observed edit'); owner.listener('change', 'tracked.txt');
+            await settle(tracker);
+            assert.equal(tracker.getTrackedChange(target)?.currentContent, 'later observed edit');
+            assert.equal(tracker.getOriginalContent(target), 'before');
+        } finally { fs.promises.opendir = opendir; }
+    }, 'rules'));
+
+    test('Issue #55 Rules directory ignore does not suppress a same-name ordinary file replacement', () => fixture(async ({tracker,dir}) => {
+        const target = path.join(dir, 'ignored'); fs.mkdirSync(target);
+        fs.writeFileSync(path.join(dir, '.gitignore'), 'ignored/\n'); await tracker.refreshIgnoreMatchers();
+        await tracker.onExternalFileChanged(Uri.file(target));
+        fs.rmdirSync(target); fs.writeFileSync(target, 'replacement before');
+        assert.equal(tracker.isPathIgnored(Uri.file(target)), false);
+        assert.equal(tracker.recordScannedBaseline(target, await tracker.readFileSnapshot(Uri.file(target)), 'workspace'), true);
+        fs.writeFileSync(target, 'replacement after'); await tracker.onExternalFileChanged(Uri.file(target));
+        await settle(tracker);
+        assert.equal(tracker.getOriginalContent(target), 'replacement before');
+        assert.equal(tracker.getTrackedChange(target)?.currentContent, 'replacement after');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+    }, 'rules'));
+
     test('Issue #55 directory change automatically reconciles without accepting unknown history', () => fixture(async ({tracker,dir}) => {
         const {blind, child, target} = await lifecycleFixture(tracker, dir);
         fs.writeFileSync(target, 'pending review');

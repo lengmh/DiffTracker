@@ -9544,6 +9544,9 @@ export class DiffTracker {
         const folder = this.owningWorkspaceFolderForTraversal(uri.fsPath);
         const scope = this.effectiveMonitoringScope;
         if (!folder || scope.kind !== 'configured' || this.persistenceFailed) { return; }
+        // Callers have proved this is a directory. A file-policy probe misses
+        // directory-only ignores; configured includes still override them here.
+        if (this.isPathIgnored(uri, true)) { return; }
         if (!this.coverageGaps.get(uri.fsPath)?.subtree) {
             this.setSubtreeCoverageGap(uri.fsPath, 'supplemental-watcher-directory-change-gap',
                 'Directory observation is being verified; if verification cannot complete, recheck observation coverage.');
