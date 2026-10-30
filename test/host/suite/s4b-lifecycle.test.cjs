@@ -31,10 +31,85 @@ async function directoryChangeHost(workspace) {
     let observedNotifications = 0;
     const notifications = [];
     const providerFallbacks = [];
+    let traceRecurrence = false;
+    const directoryTrace = [];
+    const relativeTracePath = target => tracker.pathBelongsToRoot(target,root)
+        ? path.relative(root,target) : tracker.pathBelongsToRoot(root,target) ? '[ancestor]' : '[outside fixture]';
+    const scopedTracePath = target => !tracker.pathBelongsToRoot(target,child) &&
+        (tracker.pathBelongsToRoot(target,root) || tracker.pathBelongsToRoot(root,target) ||
+        (path.dirname(target)===path.dirname(root) && path.basename(target).startsWith(`${path.basename(root)}-incoming-`)));
+    const providerTrace = [];
+    const policyTrace = [];
+    const ignoredPath = tracker.isPathIgnored;
+    tracker.isPathIgnored = function(uri,...args) {
+        const result = ignoredPath.call(this,uri,...args);
+        if (traceRecurrence && scopedTracePath(uri.fsPath) && policyTrace.length<24) {
+            policyTrace.push({path:relativeTracePath(uri.fsPath),directory:args[0]===true,ignored:result});
+        }
+        return result;
+    };
+    const providerApi = vscode.workspace.fs, providerStat = providerApi.stat;
+    const providerDescriptor = Object.getOwnPropertyDescriptor(providerApi,'stat');
+    const providerTracing = providerDescriptor?.writable === true;
+    if (providerTracing) {
+        providerApi.stat = function(uri,...args) {
+            const trace = traceRecurrence && scopedTracePath(uri.fsPath) && providerTrace.length<32
+                ? {path:relativeTracePath(uri.fsPath),pending:true} : undefined;
+            if (trace) { providerTrace.push(trace); }
+            let result;
+            try { result=providerStat.call(this,uri,...args); }
+            catch (error) {
+                if (trace) { trace.error={name:error?.name,code:error?.code};trace.pending=false; }
+                throw error;
+            }
+            if (!trace) { return result; }
+            return Promise.resolve(result).then(value=>{
+                trace.type=value.type;trace.pending=false;return value;
+            },error=>{
+                trace.error={name:error?.name,code:error?.code};trace.pending=false;throw error;
+            });
+        };
+    }
+    const traceState = uri => ({path:relativeTracePath(uri.fsPath),epoch:tracker.sessionEpoch,
+        recording:tracker.isRecording,external:tracker.externalWatcherEnabled,snapshot:tracker.snapshotInitialized,
+        building:tracker.baselineBuilding,transaction:!!tracker.baselineTransaction,restoring:tracker.restoringEpoch,
+        rechecking:tracker.coverageRecheckEpoch,initialIgnore:tracker.initialIgnoreEpoch,
+        scopeApplyPreflight:tracker.scopeApplyPreflight,scopeApplications:tracker.activeScopeApplications,
+        pending:!!tracker.pendingMonitoringScope,git:tracker.gitContextPending,gitPauses:tracker.pausedGitRepositories.size,
+        recovery:tracker.recoveryBlocked,persistence:tracker.persistenceFailed,workspaceChanged:tracker.workspaceContextChanged,
+        fileGap:!!tracker.coverageGaps.get(uri.fsPath)?.file,baselineFile:tracker.baselineExistingFiles.has(uri.fsPath),
+        opaqueFile:tracker.opaqueBaselineFiles.has(uri.fsPath),hostWatchers:tracker.fileWatchers.length,
+        generation:tracker.coverageGeneration,watcherRevision:tracker.watcherCoverageRevision,ignoreRevision:tracker.ignorePolicyRevision,
+        jobs:[...tracker.directoryObservations].slice(0,8).map(([key,job])=>
+            ({root:relativeTracePath(key),path:relativeTracePath(job.directory),dirty:job.dirty,current:job.current()})),
+        dirtyUnderPath:vscode.workspace.textDocuments.filter(doc=>doc.uri.scheme==='file'&&doc.isDirty&&
+            tracker.pathBelongsToRoot(doc.uri.fsPath,uri.fsPath)).length});
+    for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation']) {
+        const original = tracker[method];
+        tracker[method] = async function(uri,...args) {
+            const trace = traceRecurrence && scopedTracePath(uri.fsPath) && directoryTrace.length<24
+                ? {method,before:traceState(uri),pending:true} : undefined;
+            if (trace) { directoryTrace.push(trace); }
+            try {
+                const result = await original.call(this,uri,...args);
+                if (trace && method==='isUntrackedDirectory') {
+                    trace.directory=result;
+                    try { trace.nodeDirectory=fs.lstatSync(uri.fsPath).isDirectory(); } catch (error) { trace.nodeError=error?.code; }
+                }
+                return result;
+            } catch (error) {
+                if (trace) { trace.error={name:error?.name,code:error?.code}; }
+                throw error;
+            } finally {
+                if (trace) { trace.pending=false;trace.after=traceState(uri); }
+            }
+        };
+    }
     fs.lstatSync = function(target, ...args) {
         const result = nativeLstat.call(this, target, ...args);
         if (String(target).startsWith(`${root}${path.sep}`) && providerFallbacks.length < 32 &&
-            new Error().stack.includes('isUntrackedDirectory')) {
+            new Error().stack.split('\n').some(line=>line.includes('isUntrackedDirectory') &&
+                /(?:out\/diffTracker\.js|src\/diffTracker\.ts):/.test(line.replace(/\\/g,'/')))) {
             providerFallbacks.push({path:path.relative(root,String(target)),directory:result.isDirectory()});
         }
         return result;
@@ -107,6 +182,7 @@ async function directoryChangeHost(workspace) {
         assert.ok(excludedEvidence);
         assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked');
         assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
+        traceRecurrence = true;
         const originalEvidence = {...excludedEvidence}, reactivated = [];
         const diagnostics = tracker.onDidTrackChanges(() => {
             reactivated.push(...tracker.getSubtreeCoverageGaps().filter(gap => gap.targetPath === child));
@@ -132,7 +208,8 @@ async function directoryChangeHost(workspace) {
                     tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
                     tracker.directoryObservations.size === 0 &&
                     tracker.getTrackedChange(current)?.reviewKind === 'unknown', () => ({
-                        notifications,providerFallbacks,epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
+                        notifications,providerFallbacks,directoryTrace,providerTracing,providerTrace,policyTrace,
+                        epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
                         externalWatcherEnabled:tracker.externalWatcherEnabled,snapshotInitialized:tracker.snapshotInitialized,
                         baselineBuilding:tracker.baselineBuilding,baselineTransaction:!!tracker.baselineTransaction,
                         restoringEpoch:tracker.restoringEpoch,coverageRecheckEpoch:tracker.coverageRecheckEpoch,
@@ -175,6 +252,7 @@ async function directoryChangeHost(workspace) {
     } finally {
         fs.watch = nativeWatch;
         fs.lstatSync = nativeLstat;
+        if (providerTracing) { providerApi.stat=providerStat; }
         await tracker.dispose();
         fs.rmSync(root, {recursive:true,force:true});
         for (let round = 0; round < 3; round++) { fs.rmSync(`${root}-incoming-${round}`, {recursive:true,force:true}); }
