@@ -26,11 +26,16 @@ export function verifyReleaseMetadata(metadata) {
     return asset;
 }
 
-export async function prepareReleasedArtifact(destination) {
+export async function prepareReleasedArtifact(destination, { githubToken = process.env.GITHUB_TOKEN } = {}) {
     mkdirSync(destination, { recursive: true });
     const metadataUrl = `https://api.github.com/repos/${RELEASE.repository}/releases/tags/${RELEASE.tag}`;
     const fetchChecked = async url => {
-        const response = await fetch(url, { signal: AbortSignal.timeout(60_000), headers: { 'User-Agent': 'DiffTracker-installed-RC-verification' } });
+        const headers = { 'User-Agent': 'DiffTracker-installed-RC-verification' };
+        // The workflow's read-only repository token is for this pinned API
+        // request only. Never send it to the release download or a redirect.
+        if (url === metadataUrl && githubToken) { headers.Authorization = `Bearer ${githubToken}`; }
+        const response = await fetch(url, { signal: AbortSignal.timeout(60_000), headers,
+            redirect: url === metadataUrl ? 'error' : 'follow' });
         assert.equal(response.ok, true, `${url}: HTTP ${response.status}`);
         return response;
     };

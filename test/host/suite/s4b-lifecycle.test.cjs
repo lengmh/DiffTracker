@@ -1,5 +1,5 @@
-// Real native watcher identity coverage, deliberately without a host workspace
-// watcher that could mask a dead direct owner by reporting the parent rename.
+// Native-only coverage first, followed by the real mixed native/Host sources
+// installed by public Recheck. The final identity test stays native-only.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -24,12 +24,15 @@ async function directoryChangeHost(workspace) {
     const root = vscode.Uri.file(path.join(workspace, 's4b-change-owner')).fsPath;
     const child = path.join(root, 'existing');
     const target = path.join(child, 'tracked.txt');
+    const nativeUnknownTarget = path.join(child, 'unproven.txt');
     const sibling = path.join(root, 'sibling.txt');
+    const liveTargets=Array.from({length:3},(_,index)=>path.join(root,`live-${index}`,'tracked.txt'));
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
     const nativeLstat = fs.lstatSync;
     let observedNotifications = 0;
     const notifications = [];
+    const nativeFileNotifications = new Map();
     const providerFallbacks = [];
     let traceRecurrence = false;
     const directoryTrace = [];
@@ -41,6 +44,16 @@ async function directoryChangeHost(workspace) {
     const providerTrace = [];
     const policyTrace = [];
     const runtimePublicationCallers = {};
+    const createdDirectoryIdentities = new Map();
+    const observedCreationMatches = directory => {
+        const creation = createdDirectoryIdentities.get(directory);
+        if (!creation || creation.epoch!==tracker.sessionEpoch) { return false; }
+        try {
+            const current = fs.lstatSync(directory,{bigint:true});
+            return current.isDirectory() && current.dev===creation.identity.dev && current.ino===creation.identity.ino &&
+                current.birthtimeNs===creation.identity.birthtimeNs;
+        } catch { return false; }
+    };
     const ignoredPath = tracker.isPathIgnored;
     tracker.isPathIgnored = function(uri,...args) {
         const result = ignoredPath.call(this,uri,...args);
@@ -99,6 +112,8 @@ async function directoryChangeHost(workspace) {
     for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation']) {
         const original = tracker[method];
         tracker[method] = async function(uri,...args) {
+            if (method==='reconcileDirectoryObservation' && args[1] && scopedTracePath(uri.fsPath) &&
+                createdDirectoryIdentities.size<16) { createdDirectoryIdentities.set(uri.fsPath,{epoch:args[0],identity:args[1]}); }
             const trace = traceRecurrence && scopedTracePath(uri.fsPath) && directoryTrace.length<24
                 ? {method,before:traceState(uri),pending:true} : undefined;
             if (trace && method==='reconcileDirectoryObservation') { trace.creationIdentity=!!args[1]; }
@@ -129,10 +144,19 @@ async function directoryChangeHost(workspace) {
     };
     fs.watch = function(directory, ...args) {
         const listener = args[args.length - 1];
-        if (String(directory) === root && typeof listener === 'function') {
+        const watchedDirectory=String(directory);
+        if (tracker.pathBelongsToRoot(watchedDirectory,root) && typeof listener === 'function') {
             args[args.length - 1] = (kind, filename) => {
-                if (notifications.length < 128) { notifications.push({kind,filename:String(filename)}); }
-                if (String(filename) === 'existing') { observedNotifications++; }
+                if(watchedDirectory===root){
+                    if (notifications.length < 128) { notifications.push({kind,filename:String(filename)}); }
+                    if (String(filename) === 'existing') { observedNotifications++; }
+                }
+                if(filename!==null&&filename!==undefined){
+                    const changed=path.join(watchedDirectory,String(filename));
+                    if(changed===nativeUnknownTarget||changed===sibling||liveTargets.includes(changed)){
+                        nativeFileNotifications.set(changed,(nativeFileNotifications.get(changed)??0)+1);
+                    }
+                }
                 listener(kind, filename);
             };
         }
@@ -141,6 +165,7 @@ async function directoryChangeHost(workspace) {
     try {
         fs.mkdirSync(child, {recursive:true});
         fs.writeFileSync(target, 'known before\n');
+        fs.writeFileSync(nativeUnknownTarget, 'unproven before native observation\n');
         fs.writeFileSync(sibling, 'sibling before\n');
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(root));
         const requested = validateAndCanonicalizeScope({mode:'rules',
@@ -167,6 +192,16 @@ async function directoryChangeHost(workspace) {
         await until('directory verification to finish automatically', () =>
             tracker.directoryObservations.size === 0 && tracker.getSubtreeCoverageGaps().length === 0);
         assert.equal(tracker.getOriginalContent(target), 'known before\n');
+        const nativeUnknown = tracker.getUnknownReviewToken(nativeUnknownTarget);assert.ok(nativeUnknown);
+        assert.equal(tracker.getOriginalContent(nativeUnknownTarget),undefined);
+        const nativeUnknownEvents=nativeFileNotifications.get(nativeUnknownTarget)??0;
+        fs.writeFileSync(nativeUnknownTarget,'later native Unknown edit\n');
+        await until('continued native-only Unknown observation',()=>
+            (nativeFileNotifications.get(nativeUnknownTarget)??0)>nativeUnknownEvents &&
+            tracker.getUnknownReviewToken(nativeUnknownTarget)?.reviewRevision!==nativeUnknown.reviewRevision);
+        assert.ok(tracker.getUnknownReviewToken(nativeUnknownTarget));
+        assert.equal(tracker.getOriginalContent(nativeUnknownTarget),undefined);
+        console.log('PASS HOST-ISSUE-55 native-only directory observation preserves Unknown and later child edits without creation provenance');
         fs.writeFileSync(target, 'later observed edit\n');
         await until('continued native child observation after directory verification', () =>
             tracker.getTrackedChange(target)?.currentContent === 'later observed edit\n');
@@ -193,12 +228,22 @@ async function directoryChangeHost(workspace) {
         console.log('PASS HOST-ISSUE-55 Apply retires excluded diagnostics and owners while native sibling observation continues');
         const excludedEvidence = tracker.coverageGaps.get(child)?.subtree;
         assert.ok(excludedEvidence);
+        // Recheck installs real Host watchers as well. A platform may provide
+        // an actual create identity for a moved path; a native notification
+        // alone must still retain Unknown, and existing Unknown stays intact.
         assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked');
         assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
         traceRecurrence = true;
         const originalEvidence = {...excludedEvidence}, reactivated = [];
+        const observedUnknowns=new Set(),changedUnknownBeforeImages=[];
         const diagnostics = tracker.onDidTrackChanges(() => {
             reactivated.push(...tracker.getSubtreeCoverageGaps().filter(gap => gap.targetPath === child));
+            for(const filePath of liveTargets){
+                if(tracker.getTrackedChange(filePath)?.reviewKind==='unknown'){observedUnknowns.add(filePath);}
+                if(observedUnknowns.has(filePath)&&tracker.getOriginalContent(filePath)!==undefined){
+                    changedUnknownBeforeImages.push(path.relative(root,filePath));
+                }
+            }
         });
         const opendir = fs.promises.opendir; let excludedEnumerations = 0;
         fs.promises.opendir = async (directory, ...args) => {
@@ -214,13 +259,16 @@ async function directoryChangeHost(workspace) {
                 fs.rmSync(child, {recursive:true}); fs.mkdirSync(child);
                 await until(`real excluded-directory delete/recreate notification ${round}`, () => observedNotifications > before);
                 const incoming = `${root}-incoming-${round}`, live = path.join(root, `live-${round}`);
+                assert.equal(fs.existsSync(live),false,'the incoming path must be absent before its actual move');
                 fs.mkdirSync(incoming); fs.writeFileSync(path.join(incoming, 'tracked.txt'), `imported ${round}\n`);
                 fs.renameSync(incoming, live);
                 const current = path.join(live, 'tracked.txt');
                 await until(`automatic observation of moved directory ${round}`, () =>
                     tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
                     tracker.directoryObservations.size === 0 &&
-                    tracker.getTrackedChange(current)?.reviewKind === 'unknown', () => ({
+                    (tracker.getTrackedChange(current)?.reviewKind === 'unknown' ||
+                        (observedCreationMatches(live) && tracker.getTrackedChange(current)?.reviewKind === 'text' &&
+                            tracker.getOriginalContent(current)==='')), () => ({
                         notifications,providerFallbacks,directoryTrace,providerTracing,providerTrace,policyTrace,runtimePublicationCallers,
                         epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
                         externalWatcherEnabled:tracker.externalWatcherEnabled,snapshotInitialized:tracker.snapshotInitialized,
@@ -241,20 +289,32 @@ async function directoryChangeHost(workspace) {
                         currentContent:tracker.getTrackedChange(current)?.currentContent,
                         originalKnown:tracker.getOriginalContent(current)!==undefined
                     }));
-                const unknown = tracker.getUnknownReviewToken(current); assert.ok(unknown);
+                const unknown = tracker.getUnknownReviewToken(current);
+                if (unknown) { assert.equal(tracker.getOriginalContent(current),undefined); }
+                else {
+                    assert.equal(observedCreationMatches(live),true,'text creation requires the actual Host create identity');
+                    assert.equal(tracker.getOriginalContent(current),'');
+                    assert.equal(tracker.getTrackedChange(current)?.currentContent,`imported ${round}\n`);
+                }
+                const childEvents=nativeFileNotifications.get(current)??0;
                 fs.writeFileSync(current, `later native child edit ${round}\n`);
                 await until(`continued moved-directory native observation ${round}`, () =>
-                    tracker.getUnknownReviewToken(current)?.reviewRevision !== unknown.reviewRevision);
-                assert.equal(tracker.getTrackedChange(current)?.reviewKind, 'unknown');
-                assert.equal(tracker.getOriginalContent(current), undefined);
+                    (nativeFileNotifications.get(current)??0)>childEvents &&
+                    (unknown ? tracker.getUnknownReviewToken(current)?.reviewRevision !== unknown.reviewRevision
+                        : tracker.getTrackedChange(current)?.currentContent === `later native child edit ${round}\n`));
+                assert.equal(tracker.getTrackedChange(current)?.reviewKind,unknown?'unknown':'text');
+                assert.equal(tracker.getOriginalContent(current),unknown?undefined:'');
+                const siblingEvents=nativeFileNotifications.get(sibling)??0;
                 fs.writeFileSync(sibling, `later native sibling edit ${round}\n`);
                 await until(`continued retained-parent native observation ${round}`, () =>
+                    (nativeFileNotifications.get(sibling)??0)>siblingEvents &&
                     tracker.getTrackedChange(sibling)?.currentContent === `later native sibling edit ${round}\n`);
                 await until(`bounded directory work after round ${round}`, () => tracker.directoryObservations.size === 0);
                 assert.deepEqual(tracker.getSubtreeCoverageGaps(), [], `Limited must not recur after round ${round}`);
                 assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
                 assert.deepEqual(excludedEvidence, originalEvidence);
                 assert.deepEqual(reactivated, [], 'the same old excluded gap must stay inactive throughout native callbacks');
+                assert.deepEqual(changedUnknownBeforeImages,[],'an observed Unknown must never become an accepted before-image');
                 assert.equal(tracker.supplementalDirectoryWatchers.has(child), false);
                 assert.equal(tracker.getOriginalContent(sibling), 'sibling before\n');
             }

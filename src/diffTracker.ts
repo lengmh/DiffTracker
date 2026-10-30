@@ -2854,6 +2854,8 @@ export class DiffTracker {
             try { observedDirectory = fs.lstatSync(filePath).isDirectory(); }
             catch { /* The ordinary reader retains missing/unreadable evidence. */ }
         }
+        const configuredDirectory = observedDirectory &&
+            (this.committedScopeDuringApply ?? this.effectiveMonitoringScope).kind === 'configured';
         if (exists && !observedDirectory) { this.excludedDirectoryKinds.delete(filePath); }
         if (!exists && this.scopeExplicitlyExcludesDirectory(filePath)) {
             const known = this.excludedDirectoryKinds.get(filePath);
@@ -2891,16 +2893,18 @@ export class DiffTracker {
             // Pending exclusions likewise retain their deferred control evidence.
             if (!this.committedScopeDuringApply &&
                 this.isPathIgnored(vscode.Uri.file(filePath), true, true, false)) { return; }
-            // Native rename also reports metadata changes and existing/moved
-            // directories. It cannot prove that their children were absent.
-            this.setSubtreeCoverageGap(filePath, 'supplemental-watcher-directory-change-gap',
-                'Directory observation is being verified; if verification cannot complete, recheck observation coverage.');
+            if (configuredDirectory) {
+                // Configured observation cannot infer child creation from a
+                // directory notification. Legacy keeps its existing import path.
+                this.setSubtreeCoverageGap(filePath, 'supplemental-watcher-directory-change-gap',
+                    'Directory observation is being verified; if verification cannot complete, recheck observation coverage.');
+            }
         }
         registerEvent();
         for (const job of this.directoryObservations.values()) {
             if (this.pathBelongsToRoot(filePath, job.directory)) { job.dirty = true; }
         }
-        this.dispatchExternalEvent(vscode.Uri.file(filePath), observedDirectory || kind === 'change'
+        this.dispatchExternalEvent(vscode.Uri.file(filePath), configuredDirectory || kind === 'change'
             ? 'change' : exists ? 'create' : 'delete', epoch);
     }
 

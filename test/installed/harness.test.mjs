@@ -1,10 +1,12 @@
 // These are harness guard tests, not installed Host acceptance evidence.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { CANDIDATE_VERSION, RELEASE, verifyReleaseMetadata } from './artifacts.mjs';
+import { CANDIDATE_VERSION, RELEASE, verifyReleaseMetadata, prepareReleasedArtifact } from './artifacts.mjs';
 
 function metadata() {
     return {
@@ -18,6 +20,35 @@ function metadata() {
 
 test('accepts only the independently pinned official released asset', () => {
     assert.equal(verifyReleaseMetadata(metadata()).id, RELEASE.assetId);
+});
+test('release metadata credentials stay on the pinned API request and never reach the asset download', async () => {
+    const destination=mkdtempSync(path.join(os.tmpdir(),'dt-release-auth-'));
+    const originalFetch=globalThis.fetch,requests=[],stop=new Error('Fixture stops before downloading bytes');
+    const metadataUrl=`https://api.github.com/repos/${RELEASE.repository}/releases/tags/${RELEASE.tag}`;
+    globalThis.fetch=async(url,options)=>{
+        requests.push({url,options});
+        if(url===metadataUrl){return {ok:true,json:async()=>metadata()};}
+        throw stop;
+    };
+    try {
+        await assert.rejects(prepareReleasedArtifact(destination,{githubToken:'test-only-credential'}),error=>error===stop);
+        assert.equal(requests.length,2);
+        assert.equal(requests[0].url,metadataUrl);
+        assert.equal(requests[0].options.headers.Authorization,'Bearer test-only-credential');
+        assert.equal(requests[0].options.redirect,'error','authenticated metadata must not redirect credentials');
+        assert.equal(requests[1].url,RELEASE.url);
+        assert.equal(requests[1].options.headers.Authorization,undefined);
+    } finally {globalThis.fetch=originalFetch;rmSync(destination,{recursive:true,force:true});}
+});
+test('an anonymous metadata refusal stops before any asset download or retry', async () => {
+    const destination=mkdtempSync(path.join(os.tmpdir(),'dt-release-refusal-'));
+    const originalFetch=globalThis.fetch,requests=[];
+    globalThis.fetch=async(url,options)=>{requests.push({url,options});return {ok:false,status:403};};
+    try {
+        await assert.rejects(prepareReleasedArtifact(destination,{githubToken:''}),/HTTP 403/);
+        assert.equal(requests.length,1);
+        assert.equal(requests[0].options.headers.Authorization,undefined);
+    } finally {globalThis.fetch=originalFetch;rmSync(destination,{recursive:true,force:true});}
 });
 for (const [label, mutate] of [
     ['different commit', value => { value.target_commitish = '0'.repeat(40); }],

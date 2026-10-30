@@ -802,6 +802,32 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         return {blind, child, target, scope};
     }
 
+    for(const move of [false,true]) for(const retainedUnknown of [false,true])
+    test(`Issue #55 legacy native rename retains child import and future observation (move=${move}, unknown=${retainedUnknown})`,()=>fixture(async({tracker,dir})=>{
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        tracker.sessionWorkspaceRoots=tracker.getWorkspaceRoots();
+        await tracker.refreshIgnoreMatchers();
+        const parent=path.join(dir,'legacy-parent');fs.mkdirSync(parent);
+        assert.equal(tracker.watchImportedDirectory(parent,tracker.sessionEpoch),true);
+        const child=path.join(parent,'child'),incoming=move?path.join(dir,'legacy-incoming'):child;
+        fs.mkdirSync(incoming);fs.writeFileSync(path.join(incoming,'tracked.txt'),'imported contents');
+        if(move){fs.renameSync(incoming,child);}
+        const target=path.join(child,'tracked.txt');
+        h.setListedFiles([Uri.file(target)]);
+        if(retainedUnknown){tracker.recordUnresolvedBaseline(target,'Existing unproven content');}
+        activeNativeWatcher(nativeDirectoryWatchers,parent).listener('rename','child');await settle(tracker);
+        const owner=activeNativeWatcher(nativeDirectoryWatchers,child);assert.ok(owner,'legacy imports must retain a live child owner');
+        const unknown=tracker.getUnknownReviewToken(target);
+        if(retainedUnknown){assert.ok(unknown);}
+        else{assert.equal(tracker.getTrackedChange(target)?.currentContent,'imported contents');}
+        assert.equal(tracker.getOriginalContent(target),retainedUnknown?undefined:'','legacy import must preserve the existing before-image semantics');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+        fs.writeFileSync(target,'later native edit');owner.listener('change','tracked.txt');await settle(tracker);
+        if(retainedUnknown){assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);assert.equal(tracker.getTrackedChange(target)?.reviewKind,'unknown');}
+        else{assert.equal(tracker.getTrackedChange(target)?.currentContent,'later native edit');}
+        assert.equal(tracker.getOriginalContent(target),retainedUnknown?undefined:'');
+    },'rules'));
+
     test('Issue #55 native directory rename is an observation without child creation provenance', () => fixture(async ({tracker,dir}) => {
         const {blind, child, target} = await lifecycleFixture(tracker, dir);
         const unseen = path.join(child, 'unproven.txt');

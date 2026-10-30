@@ -291,6 +291,9 @@ Recovery 只自动接续本操作已经授权的、合法且必要的步骤。Re
 | watcher 容量审查修复 | 普通目录核验和操作后的区域恢复均复用通过 epoch、身份及归属校验的健康 owner；130/256 个目录保持原 handle 峰值，仍执行扫描、事件版本和持久化证明，未提高上限 |
 | Windows 定向定位 | `2cdac55863322704fdb5591cf1e3a725c8dcaa8f` 的 [Verification #693](https://github.com/lengmh/DiffTracker/actions/runs/41002789922) 确认真实 native 通知到达、目录识别正确，协调流程等待期间 `baselineBuilding` 变为 true 后退出，未建立所需新 owner。独立文件持久化在通知之前/核验中途的确定性复现均先失败后通过 |
 | 本批续接修复 | 目录分类、ignore 发现及 bridge 准备完成后，仅等待当时已在途的有限 runtime Ready 写入，再核对原守卫。尚未绑定观察区域时允许父通知合并；开始准备后区域改变则退出该轮。证明开始前的稳定事件由本次交接覆盖，不再无条件消耗第二轮；owner 交接、扫描及精确证据退休不放宽，仍最多两轮、共享条目预算。单目录及父通知扩大区域的两次有限写入均先失败后通过，无需额外通知；准备等待期间停止/pending/dirty/Git/存储失败与身份替换仍受保护 |
+| legacy 兼容复审修复 | native 目录 rename 只在 committed configured scope 下归一为观察 change；legacy 保留原有目录导入入口，不生成 configured 专用义务。新建/移入 × 已有/无 Unknown 四例先失败后通过，并验证后续子文件修改；原有 Unknown 不改为接受基线 |
+| Host 来源断言 | `de57b45d2f603f1585f597c6dbf634c07f0cb0e0` 的 Windows 已建立 owner 且 gaps 为空；原超时断言忽略了 public Recheck 后真实 Host create 提供的创建来源。本批只在记录到同 epoch、同物理身份的实际 create 时允许已证明为空的 before-image；已出现的 Unknown 不得转为接受基线，并增加纯 native Unknown 的后续子文件观察。三轮子文件和兄弟修改均要求真实 native 回调计数增加，保留原超时 |
+| installed RC 下载 | 同轮匿名旧版 release API 请求返回 HTTP 403，未进入安装验收；具体拒绝原因未记录，不能认定为限流。Verification 在该元数据步骤提供已有只读仓库 token，仅用于固定 API 请求且禁止带凭据重定向；制品下载不带凭据，原 release 身份、大小与 SHA-256 校验不变。新增凭据边界与拒绝即停止回归 |
 | 验证边界 | 本地没有真实 Extension Host 环境；Windows、Linux Stable、最低 VS Code、installed RC、降级拒绝和最终 VSIX 的实际结果以本提交 exact-head Verification 与 PR #56 技术说明为准。自动复审按新 head 去重观察 |
 | 合并与发布 | 未执行 |
 
