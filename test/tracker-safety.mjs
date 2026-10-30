@@ -5699,6 +5699,13 @@ test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted
 
 registerPR12BoundedInvariants({
     test, vscode, Uri, DiffTracker, file, document, pause,
+    createStatusBarManager: current => {
+        const boundary = {StatusBarAlignment:{Right:2},ThemeColor:class {constructor(id){this.id=id;}},
+            window:{createStatusBarItem:()=>({show(){},dispose(){}})}};
+        Module._load = function(id,...args) {return id==='vscode'?boundary:originalLoad.call(this,id,...args);};
+        try {const {StatusBarManager}=require('../out/statusBarManager.js');return new StatusBarManager(current);}
+        finally {Module._load=originalLoad;}
+    },
     getTracker: () => tracker, setTracker: value => { tracker=value; },
     setListedFiles: value => { listedFiles=value; },
     setListedIgnores: value => { listedIgnores=value; },

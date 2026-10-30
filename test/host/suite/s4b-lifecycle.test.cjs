@@ -25,12 +25,12 @@ async function directoryChangeHost(workspace) {
     const sibling = path.join(root, 'sibling.txt');
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
-    let observedNotification = false;
+    let observedNotifications = 0;
     fs.watch = function(directory, ...args) {
         const listener = args[args.length - 1];
         if (String(directory) === root && typeof listener === 'function') {
             args[args.length - 1] = (kind, filename) => {
-                if (String(filename) === 'existing') { observedNotification = true; }
+                if (String(filename) === 'existing') { observedNotifications++; }
                 listener(kind, filename);
             };
         }
@@ -61,7 +61,7 @@ async function directoryChangeHost(workspace) {
         // libuv may classify directory metadata as rename (Linux) or change.
         // Deterministic tests exercise both callback branches separately; this
         // scenario must use the platform's real callback without rewriting it.
-        await until('a real native directory notification', () => observedNotification);
+        await until('a real native directory notification', () => observedNotifications > 0);
         await until('directory verification to finish automatically', () =>
             tracker.directoryObservations.size === 0 && tracker.getSubtreeCoverageGaps().length === 0);
         assert.equal(tracker.getOriginalContent(target), 'known before\n');
@@ -89,10 +89,60 @@ async function directoryChangeHost(workspace) {
             tracker.getTrackedChange(sibling)?.currentContent === 'sibling observed after exclusion\n');
         assert.equal(tracker.getOriginalContent(sibling), 'sibling before\n');
         console.log('PASS HOST-ISSUE-55 Apply retires excluded diagnostics and owners while native sibling observation continues');
+        const excludedEvidence = tracker.coverageGaps.get(child)?.subtree;
+        assert.ok(excludedEvidence);
+        assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked');
+        assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
+        const originalEvidence = {...excludedEvidence}, reactivated = [];
+        const diagnostics = tracker.onDidTrackChanges(() => {
+            reactivated.push(...tracker.getSubtreeCoverageGaps().filter(gap => gap.targetPath === child));
+        });
+        const opendir = fs.promises.opendir; let excludedEnumerations = 0;
+        fs.promises.opendir = async (directory, ...args) => {
+            if (String(directory) === child || String(directory).startsWith(`${child}${path.sep}`)) { excludedEnumerations++; }
+            return opendir(directory, ...args);
+        };
+        try {
+            for (let round = 0; round < 3; round++) {
+                const before = observedNotifications;
+                const inner = path.join(child, `created-${round}`); fs.mkdirSync(inner);
+                fs.writeFileSync(path.join(inner, 'ignored.txt'), `excluded modification ${round}\n`);
+                fs.renameSync(inner, path.join(child, `renamed-${round}`));
+                fs.rmSync(child, {recursive:true}); fs.mkdirSync(child);
+                await until(`real excluded-directory delete/recreate notification ${round}`, () => observedNotifications > before);
+                const incoming = `${root}-incoming-${round}`, live = path.join(root, `live-${round}`);
+                fs.mkdirSync(incoming); fs.writeFileSync(path.join(incoming, 'tracked.txt'), `imported ${round}\n`);
+                fs.renameSync(incoming, live);
+                const current = path.join(live, 'tracked.txt');
+                await until(`automatic observation of moved directory ${round}`, () =>
+                    tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
+                    tracker.directoryObservations.size === 0 &&
+                    tracker.getTrackedChange(current)?.reviewKind === 'unknown');
+                const unknown = tracker.getUnknownReviewToken(current); assert.ok(unknown);
+                fs.writeFileSync(current, `later native child edit ${round}\n`);
+                await until(`continued moved-directory native observation ${round}`, () =>
+                    tracker.getUnknownReviewToken(current)?.reviewRevision !== unknown.reviewRevision);
+                assert.equal(tracker.getTrackedChange(current)?.reviewKind, 'unknown');
+                assert.equal(tracker.getOriginalContent(current), undefined);
+                fs.writeFileSync(sibling, `later native sibling edit ${round}\n`);
+                await until(`continued retained-parent native observation ${round}`, () =>
+                    tracker.getTrackedChange(sibling)?.currentContent === `later native sibling edit ${round}\n`);
+                await until(`bounded directory work after round ${round}`, () => tracker.directoryObservations.size === 0);
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(), [], `Limited must not recur after round ${round}`);
+                assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
+                assert.deepEqual(excludedEvidence, originalEvidence);
+                assert.deepEqual(reactivated, [], 'the same old excluded gap must stay inactive throughout native callbacks');
+                assert.equal(tracker.supplementalDirectoryWatchers.has(child), false);
+                assert.equal(tracker.getOriginalContent(sibling), 'sibling before\n');
+            }
+            assert.equal(excludedEnumerations, 0);
+        } finally { fs.promises.opendir = opendir; diagnostics.dispose(); }
+        console.log('PASS HOST-ISSUE-55 cleared Limited stays clear through three excluded create/modify/rename/delete-recreate and included move/native-edit rounds');
     } finally {
         fs.watch = nativeWatch;
         await tracker.dispose();
         fs.rmSync(root, {recursive:true,force:true});
+        for (let round = 0; round < 3; round++) { fs.rmSync(`${root}-incoming-${round}`, {recursive:true,force:true}); }
         fs.rmSync(storage, {recursive:true,force:true});
     }
 }
