@@ -1334,7 +1334,8 @@ export function registerPR11ReviewRegressions(h) {
                 'reloaded legacyV3 matcher must use persisted committed policy while settings are structured');
 
             const configured=scope();
-            assert.equal((await restored.applyConfiguredMonitoringScope(configured)).status,'applied');
+            const applied=await restored.applyConfiguredMonitoringScope(configured);
+            assert.equal(applied.status,'applied',JSON.stringify(applied));
             assert.equal(restored.committedLegacyWatchExcludeByRoot.size,0,
                 'successful configured publication releases the committed legacy policy snapshot');
         }finally{controller.dispose();vscode.workspace.getConfiguration=old;}
@@ -1397,7 +1398,8 @@ export function registerPR11ReviewRegressions(h) {
         await t.onExternalFileCreated(Uri.file(dir));
         if(known) assert.equal((await t.keepAllChangesInFile(p)).status,'success');
         const owner=h.nativeDirectoryWatchers.find(item=>item.active&&item.directory===dir);
-        assert.ok(owner);
+        assert.ok(owner,JSON.stringify({gaps:t.getSubtreeCoverageGaps(),recording:t.getIsRecording(),
+            baseline:t.getBaselineState(),pending:t.pendingMonitoringScope}));
         fs.writeFileSync(p,'queued child change');
         await t.onExternalFileChanged(Uri.file(p));
         assert.equal(t.externalChangeTimers.has(p),true);
@@ -1517,7 +1519,8 @@ export function registerPR11ReviewRegressions(h) {
         isolated.startRecording();
         await waitUntil(()=>isolated.getBaselineState()==='ready');
         const initial=makeScope();
-        assert.equal((await isolated.applyConfiguredMonitoringScope(initial)).status,'applied');
+        const initialized=await isolated.applyConfiguredMonitoringScope(initial);
+        assert.equal(initialized.status,'applied',JSON.stringify(initialized));
 
         const candidate=makeScope([{scope:'all',path:relative(target)}]);
         const originalFlushPersist=isolated.flushPersistState.bind(isolated);

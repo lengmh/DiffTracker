@@ -12,6 +12,9 @@ import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, conf
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
+const UNNAMED_SUPPLEMENTAL_REASON = 'Supplemental watcher returned an unnamed event; observation coverage for the current subtree is unverified.';
+const UNNAMED_IMPORTED_REASON = 'Directory watcher returned an unnamed event; observation coverage for the current subtree is unverified.';
+
 export interface ObservationCoverageRecheckResult {
     status: 'rechecked' | 'limited' | 'conflict' | 'failed';
     reason?: string;
@@ -290,6 +293,7 @@ interface BaselineTransaction {
     // Authoritative identity check only at the synchronous durable commit barrier.
     commitValid?: () => boolean;
     observedEvents?: Map<string, StartupEvent>;
+    settledSettingsWrite?: SettledSettingsWrite;
     deferReady?: boolean;
     readyPrepared?: boolean;
     baselineRecovery?: { payload: Uint8Array; digest: string; prepared: boolean };
@@ -297,6 +301,12 @@ interface BaselineTransaction {
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
+}
+
+interface SettledSettingsWrite {
+    matches: (uri: vscode.Uri, kind: StartupEvent['kind']) => boolean;
+    verify: () => boolean;
+    ownsCurrent: () => boolean;
 }
 
 interface StartupEvent {
@@ -561,8 +571,13 @@ export class DiffTracker {
     private activeExternalOperations = new Map<number, { uri: vscode.Uri; kind: 'change' | 'delete' }>();
 
     private recordBaselineTransactionEvent(uri: vscode.Uri, kind: StartupEvent['kind']): void {
-        const events = this.baselineTransaction?.observedEvents;
+        const transaction = this.baselineTransaction;
+        const events = transaction?.observedEvents;
         if (!events) { return; }
+        // Only a notification for the already-reconciled, exact settings write
+        // may be a duplicate. New bytes, identity, dirty state or other paths
+        // retain the ordinary transaction invalidation and replay path.
+        if (transaction?.settledSettingsWrite?.matches(uri,kind)) { return; }
         const previous = events.get(uri.fsPath);
         events.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
     }
@@ -868,6 +883,7 @@ export class DiffTracker {
         creations: Map<string, fs.BigIntStats>; active: () => boolean; current: () => boolean;
     }>();
     private runtimeBaselinePublications = new Set<Promise<boolean>>();
+    private settledScopeSettings = new WeakMap<ScopeOperationObservation,SettledSettingsWrite>();
     // Persisted as restart uncertainty, never as proof that an OS handle lives.
     private importedCoverageObligations = new Set<string>();
     private readonly importedCoverageRestartCode = 'imported-coverage-restart-required';
@@ -1349,6 +1365,25 @@ export class DiffTracker {
         return this.queueObservationCoverageRecheck();
     }
 
+    public getObservationCoverageRecheckBlocker(): string | undefined {
+        if (this.coverageRecheckEpoch !== undefined) { return 'Observation coverage is already being rechecked.'; }
+        return this.observationCoverageRecheckBlocker(this.sessionEpoch,
+            () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty),
+            () => this.pausedGitRepositories.size > 0);
+    }
+
+    private observationCoverageRecheckBlocker(epoch: number, dirty: () => boolean, gitPaused: () => boolean): string | undefined {
+        if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
+            this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
+            this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
+            gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
+            this.effectiveMonitoringScope.kind !== 'configured') {
+            return 'Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.';
+        }
+        if (dirty()) { return 'Save or discard unsaved editor changes before rechecking observation coverage.'; }
+        return undefined;
+    }
+
     public recheckScopeOperationCoverage(targets: readonly ScopeCoverageTarget[], revision: string): Promise<ObservationCoverageRecheckResult> {
         if (this.getEffectiveMonitoringScope().scopeRevision !== revision || targets.length === 0 ||
             targets.some(target => this.coverageGaps.get(target.path)?.[target.kind]?.scopeOperationRevision !== revision)) {
@@ -1392,17 +1427,11 @@ export class DiffTracker {
         const gitPaused = () => [...this.pausedGitRepositories.keys()].some(root => !targets || targets.some(target =>
             this.pathBelongsToRoot(target.path,root) || (target.kind==='subtree' && this.pathBelongsToRoot(root,target.path))));
         const conflict = (reason: string): ObservationCoverageRecheckResult => ({ status: 'conflict', reason });
-        if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
-            this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
-            this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
-            gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
-            this.effectiveMonitoringScope.kind !== 'configured') {
-            return conflict('Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.');
-        }
-        if (dirty()) {
-            return conflict('Save or discard unsaved editor changes before rechecking observation coverage.');
-        }
+        const blocker = this.observationCoverageRecheckBlocker(epoch,dirty,gitPaused);
+        if (blocker) { return conflict(blocker); }
         const scope = this.effectiveMonitoringScope;
+        // Keep the configured-scope type explicit after the shared UI guard.
+        if (scope.kind !== 'configured') { return conflict('Recheck requires a configured monitoring scope.'); }
         const watcherRevision = this.watcherCoverageRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
         const policyRevision = this.ignorePolicyRevision;
@@ -2803,7 +2832,7 @@ export class DiffTracker {
                 this.setSubtreeCoverageGap(
                     coverageRoot,
                     'supplemental-watcher-runtime-gap',
-                    'Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild.',
+                    UNNAMED_SUPPLEMENTAL_REASON,
                     true,this.scopeOwnerFailureRevision(current)
                 );
                 return;
@@ -3149,7 +3178,7 @@ export class DiffTracker {
             const entry = this.importedDirectoryWatchers.get(directory)!;
             if (!filename) {
                 entry.eventRevision = (entry.eventRevision ?? 0) + 1;
-                reportFailure('Directory watcher returned an unnamed event; recheck observation coverage to reconcile the current scope');
+                reportFailure(UNNAMED_IMPORTED_REASON);
                 return;
             }
             this.dispatchNamedDirectoryEvent(directory, directory, kind, filename, epoch, () => {
@@ -3875,7 +3904,7 @@ export class DiffTracker {
     private async commitPreparedScopePersistence(transaction: BaselineTransaction): Promise<boolean> {
         const epoch = this.sessionEpoch;
         const storageUri = this.storageUri;
-        if (!storageUri) { return true; }
+        if (!storageUri) { return transaction.commitValid?.() ?? true; }
         const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
         if (!failureUri) { return true; }
 
@@ -3884,7 +3913,8 @@ export class DiffTracker {
                 epoch === this.sessionEpoch &&
                 this.baselineTransaction === transaction &&
                 this.isCurrentEpoch(transaction.epoch) &&
-                (transaction.valid?.() ?? true);
+                (transaction.valid?.() ?? true) &&
+                (transaction.commitValid?.() ?? true);
             if (!transactionCurrent()) { return false; }
             try {
                 // Marker deletion is the durable commit point. All context
@@ -6190,6 +6220,8 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        transaction.settledSettingsWrite = scopeOperation && this.settledScopeSettings.get(scopeOperation);
+        transaction.commitValid = transaction.settledSettingsWrite?.verify;
         // The candidate matcher refresh below is allowed to establish one new
         // policy generation for the requested scope. Once that refresh
         // completes, every acquisition and durable barrier must stay on that
@@ -6493,15 +6525,88 @@ export class DiffTracker {
             this.isDormantClearedStoppedImportRestartGap(targetPath, evidence);
     }
 
+    private coverageReasonForDisplay(reason: string): string {
+        // Older sessions retain their exact diagnostic evidence. Correct known
+        // obsolete recovery advice only in its presentation, including when an
+        // imported restart or pending-control record wraps the native reason.
+        return reason.replace(
+            'Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild.',
+            UNNAMED_SUPPLEMENTAL_REASON
+        ).replace(
+            'Directory watcher returned an unnamed event; rebuild the baseline to reconcile',
+            UNNAMED_IMPORTED_REASON
+        );
+    }
+
     public getCoverageGaps(): Array<[string, string]> {
         const result: Array<[string, string]> = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (record.file && !this.isDormantCoverageGap(targetPath, record.file)) { result.push([targetPath, record.file.reason]); }
-            if (record.subtree && !this.isDormantCoverageGap(targetPath, record.subtree)) { result.push([targetPath, record.subtree.reason]); }
+            if (record.file && !this.isDormantCoverageGap(targetPath, record.file)) { result.push([targetPath, this.coverageReasonForDisplay(record.file.reason)]); }
+            if (record.subtree && !this.isDormantCoverageGap(targetPath, record.subtree)) { result.push([targetPath, this.coverageReasonForDisplay(record.subtree.reason)]); }
         }
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
         );
+    }
+
+    public async prepareOwnedScopeSettings(
+        operation: ScopeOperationObservation, uri: vscode.Uri | undefined,
+        scope: CanonicalMonitoringScope, requestCurrent: () => boolean
+    ): Promise<void> {
+        const epoch=this.sessionEpoch;
+        if (!uri || uri.scheme!=='file' || !this.isRecording || !this.snapshotInitialized ||
+            this.baselineBuilding || this.baselineTransaction || this.restoringEpoch!==undefined) { return; }
+        const current=(requireActivity=true)=>this.isCurrentEpoch(epoch) && (!requireActivity || operation.activity.active) && requestCurrent() &&
+            !this.hasDirtyDocument(uri.fsPath) && !this.isPathIgnored(uri) &&
+            this.configuredScopeMonitorsPath(scope,uri) && !this.validateResourceTarget(uri.fsPath);
+        if (!current()) { return; }
+        const controlPath=this.canonicalTrackingPath(uri.fsPath);
+        // This is one known control file, never a scope traversal. Bound both
+        // individual proof size and total verification reads for late events.
+        let reads=16,remainingBytes=4*1024*1024;
+        const same=(a:fs.BigIntStats,b:fs.BigIntStats)=>a.dev===b.dev && a.ino===b.ino &&
+            a.birthtimeNs===b.birthtimeNs && a.mtimeNs===b.mtimeNs && a.ctimeNs===b.ctimeNs &&
+            a.mode===b.mode && a.size===b.size;
+        const read=(requireActivity=true): {identity:fs.BigIntStats;hash:string} | undefined => {
+            if (!current(requireActivity) || reads--<=0) { return undefined; }
+            let descriptor:number|undefined;
+            try {
+                const before=fs.lstatSync(uri.fsPath,{bigint:true});
+                if (!before.isFile() || before.isSymbolicLink() || before.size>1024n*1024n ||
+                    before.size>BigInt(remainingBytes)) { return undefined; }
+                remainingBytes-=Number(before.size);
+                descriptor=fs.openSync(uri.fsPath,fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+                const opened=fs.fstatSync(descriptor,{bigint:true});
+                if (!same(before,opened)) { return undefined; }
+                const hash=createHash('sha256'),buffer=Buffer.alloc(64*1024);
+                for(let offset=0;offset<Number(opened.size);){
+                    const size=fs.readSync(descriptor,buffer,0,Math.min(buffer.length,Number(opened.size)-offset),offset);
+                    if (!size) { return undefined; }
+                    hash.update(buffer.subarray(0,size));offset+=size;
+                }
+                const after=fs.fstatSync(descriptor,{bigint:true});
+                if (!same(before,after) || !same(after,fs.lstatSync(uri.fsPath,{bigint:true}))) { return undefined; }
+                return {identity:after,hash:hash.digest('hex')};
+            } catch { return undefined; }
+            finally { if(descriptor!==undefined){fs.closeSync(descriptor);} }
+        };
+        const saved=read();
+        if (!saved) { return; }
+        await this.readFileAndUpdate(uri.fsPath,uri,current);
+        const verify=(requireActivity=true)=>{
+            const latest=read(requireActivity);
+            return !!latest && latest.hash===saved.hash && same(latest.identity,saved.identity);
+        };
+        if (!verify()) { return; }
+        this.settledScopeSettings.set(operation,{
+            matches:(target,kind)=>target.scheme==='file' && kind!=='delete' &&
+                target.fsPath===controlPath && verify(),
+            verify:()=>verify(),ownsCurrent:()=>verify(false)
+        });
+    }
+
+    public ownedScopeSettingsAreCurrent(operation: ScopeOperationObservation): boolean | undefined {
+        return this.settledScopeSettings.get(operation)?.ownsCurrent();
     }
 
     public captureScopeOperationObservation(): ScopeOperationObservation {
@@ -6619,7 +6724,7 @@ export class DiffTracker {
             result.push({
                 targetPath,
                 reasonCode: record.subtree.reasonCode,
-                reason: record.subtree.reason
+                reason: this.coverageReasonForDisplay(record.subtree.reason)
             });
         }
         return result.sort((left, right) =>
@@ -9643,23 +9748,31 @@ export class DiffTracker {
                 return publications.every(result => result.status === 'fulfilled' && result.value) &&
                     current() && (directory === undefined || job.directory === directory) && !this.persistenceFailed;
             };
-            // A finite follow-up covers notifications received during the first
-            // pass. Both passes consume one allowance; busy trees remain limited.
+            // Keep two actual proof passes and two preparation interruptions
+            // without progress. Pre-proof coalescing moves strictly upward
+            // within this workspace, so path depth bounds that progress without
+            // consuming proof passes. All passes share the traversal budget.
             // A save failure must stop further passes without invalidating the
             // current pass's rollback/coverage-failure publication.
-            for (let pass = 0; pass < 2 && active() && !this.persistenceFailed; pass++) {
+            for (let proofs=0,preparations=0; proofs<2 && preparations<2 && active() && !this.persistenceFailed;) {
                 // An independent file creation briefly holds the same Ready
                 // publication guard. Wait for that exact finite set of writes;
                 // no proof may run while it is held. Other lifecycle guards
                 // still cancel the job, and new activity cannot add passes.
-                if (!await settlePreparation()) { break; }
+                const beforePreparation=job.directory;
+                if (!await settlePreparation()) {
+                    if(job.directory===beforePreparation){preparations++;}
+                    continue;
+                }
                 job.dirty = false;
                 const directory = job.directory;
                 let publicationVersion = this.baselineCompletionVersion;
+                let proofBegan=false;
                 const observation: DirectoryObservation = { current: () => current() && job.directory === directory,
                     settlePreparation: () => settlePreparation(directory), budget,
                     beginProof: target => {
                         if (target === directory) {
+                            proofBegan=true;
                             // The proof covers notifications and publications
                             // already settled during preparation. Only later
                             // activity can require the bounded follow-up.
@@ -9668,6 +9781,7 @@ export class DiffTracker {
                         }
                     } };
                 await this.onExternalFileCreated(vscode.Uri.file(directory), false, undefined, false, observation);
+                if(proofBegan){proofs++;}else if(job.directory===directory){preparations++;}
                 if (!job.dirty && publicationVersion === this.baselineCompletionVersion) { break; }
             }
         })().finally(() => {

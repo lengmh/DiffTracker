@@ -16,7 +16,7 @@ const largeFileReminderToken={filePath,epoch:1,reviewRevision:'large-reminder-cu
 function harness(change = { filePath, fileName: 'empty.m', originalContent: '', currentContent: '' }) {
     const messages = [];
     const commands = [];
-    const state = { changes: change ? [change] : [], subtreeCoverageGaps: [], configuration: {}, updates: [], createdPanels: [], result: { status: 'success' }, error: undefined };
+    const state = { changes: change ? [change] : [], subtreeCoverageGaps: [], recheckBlocker:'Open Monitoring Scope to resolve the current scope first.', configuration: {}, updates: [], createdPanels: [], result: { status: 'success' }, error: undefined };
     const vscode = {
         Uri: {
             file: value => ({ fsPath: value }),
@@ -100,6 +100,9 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         getLargeFileReminderToken:target=>state.changes.find(change=>change.filePath===target)?.largeFileReminder?.pending
             ? {...largeFileReminderToken,filePath:target} : undefined,
         getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
+        prepareOwnedScopeSettings:async()=>{},
+        ownedScopeSettingsAreCurrent:()=>undefined,
+        getObservationCoverageRecheckBlocker:()=>state.recheckBlocker,
         getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
     };
@@ -266,6 +269,29 @@ await test('unknown state is visible in generated DOM, tree and incremental payl
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
 });
 
+await test('coverage diagnostics expose the existing guarded Recheck action without prescribing a rebuild', async () => {
+    const h = harness(null);
+    h.state.recheckBlocker=undefined;
+    h.state.subtreeCoverageGaps=[{targetPath:'/workspace/generated-cache',reasonCode:'supplemental-watcher-runtime-gap',
+        reason:'Supplemental watcher returned an unnamed event; observation coverage for the current subtree is unverified.'}];
+    const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    let row=(await tree.getChildren()).find(item=>item.label==='Monitoring Coverage Limited').children[0];
+    assert.equal(row.contextValue,'coverageDiagnosticSubtreeRecheck');
+    assert.match(row.tooltip,/Recheck Observation Coverage/);
+    assert.doesNotMatch(row.tooltip,/baseline rebuild/);
+    const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+    const menus=manifest.contributes.menus['view/item/context'];
+    assert.ok(menus.some(menu=>menu.command==='diffTracker.recheckObservationCoverage' &&
+        menu.when.includes('viewItem == coverageDiagnosticSubtreeRecheck') && menu.group.startsWith('inline')));
+    assert.ok(menus.some(menu=>menu.command==='diffTracker.excludeCoverageSubtree' &&
+        menu.when.includes('viewItem == coverageDiagnosticSubtreeRecheck')));
+    h.state.recheckBlocker='Recheck requires an active, ready configured scope.';
+    row=(await tree.getChildren()).find(item=>item.label==='Monitoring Coverage Limited').children[0];
+    assert.equal(row.contextValue,'coverageDiagnosticSubtree');
+    assert.equal(row.command.command,'diffTracker.manageMonitoringScope');
+    assert.match(row.tooltip,/Recheck requires an active, ready configured scope/);
+});
+
 await test('subtree coverage diagnostics are visible and actionable without becoming file review items', async () => {
     const h = harness(null);
     h.state.subtreeCoverageGaps = [{
@@ -285,7 +311,8 @@ await test('subtree coverage diagnostics are visible and actionable without beco
     assert.equal(diagnostic.children[0].coveragePath, '/workspace/imported-tree');
     const manifest = JSON.parse(fs.readFileSync('package.json','utf8'));
     const menu = manifest.contributes.menus['view/item/context'].find(entry =>
-        entry.command === 'diffTracker.excludeCoverageSubtree');
+        entry.command === 'diffTracker.excludeCoverageSubtree' &&
+        entry.when.endsWith('viewItem == coverageDiagnosticSubtree'));
     assert.match(menu.when,/coverageDiagnosticSubtree/);
     assert.equal(menu.group,'inline','coverage diagnostics retain their hover action');
 
@@ -358,6 +385,8 @@ for (const coverageLimited of [false, true]) {
 // https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/browser/parts/views/treeView.ts#L1500-L1522
 for (const [command, contextValue] of [
     ['diffTracker.excludeCoverageSubtree', 'coverageDiagnosticSubtree'],
+    ['diffTracker.excludeCoverageSubtree', 'coverageDiagnosticSubtreeRecheck'],
+    ['diffTracker.recheckObservationCoverage', 'coverageDiagnosticSubtreeRecheck'],
     ['diffTracker.acceptFile', 'changedFile'],
     ['diffTracker.revertFile', 'changedFile'],
     ['diffTracker.acknowledgeOpaqueChange', 'opaqueFile'],
@@ -367,14 +396,15 @@ for (const [command, contextValue] of [
     await test(`${command} has distinct scoped hover and right-click contributions`, () => {
         const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
         const entries = manifest.contributes.menus['view/item/context']
-            .filter(item => item.command === command);
+            .filter(item => item.command === command &&
+                item.when === `view == diffTracker.changesView && viewItem == ${contextValue}`);
         assert.equal(entries.length, 2, 'exactly one entry per menu surface');
         for (const entry of entries) {
             assert.equal(entry.when,
                 `view == diffTracker.changesView && viewItem == ${contextValue}`,
                 'both surfaces must retain the same owning view and row category');
         }
-        assert.equal(entries.filter(item => item.group === 'inline').length, 1,
+        assert.equal(entries.filter(item => item.group?.split('@')[0] === 'inline').length, 1,
             'one primary hover action');
         assert.equal(entries.filter(item => item.group && item.group.split('@')[0] !== 'inline').length, 1,
             'one secondary right-click action, separate from the hover contribution');
@@ -405,6 +435,7 @@ await test('coverage exclude quick action stages an exact root-local request wit
         {scope:'all',pattern:'**/*.tmp'}
     ]},roots);
     assert.equal(request.ok,true);
+    const workspaceSettings={monitoringScope:request.scope.mode,watchInclude:request.scope.includes,watchExclude:request.scope.excludes};
     const controller=Object.create(h.load('monitoringScopeController.ts').MonitoringScopeController.prototype);
     let saveCount=0,reconcileCount=0;
     Object.assign(controller,{
@@ -416,10 +447,11 @@ await test('coverage exclude quick action stages an exact root-local request wit
         getRequestedScope:()=>request,
         reconcileRequestedScope:()=>{reconcileCount++;}
     });
-    h.vscode.workspace.getConfiguration=()=>({update:async(key,value,target)=>{
+    h.vscode.workspace.getConfiguration=()=>({inspect:key=>({workspaceValue:workspaceSettings[key]}),update:async(key,value,target)=>{
         assert.equal(key,'watchExclude','the quick action must only update exclusions');
         assert.equal(target,h.vscode.ConfigurationTarget.Workspace);
         saveCount++;
+        workspaceSettings[key]=value;
         request=validate({...request.scope,excludes:value},roots);
     }});
     const first=await controller.requestExcludeCoverageSubtree(target);
@@ -853,7 +885,7 @@ await test('scope editor stays blocked through each applied quick exclusion and 
 });
 
 for (const failure of ['rejected operation', 'failed settings write']) {
-    await test(`scope editor ownership is released after a ${failure}`, async () => {
+    await test(`scope editor preserves the correct ownership after a ${failure}`, async () => {
         const h = monitoringScopeCommandHarness();
         if (failure === 'rejected operation') {
             h.tracker.getSubtreeCoverageGaps = () => { throw new Error('controlled coverage lookup failure'); };
@@ -861,8 +893,14 @@ for (const failure of ['rejected operation', 'failed settings write']) {
         } else {
             h.state.beforeConfigurationUpdate = async () => { throw new Error('controlled settings failure'); };
             const result = await h.run('excludeCoverageSubtree', h.targets[0]);
-            assert.equal(result.status, 'conflict');
+            assert.equal(result.status, 'partial');
             assert.match(result.reason,/controlled settings failure/);
+            assert.equal(h.controller.hasPendingScopeSettingsWrites(),true);
+            await h.run('manageMonitoringScope');
+            assert.equal(h.WatchExcludePanel.currentPanel,undefined);
+            assert.match(h.state.warnings.at(-1),/unverified.*reload/i);
+            h.controller.dispose();
+            return;
         }
         await h.run('manageMonitoringScope');
         assert.ok(h.WatchExcludePanel.currentPanel, 'a failed command must not leave the editor locked');

@@ -1,0 +1,106 @@
+{
+  "sourceVersion": "0.8.10",
+  "sourceCommit": "ddc2190cc0dba35944fc80dfba8ba963a2d850ca",
+  "state": {
+    "version": 5,
+    "isRecording": true,
+    "baselineState": "ready",
+    "scanCoverage": "c9a52334014471685b79ff7d52d9072b74e7474427d9ec6281b6b74c9de9f043",
+    "workspaceRoots": [
+      "FIXTURE_WORKSPACE"
+    ],
+    "effectiveMonitoringScope": {
+      "kind": "configured",
+      "mode": "wholeWorkspace",
+      "roots": [
+        {
+          "name": "pr12-audit",
+          "uri": "file://FIXTURE_WORKSPACE",
+          "caseSensitive": true
+        }
+      ],
+      "includes": [],
+      "excludes": [],
+      "scopeRevision": "a61738ec21f73527737e830e35f5abe4bd54f4ffbd9e07a41d13c5aa1418c875"
+    },
+    "retainedReviewPaths": [],
+    "coverageGaps": [
+      [
+        "FIXTURE_WORKSPACE/native-owner",
+        {
+          "subtree": {
+            "targetKind": "subtree",
+            "reasonCode": "supplemental-watcher-runtime-gap",
+            "reason": "Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild."
+          }
+        }
+      ]
+    ],
+    "legacyWatchExcludeByRoot": [],
+    "fileSnapshots": [
+      [
+        "FIXTURE_WORKSPACE/native-owner/tracked.txt",
+        "original"
+      ],
+      [
+        "FIXTURE_WORKSPACE/ProbeName",
+        "probe"
+      ],
+      [
+        "FIXTURE_WORKSPACE/undo.txt",
+        "undo baseline"
+      ]
+    ],
+    "fileModes": [
+      [
+        "FIXTURE_WORKSPACE/undo.txt",
+        384
+      ],
+      [
+        "FIXTURE_WORKSPACE/ProbeName",
+        384
+      ],
+      [
+        "FIXTURE_WORKSPACE/native-owner/tracked.txt",
+        384
+      ]
+    ],
+    "baselineExistingFiles": [
+      "FIXTURE_WORKSPACE/native-owner/tracked.txt",
+      "FIXTURE_WORKSPACE/ProbeName",
+      "FIXTURE_WORKSPACE/undo.txt"
+    ],
+    "unresolvedBaselineFiles": [
+      [
+        "FIXTURE_WORKSPACE/native-owner/unknown.txt",
+        "Unverified before-image"
+      ]
+    ],
+    "opaqueBaselineFiles": [],
+    "largeFileReminders": [],
+    "revertHistory": [
+      {
+        "id": "revert-1793364020822-1",
+        "createdAt": "2026-10-30T12:40:20.822Z",
+        "items": [
+          {
+            "filePath": "FIXTURE_WORKSPACE/undo.txt",
+            "baselineRevision": "1920485f12285d10d143982cbb060feb905f3f16c0f3aa39bc6a0b50d7b597c2",
+            "before": {
+              "exists": true,
+              "content": "undo pending",
+              "mode": 384
+            },
+            "after": {
+              "exists": true,
+              "content": "undo baseline",
+              "mode": 384
+            },
+            "saveMode": "disk"
+          }
+        ]
+      }
+    ],
+    "gitContexts": []
+  }
+}
