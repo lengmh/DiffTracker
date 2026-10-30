@@ -27,8 +27,18 @@ async function directoryChangeHost(workspace) {
     const sibling = path.join(root, 'sibling.txt');
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
+    const nativeLstat = fs.lstatSync;
     let observedNotifications = 0;
     const notifications = [];
+    const providerFallbacks = [];
+    fs.lstatSync = function(target, ...args) {
+        const result = nativeLstat.call(this, target, ...args);
+        if (String(target).startsWith(`${root}${path.sep}`) && providerFallbacks.length < 32 &&
+            new Error().stack.includes('isUntrackedDirectory')) {
+            providerFallbacks.push({path:path.relative(root,String(target)),directory:result.isDirectory()});
+        }
+        return result;
+    };
     fs.watch = function(directory, ...args) {
         const listener = args[args.length - 1];
         if (String(directory) === root && typeof listener === 'function') {
@@ -122,7 +132,17 @@ async function directoryChangeHost(workspace) {
                     tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
                     tracker.directoryObservations.size === 0 &&
                     tracker.getTrackedChange(current)?.reviewKind === 'unknown', () => ({
-                        notifications,epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
+                        notifications,providerFallbacks,epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
+                        externalWatcherEnabled:tracker.externalWatcherEnabled,snapshotInitialized:tracker.snapshotInitialized,
+                        baselineBuilding:tracker.baselineBuilding,baselineTransaction:!!tracker.baselineTransaction,
+                        restoringEpoch:tracker.restoringEpoch,coverageRecheckEpoch:tracker.coverageRecheckEpoch,
+                        scopeApplyPreflight:tracker.scopeApplyPreflight,activeScopeApplications:tracker.activeScopeApplications,
+                        pendingScope:tracker.pendingMonitoringScope?.scopeRevision,scopeKind:tracker.effectiveMonitoringScope.kind,
+                        recoveryBlocked:tracker.recoveryBlocked,persistenceFailed:tracker.persistenceFailed,persistenceIssue:tracker.persistenceIssue,
+                        workspaceChanged:tracker.workspaceContextChanged,gitPending:tracker.gitContextPending,
+                        ignoredDirectory:tracker.isPathIgnored(vscode.Uri.file(live),true),
+                        ignoredFile:tracker.testIgnorePath(live),workspaceOwner:tracker.owningWorkspaceFolderForTraversal(live)?.name,
+                        canonicalPath:path.relative(root,tracker.canonicalTrackingPath(live)),
                         owners:[...tracker.supplementalDirectoryWatchers].map(([directory,owner])=>
                             ({path:path.relative(root,directory),epoch:owner.epoch,coverageRoot:path.relative(root,owner.coverageRoot)})),
                         jobs:[...tracker.directoryObservations].map(([directory,job])=>({path:path.relative(root,directory),dirty:job.dirty})),
@@ -150,9 +170,11 @@ async function directoryChangeHost(workspace) {
             }
             assert.equal(excludedEnumerations, 0);
         } finally { fs.promises.opendir = opendir; diagnostics.dispose(); }
+        console.log(`HOST-ISSUE-55 provider fallback metadata: ${JSON.stringify(providerFallbacks)}`);
         console.log('PASS HOST-ISSUE-55 cleared Limited stays clear through three excluded create/modify/rename/delete-recreate and included move/native-edit rounds');
     } finally {
         fs.watch = nativeWatch;
+        fs.lstatSync = nativeLstat;
         await tracker.dispose();
         fs.rmSync(root, {recursive:true,force:true});
         for (let round = 0; round < 3; round++) { fs.rmSync(`${root}-incoming-${round}`, {recursive:true,force:true}); }

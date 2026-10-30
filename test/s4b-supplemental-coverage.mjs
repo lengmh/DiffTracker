@@ -1410,6 +1410,72 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
     }, 'rules'));
 
+    for (const count of [130,256]) test(`Issue #55 healthy ${count} directory owners reconcile without duplicate bridge capacity`, () => fixture(async ({tracker,dir}) => {
+        const {blind,child,target,scope} = await lifecycleFixture(tracker,dir);
+        for (let index=2;index<count;index++) { fs.mkdirSync(path.join(blind,`covered-${index}`)); }
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        assert.equal(tracker.activeDirectDirectoryWatcherCount(tracker.sessionEpoch),count);
+        const owners = new Map(tracker.supplementalDirectoryWatchers);
+        const watch = fs.watch; let peak = count;
+        fs.watch = (...args) => {
+            const result = watch(...args);
+            peak = Math.max(peak,nativeDirectoryWatchers.filter(owner=>owner.active).length);
+            return result;
+        };
+        try { await tracker.onExternalFileChanged(Uri.file(blind)); }
+        finally { fs.watch = watch; }
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'healthy coverage must not fail at half the configured capacity');
+        assert.equal(peak,count,'verified existing owners require no duplicate native handles');
+        for (const [directory,owner] of owners) { assert.equal(tracker.supplementalDirectoryWatchers.get(directory),owner); }
+        fs.writeFileSync(target,'continued healthy owner edit');
+        activeNativeWatcher(nativeDirectoryWatchers,child).listener('change','tracked.txt'); await settle(tracker);
+        assert.equal(tracker.getTrackedChange(target)?.currentContent,'continued healthy owner edit');
+        assert.equal(tracker.getOriginalContent(target),'before');
+        activeNativeWatcher(nativeDirectoryWatchers,blind).error(Object.assign(new Error('Later real owner failure'),{code:'EIO'}));
+        assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===blind));
+    },'rules'));
+
+    test('Issue #55 native directory notification survives delayed workspace-provider stat', () => fixture(async ({tracker,dir}) => {
+        const {blind} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'provider-lag'); fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt'); fs.writeFileSync(target,'unproven moved contents');
+        const stat = h.vscode.workspace.fs.stat; let delayed = false;
+        h.vscode.workspace.fs.stat = async uri => {
+            if (uri.fsPath===child && !delayed) { delayed=true; throw h.vscode.FileSystemError.FileNotFound(); }
+            return stat(uri);
+        };
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','provider-lag');
+            await settle(tracker); await h.waitUntil(()=>tracker.directoryObservations.size===0);
+            assert.equal(delayed,true);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            const owner = activeNativeWatcher(nativeDirectoryWatchers,child); assert.ok(owner);
+            const unknown = tracker.getUnknownReviewToken(target); assert.ok(unknown);
+            fs.writeFileSync(target,'later native edit'); owner.listener('change','tracked.txt'); await settle(tracker);
+            assert.notEqual(tracker.getUnknownReviewToken(target)?.reviewRevision,unknown.reviewRevision);
+            assert.equal(tracker.getOriginalContent(target),undefined);
+        } finally { h.vscode.workspace.fs.stat = stat; }
+    },'rules'));
+
+    test('Issue #55 directory provider permission failure keeps genuine coverage uncertainty', () => fixture(async ({tracker,dir}) => {
+        const {blind} = await lifecycleFixture(tracker,dir);
+        const child = path.join(blind,'provider-denied'); fs.mkdirSync(child);
+        const target = path.join(child,'tracked.txt'); fs.writeFileSync(target,'unreadable contents');
+        const stat = h.vscode.workspace.fs.stat;
+        h.vscode.workspace.fs.stat = async uri => {
+            if (uri.fsPath===child) { throw h.vscode.FileSystemError.NoPermissions(); }
+            return stat(uri);
+        };
+        try {
+            activeNativeWatcher(nativeDirectoryWatchers,blind).listener('rename','provider-denied');
+            await settle(tracker);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===child));
+            assert.equal(activeNativeWatcher(nativeDirectoryWatchers,child),undefined);
+            assert.equal(tracker.getOriginalContent(target),undefined);
+            assert.equal(fs.readFileSync(target,'utf8'),'unreadable contents');
+        } finally { h.vscode.workspace.fs.stat = stat; }
+    },'rules'));
+
     test('Issue #55 directory change automatically reconciles without accepting unknown history', () => fixture(async ({tracker,dir}) => {
         const {blind, child, target} = await lifecycleFixture(tracker, dir);
         fs.writeFileSync(target, 'pending review');

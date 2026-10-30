@@ -2577,7 +2577,8 @@ export class DiffTracker {
         epoch: number,
         budget: { remainingEntries: number },
         creationIsCurrent: () => boolean,
-        observeStopped = false
+        observeStopped = false,
+        reuseHealthyOwners = false
     ): Promise<ImportedCoverageHandoff> {
         const folder = this.owningWorkspaceFolderForTraversal(root);
         if (!folder) { throw new Error('Imported directory has no workspace owner'); }
@@ -2585,7 +2586,9 @@ export class DiffTracker {
             this.workspaceFolderOwnsTraversalPath(folder, directory);
         const bridges = new Map([...this.importedDirectoryWatchers].filter(([directory, entry]) =>
             owns(directory) && entry.epoch === epoch));
-        if (!bridges.has(root)) { throw new Error('Imported bridge ownership is incomplete'); }
+        if (!bridges.has(root) && !(reuseHealthyOwners && this.canReuseSupplementalDirectoryOwner(root,epoch))) {
+            throw new Error('Imported bridge ownership is incomplete');
+        }
         const ignoreRevision = this.ignorePolicyRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
         const generation = this.coverageGeneration;
@@ -2691,6 +2694,15 @@ export class DiffTracker {
         return current.isDirectory() && !current.isSymbolicLink() &&
             current.dev === identity.dev && current.ino === identity.ino &&
             current.birthtimeNs === identity.birthtimeNs;
+    }
+
+    private canReuseSupplementalDirectoryOwner(directory: string, epoch: number): boolean {
+        const owner = this.supplementalDirectoryWatchers.get(directory);
+        if (owner?.epoch !== epoch || !this.supplementalCoverageRoots.has(owner.coverageRoot)) { return false; }
+        const folder = this.owningWorkspaceFolderForTraversal(directory);
+        if (!folder || !this.workspaceFolderOwnsTraversalPath(folder,owner.coverageRoot)) { return false; }
+        try { return this.supplementalIdentityMatches(fs.lstatSync(directory,{bigint:true}),owner.identity); }
+        catch { return false; }
     }
 
     private scopeOwnerFailureRevision(owner: SupplementalDirectoryWatch): string | undefined {
@@ -3155,10 +3167,12 @@ export class DiffTracker {
         epoch: number,
         inheritedAbsence = false,
         preparationBudget: { remainingEntries: number } = { remainingEntries: this.maxScopePreflightEntries },
-        traversalOwner?: vscode.WorkspaceFolder
+        traversalOwner?: vscode.WorkspaceFolder,
+        reuseHealthyOwners = false
     ): Promise<void> {
         const pending = [root];
         const installed = new Map<string, { current: ImportedDirectoryWatch; previous?: ImportedDirectoryWatch }>();
+        if (reuseHealthyOwners) { this.pruneIgnoredImportedDirectoryWatchers(); }
         try {
             while (pending.length > 0 && this.isCurrentEpoch(epoch)) {
                 const directory = pending.pop()!;
@@ -3167,7 +3181,8 @@ export class DiffTracker {
                 // Watch before enumeration so later children cannot fall into the
                 // discovery gap. Empty and ignored-file-only directories count too.
                 const previous = this.importedDirectoryWatchers.get(directory);
-                if (this.watchImportedDirectory(directory, epoch, inheritedAbsence)) {
+                if ((!reuseHealthyOwners || !this.canReuseSupplementalDirectoryOwner(directory,epoch)) &&
+                    this.watchImportedDirectory(directory, epoch, inheritedAbsence)) {
                     installed.set(directory, { current: this.importedDirectoryWatchers.get(directory)!, previous });
                 }
                 let handle: fs.Dir | undefined;
@@ -9538,7 +9553,15 @@ export class DiffTracker {
         if (this.baselineExistingFiles.has(uri.fsPath) || this.opaqueBaselineFiles.has(uri.fsPath)) { return false; }
         try {
             return !!((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory);
-        } catch {
+        } catch (error) {
+            // A local native event can arrive before the workspace provider sees
+            // the new directory. Classify metadata only; coverage still needs
+            // the existing watch/scan/persistence proof. Permission failures
+            // continue through the normal unavailable-file reader.
+            if (this.isFileNotFound(error)) {
+                try { return fs.lstatSync(uri.fsPath).isDirectory(); }
+                catch { /* The normal reader retains the actual failure. */ }
+            }
             // Let the normal reader report missing/unreadable files.
             return false;
         }
@@ -9992,7 +10015,7 @@ export class DiffTracker {
                     const importedPreparationBudget = directoryObservation?.budget ?? { remainingEntries: this.maxScopePreflightEntries };
                     let watchFailed = false;
                     let handoff: ImportedCoverageHandoff | undefined;
-                    try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget); }
+                    try { await this.watchImportedTree(filePath, epoch, false, importedPreparationBudget,undefined,!!directoryObservation); }
                     catch {
                         watchFailed = true;
                         failureReason = watcherFailureReason;
@@ -10002,7 +10025,7 @@ export class DiffTracker {
                         !this.baselineBuilding && !this.baselineTransaction) {
                         try {
                             handoff = await this.prepareImportedCoverageHandoff(
-                                filePath, epoch, importedPreparationBudget, creationIsCurrent, observeStopped
+                                filePath, epoch, importedPreparationBudget, creationIsCurrent, observeStopped,!!directoryObservation
                             );
                         } catch (error) {
                             watchFailed = true;
