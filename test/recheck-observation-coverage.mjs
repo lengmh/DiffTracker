@@ -195,17 +195,18 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(tracker.getOriginalContent(target), 'original');
     }));
 
-    for(const code of ['directory-runtime-coverage-gap','directory-scan-coverage-gap']) for(const failure of ['none','reload','native','bytes'])
+    for(const code of ['directory-runtime-coverage-gap','directory-scan-coverage-gap']) for(const failure of ['none','reload','overlap','native','bytes'])
     test(`RECHECK restores an old ${code} without a saved imported-owner descriptor (${failure})`,()=>fixture(async context=>{
         let {tracker}=context;const {dir}=context;
         const unrelated=await seed(context);
-        const directory=path.join(dir,'old-import');fs.mkdirSync(directory);
+        const directory=failure==='overlap'?path.join(dir,'cache','imported'):path.join(dir,'old-import');fs.mkdirSync(directory,{recursive:true});
+        if(failure==='overlap'){setVsCodeExcludes({'files.watcherExclude':{'cache/**':true}});}
         const child=path.join(directory,'tracked.txt');fs.writeFileSync(child,'original');
         assert.equal((await tracker.applyConfiguredMonitoringScope(context.scope)).status,'applied');
         assert.equal(tracker.getOriginalContent(child),'original');
         tracker.setSubtreeCoverageGap(directory,code,'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit');
         let token=tracker.getReviewToken(unrelated);
-        if(failure==='reload'){
+        if(failure==='reload'||failure==='overlap'){
             assert.equal(await tracker.flushPendingPersistence(),true);
             const storage=tracker.storageUri;await tracker.dispose();
             tracker=new h.DiffTracker(storage);h.setTracker(tracker);
@@ -245,6 +246,103 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(await tracker.flushPendingPersistence(),true);
         assert.equal(savedState(tracker).coverageGaps.some(([target,record])=>target===directory&&record.importedCoverageRequired),true,JSON.stringify({saved:savedState(tracker).coverageGaps.map(([p,r])=>[path.relative(dir,p),r]),live:[...tracker.importedCoverageObligations].map(p=>path.relative(dir,p)),owners:[...tracker.supplementalDirectoryWatchers].map(([p,r])=>[path.relative(dir,p),path.relative(dir,r.coverageRoot)])}));
     }));
+
+    for(const late of ['owner-failure','overflow','excluded-noise','overflow-budget','stop','regional-unrelated-overflow','regional-selected-overflow','regional-parent-overflow'])
+    test(`RECHECK reports post-certification ${late} after replay without accepting new baselines`,()=>fixture(async context=>{
+        let {tracker}=context;const {dir}=context;let target=await seed(context);
+        const regional=late.startsWith('regional-');
+        if(regional){
+            const folder=path.join(dir,'selected');fs.mkdirSync(folder);target=path.join(folder,'tracked.txt');
+            fs.writeFileSync(target,'baseline');assert.equal((await tracker.applyConfiguredMonitoringScope(context.scope)).status,'applied');
+            fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        }
+        tracker.setFileCoverageGap(target,'pending-scope-gap','Earlier pending scope interval');
+        tracker.markFileUnavailable(target,'Earlier pending scope interval');
+        const targets=[{path:target,kind:'file',workspaceRoot:context.scope.roots[0].uri}];
+        if(regional){assert.equal(await tracker.retainScopeOperationRecovery(targets,context.scope.scopeRevision),true);}
+        const watch=fs.watch,open=fs.promises.open,limit=tracker.maxScopePreflightEntries,byteLimit=tracker.maxPersistedBytes;
+        let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+        fs.promises.open=async(file,...args)=>{
+            const handle=await open(file,...args);
+            if(!held&&String(file)===target&&!tracker.baselineTransaction&&!tracker.coverageGaps.get(target)?.file&&tracker.restoringEpoch===tracker.sessionEpoch){
+                held=true;enter();await gate;
+            }
+            return handle;
+        };
+        const lateDirectory=path.join(dir,'late-import');
+        const action=regional?tracker.recheckScopeOperationCoverage(targets,context.scope.scopeRevision):tracker.recheckObservationCoverage();let outcome;
+        try{
+            await Promise.race([entered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
+            if(late==='stop'){tracker.stopRecording();}
+            else if(late==='owner-failure'){
+                fs.mkdirSync(lateDirectory);fs.writeFileSync(path.join(lateDirectory,'unverified.txt'),'late content');
+                fs.watch=(directory,...args)=>{
+                    if(path.resolve(String(directory))===lateDirectory){throw Object.assign(new Error('Late native owner failed'),{code:'ENOSPC'});}
+                    return watch(directory,...args);
+                };
+                tracker.dispatchExternalEvent(Uri.file(lateDirectory),'create',tracker.sessionEpoch);
+            }else{
+                tracker.maxScopePreflightEntries=2;
+                const parent=late==='excluded-noise'?path.join(dir,'excluded'):dir;
+                        if(late==='excluded-noise'){fs.mkdirSync(parent);}
+                for(let index=0;index<3;index++){
+                    const selected=late==='regional-selected-overflow'&&index===2,ancestor=late==='regional-parent-overflow'&&index===2;
+                    const file=selected?target:ancestor?path.dirname(target):path.join(parent,`late-${index}.txt`);
+                    if(ancestor){fs.rmSync(file,{recursive:true});}else if(!selected){fs.writeFileSync(file,'unverified late content');}
+                    tracker.dispatchExternalEvent(Uri.file(file),ancestor?'delete':selected?'change':'create',tracker.sessionEpoch);
+                }
+                if(late==='overflow-budget'){tracker.maxPersistedBytes=1;}
+            }
+        }finally{release();try{outcome=await action;}finally{fs.watch=watch;fs.promises.open=open;tracker.maxScopePreflightEntries=limit;tracker.maxPersistedBytes=byteLimit;}}
+        assert.equal(tracker.getOriginalContent(target),'baseline');
+        if(late==='stop'||late==='overflow-budget'){
+            assert.notEqual(outcome.status,'rechecked',JSON.stringify(outcome));assert.equal(tracker.getIsRecording(),false);
+            if(late==='overflow-budget'){assert.equal(outcome.status,'failed');assert.match(outcome.reason,/overflow/);}
+            return;
+        }
+        if(regional){
+            assert.equal(outcome.status,late==='regional-unrelated-overflow'?'rechecked':'limited',JSON.stringify(outcome));
+            const classification=tracker.getScopeOperationCoverageGaps(targets);
+            assert.equal(classification.related.length,late==='regional-unrelated-overflow'?0:1);
+            assert.ok(classification.unrelated.length>0,'unselected overflow uncertainty remains separately visible');
+            if(late!=='regional-unrelated-overflow'){
+                assert.equal(await tracker.flushPendingPersistence(),true);
+                const marker=savedState(tracker).coverageGaps.find(([file])=>file===target)?.[1]?.file;
+                assert.equal(marker?.reasonCode,'scope-recheck-incomplete');
+                assert.equal(marker?.scopeOperationRevision,context.scope.scopeRevision);
+                // A scoped retry must not misclassify this still-outstanding
+                // obligation as an unrelated background failure.
+                const retry=await tracker.recheckScopeOperationCoverage(targets,context.scope.scopeRevision);
+                assert.notEqual(retry.status,'rechecked',JSON.stringify(retry));
+                assert.equal(tracker.getScopeOperationCoverageGaps(targets).related.length,1);
+                const storage=tracker.storageUri;await tracker.dispose();tracker=new h.DiffTracker(storage);h.setTracker(tracker);
+                assert.equal(await tracker.restorePersistedState(),'restored');
+                assert.equal(tracker.getScopeOperationCoverageGaps(targets).related.length,1);
+                assert.equal(tracker.getOriginalContent(target),'baseline');
+                // The deleted parent cannot host the required native owner.
+                // Restore that directory, leaving the file deleted, then prove
+                // coverage without accepting its missing current state.
+                if(late==='regional-parent-overflow'){fs.mkdirSync(path.dirname(target));}
+                assert.equal((await tracker.recheckObservationCoverage()).status,'rechecked');
+                assert.deepEqual(tracker.getCoverageGaps(),[]);
+                assert.equal(tracker.getOriginalContent(target),'baseline');
+                if(late==='regional-parent-overflow'){assert.equal(tracker.getTrackedChange(target)?.isDeleted,true);}
+            }
+            return;
+        }
+        if(late==='excluded-noise'){
+            assert.equal(outcome.status,'rechecked',JSON.stringify(outcome));assert.deepEqual(tracker.getCoverageGaps(),[]);return;
+        }
+        assert.notEqual(outcome.status,'rechecked',JSON.stringify(outcome));
+        if(late==='owner-failure'){
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===lateDirectory));
+        }else{
+            assert.ok(tracker.getSubtreeCoverageGaps().length>0,'dropped notifications retain durable subtree uncertainty');
+            assert.equal(tracker.getOriginalContent(path.join(dir,'late-2.txt')),undefined);
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            assert.ok(savedState(tracker).coverageGaps.some(([,record])=>record.subtree));
+        }
+    },'wholeWorkspace',[{scope:'all',pattern:'/excluded/'}]));
 
     async function seedDirectoryGap(context, code = 'directory-runtime-coverage-gap') {
         const {tracker, dir, scope} = context;
@@ -323,8 +421,10 @@ export function registerRecheckObservationCoverage(h, fixture) {
         }
         if (barrier === 'durable-copy') {
             assert.equal(await tracker.flushPendingPersistence(), true);
-            assert.equal(savedState(tracker).coverageGaps.find(([directory]) => directory === files.child)?.[1].subtree?.reasonCode,
-                'directory-runtime-coverage-gap');
+            const savedGap=savedState(tracker).coverageGaps.find(([directory])=>directory===files.child)?.[1];
+            assert.equal(savedGap?.importedCoverageRequired,true,'failed certification retains its independent restart obligation');
+            assert.equal(savedGap?.subtree?.reasonCode,'imported-coverage-restart-required');
+            assert.equal(savedGap?.subtree?.reason,files.evidence.reason,'the old unverified interval remains durable');
             assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked', 'a quiet retry is idempotent');
         }
     }));

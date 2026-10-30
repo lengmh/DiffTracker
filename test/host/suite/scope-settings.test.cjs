@@ -10,6 +10,21 @@ module.exports = async function scopeSettingsCheckpoint() {
     const scopeStatus = () => vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
     const trace = [];
     const {DiffTracker}=require('../../../out/diffTracker.js');
+    const {MonitoringScopeController}=require('../../../out/monitoringScopeController.js');
+    const updateSetting=MonitoringScopeController.prototype.updateOwnedScopeSetting;
+    MonitoringScopeController.prototype.updateOwnedScopeSetting=function(config,key,value,before,expected){
+        const details=()=>{
+            const scope=this.getRequestedScope().scope;
+            const tracker=this.tracker;
+            return {settingsMatch:this.settingsFingerprint()===this.settingsFingerprint(expected),
+                revision:scope?.scopeRevision,effective:tracker.getEffectiveMonitoringScope().scopeRevision,
+                review:scope?tracker.getExplicitlyExcludedReviewRevision(scope):null,
+                paths:scope?tracker.getExplicitlyExcludedPendingReviewPaths(scope).map(file=>({path:path.relative(workspace,file),
+                    kind:tracker.getTrackedChange(file)?.reviewKind,reason:tracker.coverageGaps.get(file)?.file})):[]};
+        };
+        const entry={stage,kind:'owned-setting',key,before:details()};trace.push(entry);
+        return Promise.resolve(updateSetting.apply(this,arguments)).finally(()=>{entry.after=details();});
+    };
     const wrapped=new Map();
     let stage = 'activation';
     const until = async (description,predicate) => {
@@ -161,5 +176,6 @@ module.exports = async function scopeSettingsCheckpoint() {
             assert.equal(final.trackedChanges.some(change=>change.filePath===uri(`${folder}/existing.txt`).fsPath),false);
         }
         console.log(`PASS HOST-EXCLUDES real configuration with excluded settings: Save and Apply, shortcut, Apply Saved Request, Restore and continued observation: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
-    } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;} }
+    } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;}
+        MonitoringScopeController.prototype.updateOwnedScopeSetting=updateSetting; }
 };

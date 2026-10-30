@@ -82,14 +82,54 @@ export interface MonitoringScopeConfirmation {
     affectedReviewPaths: readonly string[];
 }
 
-export type MonitoringScopeActionOutcome = MonitoringScopeApplyOutcome |
-    {status:'alreadyExcluded'|'blocked'|'cancelled';reason?:string};
+export type MonitoringScopeActionOutcome = MonitoringScopeApplyOutcome | ObservationCoverageRecheckResult |
+    {status:'alreadyExcluded'|'blocked'|'cancelled'|'migrated'|'manual'|'completed';reason?:string;manual?:string[]};
+
+export interface ScopeOperationReportToken {
+    sequence:number;
+    requestVersion:string;
+    effectiveRevision:string;
+}
 
 export class MonitoringScopeController implements vscode.Disposable {
     private lastOperationOutcome?: MonitoringScopeActionOutcome;
 
-    public recordOperationOutcome(outcome: MonitoringScopeActionOutcome): void {
-        this.lastOperationOutcome = JSON.parse(JSON.stringify(outcome)) as MonitoringScopeActionOutcome;
+    private operationSequence=0;
+
+    public captureOperationOutcomeToken():ScopeOperationReportToken {
+        const requestVersion=this.getRequestVersion(),effectiveRevision=this.tracker.getEffectiveMonitoringScope().scopeRevision;
+        return {sequence:++this.operationSequence,requestVersion,effectiveRevision};
+    }
+
+    /** Only local validation/review feedback may be reported by a UI callback. */
+    public recordUnchangedOperationOutcome(outcome:MonitoringScopeApplyOutcome,token:ScopeOperationReportToken):void {
+        if (outcome.scopeCommitted || (outcome.settingsStatus && outcome.settingsStatus!=='unchanged') ||
+            (outcome.coverageStatus && outcome.coverageStatus!=='notRun') ||
+            !['conflict','invalid','cancelled','restored','failed'].includes(outcome.status)) { return; }
+        if(token.sequence!==this.operationSequence || (outcome.status!=='conflict' && token.requestVersion!==this.getRequestVersion()) ||
+            token.effectiveRevision!==this.tracker.getEffectiveMonitoringScope().scopeRevision){return;}
+        this.operationSequence++;
+        this.lastOperationOutcome=JSON.parse(JSON.stringify(outcome)) as MonitoringScopeApplyOutcome;
+    }
+
+    private async recordScopeOperation<T>(
+        operation:()=>Promise<T>, present:(result:T)=>MonitoringScopeActionOutcome
+    ):Promise<T> {
+        const sequence=++this.operationSequence;
+        try {
+            const result=await operation();
+            // The latest user initiation owns diagnostics. A late completion
+            // or a closed panel cannot overwrite a newer operation's result.
+            if(sequence===this.operationSequence){
+                this.lastOperationOutcome=JSON.parse(JSON.stringify(present(result))) as MonitoringScopeActionOutcome;
+            }
+            return result;
+        } catch(error) {
+            if(sequence===this.operationSequence){
+                this.lastOperationOutcome={status:'failed',reason:`Scope operation did not complete: ${String(error)} Check requested and effective state in Status.`};
+            }
+            throw error;
+        }
     }
     private readonly disposables: vscode.Disposable[] = [];
     private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
@@ -144,6 +184,10 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        return this.recordScopeOperation(()=>this.recheckObservationCoverageNow(),result=>result);
+    }
+
+    private recheckObservationCoverageNow(): Promise<ObservationCoverageRecheckResult> {
         const blocker=this.getScopeSettingsWriteBlocker();
         if (blocker) { return Promise.resolve({status:'conflict',reason:blocker}); }
         this.reconcileRequestedScope();
@@ -510,11 +554,11 @@ export class MonitoringScopeController implements vscode.Disposable {
      */
     public requestExcludeCoverageSubtree(targetPath: string): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
         // Merge only after all earlier scope-setting writes have finished.
-        return this.enqueueScopeSettingsWrite(() => this.saveCoverageSubtreeExclusion(targetPath));
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>this.saveCoverageSubtreeExclusion(targetPath)),result=>result);
     }
 
     public requestExcludeResource(targetPath: string, directory: boolean): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
-        return this.enqueueScopeSettingsWrite(() => this.saveCoverageSubtreeExclusion(targetPath, false, directory));
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>this.saveCoverageSubtreeExclusion(targetPath,false,directory)),result=>result);
     }
 
     public excludeCoverageSubtree(
@@ -525,7 +569,14 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     /** Confirm a quick exclusion before saving settings or pausing any reads. */
-    public async excludeResource(
+    public excludeResource(
+        targetPath:string,directory:boolean,confirm:(affectedReviewPaths:readonly string[])=>Promise<boolean>,
+        requireCoverage=false,stillCurrent:()=>boolean=()=>true
+    ):Promise<MonitoringScopeApplyOutcome|{status:'cancelled'|'alreadyExcluded'|'blocked';reason?:string}> {
+        return this.recordScopeOperation(()=>this.excludeResourceNow(targetPath,directory,confirm,requireCoverage,stillCurrent),result=>result);
+    }
+
+    private async excludeResourceNow(
         targetPath: string,
         directory: boolean,
         confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>,
@@ -751,13 +802,15 @@ export class MonitoringScopeController implements vscode.Disposable {
             expectedRequestVersion?: string;
         }
     ): Promise<ScopeValidationResult> {
-        return this.enqueueScopeSettingsWrite(async () => {
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(async () => {
             try { return await this.saveRequestedScopeNow(request,options); }
             catch (error) {
                 if (!(error instanceof ScopeSettingsOwnershipConflict)) { throw error; }
                 return {ok:false,warnings:[],errors:[{field:'exclude' as const,message:error.message}]};
             }
-        });
+        }),result=>result.ok ? {status:'saved',settingsStatus:'saved',scopeCommitted:false,coverageStatus:'notRun',
+            reason:'Monitoring scope request saved only. It is pending until applied; excluded paths may pause reads.'}
+            : {status:'conflict',reason:result.errors.map(error=>error.message).join('; ')});
     }
 
     public getRequestVersion(): string {
@@ -766,7 +819,14 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     /** Validate and confirm the complete editor proposal before any settings write. */
-    public async saveAndApplyScope(
+    public saveAndApplyScope(
+        request:MonitoringScopeRequest,confirm:(proposal:MonitoringScopeConfirmation)=>Promise<boolean>,
+        expectedRequestVersion=this.getRequestVersion(),proposalStillCurrent:()=>boolean=()=>true
+    ):Promise<MonitoringScopeApplyOutcome> {
+        return this.recordScopeOperation(()=>this.saveAndApplyScopeNow(request,confirm,expectedRequestVersion,proposalStillCurrent),result=>result);
+    }
+
+    private async saveAndApplyScopeNow(
         request: MonitoringScopeRequest,
         confirm: (proposal: MonitoringScopeConfirmation) => Promise<boolean>,
         expectedRequestVersion = this.getRequestVersion(),
@@ -979,7 +1039,14 @@ export class MonitoringScopeController implements vscode.Disposable {
         return validated;
     }
 
-    public async applyPendingScope(options?: {
+    public applyPendingScope(options?: {
+        grantConsent?:boolean;discardExplicitlyExcludedReviews?:boolean;
+        expectedScopeRevision?:string;expectedAffectedReviewRevision?:string;
+    }):Promise<MonitoringScopeApplyOutcome> {
+        return this.recordScopeOperation(()=>this.applyPendingScopeNow(options),result=>result);
+    }
+
+    private async applyPendingScopeNow(options?: {
         grantConsent?: boolean;
         discardExplicitlyExcludedReviews?: boolean;
         expectedScopeRevision?: string;
@@ -1086,7 +1153,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public migrateLegacyWatchRules(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
-        return this.enqueueScopeSettingsWrite(() => this.migrateLegacyWatchRulesNow());
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>this.migrateLegacyWatchRulesNow()),result=>result);
     }
 
     private async migrateLegacyWatchRulesNow(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
@@ -1155,7 +1222,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     public completeLegacyMigrationUsingCurrentScope(
         reviewedTarget?: MonitoringScopeRequest
     ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
-        return this.enqueueScopeSettingsWrite(() => this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget));
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget)),result=>result);
     }
 
     private async completeLegacyMigrationUsingCurrentScopeNow(
@@ -1272,6 +1339,10 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public restoreEffectiveScopeConfiguration(options?: {expectedRequestVersion:string;expectedScopeRevision?:string}): Promise<MonitoringScopeApplyOutcome> {
+        return this.recordScopeOperation(()=>this.restoreEffectiveScopeConfigurationRequest(options),result=>result);
+    }
+
+    private restoreEffectiveScopeConfigurationRequest(options?: {expectedRequestVersion:string;expectedScopeRevision?:string}): Promise<MonitoringScopeApplyOutcome> {
         const blocker=this.getScopeSettingsWriteBlocker();
         if (blocker) { return Promise.resolve({status:'conflict',reason:blocker,settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'}); }
         return this.enqueueScopeSettingsWrite(() => this.restoreEffectiveScopeConfigurationNow(options));

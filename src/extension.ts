@@ -1300,7 +1300,6 @@ export async function activate(context: vscode.ExtensionContext) {
                     );
                     return answer === 'Discard Reviews and Stop Recording';
                 }, false, lease?.current);
-                monitoringScopeController.recordOperationOutcome(outcome);
                 if (outcome.status === 'applied') {
                     void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected path. Workspace files and unrelated reviews are unchanged.'}`);
                 } else if (outcome.status === 'alreadyExcluded') {
@@ -1333,7 +1332,6 @@ export async function activate(context: vscode.ExtensionContext) {
                     );
                     return answer === 'Discard Reviews and Stop Recording';
                 }, lease?.current);
-                monitoringScopeController.recordOperationOutcome(outcome);
                 if (outcome.status === 'applied') {
                     void vscode.window.showInformationMessage(
                         `Code Diff Tracker: ${outcome.reason ?? 'Stopped recording the selected folder. Workspace files and unrelated reviews are unchanged.'}`
