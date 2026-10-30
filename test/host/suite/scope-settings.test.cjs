@@ -20,6 +20,11 @@ module.exports = async function scopeSettingsCheckpoint() {
         throw new Error(`Scope settings Host timed out: ${description}; trace=${JSON.stringify(trace)}`);
     };
     await vscode.extensions.getExtension('lengmh.code-diff-tracker').activate();
+    const configurationSources=()=>({
+        workspace:vscode.workspace.getConfiguration('diffTracker').inspect('watchExclude').workspaceValue,
+        folder:vscode.workspace.getConfiguration('diffTracker',vscode.workspace.workspaceFolders[0].uri)
+            .inspect('watchExclude').workspaceFolderValue
+    });
     const observe = vscode.workspace.onDidChangeConfiguration(event => {
         const keys = ['monitoringScope','watchInclude','watchExclude'].filter(key=>event.affectsConfiguration(`diffTracker.${key}`));
         if (keys.length) { trace.push({stage,kind:'notification',keys}); }
@@ -51,9 +56,11 @@ module.exports = async function scopeSettingsCheckpoint() {
         assert.equal(vscode.workspace.getConfiguration('diffTracker').inspect('watchInclude').workspaceValue,undefined,
             'the single-folder fixture must exercise unset-to-empty settings');
         stage='stopped-save';
+        trace.push({stage,kind:'sources-before',...configurationSources()});
         const first = await vscode.commands.executeCommand('diffTracker._testSaveAndApplyScope',{
             mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/prior-cache/'},{scope:'all',pattern:'/generated-cache/'}]
         });
+        trace.push({stage,kind:'sources-after',...configurationSources()});
         assert.equal(first.status,'applied',JSON.stringify({first,trace}));
         assert.equal(first.scopeCommitted,true);
         assert.equal((await state()).isRecording,false,'saving exclusions must not start recording');

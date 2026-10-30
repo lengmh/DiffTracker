@@ -123,7 +123,9 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         vscode.workspace.getConfiguration = (...args) => ({
             ...oldConfig(...args),
             get: (key, fallback) => Object.hasOwn(config, key) ? config[key] : oldConfig(...args).get(key, fallback),
-            inspect: key => ({ workspaceValue: config[key] }),
+            inspect: key => ({ workspaceValue: config[key],
+                workspaceFolderValue:options.singleFolderAlias && args[1]
+                    ? hooks.folderValue ? hooks.folderValue(key) : config[key] : undefined }),
             update: async (key, value) => {
                 writes.push([key, value]);
                 await hooks.beforeWrite?.(key, value);
@@ -184,6 +186,28 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         },{deferConfigurationReadback:key=>key==='watchExclude'});
     },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
 
+    for(const independent of ['workspace-file','different-folder-value'])
+    test(`EXCLUDES owned save retains independent Folder guard (${independent})`, () => fixture(async ({tracker,scope}) => {
+        const workspaceFile=vscode.workspace.workspaceFile;
+        try{
+            if(independent==='workspace-file'){vscode.workspace.workspaceFile=Uri.file('scope-test.code-workspace');}
+            await withController(tracker,scope,async({controller,hooks,config})=>{
+                if(independent==='different-folder-value'){
+                    let changed=false;
+                    hooks.afterWrite=key=>{if(key==='watchExclude'){changed=true;}};
+                    hooks.folderValue=key=>key==='watchExclude'&&changed
+                        ? [{scope:'all',pattern:'/independent-folder/'}] : config[key];
+                }
+                const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],
+                    excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+                assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,false);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/generated-cache/'}]);
+            },{singleFolderAlias:true});
+        }finally{vscode.workspace.workspaceFile=workspaceFile;}
+    },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
     test('EXCLUDES coverage shortcut settles its saved exclusion and retires only its target gap', () => fixture(async ({tracker,scope,dir}) => {
         const selected = path.join(dir,'generated-cache');
         fs.mkdirSync(selected);
@@ -194,6 +218,31 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
             assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
         },{deferConfigurationReadback:key=>key==='watchExclude'});
+    },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
+    test('EXCLUDES single-folder Workspace and Folder aliases retain owned Save and Apply authority', () => fixture(async ({tracker,scope}) => {
+        await withController(tracker,scope,async({controller})=>{
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],
+                excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
+        },{singleFolderAlias:true});
+    },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
+    test('EXCLUDES changing workspace layout cannot turn an independent source into an owned alias', () => fixture(async ({tracker,scope}) => {
+        const workspaceFile=vscode.workspace.workspaceFile;
+        vscode.workspace.workspaceFile=Uri.file('independent.code-workspace');
+        try{
+            await withController(tracker,scope,async({controller,hooks,config})=>{
+                hooks.afterWrite=key=>{if(key==='watchExclude'){vscode.workspace.workspaceFile=undefined;}};
+                const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],
+                    excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+                assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,false);
+                assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/generated-cache/'}]);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+            },{singleFolderAlias:true});
+        }finally{vscode.workspace.workspaceFile=workspaceFile;}
     },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
 
     test('EXCLUDES an observed competing edit cannot be compensated away when its final value matches the proposal', () => fixture(async ({tracker,scope}) => {

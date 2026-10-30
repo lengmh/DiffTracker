@@ -1,12 +1,96 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 
 export function registerRecheckObservationCoverage(h, fixture) {
     const { test, setVsCodeExcludes, nativeDirectoryWatchers, waitUntil, Uri, vscode, fireConfigurationChanged } = h;
     const ownerFor = directory => [...nativeDirectoryWatchers].reverse().find(owner =>
         owner.active && path.resolve(String(owner.directory)) === directory);
     const savedState = tracker => JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
+    test('RECHECK upgrades a 0.8.10 tracker unnamed runtime record without replacing baselines or Undo', () => fixture(async context => {
+        let {tracker}=context;
+        const {dir}=context,storage=tracker.storageUri;
+        const fixtureState=JSON.parse(fs.readFileSync(new URL('./fixtures/unnamed-runtime-0.8.10.json',import.meta.url),'utf8'));
+        assert.equal(fixtureState.sourceVersion,'0.8.10');
+        assert.equal(fixtureState.sourceCommit,'ddc2190cc0dba35944fc80dfba8ba963a2d850ca');
+        const bind=value=>{
+            if(Array.isArray(value)){return value.map(bind);}
+            if(value&&typeof value==='object'){return Object.fromEntries(Object.entries(value).map(([key,item])=>[key,bind(item)]));}
+            if(typeof value!=='string'){return value;}
+            const uriPrefix='file://FIXTURE_WORKSPACE';
+            if(value.startsWith(uriPrefix)){return Uri.file(path.join(dir,...value.slice(uriPrefix.length).split('/').filter(Boolean))).toString();}
+            if(value.startsWith('FIXTURE_WORKSPACE')){return path.join(dir,...value.slice('FIXTURE_WORKSPACE'.length).split('/').filter(Boolean));}
+            return value;
+        };
+        const state=bind(fixtureState.state);
+        // Rebind only fixture location/root identity; retain old diagnostics,
+        // snapshots, unknown before-image and the actual persisted Undo record.
+        const checked=validateAndCanonicalizeScope(state.effectiveMonitoringScope,tracker.currentWorkspaceRootIdentities());
+        assert.equal(checked.ok,true,JSON.stringify(checked.errors));
+        state.effectiveMonitoringScope={kind:'configured',...checked.scope};
+        const blind=path.join(dir,'native-owner'),target=path.join(blind,'tracked.txt'),undo=path.join(dir,'undo.txt');
+        fs.mkdirSync(blind);fs.writeFileSync(target,'pending');fs.writeFileSync(undo,'undo baseline');
+        fs.writeFileSync(path.join(blind,'unknown.txt'),'unknown before');
+        setVsCodeExcludes({'files.watcherExclude':{'native-owner/**':true}});
+        await tracker.dispose();
+        fs.mkdirSync(storage.fsPath,{recursive:true});
+        fs.writeFileSync(path.join(storage.fsPath,'session-state.json'),JSON.stringify(state));
+        tracker=new h.DiffTracker(storage);h.setTracker(tracker);
+        assert.equal(await tracker.restorePersistedState(),'restored');
+        assert.equal(tracker.getOriginalContent(target),'original');
+        assert.equal(tracker.getOriginalContent(path.join(blind,'unknown.txt')),undefined);
+        assert.equal((await tracker.recheckObservationCoverage()).status,'rechecked');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+        assert.equal(tracker.getTrackedChange(target)?.currentContent,'pending');
+        assert.equal(tracker.getTrackedChange(path.join(blind,'unknown.txt'))?.reviewKind,'unknown');
+        assert.deepEqual(tracker.revertHistory,state.revertHistory);
+        fs.writeFileSync(target,'observed after upgrade');ownerFor(blind).listener('change','tracked.txt');
+        await waitUntil(()=>tracker.getTrackedChange(target)?.currentContent==='observed after upgrade');
+        assert.equal((await tracker.undoLastRevert()).succeeded,1);
+        assert.equal(fs.readFileSync(undo,'utf8'),'undo pending');
+    }));
+    for (const scenario of ['success','dirty','native-failure'])
+    test(`RECHECK unnamed callback preserves review and Undo (${scenario})`, () => fixture(async ({tracker,scope,dir}) => {
+        const blind=path.join(dir,'native-owner');fs.mkdirSync(blind);
+        const target=path.join(blind,'tracked.txt'),undo=path.join(dir,'undo.txt');
+        fs.writeFileSync(target,'original');fs.writeFileSync(undo,'undo baseline');
+        setVsCodeExcludes({'files.watcherExclude':{'native-owner/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        fs.writeFileSync(undo,'undo pending');await tracker.readFileAndUpdate(undo,Uri.file(undo));
+        assert.equal((await tracker.revertFile(undo)).status,'success');
+        const history=structuredClone(tracker.revertHistory),token=tracker.getReviewToken(target);
+        const unknown=path.join(blind,'unknown.txt');fs.writeFileSync(unknown,'unknown before');
+        tracker.recordUnresolvedBaseline(unknown,'Unverified before-image');
+        await tracker.readFileAndUpdate(unknown,Uri.file(unknown));
+        ownerFor(blind).listener('change',undefined);
+        assert.equal(tracker.getSubtreeCoverageGaps().find(gap=>gap.targetPath===blind)?.reasonCode,
+            'supplemental-watcher-runtime-gap');
+        const watch=fs.watch;
+        if(scenario==='native-failure'){
+            const failure=Object.assign(new Error('Synthetic native owner unavailable'),{code:'ENOSPC'});
+            ownerFor(blind).error(failure);
+            fs.watch=(directory,...args)=>{if(String(directory)===blind){throw failure;}return watch(directory,...args);};
+        }
+        if(scenario==='dirty'){vscode.workspace.textDocuments.push({uri:Uri.file(target),isDirty:true});}
+        try{
+            const result=await tracker.recheckObservationCoverage();
+            assert.equal(result.status,scenario==='success'?'rechecked':scenario==='dirty'?'conflict':'limited',
+                JSON.stringify({result,gaps:tracker.getSubtreeCoverageGaps()}));
+            assert.equal(tracker.getOriginalContent(target),'original');
+            assert.deepEqual(tracker.getReviewToken(target),token);
+            assert.equal(tracker.getOriginalContent(unknown),undefined);
+            assert.equal(tracker.getTrackedChange(unknown).reviewKind,'unknown');
+            assert.deepEqual(tracker.revertHistory,history);
+            if(scenario==='success'){
+                fs.writeFileSync(target,'later native edit');ownerFor(blind).listener('change','tracked.txt');
+                await waitUntil(()=>tracker.getTrackedChange(target)?.currentContent==='later native edit');
+                assert.equal((await tracker.undoLastRevert()).succeeded,1);
+                assert.equal(fs.readFileSync(undo,'utf8'),'undo pending');
+            }else{assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===blind));}
+        }finally{fs.watch=watch;if(scenario==='dirty'){vscode.workspace.textDocuments.pop();}}
+    }));
     async function seed({ tracker, scope, dir }) {
         const target = path.join(dir, 'baseline.txt');
         fs.writeFileSync(target, 'baseline');

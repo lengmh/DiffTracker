@@ -257,7 +257,13 @@ export class MonitoringScopeController implements vscode.Disposable {
         return createLegacySourceFingerprint(this.getLegacySourceSnapshot(roots));
     }
 
-    private migrationUnaffectedSourcesMatch(before: LegacySourceSnapshot, after: LegacySourceSnapshot): boolean {
+    private migrationUnaffectedSourcesMatch(before: LegacySourceSnapshot, after: LegacySourceSnapshot, workspaceFile: string | undefined): boolean {
+        if (vscode.workspace.workspaceFile?.toString() !== workspaceFile) { return false; }
+        const aliasesWorkspace = !workspaceFile && before.roots.length === 1 && after.roots.length === 1 &&
+            before.folders.length === 1 && after.folders.length === 1 &&
+            before.folders[0].root.uri === after.folders[0].root.uri &&
+            [before,after].every(snapshot => createLegacySourceFingerprint(snapshot.folders[0].workspaceFolder) ===
+                createLegacySourceFingerprint(snapshot.workspace));
         const projection = (snapshot: LegacySourceSnapshot) => ({
             model: snapshot.model,
             semanticsModel: snapshot.semanticsModel,
@@ -265,7 +271,11 @@ export class MonitoringScopeController implements vscode.Disposable {
             global: snapshot.global,
             folders: snapshot.folders.map(folder => ({
                 root: folder.root,
-                workspaceFolder: folder.workspaceFolder
+                // In a single-folder window VS Code exposes the same source
+                // as Workspace and Folder configuration. Its owned Workspace
+                // update is not an independent Folder edit. A workspace file,
+                // multiple roots, or differing values keep the strict guard.
+                workspaceFolder: aliasesWorkspace ? {kind:'workspaceAlias'} : folder.workspaceFolder
             }))
         });
         return createLegacySourceFingerprint(projection(before)) ===
@@ -696,11 +706,12 @@ export class MonitoringScopeController implements vscode.Disposable {
         const roots = JSON.stringify(this.getWorkspaceRoots());
         const effectiveFingerprint = createLegacySourceFingerprint(effective);
         const legacy = this.getLegacySourceSnapshot();
+        const workspaceFile = vscode.workspace.workspaceFile?.toString();
         let settingsOwnershipLost = false;
         const current = () => !settingsOwnershipLost && !this.disposed && this.settingsFingerprint() === this.settingsFingerprint(expected) &&
             JSON.stringify(this.getWorkspaceRoots()) === roots &&
             createLegacySourceFingerprint(this.tracker.getEffectiveMonitoringScope()) === effectiveFingerprint &&
-            this.migrationUnaffectedSourcesMatch(legacy,this.getLegacySourceSnapshot());
+            this.migrationUnaffectedSourcesMatch(legacy,this.getLegacySourceSnapshot(),workspaceFile);
         const reviewCurrent = () => this.tracker.getExplicitlyExcludedReviewRevision(scope) === affectedReviewRevision;
         this.scopeActionInProgress = true;
         try {
@@ -978,6 +989,7 @@ export class MonitoringScopeController implements vscode.Disposable {
 
     private async migrateLegacyWatchRulesNow(): Promise<{ status: 'migrated' | 'manual' | 'conflict'; reason?: string; manual?: string[] }> {
         const approvedSource = this.getLegacySourceSnapshot();
+        const workspaceFile = vscode.workspace.workspaceFile?.toString();
         const approvedSourceFingerprint = createLegacySourceFingerprint(approvedSource);
         const liveRules = this.getLegacyWatchRules();
         const committedRules = this.getCommittedLegacyRules()
@@ -1019,7 +1031,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const currentSource = this.getLegacySourceSnapshot();
         if (!latestRequested.ok || !latestRequested.scope ||
             latestRequested.scope.scopeRevision !== validated.scope.scopeRevision ||
-            !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
+            !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource,workspaceFile)) {
             return { status: 'conflict', reason: 'Legacy rule sources or the migration target changed while settings were being written; review the current migration again.' };
         }
         try {
@@ -1049,6 +1061,7 @@ export class MonitoringScopeController implements vscode.Disposable {
     ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
         const roots = this.getWorkspaceRoots();
         const approvedSource = this.getLegacySourceSnapshot(roots);
+        const workspaceFile = vscode.workspace.workspaceFile?.toString();
         const approvedSourceFingerprint = this.getManualApprovedSourceFingerprint(roots);
         let requested: ScopeValidationResult;
 
@@ -1074,7 +1087,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             const currentSource = this.getLegacySourceSnapshot();
             if (!latestRequested.ok || !latestRequested.scope ||
                 latestRequested.scope.scopeRevision !== requested.scope.scopeRevision ||
-                !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource)) {
+                !this.migrationUnaffectedSourcesMatch(approvedSource, currentSource,workspaceFile)) {
                 return {
                     status: 'invalid',
                     reason: 'Legacy rule sources or the reviewed migration target changed while settings were being saved; review the current migration again.'
