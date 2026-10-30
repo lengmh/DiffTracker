@@ -1270,7 +1270,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // pending, even if the editor that started that write has closed.
         if (monitoringScopeController.hasActiveScopeAction()) {
             void vscode.window.showWarningMessage(
-                'Code Diff Tracker: Wait for the monitoring-scope action (including quick exclusion confirmation and settings save) to finish before opening Manage Monitoring Scope.'
+                `Code Diff Tracker: ${monitoringScopeController.getScopeSettingsWriteBlocker() ?? 'Wait for the monitoring-scope action (including quick exclusion confirmation and settings save) to finish before opening Manage Monitoring Scope.'}`
             );
             return undefined;
         }

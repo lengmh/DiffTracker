@@ -8,7 +8,8 @@ export function registerRecheckObservationCoverage(h, fixture) {
     const ownerFor = directory => [...nativeDirectoryWatchers].reverse().find(owner =>
         owner.active && path.resolve(String(owner.directory)) === directory);
     const savedState = tracker => JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
-    test('RECHECK upgrades a 0.8.10 tracker unnamed runtime record without replacing baselines or Undo', () => fixture(async context => {
+    for(const failure of ['none','native','persistence'])
+    test(`RECHECK upgrades a 0.8.10 unnamed runtime record without replacing baselines or Undo (${failure})`, () => fixture(async context => {
         let {tracker}=context;
         const {dir}=context,storage=tracker.storageUri;
         const fixtureState=JSON.parse(fs.readFileSync(new URL('./fixtures/unnamed-runtime-0.8.10.json',import.meta.url),'utf8'));
@@ -40,7 +41,35 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(await tracker.restorePersistedState(),'restored');
         assert.equal(tracker.getOriginalContent(target),'original');
         assert.equal(tracker.getOriginalContent(path.join(blind,'unknown.txt')),undefined);
-        assert.equal((await tracker.recheckObservationCoverage()).status,'rechecked');
+        const watch=fs.watch,write=vscode.workspace.fs.writeFile;let injected=false;
+        if(failure==='native'){
+            const error=Object.assign(new Error('Synthetic upgraded native owner unavailable'),{code:'ENOSPC'});
+            ownerFor(blind)?.error(error);
+            fs.watch=(directory,...args)=>{if(String(directory)===blind){injected=true;throw error;}return watch(directory,...args);};
+        }
+        if(failure==='persistence'){
+            vscode.workspace.fs.writeFile=async(uri,bytes)=>{
+                if(!injected&&path.basename(uri.fsPath)==='session-state.tmp.json'){
+                    const candidate=JSON.parse(Buffer.from(bytes).toString());
+                    if(!candidate.coverageGaps.some(([,record])=>record.subtree?.reasonCode==='coverage-recheck-incomplete')){
+                        injected=true;throw new Error('Synthetic upgraded retirement persistence failure');
+                    }
+                }
+                return write(uri,bytes);
+            };
+        }
+        let result;
+        try{result=await tracker.recheckObservationCoverage();}
+        finally{fs.watch=watch;vscode.workspace.fs.writeFile=write;}
+        assert.equal(result.status,failure==='none'?'rechecked':failure==='native'?'limited':'failed',JSON.stringify(result));
+        if(failure!=='none'){
+            assert.equal(injected,true);assert.ok(tracker.getSubtreeCoverageGaps().length>0);
+            assert.equal(tracker.getOriginalContent(target),'original');
+            assert.equal(tracker.getOriginalContent(path.join(blind,'unknown.txt')),undefined);
+            assert.deepEqual(tracker.revertHistory,state.revertHistory);
+            assert.ok(savedState(tracker).coverageGaps.length>0,'unverified recovery must remain durable');
+            return;
+        }
         assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
         assert.equal(tracker.getTrackedChange(target)?.currentContent,'pending');
         assert.equal(tracker.getTrackedChange(path.join(blind,'unknown.txt'))?.reviewKind,'unknown');

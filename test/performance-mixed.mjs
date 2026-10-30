@@ -77,6 +77,7 @@ const configurationChanged = new Emitter();
 const hostWatchers = new Set();
 const nativeWatchers = new Map();
 const burstDirectoryNotifications = new Set();
+const nativeEventTrace = [];
 const watcherMetrics = { apiBoundaryPeak: 0, realNativePeak: 0, realNativeEvents: 0, injectedHostEvents: 0 };
 const warnings = [];
 let phase = 'setup';
@@ -93,6 +94,9 @@ const nativeWatch = fs.watch;
 fs.watch = (directory, options, listener) => {
     const watcher = nativeWatch(directory, options, (...args) => {
         watcherMetrics.realNativeEvents++;
+        if(nativeEventTrace.length===64){nativeEventTrace.shift();}
+        nativeEventTrace.push({phase,directory:path.relative(root,String(directory)),
+            kind:args[0],filename:args[1]?.toString()??null});
         // Some native backends notify a parent about child-directory metadata
         // when entries inside that child are created, removed or replaced.
         // Record the boundary evidence without changing the production event.
@@ -371,7 +375,11 @@ try {
     assert.equal(await tracker.flushPendingPersistence(), true);
     const beforeRecheckSession = readSession();
     const persistedBurstGaps = new Map(beforeRecheckSession.coverageGaps);
-    assert.deepEqual(new Set(persistedBurstGaps.keys()), new Set(burstCoverageGaps.map(gap => gap.targetPath)));
+    assert.deepEqual(new Set(persistedBurstGaps.keys()), new Set(burstCoverageGaps.map(gap => gap.targetPath)),JSON.stringify({
+        before:burstCoverageGaps.map(gap=>({path:path.relative(root,gap.targetPath),code:gap.reasonCode})),
+        persisted:[...persistedBurstGaps].map(([target,record])=>({path:path.relative(root,target),record})),
+        nativeEventTrace
+    }));
     for (const gap of burstCoverageGaps) {
         const evidence = persistedBurstGaps.get(gap.targetPath);
         assert.equal(evidence.file, undefined);

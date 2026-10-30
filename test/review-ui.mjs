@@ -885,7 +885,7 @@ await test('scope editor stays blocked through each applied quick exclusion and 
 });
 
 for (const failure of ['rejected operation', 'failed settings write']) {
-    await test(`scope editor ownership is released after a ${failure}`, async () => {
+    await test(`scope editor preserves the correct ownership after a ${failure}`, async () => {
         const h = monitoringScopeCommandHarness();
         if (failure === 'rejected operation') {
             h.tracker.getSubtreeCoverageGaps = () => { throw new Error('controlled coverage lookup failure'); };
@@ -893,8 +893,14 @@ for (const failure of ['rejected operation', 'failed settings write']) {
         } else {
             h.state.beforeConfigurationUpdate = async () => { throw new Error('controlled settings failure'); };
             const result = await h.run('excludeCoverageSubtree', h.targets[0]);
-            assert.equal(result.status, 'conflict');
+            assert.equal(result.status, 'partial');
             assert.match(result.reason,/controlled settings failure/);
+            assert.equal(h.controller.hasPendingScopeSettingsWrites(),true);
+            await h.run('manageMonitoringScope');
+            assert.equal(h.WatchExcludePanel.currentPanel,undefined);
+            assert.match(h.state.warnings.at(-1),/unverified.*reload/i);
+            h.controller.dispose();
+            return;
         }
         await h.run('manageMonitoringScope');
         assert.ok(h.WatchExcludePanel.currentPanel, 'a failed command must not leave the editor locked');

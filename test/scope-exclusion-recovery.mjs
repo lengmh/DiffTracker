@@ -128,13 +128,14 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                     ? hooks.folderValue ? hooks.folderValue(key) : config[key] : undefined }),
             update: async (key, value) => {
                 writes.push([key, value]);
-                await hooks.beforeWrite?.(key, value);
-                await new Promise(resolve => setImmediate(resolve));
                 const publish = async () => {
                     config[key] = structuredClone(value);
                     await hooks.afterWrite?.(key, value);
                     notifyConfiguration(key);
                 };
+                if(hooks.update){return hooks.update(key,value,publish);}
+                await hooks.beforeWrite?.(key, value);
+                await new Promise(resolve => setImmediate(resolve));
                 if (options.deferConfigurationReadback?.(key)) {
                     configurationPublications.push(new Promise((resolve, reject) => {
                         setImmediate(() => { void publish().then(resolve, reject); });
@@ -185,6 +186,162 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             ]);
         },{deferConfigurationReadback:key=>key==='watchExclude'});
     },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
+    for(const kind of ['save','shortcut']) for(const boundary of ['acknowledgement','publication','rejection'])
+    test(`EXCLUDES uncertain ${kind} ${boundary} preserves settings and fences late writes without applying`,()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior interval');
+        await withController(tracker,scope,async({controller,config,writes,hooks})=>{
+            const timer=globalThis.setTimeout;let deadline,release,publishLate,action;
+            const response=new Promise(resolve=>{release=resolve;});
+            globalThis.setTimeout=(callback,ms,...args)=>{
+                if(ms===2000){deadline=()=>callback(...args);return timer(()=>{},60000);}
+                return timer(callback,ms,...args);
+            };
+            try{
+                hooks.update=async(key,value,publish)=>{
+                    if(key!=='watchExclude'){await publish();return;}
+                    publishLate=publish;
+                    if(boundary==='acknowledgement'){await response;await publish();}
+                    if(boundary==='rejection'){throw new Error('Rejected after an unverified write');}
+                };
+                const proposal={mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+                action=kind==='save' ? controller.saveAndApplyScope(proposal,async()=>true)
+                    : controller.excludeCoverageSubtree(selected,async()=>true);
+                for(let sample=0;sample<10&&!publishLate;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(typeof publishLate,'function');
+                if(boundary!=='rejection'){
+                    assert.equal(typeof deadline,'function','the API response and publication share a bounded deadline');
+                    deadline();
+                }
+                const outcome=await action;
+                assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,false);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.equal(controller.hasPendingScopeSettingsWrites(),true,'an unverified late write must retain its fence');
+                const count=writes.length;
+                assert.equal((await controller.saveAndApplyScope(proposal,async()=>true)).status,'conflict');
+                assert.equal((await controller.applyPendingScope()).status,'conflict');
+                assert.equal((await controller.restoreEffectiveScopeConfiguration()).status,'conflict');
+                assert.equal((await controller.recheckObservationCoverage()).status,'conflict');
+                assert.equal(writes.length,count,'neither compensation nor reentry may write across uncertainty');
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected));
+                release();await response;
+                if(boundary!=='acknowledgement'){await publishLate();}
+                for(let sample=0;sample<10&&controller.hasPendingScopeSettingsWrites();sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(controller.hasPendingScopeSettingsWrites(),false);
+                assert.deepEqual(config.watchExclude,proposal.excludes);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision,'late settlement cannot auto-apply');
+                const applied=await controller.applyPendingScope();
+                assert.equal(applied.status,'applied',JSON.stringify(applied));
+                assert.equal(writes.length,count,'Apply Saved Request consumes the settled request without rewriting it');
+                assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
+                assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
+            }finally{
+                release();globalThis.setTimeout=timer;await action?.catch(()=>{});
+            }
+        });
+    }));
+
+    test('EXCLUDES a rejected response with proved publication permits exact compensation',()=>fixture(async({tracker,scope})=>{
+        await withController(tracker,scope,async({controller,config,hooks})=>{
+            const before=structuredClone(config);let rejected=false;
+            hooks.update=async(key,value,publish)=>{
+                await publish();
+                if(key==='watchExclude'&&!rejected){rejected=true;throw new Error('Rejected after observable publication');}
+            };
+            const result=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],
+                excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+            assert.equal(result.status,'failed',JSON.stringify(result));assert.equal(result.settingsStatus,'restored');
+            assert.deepEqual(config,before);assert.equal(controller.hasPendingScopeSettingsWrites(),false);
+        });
+    }));
+
+    for(const kind of ['save-only','restore']) for(const stopped of [false,true])
+    test(`EXCLUDES ${kind} settles its three owned keys and preserves review (stopped=${stopped})`,()=>fixture(async({tracker,scope,dir})=>{
+        const target=path.join(dir,'pending.txt');fs.writeFileSync(target,'baseline');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        if(stopped){tracker.stopRecording();}const token=tracker.getReviewToken(target);
+        await withController(tracker,scope,async({controller,config,notifyConfiguration,writes})=>{
+            const proposal={mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+            if(kind==='restore'){
+                config.watchExclude=proposal.excludes;notifyConfiguration('watchExclude');
+                const result=await controller.restoreEffectiveScopeConfiguration();
+                assert.equal(result.status,'restored',JSON.stringify(result));assert.deepEqual(config.watchExclude,[]);
+            }else{
+                const saved=await controller.saveRequestedScope(proposal,{expectedRequestVersion:controller.getRequestVersion()});
+                assert.equal(saved.ok,true,JSON.stringify(saved));
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision,'Save Request Only must not apply');
+                const applied=await controller.applyPendingScope();assert.equal(applied.status,'applied',JSON.stringify(applied));
+            }
+            assert.equal(writes.length,3);assert.deepEqual(tracker.getReviewToken(target),token);
+            assert.equal(tracker.getOriginalContent(target),'baseline');assert.equal(tracker.getIsRecording(),!stopped);
+            assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
+        },{deferConfigurationReadback:()=>true});
+    }));
+
+    test('EXCLUDES shortcut compensation has a bounded response and preserves its unresolved fence',()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior interval');
+        await withController(tracker,scope,async({controller,config,writes,hooks})=>{
+            const timer=globalThis.setTimeout;let deadline,release,compensation=false,current=true,action;
+            const response=new Promise(resolve=>{release=resolve;});
+            globalThis.setTimeout=(callback,ms,...args)=>{
+                if(ms===2000){deadline=()=>callback(...args);return timer(()=>{},60000);}
+                return timer(callback,ms,...args);
+            };
+            hooks.update=async(_key,_value,publish)=>{
+                if(writes.length===1){await publish();current=false;}
+                else{compensation=true;await response;await publish();}
+            };
+            try{
+                action=controller.excludeCoverageSubtree(selected,async()=>true,()=>current);
+                for(let sample=0;sample<30&&!compensation;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(compensation,true);deadline();
+                const result=await action;
+                assert.equal(result.status,'partial',JSON.stringify(result));assert.equal(result.scopeCommitted,false);
+                assert.equal(controller.hasPendingScopeSettingsWrites(),true);assert.equal(writes.length,2);
+                assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/generated-cache/'}]);
+                release();for(let sample=0;sample<10&&controller.hasPendingScopeSettingsWrites();sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(controller.hasPendingScopeSettingsWrites(),false);assert.deepEqual(config.watchExclude,[]);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected));
+            }finally{release();globalThis.setTimeout=timer;await action?.catch(()=>{});}
+        });
+    }));
+
+    test('EXCLUDES disposal releases an unresponsive action without applying its late saved request',()=>fixture(async({tracker,scope})=>{
+        await withController(tracker,scope,async({controller,config,writes,hooks})=>{
+            let release,entered=false,completed=false;
+            const response=new Promise(resolve=>{release=resolve;});
+            hooks.update=async(key,_value,publish)=>{
+                if(key==='watchExclude'){entered=true;await response;}
+                await publish();
+            };
+            const proposal={mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+            const action=controller.saveAndApplyScope(proposal,async()=>true).then(result=>{completed=true;return result;});
+            try{
+                for(let sample=0;sample<10&&!entered;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(entered,true);controller.dispose();
+                for(let sample=0;sample<10&&!completed;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.equal(completed,true,'disposing cannot wait indefinitely for the settings service');
+                assert.equal((await action).status,'partial');assert.equal(controller.hasPendingScopeSettingsWrites(),false);
+                const count=writes.length;release();
+                for(let sample=0;sample<10&&config.watchExclude.length===0;sample++){await new Promise(resolve=>setImmediate(resolve));}
+                assert.deepEqual(config.watchExclude,proposal.excludes);assert.equal(writes.length,count);
+                assert.equal(tracker.getEffectiveMonitoringScope().scopeRevision,scope.scopeRevision);
+                const settings=new Map(),reloaded=new controller.constructor({workspaceState:{
+                    get:key=>settings.get(key),update:async(key,value)=>settings.set(key,value)
+                }},tracker);
+                try{
+                    assert.notEqual(reloaded.getStatus().requested.scope.scopeRevision,reloaded.getStatus().effective.scopeRevision);
+                    assert.equal((await reloaded.applyPendingScope()).status,'applied');
+                    assert.equal(reloaded.getStatus().requested.scope.scopeRevision,reloaded.getStatus().effective.scopeRevision);
+                }finally{reloaded.dispose();}
+            }finally{release();await action;}
+        });
+    }));
 
     for(const action of ['shortcut','save']) for(const phase of ['ignore','persist'])
     test(`EXCLUDES settled settings-file notification completes one ${action} action (${phase})`, () => fixture(async ({tracker,scope,dir}) => {
@@ -560,14 +717,15 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             let confirmations=0;
             const outcome=await controller.saveAndApplyScope(proposal,async()=>{confirmations++;return situation!=='cancel';});
             const committed=situation==='unrelated-failure';
-            assert.equal(outcome.status,situation==='cancel'?'cancelled':situation==='settings-failure'?'failed':situation==='unrelated-failure'?'applied':'partial',JSON.stringify(outcome));
+            assert.equal(outcome.status,situation==='cancel'?'cancelled':situation==='unrelated-failure'?'applied':'partial',JSON.stringify(outcome));
             assert.equal(outcome.scopeCommitted,committed);
             assert.equal(confirmations,1);
             if (situation==='cancel' || situation==='settings-failure') {
                 assert.deepEqual(config,before);
                 assert.deepEqual(tracker.getReviewToken(target),token);
-                assert.equal(outcome.settingsStatus,'unchanged');
+                assert.equal(outcome.settingsStatus,situation==='cancel'?'unchanged':'partial');
                 if(situation==='cancel')assert.equal(writes.length,0);
+                else{assert.equal(controller.hasPendingScopeSettingsWrites(),true);assert.equal(writes.length,2);}
             } else if (situation==='external-settings') {
                 assert.deepEqual(config.watchExclude,[{scope:'all',pattern:'/external/'}]);
                 assert.equal(writes.length,1);

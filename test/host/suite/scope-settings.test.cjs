@@ -109,15 +109,44 @@ module.exports = async function scopeSettingsCheckpoint() {
         assert.equal(active.scopeCommitted,true);
         const after = await scopeStatus();
         assert.equal(after.requested.scope.scopeRevision,after.effective.scopeRevision);
+        stage='active-shortcut';
+        const shortcut=await vscode.commands.executeCommand('diffTracker.excludeResource',uri('quick-cache'));
+        assert.equal(shortcut.status,'applied',JSON.stringify({shortcut,trace}));
+        assert.equal(shortcut.scopeCommitted,true);
+        const quickStatus=await scopeStatus();
+        assert.equal(quickStatus.requested.scope.scopeRevision,quickStatus.effective.scopeRevision);
+        assert.ok(quickStatus.effective.excludes.some(rule=>rule.pattern==='/quick-cache/'));
+
+        stage='apply-saved-request';
+        const savedExcludes=[...quickStatus.effective.excludes,{scope:'all',pattern:'/saved-cache/'}];
+        await vscode.workspace.getConfiguration('diffTracker').update('watchExclude',savedExcludes,vscode.ConfigurationTarget.Workspace);
+        const appliedSaved=await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(appliedSaved.status,'applied',JSON.stringify({appliedSaved,trace}));
+        const appliedStatus=await scopeStatus();
+        assert.equal(appliedStatus.requested.scope.scopeRevision,appliedStatus.effective.scopeRevision);
+
+        stage='restore-saved-request';
+        await vscode.workspace.getConfiguration('diffTracker').update('watchExclude',
+            [...savedExcludes,{scope:'all',pattern:'/temporary-draft/'}],vscode.ConfigurationTarget.Workspace);
+        const restored=await vscode.commands.executeCommand('diffTracker._testRestoreEffectiveScope');
+        assert.equal(restored.status,'restored',JSON.stringify({restored,trace}));
+        const restoredStatus=await scopeStatus();
+        assert.equal(restoredStatus.requested.scope.scopeRevision,appliedStatus.effective.scopeRevision);
+        assert.equal(restoredStatus.effective.scopeRevision,appliedStatus.effective.scopeRevision);
         assert.equal(await vscode.commands.executeCommand('diffTracker._testOriginalContent',uri('watched.txt').fsPath),'baseline\n');
         assert.equal(fs.readFileSync(uri('second-cache/existing.txt').fsPath,'utf8'),'cache baseline\n');
         fs.writeFileSync(uri('watched.txt').fsPath,'later observed text\n');
         fs.writeFileSync(uri('second-cache/existing.txt').fsPath,'excluded later text\n');
+        fs.writeFileSync(uri('quick-cache/existing.txt').fsPath,'excluded shortcut text\n');
+        fs.writeFileSync(uri('saved-cache/existing.txt').fsPath,'excluded saved request text\n');
         await until('later real observation',async()=> (await state()).trackedChanges.some(change=>
             change.filePath===uri('watched.txt').fsPath && change.currentContent==='later observed text\n'));
         const final = await state();
         assert.equal(final.isRecording,true);
         assert.equal(final.trackedChanges.some(change=>change.filePath===uri('second-cache/existing.txt').fsPath),false);
-        console.log(`PASS HOST-EXCLUDES real single-folder configuration publication and controller Save and Apply: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
+        for(const folder of ['quick-cache','saved-cache']){
+            assert.equal(final.trackedChanges.some(change=>change.filePath===uri(`${folder}/existing.txt`).fsPath),false);
+        }
+        console.log(`PASS HOST-EXCLUDES real configuration Save and Apply, shortcut, Apply Saved Request, Restore and continued observation: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
     } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;} }
 };

@@ -140,7 +140,7 @@ try {
     // from the original 150-second main scenario and its restart fixture.
     const settingsWorkspace = path.join(tempRoot,'scope-settings-workspace');
     mkdirSync(path.join(settingsWorkspace,'.vscode'),{recursive:true});
-    for (const name of ['prior-cache','generated-cache','second-cache']) {
+    for (const name of ['prior-cache','generated-cache','second-cache','quick-cache','saved-cache']) {
         mkdirSync(path.join(settingsWorkspace,name));
         writeFileSync(path.join(settingsWorkspace,name,'existing.txt'),'cache baseline\n');
     }

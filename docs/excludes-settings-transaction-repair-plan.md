@@ -79,129 +79,99 @@ Each checkpoint must distinguish proved behavior, boundary-model evidence and
 untested combinations. Passing mocked delayed-notification cases does not replace
 real Host evidence. Public examples and evidence use synthetic directories only.
 
-## Progress
+## Implementation and contract coverage
 
-- [x] Verify baseline, existing ADRs and public action seams.
-- [x] Record separate failure paths and limits of the initial boundary probe.
-- [ ] R0/R1 red/green configuration settlement and external-conflict regression.
-- [ ] R2 separate ignore-preparation reproduction and repair.
-- [ ] R3/R4 interaction and recovery matrix.
-- [ ] R5 complete real Host, quality, package and review acceptance.
+- [x] R0/R1 owned configuration settlement and external-conflict protection.
+- [x] R2 exact settings-file interference reproduction and bounded repair.
+- [x] R3/R4 interaction, lifecycle and failure boundary regressions.
+- [ ] R5 final exact-head real Host, quality, package and automatic review.
 
-The first implementation checkpoint settles an acknowledged configuration write
-against its observable Workspace request before proceeding to the next key or
-Apply. It listens before updating, accepts only the owned before/expected
-snapshots, stops on an observed competing request, and bounds missing
-publication without repeated writes or polling. The same settlement applies to
-Save and Apply compensation. An observed competing edit cannot regain old
-compensation authority by choosing the same final value as the proposal.
+Configuration API response and observable publication now share one deadline.
+Listeners start before each write. The action accepts its exact before/expected
+snapshots and retains an observed competing change even if it later chooses the
+proposal value. Missing responses and unverified rejection/publication return
+partial results without compensating across uncertainty. A retained write fence
+blocks new writes and Apply until the response and observable state settle, or
+the controller closes. Late completion never resumes Apply or compensation.
+Save Request Only and Restore use the same settlement, and disposal does not
+wait indefinitely for the API. An unresolved failure explains waiting or
+reloading before reviewing the saved Workspace request. Successful ordinary
+operations still need one initiation.
 
-Seven production controller/tracker boundary regressions cover delayed Save and
-Apply, the coverage shortcut, competing changes in both paths, delayed
-compensation, withdrawal after owned publication, and old unnamed-event
-diagnostic presentation. The scope settings
-Host checkpoint uses actual VS Code update/notification APIs in an isolated
-single-folder workspace, including stopped and active Save and Apply and
-continued real file observation. Its cross-platform execution remains pending.
+Single-folder VS Code windows expose Workspace settings through the Folder
+view too ([VS Code 1.80.2 implementation](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/configuration/browser/configurationService.ts#L609)).
+Joint before/after alias qualification preserves owned writes while retaining
+independent Folder values, multiple roots and workspace-file topology guards.
+Raw unset/empty values and canonical rule ordering keep their existing meaning.
 
-Unnamed-event recovery uses the existing guarded Recheck action; no baseline
-rebuild is prescribed or added. Ready coverage rows expose Recheck alongside
-exclusion. Blocked rows explain the current guard and retain scope management.
-Known obsolete persisted advice is corrected only for display; stored evidence
-and before-images are retained. The separately reported unnamed-event case was
-identified as 0.8.10; this does not establish the activated build for the
-exclusion-save failures, nor identify which gap remained after its Recheck.
+Before Apply, the tracker reconciles the one known settings control file through
+the ordinary review reader, preserving its original baseline. An operation-bound
+receipt checks epoch, request, scope eligibility, physical identity, metadata and
+SHA256. Only matching late notifications are duplicates; other events retain
+transaction invalidation and replay. The file is reverified at durable commit.
+Proof is limited to a 1 MiB file, 16 reads and 4 MiB total. Changed or unverified
+physical settings cannot be overwritten by compensation. An explicitly excluded
+control file is not read. No Apply retry or polling is added.
 
-R1 is not yet complete: missing/rejected update publication, partial saves and
-the broader conflict/restart matrix need further qualification. An independent
-R2 boundary probe now reproduces the exact ignore-policy invalidation when a
-notification for the settings file written by the action arrives during Apply
-preparation. The failed transaction compensates its exclusion request. This is
-separate from stale configuration readback and does not prove the field cause;
-the bounded handling below is now under real Host qualification. The initial
-documentation-head Verification run also failed Windows Stable Host during
-automatic moved-directory observation; that failure remains under diagnosis
-and is not established as repaired by the settings settlement changes.
+| Contract | Deterministic coverage |
+| --- | --- |
+| Delayed/duplicate publication, unset/empty values, canonical order, API timeout or rejection, partial three-key save | `EXCLUDES` cases in `test/scope-exclusion-recovery.mjs` |
+| Quick resource/coverage exclusion, Save and Apply, Save Request Only, Apply Saved Request, Restore | Same cases; `SCOPE-RECOVERY` cases and real configuration Host checkpoint |
+| Raw draft, current-version leases, Cancel, conflict review, duplicate actions, newer draft and stale results | `test/review-ui.mjs` production panel/command/renderer tests |
+| External edits and observed withdrawal/ABA, independent sources, topology, dirty/Stop, identity, byte and budget failures | `EXCLUDES` cases plus existing scope/coverage regressions |
+| Saved but unapplied request, compensation failure, late completion and controller recreation | `EXCLUDES uncertain`, compensation and disposal/recreation cases |
+| Committed exclusion with incomplete required recovery; unrelated faults remain separate | `SCOPE-RECOVERY`, single-action acceptance/crash and A5 regressions |
+| Old/fresh unnamed evidence, healthy Recheck, dirty refusal, native failure and retirement persistence failure | `test/recheck-observation-coverage.mjs` |
+| Unknown before-image, pending text, durable gap evidence, Undo and subsequent native-boundary edits | Recheck/upgrade tests and existing single-action recovery regressions |
 
-Full-regression diagnosis also exposed scoped test fixtures accumulating under
-the shared harness root until later Rules scans exhausted the production entry
-budget. Scoped fixture disposal now removes only its own workspace and storage.
-Production limits and the failing assertions remain intact.
+Unnamed events retain `supplemental-watcher-runtime-gap` evidence. Existing
+public Recheck can restore coverage when its guard, scan, owner and durability
+proofs succeed. Known obsolete rebuild advice is corrected only for display,
+including wrapped old reasons; durable records remain intact. Ready diagnostic
+rows expose guarded Recheck and single-action exclusion. Blocked rows explain
+the guard and retain scope management. No baseline-replacing button is added.
+The field unnamed report was explicitly identified as 0.8.10; that does not
+establish the version of the separate Excludes report.
 
-Local checkpoint validation passed: compile, lint, complete `npm test` (1,712
-tracker cases, 193 review UI cases, 28 real temporary Git scenarios and 10 Host
-fixture tests), performance smoke checks, and the actual 75-entry VSIX privacy
-inspection. Version remains 0.8.11. Real Host and exact-head CI results are not
-established by these local checks.
+Fresh unnamed probes pass on both released 0.8.10 and current tracker sources.
+A sanitized fixture generated by released 0.8.10 source exercises restoration,
+healthy recovery, native installation failure and retirement persistence failure.
+Failures retain unverified durable state and original review/Undo; success also
+observes a later edit and executes Undo. These production tracker tests mock VS
+Code/native boundaries. They do not prove the unspecified field remaining-gap
+cause, installed 0.8.10 upgrade behavior, or real OS capacity exhaustion.
 
-The first runtime head's three real Host variants all reproduced the same
-stopped Save and Apply failure after all three configuration notifications had
-arrived. The next checkpoint addresses a separate source-ownership defect:
-single-folder VS Code windows expose their Workspace configuration model as
-Folder configuration too ([VS Code 1.80.2 implementation](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/configuration/browser/configurationService.ts#L609)).
-Comparing the Folder alias as an independent source invalidated the action's
-own exclusion write. Joint before/after alias qualification now preserves owned
-updates while retaining independent Folder values and pinning workspace-file
-topology. Delayed readback and actual source aliasing are separate contracts.
+Two deterministic directory regressions separately exposed pre-proof parent
+coalescing spending the coordinator's proof allowance. It now reserves two
+actual proof passes and separately bounds preparation interruptions without
+progress. Strict upward coalescing is bounded by workspace path depth; all
+attempts share the original traversal budget. Later native-boundary edits and
+Unknown before-images are asserted. The earlier Windows moved-directory Host
+failure predates this PR's runtime implementation; it is not attributed to the
+settings readback defect.
 
-Additional unnamed-event tests exercise a fresh callback followed by successful
-public Recheck and continued native-boundary observation, dirty-editor refusal,
-and injected native installation failure retaining Limited. All preserve
-pending review, Unknown and Undo; the successful case executes Undo afterward.
-A fixture generated by the released 0.8.10 tracker source verifies persisted
-runtime-gap recovery without replacing original baselines. These are production
-tracker tests with mocked VS Code/native boundaries, not installed old-extension
-or real OS capacity tests. Healthy fresh-callback probes also pass against the
-0.8.10 source, so an old-version label alone does not explain an unspecified
-remaining gap or guarantee that an upgrade will clear every warning.
+The minimum-version native input trace showed a command click delivered to the
+editor rather than the expected action. The driver rechecks its hit target after
+rendered hover layout before one real click; uncertain clicks are never retried.
+Functional assertions and deadlines are unchanged. Scoped fixture disposal also
+removes only its own workspace/storage, preventing later test scans from
+exhausting production entry budgets. Production limits are unchanged.
 
-Second local checkpoint validation passed: compile, lint, complete `npm test`
-(1,720 tracker cases, 193 review UI cases, 28 real temporary Git scenarios and
-10 Host fixture tests), performance checks and the actual 75-entry VSIX privacy
-inspection. The three Host failures on the first runtime head concern the new
-stopped-save assertion; the earlier documentation-head Windows moved-directory
-timeout remains a separate unresolved diagnostic. The source-alias repair still
-passed stopped Save and Apply on all three real Host variants. Active Save and
-Apply still failed: Windows/1.80 reproduced ignore-policy invalidation, while
-Stable Linux failed at candidate durable preparation.
+At `d00284a`, real Windows Stable, Linux Stable and Ubuntu 1.80 Hosts all passed,
+including Windows' three moved-directory rounds. Installed RC, downgrade and
+Linux Quality passed. Windows Quality passed tracker/UI/Git/fixture checks but
+failed the mixed performance fixture: an asynchronous diagnostic save contained
+an additional dependency-parent gap compared with the earlier snapshot. The
+callback type and proper assertion boundary remain under diagnosis; bounded
+native-event and persisted-reason evidence is added without relaxing the check.
+The subsequent failure-boundary changes extend the real configuration checkpoint
+with public quick exclusion, Apply Saved Request, Restore and later in-scope
+observation. Their complete exact-head results and automatic review remain
+required. Local checks cannot substitute for these Host results.
 
-The next implementation reconciles the one known settings control file before
-Apply, preserving its original baseline and pending review. A receipt is tied
-to this operation, epoch, request, scope eligibility and physical file identity.
-Only late notifications matching the already-observed bytes, metadata and
-identity can be duplicates; other events retain transaction invalidation and
-normal replay. The actual file is reverified at the durable commit barrier.
-There is no Apply retry, fixed delay, global polling or coverage-gap clearing.
-Receipt work is limited to a 1 MiB file, 16 verification reads and 4 MiB total;
-exhaustion fails closed. An explicitly excluded control file is not read.
-
-Four regressions reproduce both Host failure stages for the shortcut and Save
-and Apply, then pass with one settings-write sequence. Eight negative cases
-retain unrelated-event, changed-byte, replaced-identity, dirty-editor, Stop and
-budget guards, including mutations without another callback at the durable
-barrier. Changed or unverified physical settings are not overwritten by
-compensation. Local complete validation passed 1,732 tracker cases, 193 UI
-cases, 28 real temporary Git scenarios and 10 Host fixture tests, plus lint,
-performance and the actual 75-entry VSIX privacy check. Real Host confirmation
-and the remaining R1/R3/R4 matrix are still required.
-
-At the receipt checkpoint, real Windows and Linux Stable Hosts passed stopped
-and active Save and Apply, including continued file observation. Linux Stable
-passed its full Host suite. Windows later failed automatic moved-directory
-observation; the minimum-version Host failed earlier in the native Quick Diff
-driver. These are separate from the repaired settings assertions.
-
-Two deterministic filesystem regressions expose preparation-only parent
-coalescing spending the directory coordinator's proof allowance. The coordinator
-now reserves its two proof passes and bounds preparation interruptions without
-progress separately. Strict upward coalescing is bounded by workspace path
-depth, and all attempts retain the original shared traversal budget. Recovery
-assertions include later native-boundary edits and Unknown before-images.
-The minimum-version input trace shows a click delivered to the editor rather
-than the action. The driver now rechecks its hit target after rendered hover
-layout before one real command click; it never retries an uncertain click.
-
-Local validation for this checkpoint passed 1,734 tracker cases, 193 UI cases,
-28 real temporary Git scenarios, 12 Host fixture/driver tests, lint, performance
-and the 75-entry VSIX privacy inspection. Real Host confirmation of these two
-changes and the remaining settings-failure matrix are still required.
+The subsequent local checkpoint passed complete `npm test`: 1,749 tracker
+cases, 193 production UI cases, 28 real temporary Git scenarios and 12 Host
+fixture/driver tests. Targeted Excludes 36/36, scope recovery 48/48 and Recheck
+35/35 passed. Lint, performance and the actual 75-entry VSIX privacy inspection
+also passed; version remains 0.8.11. The Windows performance publication failure
+above is still open and is not superseded by the local performance result.
