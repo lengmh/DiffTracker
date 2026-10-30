@@ -213,6 +213,35 @@ async function until(predicate) { while (!predicate()) { await delay(10); } }
 const elapsed = start => Math.round((performance.now() - start) * 10) / 10;
 const mib = bytes => Math.round(bytes / MiB * 10) / 10;
 const readSession = () => JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
+function assertPersistedCoverage(records,activeGaps) {
+    const persisted=new Map(records);
+    assert.equal(persisted.size,records.length,'durable diagnostics cannot contain duplicate paths');
+    const obligations=new Set(tracker.importedCoverageObligations);
+    const active=new Map(activeGaps.map(gap=>[gap.targetPath,gap]));
+    // Restart obligations are durable even while their native coverage is
+    // healthy. They are a separate claim from the currently active gaps.
+    assert.deepEqual(new Set(persisted.keys()),new Set([...active.keys(),...obligations]),JSON.stringify({
+        active:activeGaps.map(gap=>({path:path.relative(root,gap.targetPath),code:gap.reasonCode})),
+        persisted:records.map(([target,record])=>({path:path.relative(root,target),record})),nativeEventTrace
+    }));
+    for(const [target,record] of persisted){
+        assert.equal(record.file,undefined,'the workload must not acquire a file-level gap');
+        const gap=active.get(target);
+        if(obligations.has(target)){
+            assert.equal(target,path.join(root,'node_modules'),'only the coalesced native dependency owner can require restart');
+            assert.equal(tracker.supplementalTargetActive(target,tracker.sessionEpoch),true,
+                'a restart-only record must still have verified live native coverage');
+            assert.ok([...nativeWatchers.values()].includes(target));
+            assert.equal(record.importedCoverageRequired,true);
+            assert.deepEqual(record.subtree,{targetKind:'subtree',reasonCode:'imported-coverage-restart-required',
+                reason:gap?.reason??'Imported-directory observation must be independently restored and reconciled before this subtree is trusted.'});
+        }else{
+            assert.ok(gap,'unrelated persisted uncertainty must fail the workload');
+            assert.equal(record.importedCoverageRequired,undefined);
+            assert.deepEqual(record.subtree,{targetKind:'subtree',reasonCode:gap.reasonCode,reason:gap.reason});
+        }
+    }
+}
 let disposed = false;
 try {
     assert.equal((await controller.saveRequestedScope({ mode: 'rules', includes: [], excludes: [] })).ok, true);
@@ -374,19 +403,7 @@ try {
     markPhase('coverageRecheck');
     assert.equal(await tracker.flushPendingPersistence(), true);
     const beforeRecheckSession = readSession();
-    const persistedBurstGaps = new Map(beforeRecheckSession.coverageGaps);
-    assert.deepEqual(new Set(persistedBurstGaps.keys()), new Set(burstCoverageGaps.map(gap => gap.targetPath)),JSON.stringify({
-        before:burstCoverageGaps.map(gap=>({path:path.relative(root,gap.targetPath),code:gap.reasonCode})),
-        persisted:[...persistedBurstGaps].map(([target,record])=>({path:path.relative(root,target),record})),
-        nativeEventTrace
-    }));
-    for (const gap of burstCoverageGaps) {
-        const evidence = persistedBurstGaps.get(gap.targetPath);
-        assert.equal(evidence.file, undefined);
-        assert.deepEqual(evidence.subtree, {
-            targetKind: 'subtree', reasonCode: gap.reasonCode, reason: gap.reason
-        });
-    }
+    assertPersistedCoverage(beforeRecheckSession.coverageGaps,burstCoverageGaps);
     const beforeTextTokens = tracker.getReviewTokens();
     const beforeOpaqueTokens = tracker.getOpaqueReviewTokens();
     const semanticReview = ({ timestamp: _timestamp, reviewReason: _reason, ...change }) => change;
@@ -433,7 +450,7 @@ try {
     for (const key of ['fileSnapshots', 'opaqueBaselineFiles', 'unresolvedBaselineFiles', 'baselineExistingFiles']) {
         assert.deepEqual(afterRecheckSession[key], beforeRecheckSession[key], `Recheck must preserve ${key}`);
     }
-    assert.deepEqual(afterRecheckSession.coverageGaps, []);
+    assertPersistedCoverage(afterRecheckSession.coverageGaps,[]);
     for (const [filePath, file] of expected) {
         if (file.after) { assert.equal(hash(fs.readFileSync(filePath)), file.after.fingerprint); }
         else { assert.equal(fs.existsSync(filePath), false); }

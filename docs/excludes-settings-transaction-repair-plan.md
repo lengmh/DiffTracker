@@ -161,9 +161,15 @@ At `d00284a`, real Windows Stable, Linux Stable and Ubuntu 1.80 Hosts all passed
 including Windows' three moved-directory rounds. Installed RC, downgrade and
 Linux Quality passed. Windows Quality passed tracker/UI/Git/fixture checks but
 failed the mixed performance fixture: an asynchronous diagnostic save contained
-an additional dependency-parent gap compared with the earlier snapshot. The
-callback type and proper assertion boundary remain under diagnosis; bounded
-native-event and persisted-reason evidence is added without relaxing the check.
+an additional dependency-parent record compared with active diagnostics.
+The next run's bounded event/reason trace identified a healthy owner's
+`importedCoverageRequired` / `imported-coverage-restart-required` record, retained
+for restart safety. A controlled replay of named parent-directory callbacks
+reproduced the exact old assertion failure. The fixture now asserts the exact
+union of active gaps and required restart obligations, including each record's
+reason, flag and live native owner. It still rejects unrelated or file gaps,
+requires one successful Recheck, preserves all review identities and checks
+continued observation; no production evidence is cleared to satisfy the test.
 The subsequent failure-boundary changes extend the real configuration checkpoint
 with public quick exclusion, Apply Saved Request, Restore and later in-scope
 observation. Their complete exact-head results and automatic review remain
@@ -173,5 +179,9 @@ The subsequent local checkpoint passed complete `npm test`: 1,749 tracker
 cases, 193 production UI cases, 28 real temporary Git scenarios and 12 Host
 fixture/driver tests. Targeted Excludes 36/36, scope recovery 48/48 and Recheck
 35/35 passed. Lint, performance and the actual 75-entry VSIX privacy inspection
-also passed; version remains 0.8.11. The Windows performance publication failure
-above is still open and is not superseded by the local performance result.
+also passed; version remains 0.8.11. The revised persistence assertions and
+controlled directory-callback replay also pass locally. Windows confirmation
+remains required. The extended Host scenario uses the same saved-request Save
+and Apply entry as the public panel and checks the lower-level primitive's
+affected-review guard separately; its refusal of unowned concurrent events is
+preserved.

@@ -364,7 +364,7 @@ export class MonitoringScopeController implements vscode.Disposable {
 
     public getScopeSettingsWriteBlocker(): string | undefined {
         return this.unverifiedSettingsWrite
-            ? 'A settings update is still unverified. Current settings and drafts are preserved. Wait for it to settle, or reload the window before reviewing the saved Workspace request.'
+            ? 'A settings update is still unverified. Current settings and drafts are preserved. Wait for it to settle. If it does not settle, copy any unsaved draft before reloading the window and reviewing the saved Workspace request.'
             : undefined;
     }
 
@@ -422,7 +422,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             finish(new ScopeSettingsOwnershipConflict('The scope controller closed before settings could be verified. Current settings and drafts were preserved.'));
         };
         const uncertain = (detail: string) => new ScopeSettingsOwnershipConflict(
-            `${detail} Scope was not applied. Current settings and drafts were preserved. Wait for the settings update to settle, or reload the window before reviewing the saved Workspace request.`
+            `${detail} Scope was not applied. Current settings and drafts were preserved. Wait for the settings update to settle. If it does not settle, copy any unsaved draft before reloading the window and reviewing the saved Workspace request.`
         );
         const inspect = () => {
             if (cleaned) { return; }
@@ -831,7 +831,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                             if (observationBefore && this.tracker.ownedScopeSettingsAreCurrent(observationBefore)===false) {
                                 settingsOwnershipLost=true;
                             }
-                            if (!current()) { throw new Error('Newer settings or workspace state must be preserved.'); }
+                            if (settingsOwnershipLost) { throw new Error('Settings write ownership could not be verified; automatic compensation was not attempted.'); }
+                            if (!current()) { throw new Error('Scope, workspace or settings changed after this action began; automatic compensation was not safe.'); }
                             const unchanged = this.settingsFingerprint(expected) === this.settingsFingerprint(before);
                             const config = vscode.workspace.getConfiguration('diffTracker');
                             for (const key of [...SCOPE_SETTINGS_KEYS].reverse()) {

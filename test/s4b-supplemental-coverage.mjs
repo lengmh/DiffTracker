@@ -1659,6 +1659,12 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             proof.release();await finished.entered;publication.release();await created;
             await settle(tracker);await h.waitUntil(()=>tracker.directoryObservations.size===0);
             assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            const persisted=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'),'utf8'));
+            const restart=new Map(persisted.coverageGaps).get(blind);
+            assert.equal(restart?.importedCoverageRequired,true,'healthy runtime coverage retains its independent restart obligation');
+            assert.equal(restart.subtree.reasonCode,'imported-coverage-restart-required');
+            assert.ok(tracker.importedCoverageObligations.has(blind));
             assert.equal(tracker.getOriginalContent(target),undefined);
             const unknown=tracker.getUnknownReviewToken(target);assert.ok(unknown);
             fs.writeFileSync(target,'later observed');activeNativeWatcher(nativeDirectoryWatchers,child).listener('change','tracked.txt');

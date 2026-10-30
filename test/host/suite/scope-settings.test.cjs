@@ -125,10 +125,12 @@ module.exports = async function scopeSettingsCheckpoint() {
         assert.deepEqual(savedConfirmation.affectedReviewPaths,[uri('saved-cache/existing.txt').fsPath]);
         assert.equal((await scopeStatus()).effective.scopeRevision,quickStatus.effective.scopeRevision,
             'manual pending settings cannot commit before the bound review confirmation');
-        const appliedSaved=await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope',{
-            discardExplicitlyExcludedReviews:true,expectedScopeRevision:savedConfirmation.scopeRevision,
-            expectedAffectedReviewRevision:savedConfirmation.affectedReviewRevision
-        });
+        // The public Apply Saved Request UI invokes saveAndApplyScope on the
+        // current raw request, with one bound confirmation (see applyInteractively).
+        // Exercise that production entry, rather than the lower-level Apply
+        // primitive which deliberately rejects unowned concurrent file events.
+        const savedRequest=(await scopeStatus()).rawRequested;
+        const appliedSaved=await vscode.commands.executeCommand('diffTracker._testSaveAndApplyScope',savedRequest);
         assert.equal(appliedSaved.status,'applied',JSON.stringify({appliedSaved,trace}));
         const appliedStatus=await scopeStatus();
         assert.equal(appliedStatus.requested.scope.scopeRevision,appliedStatus.effective.scopeRevision);
