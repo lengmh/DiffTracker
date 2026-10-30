@@ -425,7 +425,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                             discardExplicitlyExcludedReviews: affectedReviewPaths.length > 0,
                             expectedScopeRevision: scope.scopeRevision,
                             expectedAffectedReviewRevision: approvedReviewRevision,
-                            requestGuard:stillCurrent
+                            requestGuard:stillCurrent,
+                            scopeOperation:observationBefore
                         });
                     }
                 } catch (error) {
@@ -449,7 +450,10 @@ export class MonitoringScopeController implements vscode.Disposable {
                 }
                 return outcome.status === 'applied' ? this.finalizeScopeOperation({...outcome,settingsStatus:'saved',scopeCommitted:true},initial.effective,initial.requested.scope,false,observationBefore) : outcome;
             });
-        } finally { this.scopeActionInProgress = false; }
+        } finally {
+            if (observationBefore) { observationBefore.activity.active = false; }
+            this.scopeActionInProgress = false;
+        }
     }
 
     private prepareResourceExclusion(targetPath: string, requireCoverage: boolean, directory: boolean) {
@@ -661,7 +665,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                     outcome = await this.performPendingScopeApply({grantConsent:true,
                         discardExplicitlyExcludedReviews:affectedReviewPaths.length > 0,
                         expectedScopeRevision:scope.scopeRevision,expectedAffectedReviewRevision:affectedReviewRevision,
-                        requestGuard:()=>current() && proposalStillCurrent()});
+                        requestGuard:()=>current() && proposalStillCurrent(),scopeOperation:observationBefore});
                     if (outcome.status === 'applied') {
                         outcome = {...outcome,scopeCommitted:true,settingsStatus:'saved'};
                     }
@@ -692,7 +696,10 @@ export class MonitoringScopeController implements vscode.Disposable {
                 }
                 return outcome.status === 'applied' ? this.finalizeScopeOperation(outcome,effective,requestedBefore,false,observationBefore) : outcome;
             });
-        } finally { this.scopeActionInProgress = false; }
+        } finally {
+            if (observationBefore) { observationBefore.activity.active = false; }
+            this.scopeActionInProgress = false;
+        }
     }
 
     // Migration already owns the queue; its nested save must not enqueue again.
@@ -801,6 +808,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         expectedScopeRevision?: string;
         expectedAffectedReviewRevision?: string;
         requestGuard?: () => boolean;
+        scopeOperation?: ScopeOperationObservation;
     }): Promise<MonitoringScopeApplyOutcome> {
         const status = this.getStatus();
         const scope = status.requested.scope;
@@ -874,7 +882,8 @@ export class MonitoringScopeController implements vscode.Disposable {
             scope,
             options?.discardExplicitlyExcludedReviews === true,
             requestStillCurrent,
-            options?.expectedAffectedReviewRevision
+            options?.expectedAffectedReviewRevision,
+            options?.scopeOperation
         );
         if (applied.status === 'applied') {
             let reason: string | undefined;

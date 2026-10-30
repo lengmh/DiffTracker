@@ -136,7 +136,11 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             Controller = require('../out/monitoringScopeController.js').MonitoringScopeController;
         } finally { Module._load = oldLoad; }
         const controller = new Controller({ workspaceState: {
-            get: key => settings.get(key), update: async (key, value) => { settings.set(key, value); }
+            get: key => settings.get(key), update: async (key, value) => {
+                await hooks.beforeStateUpdate?.(key, value);
+                settings.set(key, value);
+                await hooks.afterStateUpdate?.(key, value);
+            }
         } }, tracker);
         try { await run({ controller, config, writes, hooks }); }
         finally {

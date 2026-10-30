@@ -441,4 +441,178 @@ export function registerScopeSingleActionAcceptance(h,fixture,scopeFor,withContr
         });}finally{fs.watch=watch;}
     }));
 
+    for(const beforeMode of ['wholeWorkspace','rules'])
+    test(`A5 CAUSAL postcommit background owner failure stays unrelated across workspaceState await (${beforeMode})`,()=>fixture(async({tracker,dir,scope})=>{
+        const selected=path.join(dir,'selected');fs.mkdirSync(selected);
+        const target=path.join(selected,'tracked.txt'),other=path.join(dir,'other-import');fs.writeFileSync(target,'original');
+        h.setVsCodeExcludes({'files.exclude':{'other-import/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const before=scopeFor(tracker,beforeMode);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(before)).status,'applied');
+        fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+        const watch=fs.watch;let failing=false,entered=false,beforeOther;
+        let recoveryCalls=0;const recovery=tracker.recheckScopeOperationCoverage.bind(tracker);
+        tracker.recheckScopeOperationCoverage=(...args)=>{recoveryCalls++;return recovery(...args);};
+        fs.watch=(directory,...args)=>{if(failing&&path.resolve(String(directory))===other)throw Object.assign(new Error('Independent owner ENOSPC'),{code:'ENOSPC'});return watch(directory,...args);};
+        try{await withController(tracker,before,async({controller,hooks})=>{
+            hooks.beforeStateUpdate=async key=>{
+                if(!key.endsWith('dismissedRevision.v1'))return;
+                assert.equal(entered,false);entered=true;
+                assert.ok(tracker.getEffectiveMonitoringScope().excludes.some(rule=>rule.pattern==='/selected/'),'scope committed before preference await');
+                fs.mkdirSync(other);fs.writeFileSync(path.join(other,'tracked.txt'),'independent current');
+                await tracker.onExternalFileCreated(Uri.file(other));
+                const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===other);
+                assert.ok(owner);failing=true;owner.error(Object.assign(new Error('Independent runtime ENOSPC'),{code:'ENOSPC'}));
+                beforeOther={original:tracker.getOriginalContent(path.join(other,'tracked.txt')),change:structuredClone(tracker.getTrackedChange(path.join(other,'tracked.txt')))};
+            };
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/selected/'}]},async()=>true);
+            assert.equal(entered,true);assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,'verified');assert.equal(recoveryCalls,0);
+            assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===other));
+            assert.ok(tracker.getCoverageGaps().some(([file])=>file===other));
+            assert.equal(tracker.getOriginalContent(path.join(other,'tracked.txt')),beforeOther.original);
+            assert.deepEqual({...tracker.getTrackedChange(path.join(other,'tracked.txt')),timestamp:undefined},{...beforeOther.change,timestamp:undefined});
+            assert.equal(tracker.getTrackedChange(target),undefined);assert.equal(fs.readFileSync(target,'utf8'),'pending');
+        });}finally{fs.watch=watch;}
+    }));
+
+    test('A5 CAUSAL required legacy owner obligation survives failure retry restart and quiet repair',()=>fixture(async({tracker,dir})=>{
+        const blind=path.join(dir,'.aws');fs.mkdirSync(blind);
+        const target=path.join(blind,'tracked.txt'),other=path.join(dir,'other.txt');
+        fs.writeFileSync(target,'new authorized baseline');fs.writeFileSync(other,'other original');
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        await tracker.refreshIgnoreMatchers();
+        tracker.fileSnapshots.set(other,'other original');tracker.baselineExistingFiles.add(other);
+        tracker.setFileCoverageGap(other,'file-read-failed','Independent old read failure');tracker.markFileUnavailable(other,'Independent old read failure');
+        h.setVsCodeExcludes({'files.watcherExclude':{'.aws/**':true}});
+        const watch=fs.watch;let failing=true,current=tracker;
+        fs.watch=(directory,...args)=>{if(failing&&path.resolve(String(directory))===blind)throw Object.assign(new Error('Required owner ENOSPC'),{code:'ENOSPC'});return watch(directory,...args);};
+        const proposal={mode:'wholeWorkspace',includes:[],excludes:[]};
+        const assertPartial=outcome=>{
+            assert.equal(outcome.status,'partial',JSON.stringify(outcome));assert.equal(outcome.coverageStatus,'limited');
+            assert.equal(outcome.scopeCommitted,true);assert.equal(outcome.unrelatedCoverageGaps.some(([file])=>file===blind),false);
+            assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===other));
+            assert.equal(current.coverageGaps.get(blind)?.subtree?.scopeOperationRevision,current.getEffectiveMonitoringScope().scopeRevision);
+            assert.equal([...current.supplementalDirectoryWatchers].some(([directory,owner])=>directory===blind&&owner.epoch===current.sessionEpoch),false);
+        };
+        try{
+            await withController(current,proposal,async({controller})=>{
+                assertPartial(await controller.saveAndApplyScope(proposal,async()=>true));
+                assertPartial(await controller.saveAndApplyScope(proposal,async()=>true));
+                assert.equal(await current.flushPendingPersistence(),true);
+            });
+            const storage=current.storageUri;await current.dispose();
+            current=new h.DiffTracker(storage);h.setTracker(current);
+            await withController(current,proposal,async({controller})=>{
+                assert.equal(await current.restorePersistedState(),'restored');controller.reconcileRequestedScope();
+                assertPartial(await controller.saveAndApplyScope(proposal,async()=>true));
+                failing=false;
+                const repaired=await controller.saveAndApplyScope(proposal,async()=>true);
+                assert.equal(repaired.status,'applied',JSON.stringify(repaired));assert.equal(repaired.coverageStatus,'verified');
+                assert.equal(current.getOriginalContent(target),'new authorized baseline');
+                assert.equal(current.getCoverageGaps().some(([file])=>file===blind),false);
+                assert.ok(current.getCoverageGaps().some(([file])=>file===other));
+                const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===blind);
+                assert.ok(owner);fs.writeFileSync(target,'native edit after quiet repair');owner.listener('change','tracked.txt');
+                await h.waitUntil(()=>current.getTrackedChange(target)?.currentContent==='native edit after quiet repair');
+                assert.equal(current.getOriginalContent(target),'new authorized baseline');
+                // Once the transaction's obligation was durably retired, a
+                // later error at the same path is independent background work.
+                failing=true;owner.error(Object.assign(new Error('Later independent native failure'),{code:'ENOSPC'}));
+                assert.equal(current.coverageGaps.get(blind)?.subtree?.scopeOperationRevision,undefined);
+                let recoveryCalls=0;const recovery=current.recheckScopeOperationCoverage.bind(current);
+                current.recheckScopeOperationCoverage=(...args)=>{recoveryCalls++;return recovery(...args);};
+                const later=await controller.saveAndApplyScope(proposal,async()=>true);
+                assert.equal(later.status,'applied',JSON.stringify(later));assert.equal(later.coverageStatus,'verified');
+                assert.equal(recoveryCalls,0);assert.ok(later.unrelatedCoverageGaps.some(([file])=>file===blind));
+                assert.equal(current.getOriginalContent(target),'new authorized baseline');
+                assert.equal(current.getTrackedChange(target)?.currentContent,'native edit after quiet repair');
+            });
+        }finally{fs.watch=watch;}
+    }));
+
+    test('A5 CAUSAL replacement error cannot reclaim bytes of an outstanding obligation',()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'needed');fs.mkdirSync(target);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.setSubtreeCoverageGap(target,'supplemental-watcher-system-limit-gap','Old owner failure');
+        const region={path:target,kind:'subtree',workspaceRoot:scope.roots[0].uri};
+        assert.equal(await tracker.retainScopeOperationRecovery([region],scope.scopeRevision),true);
+        const previous=tracker.coverageGaps.get(target).subtree;
+        tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()),'utf8');
+        const budget=tracker.createCandidatePersistenceBudget();
+        assert.throws(()=>tracker.reserveCandidateCoverageGap(target,{targetKind:'subtree',reasonCode:previous.reasonCode,
+            reason:previous.reason+' additional health detail'},budget),/byte capacity/);
+        assert.equal(tracker.coverageGaps.get(target).subtree,previous);
+        assert.equal(previous.scopeOperationRevision,scope.scopeRevision);
+    }));
+
+    test('A5 CAUSAL scope exposure uses committed Rules policy when candidate skips Git ignore discovery',()=>fixture(async({tracker,dir,scope})=>{
+        const hidden=path.join(dir,'hidden');fs.mkdirSync(hidden);
+        const target=path.join(hidden,'tracked.txt');fs.writeFileSync(target,'original');fs.writeFileSync(path.join(dir,'.gitignore'),'/hidden/\n');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.setFileCoverageGap(target,'file-read-failed','Existing uncertain before-image');tracker.markFileUnavailable(target,'Existing uncertain before-image');
+        const before=scopeFor(tracker,'rules');assert.equal((await tracker.applyConfiguredMonitoringScope(before)).status,'applied');
+        await withController(tracker,before,async({controller})=>{
+            const outcome=await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[]},async()=>true);
+            assert.equal(outcome.status,'partial',JSON.stringify(outcome));assert.equal(outcome.coverageStatus,'limited');
+            assert.equal(outcome.unrelatedCoverageGaps.some(([file])=>file===target),false);
+            assert.equal(tracker.getOriginalContent(target),'original');assert.equal(tracker.getTrackedChange(target)?.reviewKind,'unknown');
+            assert.equal(fs.readFileSync(target,'utf8'),'original');
+        });
+    }));
+
+    for(const failureSource of ['scope-owner','background-child'])
+    test(`A5 CAUSAL postcommit ${failureSource} error follows the actual native owner`,()=>fixture(async({tracker,dir})=>{
+        const blind=path.join(dir,'.aws');fs.mkdirSync(blind);
+        const target=path.join(blind,'tracked.txt');fs.writeFileSync(target,'new authorized baseline');
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        await tracker.refreshIgnoreMatchers();h.setVsCodeExcludes({'files.watcherExclude':{'.aws/**':true}});
+        const failed=failureSource==='scope-owner'?blind:path.join(blind,'background-child');
+        const watch=fs.watch;let failing=false,entered=false,recoveryCalls=0;
+        const recovery=tracker.recheckScopeOperationCoverage.bind(tracker);
+        tracker.recheckScopeOperationCoverage=(...args)=>{recoveryCalls++;return recovery(...args);};
+        fs.watch=(directory,...args)=>{if(failing&&path.resolve(String(directory))===failed)throw Object.assign(new Error('Owner still unavailable'),{code:'ENOSPC'});return watch(directory,...args);};
+        const proposal={mode:'wholeWorkspace',includes:[],excludes:[]};
+        try{await withController(tracker,proposal,async({controller,hooks})=>{
+            hooks.beforeStateUpdate=async key=>{
+                if(!key.endsWith('dismissedRevision.v1'))return;
+                assert.equal(entered,false);entered=true;
+                assert.equal(tracker.getEffectiveMonitoringScope().kind,'configured');
+                if(failureSource==='background-child'){
+                    fs.mkdirSync(failed);fs.writeFileSync(path.join(failed,'child.txt'),'independent child');
+                    await tracker.onExternalFileCreated(Uri.file(failed));
+                }
+                const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===failed);
+                assert.ok(owner);failing=true;owner.error(Object.assign(new Error('Postcommit native owner failure'),{code:'ENOSPC'}));
+            };
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>true);
+            assert.equal(entered,true);
+            assert.equal(outcome.status,failureSource==='scope-owner'?'partial':'applied',JSON.stringify(outcome));
+            assert.equal(outcome.coverageStatus,failureSource==='scope-owner'?'limited':'verified');
+            assert.equal(recoveryCalls,failureSource==='scope-owner'?1:0);
+            assert.equal(outcome.unrelatedCoverageGaps.some(([file])=>file===blind),failureSource==='background-child');
+            assert.equal(tracker.getOriginalContent(target),'new authorized baseline');assert.equal(fs.readFileSync(target,'utf8'),'new authorized baseline');
+        });}finally{fs.watch=watch;}
+    }));
+
+    test('A5 CAUSAL completed scope owner attribution expires before a later failure',()=>fixture(async({tracker,dir})=>{
+        const blind=path.join(dir,'.aws');fs.mkdirSync(blind);fs.writeFileSync(path.join(blind,'tracked.txt'),'original');
+        tracker.effectiveMonitoringScope=tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+        await tracker.refreshIgnoreMatchers();h.setVsCodeExcludes({'files.watcherExclude':{'.aws/**':true}});
+        const watch=fs.watch;let failing=false,recoveryCalls=0;const recovery=tracker.recheckScopeOperationCoverage.bind(tracker);
+        tracker.recheckScopeOperationCoverage=(...args)=>{recoveryCalls++;return recovery(...args);};
+        fs.watch=(directory,...args)=>{if(failing&&path.resolve(String(directory))===blind)throw Object.assign(new Error('Later independent ENOSPC'),{code:'ENOSPC'});return watch(directory,...args);};
+        const proposal={mode:'wholeWorkspace',includes:[],excludes:[]};
+        try{await withController(tracker,proposal,async({controller})=>{
+            assert.equal((await controller.saveAndApplyScope(proposal,async()=>true)).status,'applied');
+            const owner=[...h.nativeDirectoryWatchers].reverse().find(item=>item.active&&path.resolve(String(item.directory))===blind);
+            assert.ok(owner);failing=true;owner.error(Object.assign(new Error('Later independent native failure'),{code:'ENOSPC'}));
+            assert.equal(tracker.coverageGaps.get(blind)?.subtree?.scopeOperationRevision,undefined);
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>true);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));assert.equal(outcome.coverageStatus,'verified');
+            assert.equal(recoveryCalls,0);assert.ok(outcome.unrelatedCoverageGaps.some(([file])=>file===blind));
+            assert.equal(tracker.getOriginalContent(path.join(blind,'tracked.txt')),'original');
+        });}finally{fs.watch=watch;}
+    }));
+
 }

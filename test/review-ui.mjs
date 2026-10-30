@@ -481,7 +481,7 @@ function coverageExclusionHarness(){
         getCommittedLegacyCompatibilityPolicy:()=>[],
         getExplicitlyExcludedPendingReviewPaths:()=>[],
         getExplicitlyExcludedReviewRevision:()=> 'stable-empty-review',
-        captureScopeOperationObservation:()=>({wasMonitored:()=>undefined,hadGap:()=>false,hadCoverageRoot:()=>false}),
+        captureScopeOperationObservation:()=>({activity:{active:true},wasMonitored:()=>undefined,hadGapTarget:()=>false}),
         getScopeOperationRecoveryTargets:()=>h.state.scopeRecoveryTargets??[],
         getScopeOperationCoverageGaps:()=>({related:h.state.relatedScopeCoverageGaps??[],
             unrelated:h.state.unrelatedScopeCoverageGaps??h.tracker.getCoverageGaps?.()??[]}),
