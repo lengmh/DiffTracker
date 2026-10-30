@@ -107,6 +107,8 @@ test('release gates the one final VSIX before upload and validates producer evid
     assert.ok(build.indexOf('xvfb-run -a node test/installed/run.mjs') > build.indexOf('npm run package --'));
     assert.ok(build.indexOf('node test/installed/final-artifact.mjs') < build.indexOf('uses: actions/upload-artifact'));
     assert.match(build, /run\.mjs "\$RC_ARTIFACTS" --final/);
+    const installedGate = build.split('name: Validate the exact final VSIX through all five installed phases')[1];
+    assert.match(installedGate, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
     assert.match(build, /sha256: \$\{\{ steps\.identity\.outputs\.sha256 \}\}/);
     assert.match(publish, /FINAL_VSIX_SHA256: \$\{\{ needs\.build\.outputs\.sha256 \}\}/);
     assert.ok(publish.indexOf('node test/installed/final-artifact.mjs') < publish.indexOf('name: Check tag and release state'));

@@ -173,6 +173,7 @@ jobs:
       - name: Validate the exact final VSIX through all five installed phases
         env:
           FINAL_VSIX_SHA256: ${{ steps.identity.outputs.sha256 }}
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
