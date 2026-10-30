@@ -34,6 +34,137 @@ export function registerRecheckObservationCoverage(h, fixture) {
         finally { release(); fs.promises.opendir = original; }
     }
 
+    test('RECHECK one quiet public recheck retires an exact busy-directory gap without accepting review', () => fixture(async context => {
+        const {tracker, dir, scope} = context;
+        const unrelated = await seed(context);
+        const blind = path.join(dir, 'busy-blind'), child = path.join(blind, 'child');
+        fs.mkdirSync(child, {recursive:true});
+        const target = path.join(child, 'tracked.txt'); fs.writeFileSync(target, 'original');
+        setVsCodeExcludes({'files.watcherExclude': {'busy-blind/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        const unknown = path.join(child, 'unknown.txt'); fs.writeFileSync(unknown, 'unknown original');
+        tracker.recordUnresolvedBaseline(unknown, 'Original before-image is unknown');
+        const token = tracker.getReviewToken(unrelated);
+        const opendir = fs.promises.opendir;
+        let activity = 0;
+        fs.promises.opendir = async (directory, ...args) => {
+            const result = await opendir(directory, ...args);
+            if (String(directory) === child) {
+                fs.writeFileSync(target, `busy ${++activity}`);
+                ownerFor(child).listener('change', 'tracked.txt');
+            }
+            return result;
+        };
+        try { await tracker.onExternalFileChanged(Uri.file(child)); }
+        finally { fs.promises.opendir = opendir; }
+        assert.ok(activity > 0 && activity < 24);
+        assert.equal(tracker.directoryObservations.size, 0);
+        assert.equal(tracker.getSubtreeCoverageGaps().find(gap => gap.targetPath === child)?.reasonCode,
+            'directory-runtime-coverage-gap');
+        const disk = fs.readFileSync(target, 'utf8');
+        const result = await tracker.recheckObservationCoverage();
+        assert.equal(result.status, 'rechecked', JSON.stringify({result,gaps:tracker.getSubtreeCoverageGaps()}));
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(), []);
+        assert.equal(tracker.getOriginalContent(target), 'original');
+        assert.equal(tracker.getTrackedChange(target)?.currentContent, disk);
+        assert.equal(tracker.getOriginalContent(unknown), undefined);
+        assert.equal(tracker.getTrackedChange(unknown)?.reviewKind, 'unknown');
+        assert.deepEqual(tracker.getReviewToken(unrelated), token);
+        assert.equal(fs.readFileSync(target, 'utf8'), disk);
+        assert.equal(await tracker.flushPendingPersistence(), true);
+        const saved = savedState(tracker);
+        assert.equal(new Map(saved.fileSnapshots).get(target), 'original');
+        assert.notEqual(saved.coverageGaps.find(([directory]) => directory === child)?.[1].subtree?.reasonCode,
+            'directory-runtime-coverage-gap');
+        fs.writeFileSync(target, 'native edit after public recheck');
+        ownerFor(child).listener('change', 'tracked.txt');
+        await waitUntil(() => tracker.getTrackedChange(target)?.currentContent === 'native edit after public recheck');
+        assert.equal(tracker.getOriginalContent(target), 'original');
+    }));
+
+    async function seedDirectoryGap(context, code = 'directory-runtime-coverage-gap') {
+        const {tracker, dir, scope} = context;
+        const unrelated = await seed(context);
+        const blind = path.join(dir, 'import-gap'), child = path.join(blind, 'child');
+        fs.mkdirSync(child, {recursive:true});
+        const target = path.join(child, 'tracked.txt'); fs.writeFileSync(target, 'original');
+        setVsCodeExcludes({'files.watcherExclude': {'import-gap/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
+        const unknown = path.join(child, 'unknown.txt'); fs.writeFileSync(unknown, 'unknown original');
+        tracker.recordUnresolvedBaseline(unknown, 'Original before-image is unknown');
+        tracker.setSubtreeCoverageGap(child, code, 'Old directory observation interval');
+        return {unrelated, child, target, unknown, evidence:tracker.coverageGaps.get(child).subtree,
+            token:tracker.getReviewToken(unrelated)};
+    }
+
+    test('RECHECK exact scan-gap repair retains unknown before-images and future native observation', () => fixture(async context => {
+        const {tracker} = context;
+        const files = await seedDirectoryGap(context, 'directory-scan-coverage-gap');
+        assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked');
+        assert.equal(tracker.getOriginalContent(files.target), 'original');
+        assert.equal(tracker.getOriginalContent(files.unknown), undefined);
+        assert.equal(tracker.getTrackedChange(files.unknown)?.reviewKind, 'unknown');
+        assert.deepEqual(tracker.getReviewToken(files.unrelated), files.token);
+        fs.writeFileSync(files.target, 'after scan-gap repair');
+        ownerFor(files.child).listener('change', 'tracked.txt');
+        await waitUntil(() => tracker.getTrackedChange(files.target)?.currentContent === 'after scan-gap repair');
+    }));
+
+    for (const barrier of ['new-evidence', 'identity', 'durable-copy', 'new-evidence-at-copy']) test(`RECHECK exact import-gap retirement refuses ${barrier}`, () => fixture(async context => {
+        const {tracker, dir} = context;
+        const files = await seedDirectoryGap(context);
+        let result, replacement;
+        if (barrier === 'durable-copy' || barrier === 'new-evidence-at-copy') {
+            const copy = vscode.workspace.fs.copy;
+            let injected = false;
+            vscode.workspace.fs.copy = async (...args) => {
+                if (tracker.baselineTransaction && !injected) {
+                    injected = true;
+                    if (barrier === 'durable-copy') { throw new Error('Injected certification copy failure'); }
+                    tracker.setSubtreeCoverageGap(files.child, 'directory-runtime-coverage-gap', 'New uncertainty at durable copy');
+                    replacement = tracker.coverageGaps.get(files.child).subtree;
+                }
+                return copy(...args);
+            };
+            try { result = await tracker.recheckObservationCoverage(); }
+            finally { vscode.workspace.fs.copy = copy; }
+            assert.equal(injected, true);
+            assert.equal(result.status, barrier === 'durable-copy' ? 'failed' : 'limited');
+        } else {
+            await atEnumeration(barrier === 'identity' ? dir : files.child, async (entered, release) => {
+                const recheck = tracker.recheckObservationCoverage();
+                try {
+                    await entered;
+                    if (barrier === 'identity') {
+                        fs.renameSync(files.child, path.join(dir, 'old-owner'));
+                        fs.mkdirSync(files.child); fs.writeFileSync(files.target, 'replacement');
+                    } else {
+                        tracker.setSubtreeCoverageGap(files.child, 'directory-runtime-coverage-gap', 'New uncertainty during Recheck');
+                        replacement = tracker.coverageGaps.get(files.child).subtree;
+                    }
+                } finally { release(); }
+                result = await recheck;
+            });
+            assert.equal(result.status, 'limited');
+        }
+        assert.equal(tracker.coverageGaps.get(files.child)?.subtree, replacement ?? files.evidence);
+        assert.equal(tracker.getOriginalContent(files.target), 'original');
+        assert.equal(tracker.getOriginalContent(files.unknown), undefined);
+        assert.equal(tracker.getTrackedChange(files.unknown)?.reviewKind, 'unknown');
+        assert.deepEqual(tracker.getReviewToken(files.unrelated), files.token);
+        if (barrier === 'new-evidence-at-copy') {
+            assert.equal(await tracker.flushPendingPersistence(), true);
+            assert.equal(savedState(tracker).coverageGaps.find(([directory]) => directory === files.child)?.[1].subtree?.reason,
+                'New uncertainty at durable copy');
+        }
+        if (barrier === 'durable-copy') {
+            assert.equal(await tracker.flushPendingPersistence(), true);
+            assert.equal(savedState(tracker).coverageGaps.find(([directory]) => directory === files.child)?.[1].subtree?.reasonCode,
+                'directory-runtime-coverage-gap');
+            assert.equal((await tracker.recheckObservationCoverage()).status, 'rechecked', 'a quiet retry is idempotent');
+        }
+    }));
+
     test('RECHECK reinstalls failed coverage without accepting pending text or opaque changes', () => fixture(async ({ tracker, scope, dir }) => {
         const blind = path.join(dir, 'blind');
         fs.mkdirSync(blind);

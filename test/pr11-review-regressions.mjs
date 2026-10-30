@@ -1203,8 +1203,12 @@ export function registerPR11ReviewRegressions(h) {
             if(change==='modal'){
                 let prompted=false;
                 vscode.window.showInformationMessage=async()=>undefined;
-                vscode.window.showWarningMessage=async(message,_options,...answers)=>{
-                    if(answers.includes('Discard Reviews and Apply')){prompted=true;mutate();return 'Discard Reviews and Apply';}
+                vscode.window.showWarningMessage=async(message,options,...answers)=>{
+                    if(answers.includes('Confirm and Apply')){
+                        assert.equal(prompted,false,'the current proposal is confirmed only once');
+                        assert.ok(options.detail.includes(p));assert.equal(options.detail.includes(q),false);
+                        prompted=true;mutate();return 'Confirm and Apply';
+                    }
                     return undefined;
                 };
                 await h.createScopePanel(controller).applyInteractively();
