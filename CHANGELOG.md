@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.12
+
+- Coordinate exclusion settings saves and Apply across single-folder configuration aliases, delayed readback and missing notifications. Quick exclusions, Save and Apply, Save Request Only and Restore retain their existing confirmation and safety guards.
+- Avoid invalidating scope preparation for delayed notifications from an already verified settings-file write. Preserve competing edits, drafts, pending reviews, Unknown before-images and Undo; report saved requests that were not applied and incomplete verification without automatic late Apply or unsafe compensation.
+- Expose guarded Recheck from coverage rows and replace obsolete unnamed-event advice that prescribed a baseline rebuild. Retain durable unverified evidence and original baselines when recovery cannot complete.
+- Complete necessary directory observation after finite bursts of parent directory notifications without requiring an extra filesystem event. Preserve the original work budgets and continued observation of later file changes.
+
 ## 0.8.11
 
 - Automatically reconcile directory creation, imports, renames and finite bursts of activity within bounded observation budgets. Continue observing subsequent file changes without requiring another event or manual Recheck.
