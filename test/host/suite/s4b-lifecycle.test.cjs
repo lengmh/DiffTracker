@@ -9,10 +9,12 @@ const { DiffTracker } = require('../../../out/diffTracker.js');
 const { validateAndCanonicalizeScope } = require('../../../out/monitoringScope.js');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function until(description, predicate) {
+async function until(description, predicate, diagnostics) {
     const deadline = Date.now() + 15000;
     while (!predicate()) {
-        if (Date.now() > deadline) { throw new Error(`Timed out waiting for ${description}`); }
+        if (Date.now() > deadline) {
+            throw new Error(`Timed out waiting for ${description}${diagnostics ? `: ${JSON.stringify(diagnostics())}` : ''}`);
+        }
         await delay(50);
     }
 }
@@ -26,10 +28,12 @@ async function directoryChangeHost(workspace) {
     const tracker = new DiffTracker(vscode.Uri.file(storage));
     const nativeWatch = fs.watch;
     let observedNotifications = 0;
+    const notifications = [];
     fs.watch = function(directory, ...args) {
         const listener = args[args.length - 1];
         if (String(directory) === root && typeof listener === 'function') {
             args[args.length - 1] = (kind, filename) => {
+                if (notifications.length < 128) { notifications.push({kind,filename:String(filename)}); }
                 if (String(filename) === 'existing') { observedNotifications++; }
                 listener(kind, filename);
             };
@@ -117,7 +121,16 @@ async function directoryChangeHost(workspace) {
                 await until(`automatic observation of moved directory ${round}`, () =>
                     tracker.supplementalDirectoryWatchers.get(live)?.epoch === tracker.sessionEpoch &&
                     tracker.directoryObservations.size === 0 &&
-                    tracker.getTrackedChange(current)?.reviewKind === 'unknown');
+                    tracker.getTrackedChange(current)?.reviewKind === 'unknown', () => ({
+                        notifications,epoch:tracker.sessionEpoch,recording:tracker.getIsRecording(),
+                        owners:[...tracker.supplementalDirectoryWatchers].map(([directory,owner])=>
+                            ({path:path.relative(root,directory),epoch:owner.epoch,coverageRoot:path.relative(root,owner.coverageRoot)})),
+                        jobs:[...tracker.directoryObservations].map(([directory,job])=>({path:path.relative(root,directory),dirty:job.dirty})),
+                        gaps:tracker.getSubtreeCoverageGaps().map(gap=>({path:path.relative(root,gap.targetPath),reasonCode:gap.reasonCode})),
+                        reviewKind:tracker.getTrackedChange(current)?.reviewKind,
+                        currentContent:tracker.getTrackedChange(current)?.currentContent,
+                        originalKnown:tracker.getOriginalContent(current)!==undefined
+                    }));
                 const unknown = tracker.getUnknownReviewToken(current); assert.ok(unknown);
                 fs.writeFileSync(current, `later native child edit ${round}\n`);
                 await until(`continued moved-directory native observation ${round}`, () =>

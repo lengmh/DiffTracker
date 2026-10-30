@@ -1310,6 +1310,27 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         assert.ok(activeNativeWatcher(nativeDirectoryWatchers, blind));
     }, 'rules'));
 
+    for (const owner of ['legacy-imported','rules-imported','rules-supplemental'])
+    test(`Issue #55 native directory policy ignores ordinary excluded children (${owner})`, () => fixture(async ({tracker,dir}) => {
+        const parent = path.join(dir,'native-parent'), child = path.join(parent,'ignored');
+        fs.mkdirSync(child,{recursive:true}); fs.writeFileSync(path.join(child,'unobserved.txt'),'ignored current');
+        fs.writeFileSync(path.join(dir,'.gitignore'),'ignored/\n');
+        if (owner==='legacy-imported') {
+            tracker.effectiveMonitoringScope = tracker.createLegacyEffectiveScopeForRoots(tracker.getWorkspaceRoots());
+            h.setListedIgnores([Uri.file(path.join(dir,'.gitignore'))]);
+        }
+        await tracker.refreshIgnoreMatchers();
+        assert.equal(tracker.isPathIgnored(Uri.file(child)),false);
+        assert.equal(tracker.isPathIgnored(Uri.file(child),true),true);
+        if (owner==='rules-supplemental') {
+            await tracker.installSupplementalCoverageTargets([parent],tracker.sessionEpoch,true);
+            tracker.commitSupplementalCoverageTargets([parent]);
+        } else { assert.equal(tracker.watchImportedDirectory(parent,tracker.sessionEpoch),true); }
+        activeNativeWatcher(nativeDirectoryWatchers,parent).listener('change','ignored');
+        await settle(tracker);
+        assert.equal(tracker.coverageGaps.has(child),false,'native dispatch must filter directory policy before publishing an obligation');
+    },'rules'));
+
     for (const relative of ['ignored', 'parent/ignored']) for (const stopped of [false, true])
     test(`Issue #55 Rules directory ignore skips ${relative} change before observation (stopped=${stopped})`, () => fixture(async ({tracker,dir}) => {
         const ignored = path.join(dir, relative);

@@ -147,10 +147,29 @@ module.exports = async function runExtensionHostScenario() {
             folder: primaryFolder.name,
             path: 'dist/s3-private'
         }], vscode.ConfigurationTarget.Workspace);
-        const descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
-            grantConsent: true
-        });
-        assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify(descendantWatcherApply));
+        const { DiffTracker } = require('../../../out/diffTracker.js');
+        const performScopeApply = DiffTracker.prototype.performConfiguredMonitoringScopeApply;
+        let scopePreparationDiagnostic;
+        DiffTracker.prototype.performConfiguredMonitoringScopeApply = async function(...args) {
+            const readiness = () => ({epoch:this.sessionEpoch,recording:this.isRecording,
+                baselineBuilding:this.baselineBuilding,baselineTransaction:!!this.baselineTransaction,
+                scopeApplyPreflight:this.scopeApplyPreflight,activeScopeApplications:this.activeScopeApplications,
+                watcherRevision:this.watcherCoverageRevision,ignoreRevision:this.ignorePolicyRevision,
+                workspaceChanged:this.workspaceContextChanged,gitPending:this.gitContextPending,
+                gitPauses:this.pausedGitRepositories.size,recoveryBlocked:this.recoveryBlocked,
+                effectiveRevision:this.effectiveMonitoringScope.scopeRevision,pendingRevision:this.pendingMonitoringScope?.scopeRevision});
+            const before = readiness();
+            const result = await performScopeApply.apply(this,args);
+            if (result.status === 'conflict') { scopePreparationDiagnostic = {before,after:readiness()}; }
+            return result;
+        };
+        let descendantWatcherApply;
+        try {
+            descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
+                grantConsent: true
+            });
+        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply; }
+        assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify({outcome:descendantWatcherApply,scopePreparationDiagnostic}));
 
         await scopeConfig.update('watchInclude', [privateInclude],
             vscode.ConfigurationTarget.Workspace);

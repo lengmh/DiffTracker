@@ -2871,6 +2871,10 @@ export class DiffTracker {
             const folder = this.owningWorkspaceFolderForTraversal(filePath);
             if (folder && isHardUnmonitorableRelativePath(this.toPosixPath(path.relative(folder.uri.fsPath, filePath)),
                 this.workspaceRootIdentityForFolder(folder), true)) { return; }
+            // Candidate policy cannot discard events needed by Apply rollback.
+            // Pending exclusions likewise retain their deferred control evidence.
+            if (!this.committedScopeDuringApply &&
+                this.isPathIgnored(vscode.Uri.file(filePath), true, true, false)) { return; }
             // Native rename also reports metadata changes and existing/moved
             // directories. It cannot prove that their children were absent.
             this.setSubtreeCoverageGap(filePath, 'supplemental-watcher-directory-change-gap',
