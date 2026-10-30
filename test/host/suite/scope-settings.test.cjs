@@ -9,6 +9,8 @@ module.exports = async function scopeSettingsCheckpoint() {
     const state = () => vscode.commands.executeCommand('diffTracker._testState');
     const scopeStatus = () => vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
     const trace = [];
+    const {DiffTracker}=require('../../../out/diffTracker.js');
+    const wrapped=new Map();
     let stage = 'activation';
     const until = async (description,predicate) => {
         const deadline = Date.now()+10_000;
@@ -25,6 +27,25 @@ module.exports = async function scopeSettingsCheckpoint() {
         folder:vscode.workspace.getConfiguration('diffTracker',vscode.workspace.workspaceFolders[0].uri)
             .inspect('watchExclude').workspaceFolderValue
     });
+    for(const method of ['prepareOwnedScopeSettings','recordBaselineTransactionEvent','commitPreparedScopePersistence']){
+        const original=DiffTracker.prototype[method];wrapped.set(method,original);
+        DiffTracker.prototype[method]=function(...args){
+            const transaction=this.baselineTransaction;
+            const enabled=method!=='recordBaselineTransactionEvent'||!!transaction;
+            const details=()=>({epoch:this.sessionEpoch,ignoreRevision:this.ignorePolicyRevision,
+                ignoreRefresh:this.ignoreRefreshVersion,scope:this.getEffectiveMonitoringScope().scopeRevision,
+                proof:method==='prepareOwnedScopeSettings'?this.settledScopeSettings.has(args[0]):!!transaction?.settledSettingsWrite,
+                events:[...(transaction?.observedEvents?.values()??[])].map(event=>({
+                    kind:event.kind,path:path.relative(workspace,event.uri.fsPath).startsWith('..')?'outside fixture':path.relative(workspace,event.uri.fsPath)
+                }))});
+            const entry=enabled&&trace.length<64?{stage,kind:method,before:details()}:undefined;
+            if(entry){trace.push(entry);}
+            if(method==='recordBaselineTransactionEvent'){
+                const result=original.apply(this,args);if(entry){entry.after=details();}return result;
+            }
+            return Promise.resolve(original.apply(this,args)).finally(()=>{if(entry){entry.after=details();}});
+        };
+    }
     const observe = vscode.workspace.onDidChangeConfiguration(event => {
         const keys = ['monitoringScope','watchInclude','watchExclude'].filter(key=>event.affectsConfiguration(`diffTracker.${key}`));
         if (keys.length) { trace.push({stage,kind:'notification',keys}); }
@@ -98,5 +119,5 @@ module.exports = async function scopeSettingsCheckpoint() {
         assert.equal(final.isRecording,true);
         assert.equal(final.trackedChanges.some(change=>change.filePath===uri('second-cache/existing.txt').fsPath),false);
         console.log(`PASS HOST-EXCLUDES real single-folder configuration publication and controller Save and Apply: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
-    } finally { observe.dispose(); }
+    } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;} }
 };

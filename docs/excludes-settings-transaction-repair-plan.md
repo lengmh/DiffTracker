@@ -118,7 +118,7 @@ R2 boundary probe now reproduces the exact ignore-policy invalidation when a
 notification for the settings file written by the action arrives during Apply
 preparation. The failed transaction compensates its exclusion request. This is
 separate from stale configuration readback and does not prove the field cause;
-causal, bounded handling remains unimplemented. The initial
+the bounded handling below is now under real Host qualification. The initial
 documentation-head Verification run also failed Windows Stable Host during
 automatic moved-directory observation; that failure remains under diagnosis
 and is not established as repaired by the settings settlement changes.
@@ -161,4 +161,26 @@ Second local checkpoint validation passed: compile, lint, complete `npm test`
 inspection. The three Host failures on the first runtime head concern the new
 stopped-save assertion; the earlier documentation-head Windows moved-directory
 timeout remains a separate unresolved diagnostic. The source-alias repair still
-requires exact-head real Host confirmation.
+passed stopped Save and Apply on all three real Host variants. Active Save and
+Apply still failed: Windows/1.80 reproduced ignore-policy invalidation, while
+Stable Linux failed at candidate durable preparation.
+
+The next implementation reconciles the one known settings control file before
+Apply, preserving its original baseline and pending review. A receipt is tied
+to this operation, epoch, request, scope eligibility and physical file identity.
+Only late notifications matching the already-observed bytes, metadata and
+identity can be duplicates; other events retain transaction invalidation and
+normal replay. The actual file is reverified at the durable commit barrier.
+There is no Apply retry, fixed delay, global polling or coverage-gap clearing.
+Receipt work is limited to a 1 MiB file, 16 verification reads and 4 MiB total;
+exhaustion fails closed. An explicitly excluded control file is not read.
+
+Four regressions reproduce both Host failure stages for the shortcut and Save
+and Apply, then pass with one settings-write sequence. Eight negative cases
+retain unrelated-event, changed-byte, replaced-identity, dirty-editor, Stop and
+budget guards, including mutations without another callback at the durable
+barrier. Changed or unverified physical settings are not overwritten by
+compensation. Local complete validation passed 1,732 tracker cases, 193 UI
+cases, 28 real temporary Git scenarios and 10 Host fixture tests, plus lint,
+performance and the actual 75-entry VSIX privacy check. Real Host confirmation
+and the remaining R1/R3/R4 matrix are still required.

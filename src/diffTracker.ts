@@ -293,6 +293,7 @@ interface BaselineTransaction {
     // Authoritative identity check only at the synchronous durable commit barrier.
     commitValid?: () => boolean;
     observedEvents?: Map<string, StartupEvent>;
+    settledSettingsWrite?: SettledSettingsWrite;
     deferReady?: boolean;
     readyPrepared?: boolean;
     baselineRecovery?: { payload: Uint8Array; digest: string; prepared: boolean };
@@ -300,6 +301,12 @@ interface BaselineTransaction {
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
+}
+
+interface SettledSettingsWrite {
+    matches: (uri: vscode.Uri, kind: StartupEvent['kind']) => boolean;
+    verify: () => boolean;
+    ownsCurrent: () => boolean;
 }
 
 interface StartupEvent {
@@ -564,8 +571,13 @@ export class DiffTracker {
     private activeExternalOperations = new Map<number, { uri: vscode.Uri; kind: 'change' | 'delete' }>();
 
     private recordBaselineTransactionEvent(uri: vscode.Uri, kind: StartupEvent['kind']): void {
-        const events = this.baselineTransaction?.observedEvents;
+        const transaction = this.baselineTransaction;
+        const events = transaction?.observedEvents;
         if (!events) { return; }
+        // Only a notification for the already-reconciled, exact settings write
+        // may be a duplicate. New bytes, identity, dirty state or other paths
+        // retain the ordinary transaction invalidation and replay path.
+        if (transaction?.settledSettingsWrite?.matches(uri,kind)) { return; }
         const previous = events.get(uri.fsPath);
         events.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
     }
@@ -871,6 +883,7 @@ export class DiffTracker {
         creations: Map<string, fs.BigIntStats>; active: () => boolean; current: () => boolean;
     }>();
     private runtimeBaselinePublications = new Set<Promise<boolean>>();
+    private settledScopeSettings = new WeakMap<ScopeOperationObservation,SettledSettingsWrite>();
     // Persisted as restart uncertainty, never as proof that an OS handle lives.
     private importedCoverageObligations = new Set<string>();
     private readonly importedCoverageRestartCode = 'imported-coverage-restart-required';
@@ -3891,7 +3904,7 @@ export class DiffTracker {
     private async commitPreparedScopePersistence(transaction: BaselineTransaction): Promise<boolean> {
         const epoch = this.sessionEpoch;
         const storageUri = this.storageUri;
-        if (!storageUri) { return true; }
+        if (!storageUri) { return transaction.commitValid?.() ?? true; }
         const failureUri = this.getPersistedStateUri(this.persistenceFailureFileName);
         if (!failureUri) { return true; }
 
@@ -3900,7 +3913,8 @@ export class DiffTracker {
                 epoch === this.sessionEpoch &&
                 this.baselineTransaction === transaction &&
                 this.isCurrentEpoch(transaction.epoch) &&
-                (transaction.valid?.() ?? true);
+                (transaction.valid?.() ?? true) &&
+                (transaction.commitValid?.() ?? true);
             if (!transactionCurrent()) { return false; }
             try {
                 // Marker deletion is the durable commit point. All context
@@ -6206,6 +6220,8 @@ export class DiffTracker {
         try { transaction = this.beginBaselineTransaction(restore); }
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
+        transaction.settledSettingsWrite = scopeOperation && this.settledScopeSettings.get(scopeOperation);
+        transaction.commitValid = transaction.settledSettingsWrite?.verify;
         // The candidate matcher refresh below is allowed to establish one new
         // policy generation for the requested scope. Once that refresh
         // completes, every acquisition and durable barrier must stay on that
@@ -6531,6 +6547,66 @@ export class DiffTracker {
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
         );
+    }
+
+    public async prepareOwnedScopeSettings(
+        operation: ScopeOperationObservation, uri: vscode.Uri | undefined,
+        scope: CanonicalMonitoringScope, requestCurrent: () => boolean
+    ): Promise<void> {
+        const epoch=this.sessionEpoch;
+        if (!uri || uri.scheme!=='file' || !this.isRecording || !this.snapshotInitialized ||
+            this.baselineBuilding || this.baselineTransaction || this.restoringEpoch!==undefined) { return; }
+        const current=(requireActivity=true)=>this.isCurrentEpoch(epoch) && (!requireActivity || operation.activity.active) && requestCurrent() &&
+            !this.hasDirtyDocument(uri.fsPath) && !this.isPathIgnored(uri) &&
+            this.configuredScopeMonitorsPath(scope,uri) && !this.validateResourceTarget(uri.fsPath);
+        if (!current()) { return; }
+        const controlPath=this.canonicalTrackingPath(uri.fsPath);
+        // This is one known control file, never a scope traversal. Bound both
+        // individual proof size and total verification reads for late events.
+        let reads=16,remainingBytes=4*1024*1024;
+        const same=(a:fs.BigIntStats,b:fs.BigIntStats)=>a.dev===b.dev && a.ino===b.ino &&
+            a.birthtimeNs===b.birthtimeNs && a.mtimeNs===b.mtimeNs && a.ctimeNs===b.ctimeNs &&
+            a.mode===b.mode && a.size===b.size;
+        const read=(requireActivity=true): {identity:fs.BigIntStats;hash:string} | undefined => {
+            if (!current(requireActivity) || reads--<=0) { return undefined; }
+            let descriptor:number|undefined;
+            try {
+                const before=fs.lstatSync(uri.fsPath,{bigint:true});
+                if (!before.isFile() || before.isSymbolicLink() || before.size>1024n*1024n ||
+                    before.size>BigInt(remainingBytes)) { return undefined; }
+                remainingBytes-=Number(before.size);
+                descriptor=fs.openSync(uri.fsPath,fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+                const opened=fs.fstatSync(descriptor,{bigint:true});
+                if (!same(before,opened)) { return undefined; }
+                const hash=createHash('sha256'),buffer=Buffer.alloc(64*1024);
+                for(let offset=0;offset<Number(opened.size);){
+                    const size=fs.readSync(descriptor,buffer,0,Math.min(buffer.length,Number(opened.size)-offset),offset);
+                    if (!size) { return undefined; }
+                    hash.update(buffer.subarray(0,size));offset+=size;
+                }
+                const after=fs.fstatSync(descriptor,{bigint:true});
+                if (!same(before,after) || !same(after,fs.lstatSync(uri.fsPath,{bigint:true}))) { return undefined; }
+                return {identity:after,hash:hash.digest('hex')};
+            } catch { return undefined; }
+            finally { if(descriptor!==undefined){fs.closeSync(descriptor);} }
+        };
+        const saved=read();
+        if (!saved) { return; }
+        await this.readFileAndUpdate(uri.fsPath,uri,current);
+        const verify=(requireActivity=true)=>{
+            const latest=read(requireActivity);
+            return !!latest && latest.hash===saved.hash && same(latest.identity,saved.identity);
+        };
+        if (!verify()) { return; }
+        this.settledScopeSettings.set(operation,{
+            matches:(target,kind)=>target.scheme==='file' && kind!=='delete' &&
+                target.fsPath===controlPath && verify(),
+            verify:()=>verify(),ownsCurrent:()=>verify(false)
+        });
+    }
+
+    public ownedScopeSettingsAreCurrent(operation: ScopeOperationObservation): boolean | undefined {
+        return this.settledScopeSettings.get(operation)?.ownsCurrent();
     }
 
     public captureScopeOperationObservation(): ScopeOperationObservation {

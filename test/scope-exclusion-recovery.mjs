@@ -186,6 +186,109 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         },{deferConfigurationReadback:key=>key==='watchExclude'});
     },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
 
+    for(const action of ['shortcut','save']) for(const phase of ['ignore','persist'])
+    test(`EXCLUDES settled settings-file notification completes one ${action} action (${phase})`, () => fixture(async ({tracker,scope,dir}) => {
+        const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));
+        fs.writeFileSync(settingsFile,'{}');
+        const unrelated=path.join(dir,'unrelated.txt');fs.writeFileSync(unrelated,'before');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(settingsFile),Uri.file(unrelated)]);
+        tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        assert.equal(tracker.getOriginalContent(settingsFile),'{}');
+        fs.writeFileSync(unrelated,'pending');await tracker.readFileAndUpdate(unrelated,Uri.file(unrelated));
+        const token=tracker.getReviewToken(unrelated);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior interval');
+        await withController(tracker,scope,async({controller,hooks,config,writes})=>{
+            let wrote=false,injected=false;
+            hooks.afterWrite=()=>{fs.writeFileSync(settingsFile,JSON.stringify(config));wrote=true;};
+            const notify=()=>{
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                }
+            };
+            const opendir=fs.promises.opendir,write=vscode.workspace.fs.writeFile;
+            fs.promises.opendir=async(directory,...args)=>{const result=await opendir(directory,...args);if(phase==='ignore'){notify();}return result;};
+            vscode.workspace.fs.writeFile=async(...args)=>{await write(...args);if(phase==='persist'){notify();}};
+            try{
+                const outcome=action==='shortcut'?await controller.excludeCoverageSubtree(selected,async()=>true):
+                    await controller.saveAndApplyScope({mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+                assert.equal(injected,true);
+                assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,true);
+                assert.equal(writes.length,action==='shortcut'?1:3,'no repeated configuration writes');
+                assert.equal(tracker.getOriginalContent(settingsFile),'{}');
+                assert.equal(tracker.getTrackedChange(settingsFile)?.currentContent,JSON.stringify(config));
+                assert.deepEqual(tracker.getReviewToken(unrelated),token);
+                assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
+            }finally{fs.promises.opendir=opendir;vscode.workspace.fs.writeFile=write;}
+        });
+    },'rules'));
+
+    for(const change of ['other-file','settings-bytes','settings-identity','commit-bytes','commit-identity','dirty','stop','budget'])
+    test(`EXCLUDES settings proof retains transaction and compensation protection (${change})`, () => fixture(async ({tracker,scope,dir}) => {
+        const selected=path.join(dir,'generated-cache');fs.mkdirSync(selected);
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));
+        fs.writeFileSync(settingsFile,'{}');
+        const other=path.join(dir,'other.txt');fs.writeFileSync(other,'original');
+        h.setListedFiles([Uri.file(settingsFile),Uri.file(other)]);
+        tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        const original=tracker.getOriginalContent(settingsFile);
+        await withController(tracker,scope,async({controller,hooks,config,writes})=>{
+            let wrote=false,injected=false,external,commitChanged=false;
+            hooks.afterWrite=()=>{fs.writeFileSync(settingsFile,JSON.stringify(config));wrote=true;};
+            const opendir=fs.promises.opendir,write=vscode.workspace.fs.writeFile;
+            vscode.workspace.fs.writeFile=async(...args)=>{
+                await write(...args);
+                if(change.startsWith('commit-')&&injected&&!commitChanged&&tracker.baselineTransaction){
+                    commitChanged=true;
+                    external=JSON.stringify({...config,independentAtCommit:true});
+                    if(change==='commit-identity'){fs.renameSync(settingsFile,`${settingsFile}.previous`);}
+                    // No subsequent event: the durable barrier must check the
+                    // actual file instead of trusting the earlier notification.
+                    fs.writeFileSync(settingsFile,external);
+                }
+            };
+            fs.promises.opendir=async(directory,...args)=>{
+                const result=await opendir(directory,...args);
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;
+                    if(change==='other-file'){
+                        fs.writeFileSync(other,'independent edit');tracker.dispatchExternalEvent(Uri.file(other),'change',tracker.sessionEpoch);
+                    }else{
+                        if(change==='settings-bytes'){external=JSON.stringify({...config,independent:true});fs.writeFileSync(settingsFile,external);}
+                        if(change==='settings-identity'){external=fs.readFileSync(settingsFile,'utf8');fs.renameSync(settingsFile,`${settingsFile}.previous`);fs.writeFileSync(settingsFile,external);}
+                        if(change==='dirty'){vscode.workspace.textDocuments.push({uri:Uri.file(settingsFile),isDirty:true});}
+                        if(change==='stop'){tracker.stopRecording();}
+                        for(let i=0;i<(change==='budget'?20:1);i++){
+                            tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                        }
+                    }
+                }
+                return result;
+            };
+            try{
+                const outcome=await controller.saveAndApplyScope({mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+                assert.equal(injected,true);
+                assert.notEqual(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,false);
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.equal(tracker.getOriginalContent(settingsFile),original);
+                if(change==='settings-bytes'||change==='settings-identity'||change.startsWith('commit-')){
+                    if(change.startsWith('commit-')){assert.equal(commitChanged,true);}
+                    assert.equal(outcome.status,'partial');
+                    assert.equal(writes.length,3,'do not compensate over an unowned physical settings revision');
+                    assert.equal(fs.readFileSync(settingsFile,'utf8'),external);
+                }
+                if(change==='other-file'){
+                    assert.equal(fs.readFileSync(other,'utf8'),'independent edit');
+                    assert.equal(outcome.settingsStatus,'restored','an unrelated event does not forfeit physical settings ownership');
+                }
+                if(change==='stop'){assert.equal(tracker.getIsRecording(),false);}
+            }finally{fs.promises.opendir=opendir;vscode.workspace.fs.writeFile=write;if(change==='dirty'){vscode.workspace.textDocuments.pop();}}
+        });
+    },'rules'));
+
     for(const independent of ['workspace-file','different-folder-value'])
     test(`EXCLUDES owned save retains independent Folder guard (${independent})`, () => fixture(async ({tracker,scope}) => {
         const workspaceFile=vscode.workspace.workspaceFile;

@@ -429,6 +429,15 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
     }
 
+    private scopeSettingsFile(): vscode.Uri | undefined {
+        if (vscode.workspace.workspaceFile) {
+            return vscode.workspace.workspaceFile.scheme==='file' ? vscode.workspace.workspaceFile : undefined;
+        }
+        const folders=vscode.workspace.workspaceFolders ?? [];
+        return folders.length===1 && folders[0].uri.scheme==='file'
+            ? vscode.Uri.file(path.join(folders[0].uri.fsPath,'.vscode','settings.json')) : undefined;
+    }
+
     /**
      * Stages a directory-only exclusion in Workspace Settings, never Applies it.
      * The UI must refuse to call this while a scope-editor draft may be unsaved.
@@ -499,6 +508,9 @@ export class MonitoringScopeController implements vscode.Disposable {
                             : conflict(saved.reason ?? 'The exclusion request changed before it could be saved.');
                     } else {
                         observationBefore = this.tracker.captureScopeOperationObservation();
+                        const savedVersion=this.getRequestVersion();
+                        await this.tracker.prepareOwnedScopeSettings(observationBefore,this.scopeSettingsFile(),scope,
+                            ()=>!this.disposed && stillCurrent() && this.getRequestVersion()===savedVersion);
                         outcome = await this.performPendingScopeApply({
                             discardExplicitlyExcludedReviews: affectedReviewPaths.length > 0,
                             expectedScopeRevision: scope.scopeRevision,
@@ -513,6 +525,12 @@ export class MonitoringScopeController implements vscode.Disposable {
                     try {
                         // Compensate only our still-current request. An external
                         // settings edit must not be overwritten by old values.
+                        if (outcome.status!=='applied' && observationBefore &&
+                            this.tracker.ownedScopeSettingsAreCurrent(observationBefore)===false) {
+                            settingsOwnershipLost=true;
+                            outcome={...outcome,status:'partial',settingsStatus:'partial',scopeCommitted:false,coverageStatus:'notRun',
+                                reason:'The exclusion was not applied. Its settings file changed or could not be verified; current settings and review were preserved. Review the saved Workspace request before applying it.'};
+                        }
                         const effective = this.tracker.getEffectiveMonitoringScope();
                         if (!settingsOwnershipLost && outcome.status !== 'applied' && effective.scopeRevision === initial.effective.scopeRevision &&
                             this.getRequestedScope().scope?.scopeRevision === scope.scopeRevision) {
@@ -745,6 +763,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                     // Approval can outlive independent directory activity. Pin
                     // attribution at Apply, after owned settings have settled.
                     observationBefore = this.tracker.captureScopeOperationObservation();
+                    await this.tracker.prepareOwnedScopeSettings(observationBefore,this.scopeSettingsFile(),scope,
+                        ()=>current() && proposalStillCurrent());
                     outcome = await this.performPendingScopeApply({grantConsent:true,
                         discardExplicitlyExcludedReviews:affectedReviewPaths.length > 0,
                         expectedScopeRevision:scope.scopeRevision,expectedAffectedReviewRevision:affectedReviewRevision,
@@ -761,6 +781,9 @@ export class MonitoringScopeController implements vscode.Disposable {
                     // Compensate only the exact uncommitted request still owned here.
                     if (outcome.status !== 'applied' && attempted) {
                         try {
+                            if (observationBefore && this.tracker.ownedScopeSettingsAreCurrent(observationBefore)===false) {
+                                settingsOwnershipLost=true;
+                            }
                             if (!current()) { throw new Error('Newer settings or workspace state must be preserved.'); }
                             const unchanged = this.settingsFingerprint(expected) === this.settingsFingerprint(before);
                             const config = vscode.workspace.getConfiguration('diffTracker');

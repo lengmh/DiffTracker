@@ -100,6 +100,8 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         getLargeFileReminderToken:target=>state.changes.find(change=>change.filePath===target)?.largeFileReminder?.pending
             ? {...largeFileReminderToken,filePath:target} : undefined,
         getSubtreeCoverageGaps:()=>state.subtreeCoverageGaps,
+        prepareOwnedScopeSettings:async()=>{},
+        ownedScopeSettingsAreCurrent:()=>undefined,
         getObservationCoverageRecheckBlocker:()=>state.recheckBlocker,
         getIsRecording:()=>true,
         onDidTrackChanges:()=>({dispose(){}})
