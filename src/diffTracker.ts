@@ -293,6 +293,7 @@ interface BaselineTransaction {
     // Authoritative identity check only at the synchronous durable commit barrier.
     commitValid?: () => boolean;
     observedEvents?: Map<string, StartupEvent>;
+    outsideBothScopes?: (uri: vscode.Uri) => boolean;
     settledSettingsWrite?: SettledSettingsWrite;
     deferReady?: boolean;
     readyPrepared?: boolean;
@@ -578,6 +579,11 @@ export class DiffTracker {
         // may be a duplicate. New bytes, identity, dirty state or other paths
         // retain the ordinary transaction invalidation and replay path.
         if (transaction?.settledSettingsWrite?.matches(uri,kind)) { return; }
+        // A strict descendant of an explicit directory exclusion in BOTH the
+        // committed and candidate scopes cannot change either review. This is
+        // scope classification, not authority over the settings write. The
+        // request/configuration and policy guards still run at every barrier.
+        if (transaction?.outsideBothScopes?.(uri)) { return; }
         const previous = events.get(uri.fsPath);
         events.set(uri.fsPath, { uri, firstKind: previous?.firstKind ?? kind, kind });
     }
@@ -1474,9 +1480,23 @@ export class DiffTracker {
 
         // Persist uncertainty first. Never replace another root-level control
         // obligation, and reserve all markers before publishing any of them.
+        const importedOwnerRepairs = targets ? [] : importedDirectoryGaps.filter(([target]) => {
+            const folder=this.owningWorkspaceFolderForTraversal(target);
+            return !folder || !plan.targets.some(root=>this.pathBelongsToRoot(target,root) &&
+                this.workspaceFolderOwnsTraversalPath(folder,root));
+        });
         const markers = new Map<string, CoverageGapEvidence>();
         const budget = this.createCandidatePersistenceBudget();
         try {
+            // Older failed imports can retain only the directory gap, without
+            // the independent owner descriptor added by successful handoff.
+            // Full Recheck must restore that required owner as well as scan.
+            // Reserve every descriptor before any installation or mutation.
+            if (!targets) {
+                for (const [target,evidence] of importedOwnerRepairs) {
+                    this.reserveCandidateCoverageGap(target,evidence,budget,true);
+                }
+            }
             // Scoped recovery retains its exact revision-bound evidence first.
             // Only explicit full Recheck needs a new workspace-root marker.
             for (const root of targets ? [] : this.sessionWorkspaceRoots) {
@@ -1492,6 +1512,10 @@ export class DiffTracker {
             }
         } catch (error) {
             return { status: 'failed', reason: `Recheck cannot reserve durable coverage evidence: ${String(error)}` };
+        }
+        if (!targets) {
+            for (const [target] of importedOwnerRepairs) { this.importedCoverageObligations.add(target); }
+            plan.targets=this.normalizeSupplementalTargets([...plan.targets,...importedOwnerRepairs.map(([target])=>target)]);
         }
         for (const [root, evidence] of markers) {
             if (!this.coverageGaps.get(root)?.[evidence.targetKind]) {
@@ -1558,6 +1582,13 @@ export class DiffTracker {
             }
             if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
             if (!targets) { this.commitSupplementalCoverageTargets(plan.targets); }
+            for (const [target] of importedOwnerRepairs) {
+                if (this.canReuseSupplementalDirectoryOwner(target,epoch) &&
+                    [...this.importedDirectoryWatchers].some(([directory,owner]) =>
+                        owner.epoch===epoch && this.pathBelongsToRoot(directory,target))) {
+                    handoffs.push(await this.prepareImportedCoverageHandoff(target,epoch,preparationBudget,current,false,true));
+                }
+            }
             const relevantOwner=(directory:string) => selected(directory) || !!targets?.some(target => target.kind==='file' && path.dirname(target.path)===directory);
             const owners = new Map([...this.supplementalDirectoryWatchers].filter(([directory])=>relevantOwner(directory)).map(([directory, owner]) =>
                 [directory, { owner, revision: owner.eventRevision ?? 0 }]));
@@ -2446,6 +2477,10 @@ export class DiffTracker {
                 this.pendingImportedDirectoryReconciliation.delete(directory);
                 continue;
             }
+            // The legacy resume scan has no configured-scope owner handoff or
+            // durable restart descriptor. Preserve old gap-only records until
+            // explicit Recheck certifies their independent observation owner.
+            if (this.effectiveMonitoringScope.kind === 'configured') { continue; }
             const entry = this.importedDirectoryWatchers.get(directory);
             if (entry?.epoch !== epoch || this.validateResourceTarget(directory)) {
                 // Keep the obligation pending: a later refresh may restore the
@@ -6221,6 +6256,19 @@ export class DiffTracker {
         catch { return empty('conflict', 'Another baseline transaction is active.'); }
         transaction.observedEvents = new Map();
         transaction.settledSettingsWrite = scopeOperation && this.settledScopeSettings.get(scopeOperation);
+        transaction.outsideBothScopes = uri => {
+            if (uri.scheme !== 'file' || previous.effectiveMonitoringScope.kind !== 'configured') { return false; }
+            // Policy sources remain independent of their review scope. Do not
+            // weaken their invalidation, including repository exclude policy.
+            const parts = uri.fsPath.split(path.sep).map(part=>part.toLowerCase());
+            if (parts.includes('.git') || parts[parts.length-1] === '.gitignore') { return false; }
+            // Classify the parent, never inspect excluded contents or assume
+            // that a directory-only excluded node is still a directory. A node
+            // replacement event must retain the normal identity/type checks.
+            const parent = path.dirname(uri.fsPath);
+            return this.scopeExplicitlyExcludesDirectory(parent, previous.effectiveMonitoringScope) &&
+                this.scopeExplicitlyExcludesDirectory(parent, {kind:'configured',...scope});
+        };
         transaction.commitValid = transaction.settledSettingsWrite?.verify;
         // The candidate matcher refresh below is allowed to establish one new
         // policy generation for the requested scope. Once that refresh

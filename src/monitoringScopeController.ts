@@ -48,6 +48,7 @@ interface LegacySourceSnapshot {
 }
 
 export interface MonitoringScopeStatus {
+    operationOutcome?: MonitoringScopeActionOutcome;
     requested: ScopeValidationResult;
     rawRequested: { mode: unknown; includes: unknown; excludes: unknown };
     effective: EffectiveMonitoringScope;
@@ -81,7 +82,15 @@ export interface MonitoringScopeConfirmation {
     affectedReviewPaths: readonly string[];
 }
 
+export type MonitoringScopeActionOutcome = MonitoringScopeApplyOutcome |
+    {status:'alreadyExcluded'|'blocked'|'cancelled';reason?:string};
+
 export class MonitoringScopeController implements vscode.Disposable {
+    private lastOperationOutcome?: MonitoringScopeActionOutcome;
+
+    public recordOperationOutcome(outcome: MonitoringScopeActionOutcome): void {
+        this.lastOperationOutcome = JSON.parse(JSON.stringify(outcome)) as MonitoringScopeActionOutcome;
+    }
     private readonly disposables: vscode.Disposable[] = [];
     private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
     private pendingScopeSettingsWrites = 0;
@@ -340,6 +349,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const migrationRequired = effective.kind === 'legacyV3' &&
             (legacyGlobalRules.length > 0 || legacyCommittedRules.some(([, patterns]) => patterns.length > 0));
         return {
+            operationOutcome: this.lastOperationOutcome,
             requested,
             rawRequested: this.getRequestedRawScope(),
             effective,
@@ -593,6 +603,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                             const before=this.scopeSettings();
                             await this.updateOwnedScopeSetting(vscode.workspace.getConfiguration('diffTracker'),
                                 'watchExclude',previousExcludes,before,{...before,watchExclude:previousExcludes});
+                            outcome={...outcome,scopeRevision:scope.scopeRevision,settingsStatus:'restored',scopeCommitted:false,coverageStatus:'notRun',
+                                reason:`The exclusion was not applied; its settings request was restored. ${outcome.reason ?? ''} Review the operation result in Manage Monitoring Scope.`};
                         }
                     } catch (error) {
                         outcome = { status: 'partial', settingsStatus:'partial', scopeCommitted:false, coverageStatus:'notRun',

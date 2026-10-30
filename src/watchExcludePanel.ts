@@ -28,7 +28,6 @@ export class WatchExcludePanel {
     private actionInProgress = false;
     private activeActionId?: number;
     private disposed = false;
-    private lastOutcome?: MonitoringScopeApplyOutcome;
     private nextLease = 0;
     private editorLease?: {id:number;resolve:(clean:boolean)=>void;timer:ReturnType<typeof setTimeout>};
 
@@ -343,7 +342,7 @@ export class WatchExcludePanel {
     }
 
     private showOutcome(outcome: MonitoringScopeApplyOutcome): void {
-        this.lastOutcome = outcome;
+        this.scopeController.recordOperationOutcome(outcome);
         if (outcome.status === 'cancelled') { return; }
         const text = `Code Diff Tracker: ${outcome.reason ?? (outcome.status === 'applied'
             ? 'Monitoring scope applied and observation coverage verified.' : outcome.status)}`;
@@ -375,7 +374,7 @@ export class WatchExcludePanel {
         void this.panel.webview.postMessage({
             command: 'scopeStatus',
             requestVersion: this.scopeController.getRequestVersion(),
-            operationOutcome: this.lastOutcome,
+            operationOutcome: status.operationOutcome,
             rawRequested: status.rawRequested,
             requested: {
                 ok: status.requested.ok,

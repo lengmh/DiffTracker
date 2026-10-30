@@ -79,14 +79,14 @@ module.exports = async function scopeSettingsCheckpoint() {
         stage='stopped-save';
         trace.push({stage,kind:'sources-before',...configurationSources()});
         const first = await vscode.commands.executeCommand('diffTracker._testSaveAndApplyScope',{
-            mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/prior-cache/'},{scope:'all',pattern:'/generated-cache/'}]
+            mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:'/prior-cache/'},{scope:'all',pattern:'/generated-cache/'}]
         });
         trace.push({stage,kind:'sources-after',...configurationSources()});
         assert.equal(first.status,'applied',JSON.stringify({first,trace}));
         assert.equal(first.scopeCommitted,true);
         assert.equal((await state()).isRecording,false,'saving exclusions must not start recording');
         assert.deepEqual(vscode.workspace.getConfiguration('diffTracker').inspect('watchExclude').workspaceValue,[
-            {scope:'all',pattern:'/generated-cache/'},{scope:'all',pattern:'/prior-cache/'}
+            {scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:'/generated-cache/'},{scope:'all',pattern:'/prior-cache/'}
         ]);
         stage='real-api-include';
         await roundTrip([{scope:'all',path:'watched.txt'}]);
@@ -102,18 +102,21 @@ module.exports = async function scopeSettingsCheckpoint() {
             change.filePath===uri('watched.txt').fsPath && change.currentContent==='pending before exclusion\n'));
         stage='active-save';
         const active = await vscode.commands.executeCommand('diffTracker._testSaveAndApplyScope',{
-            mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/prior-cache/'},
+            mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:'/prior-cache/'},
                 {scope:'all',pattern:'/generated-cache/'},{scope:'all',pattern:'/second-cache/'}]
         });
         assert.equal(active.status,'applied',JSON.stringify({active,trace}));
         assert.equal(active.scopeCommitted,true);
         const after = await scopeStatus();
         assert.equal(after.requested.scope.scopeRevision,after.effective.scopeRevision);
+        assert.ok(after.effective.excludes.some(rule=>rule.pattern==='/.vscode/'),'real active Apply retains the excluded settings directory');
         stage='active-shortcut';
         const shortcut=await vscode.commands.executeCommand('diffTracker.excludeResource',uri('quick-cache'));
         assert.equal(shortcut.status,'applied',JSON.stringify({shortcut,trace}));
         assert.equal(shortcut.scopeCommitted,true);
         const quickStatus=await scopeStatus();
+        assert.deepEqual(quickStatus.operationOutcome,JSON.parse(JSON.stringify(shortcut)),
+            'the actual quick command result remains available in scope diagnostics');
         assert.equal(quickStatus.requested.scope.scopeRevision,quickStatus.effective.scopeRevision);
         assert.ok(quickStatus.effective.excludes.some(rule=>rule.pattern==='/quick-cache/'));
 
@@ -157,6 +160,6 @@ module.exports = async function scopeSettingsCheckpoint() {
         for(const folder of ['quick-cache','saved-cache']){
             assert.equal(final.trackedChanges.some(change=>change.filePath===uri(`${folder}/existing.txt`).fsPath),false);
         }
-        console.log(`PASS HOST-EXCLUDES real configuration Save and Apply, shortcut, Apply Saved Request, Restore and continued observation: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
+        console.log(`PASS HOST-EXCLUDES real configuration with excluded settings: Save and Apply, shortcut, Apply Saved Request, Restore and continued observation: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
     } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;} }
 };

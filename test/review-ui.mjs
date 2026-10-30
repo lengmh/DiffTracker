@@ -2477,6 +2477,22 @@ function quickExclusionHarness(coverage = false) {
         : h.run('excludeResource', { exclusionPath: target }) };
 }
 
+for (const coverage of [false,true]) await test(`quick exclusion diagnostics retain failure before opening the scope panel (coverage=${coverage})`,async()=>{
+    const h=quickExclusionHarness(coverage);
+    h.state.confirm=true;h.state.applyFailure=true;
+    const outcome=await h.exclude();
+    assert.equal(outcome.status,'failed');
+    assert.equal(outcome.settingsStatus,'restored');
+    assert.equal(outcome.scopeCommitted,false);
+    assert.equal(outcome.coverageStatus,'notRun');
+    assert.deepEqual(h.controller.getStatus().operationOutcome,outcome);
+    await h.run('manageMonitoringScope');
+    await h.WatchExcludePanel.currentPanel.handleMessage({command:'reload'});
+    const status=h.messages.filter(message=>message.command==='scopeStatus').at(-1);
+    assert.deepEqual(status.operationOutcome,outcome);
+    h.WatchExcludePanel.currentPanel.dispose();
+});
+
 for (const answer of [false, true]) await test(`coverage-row single action ${answer ? 'applies' : 'cancels'} one bound review confirmation`, async () => {
     const h = quickExclusionHarness(true); h.state.confirm = answer;
     const before = structuredClone(h.state.changes);

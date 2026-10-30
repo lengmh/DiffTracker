@@ -195,6 +195,57 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(tracker.getOriginalContent(target), 'original');
     }));
 
+    for(const code of ['directory-runtime-coverage-gap','directory-scan-coverage-gap']) for(const failure of ['none','reload','native','bytes'])
+    test(`RECHECK restores an old ${code} without a saved imported-owner descriptor (${failure})`,()=>fixture(async context=>{
+        let {tracker}=context;const {dir}=context;
+        const unrelated=await seed(context);
+        const directory=path.join(dir,'old-import');fs.mkdirSync(directory);
+        const child=path.join(directory,'tracked.txt');fs.writeFileSync(child,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(context.scope)).status,'applied');
+        assert.equal(tracker.getOriginalContent(child),'original');
+        tracker.setSubtreeCoverageGap(directory,code,'Imported directory watch coverage is incomplete; current files were scanned, but rebuild the baseline after reducing watched directories or resolving the system watcher limit');
+        let token=tracker.getReviewToken(unrelated);
+        if(failure==='reload'){
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            const storage=tracker.storageUri;await tracker.dispose();
+            tracker=new h.DiffTracker(storage);h.setTracker(tracker);
+            await tracker.restorePersistedState();
+            token=tracker.getReviewToken(unrelated);
+            assert.equal(tracker.getOriginalContent(child),'original');
+        }
+        const unknown=path.join(directory,'unknown.txt');fs.writeFileSync(unknown,'unknown before-image');
+        tracker.recordUnresolvedBaseline(unknown,'An earlier interval is unverified');
+        const watch=fs.watch;let acquired=0;
+        fs.watch=(target,...args)=>{
+            if(path.resolve(String(target))===directory){acquired++;if(failure==='native'){throw Object.assign(new Error('Native owner unavailable'),{code:'ENOSPC'});}}
+            return watch(target,...args);
+        };
+        if(failure==='bytes'){tracker.maxPersistedBytes=Buffer.byteLength(JSON.stringify(tracker.buildPersistedState()));}
+        let result;
+        try{result=await tracker.recheckObservationCoverage();}finally{fs.watch=watch;}
+        assert.equal(tracker.getOriginalContent(child),'original');
+        assert.equal(tracker.getOriginalContent(unknown),undefined);
+        assert.deepEqual(tracker.getReviewToken(unrelated),token);
+        if(failure==='native'||failure==='bytes'){
+            assert.notEqual(result.status,'rechecked',JSON.stringify(result));
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===directory));
+            if(failure==='bytes'){assert.equal(acquired,0,'reserve descriptor bytes before installing an owner');}
+            return;
+        }
+        assert.equal(result.status,'rechecked',JSON.stringify(result));
+        assert.equal(tracker.getTrackedChange(unknown)?.reviewKind,'unknown');
+        assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===directory),false);
+        assert.deepEqual(tracker.getReviewToken(unrelated),token);
+        assert.equal(nativeDirectoryWatchers.filter(owner=>owner.active&&path.resolve(String(owner.directory))===directory).length,1,
+            'certified recovery releases its exact restored bridge instead of retaining duplicate owners');
+        const baseline=tracker.getOriginalContent(child);
+        fs.writeFileSync(child,'after repair');ownerFor(directory).listener('change','tracked.txt');
+        await waitUntil(()=>tracker.getTrackedChange(child)?.currentContent==='after repair');
+        assert.equal(tracker.getOriginalContent(child),baseline);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        assert.equal(savedState(tracker).coverageGaps.some(([target,record])=>target===directory&&record.importedCoverageRequired),true,JSON.stringify({saved:savedState(tracker).coverageGaps.map(([p,r])=>[path.relative(dir,p),r]),live:[...tracker.importedCoverageObligations].map(p=>path.relative(dir,p)),owners:[...tracker.supplementalDirectoryWatchers].map(([p,r])=>[path.relative(dir,p),path.relative(dir,r.coverageRoot)])}));
+    }));
+
     async function seedDirectoryGap(context, code = 'directory-runtime-coverage-gap') {
         const {tracker, dir, scope} = context;
         const unrelated = await seed(context);

@@ -1137,6 +1137,92 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         });
     }));
 
+    for(const action of ['shortcut','save'])
+    test(`EXCLUDES ${action} ignores an already excluded settings notification without reading excluded content`, () => fixture(async ({tracker,scope,dir}) => {
+        const selected=path.join(dir,'tests','cache');fs.mkdirSync(selected,{recursive:true});
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));
+        fs.writeFileSync(settingsFile,'{}');
+        const other=path.join(dir,'kept.txt');fs.writeFileSync(other,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(other)]);
+        tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        fs.writeFileSync(other,'pending');await tracker.readFileAndUpdate(other,Uri.file(other));
+        const token=tracker.getReviewToken(other);
+        tracker.setSubtreeCoverageGap(selected,'directory-runtime-coverage-gap','Prior imported interval');
+        await withController(tracker,scope,async({controller,hooks,config,writes})=>{
+            let wrote=false,injected=false;
+            hooks.afterWrite=()=>{fs.writeFileSync(settingsFile,JSON.stringify(config));wrote=true;};
+            const opendir=fs.promises.opendir,open=fs.openSync;
+            fs.openSync=(file,...args)=>{
+                assert.notEqual(path.resolve(String(file)),settingsFile,'excluded settings content must not be read');
+                return open(file,...args);
+            };
+            fs.promises.opendir=async(directory,...args)=>{
+                assert.notEqual(path.resolve(String(directory)),path.dirname(settingsFile),'excluded directory must not be enumerated');
+                const result=await opendir(directory,...args);
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                }
+                return result;
+            };
+            try{
+                const outcome=action==='shortcut'?await controller.excludeCoverageSubtree(selected,async()=>true):
+                    await controller.saveAndApplyScope({mode:'rules',includes:[],excludes:[...scope.excludes,{scope:'all',pattern:'/tests/cache/'}]},async()=>true);
+                assert.equal(injected,true);
+                assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,true);
+                assert.equal(writes.length,action==='shortcut'?1:3,'owned configuration writes, without compensation or retries');
+                assert.deepEqual(config.watchExclude,[...scope.excludes,{scope:'all',pattern:'/tests/cache/'}]);
+                assert.equal(controller.getStatus().effective.scopeRevision,controller.getStatus().requested.scope.scopeRevision);
+                assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
+                assert.equal(tracker.getOriginalContent(other),'original');
+                assert.deepEqual(tracker.getReviewToken(other),token);
+            }finally{fs.promises.opendir=opendir;fs.openSync=open;}
+        });
+    },'rules',[{scope:'all',pattern:'/.vscode/'}]));
+
+
+    for(const change of ['monitored-file','new-exclusion','settings-request','excluded-node-replacement','git-policy','watcher-policy'])
+    test(`EXCLUDES shared exclusions retain concurrent ${change} protection`,()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'cache');fs.mkdirSync(selected);
+        const other=path.join(dir,'kept.txt');fs.writeFileSync(other,'original');
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));fs.writeFileSync(settingsFile,'{}');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(other)]);tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        tracker.setSubtreeCoverageGap(selected,'directory-runtime-coverage-gap','Prior import');
+        await withController(tracker,scope,async({controller,hooks,config,notifyConfiguration})=>{
+            let wrote=false,injected=false;
+            hooks.afterWrite=()=>{if(fs.existsSync(path.dirname(settingsFile))){fs.writeFileSync(settingsFile,JSON.stringify(config));}wrote=true;};
+            const opendir=fs.promises.opendir;
+            fs.promises.opendir=async(directory,...args)=>{
+                const handle=await opendir(directory,...args);
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;
+                    tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                    if(change==='watcher-policy'){
+                        h.setVsCodeExcludes({'files.watcherExclude':{'kept/**':true}});h.fireConfigurationChanged('files.watcherExclude');
+                    }else if(change==='settings-request'){
+                        config.watchExclude=[...scope.excludes,{scope:'all',pattern:'/independent-choice/'}];notifyConfiguration('watchExclude');
+                    }else{
+                        let file=change==='new-exclusion'?path.join(selected,'new.txt'):change==='git-policy'?path.join(dir,'.vscode','.gitignore'):other;
+                        if(change==='excluded-node-replacement'){
+                            fs.rmSync(path.dirname(settingsFile),{recursive:true});file=path.dirname(settingsFile);
+                        }
+                        fs.writeFileSync(file,'independent content');tracker.dispatchExternalEvent(Uri.file(file),'change',tracker.sessionEpoch);
+                    }
+                }
+                return handle;
+            };
+            try{
+                const outcome=await controller.excludeCoverageSubtree(selected,async()=>true);
+                assert.equal(injected,true);assert.notEqual(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.equal(tracker.getOriginalContent(other),'original');
+                if(change==='settings-request'){assert.deepEqual(config.watchExclude,[...scope.excludes,{scope:'all',pattern:'/independent-choice/'}]);}
+            }finally{fs.promises.opendir=opendir;}
+        });
+    },'rules',[{scope:'all',pattern:'/.vscode/'}]));
+
     registerScopeSingleActionAcceptance(h,fixture,scopeFor,withController);
     registerScopeSingleActionCrashes(h,fixture,scopeFor,withController);
 }
