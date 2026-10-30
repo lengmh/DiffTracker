@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.11
+
+- Automatically reconcile directory creation, imports, renames and finite bursts of activity within bounded observation budgets. Continue observing subsequent file changes without requiring another event or manual Recheck.
+- Finish necessary coverage verification from file/folder exclusion, Save and Apply, and Restore in one action. Preserve drafts, cancellation, pending reviews and Undo; retain committed exclusions and report partial completion when verification cannot finish.
+- Keep excluded historical coverage gaps dormant through later directory activity and restart. Respect directory-only ignore rules before creating observation obligations, while preserving explicit includes and ordinary-file replacements.
+- Attribute unfinished coverage to the scope change that introduced it across retries and recovery; list independent failures separately. Reuse healthy observation owners without raising capacity limits, preserve Unknown before-images, and keep stopped sessions stopped.
+
 ## 0.8.10
 
 - Confirm quick file/folder exclusions before saving settings; cancellation preserves review state, concurrent changes invalidate consent, and failed Apply compensates only its own still-current request.
