@@ -120,7 +120,15 @@ module.exports = async function scopeSettingsCheckpoint() {
         stage='apply-saved-request';
         const savedExcludes=[...quickStatus.effective.excludes,{scope:'all',pattern:'/saved-cache/'}];
         await vscode.workspace.getConfiguration('diffTracker').update('watchExclude',savedExcludes,vscode.ConfigurationTarget.Workspace);
-        const appliedSaved=await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        const savedConfirmation=await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope');
+        assert.equal(savedConfirmation.status,'needsDiscardConfirmation',JSON.stringify({savedConfirmation,trace}));
+        assert.deepEqual(savedConfirmation.affectedReviewPaths,[uri('saved-cache/existing.txt').fsPath]);
+        assert.equal((await scopeStatus()).effective.scopeRevision,quickStatus.effective.scopeRevision,
+            'manual pending settings cannot commit before the bound review confirmation');
+        const appliedSaved=await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope',{
+            discardExplicitlyExcludedReviews:true,expectedScopeRevision:savedConfirmation.scopeRevision,
+            expectedAffectedReviewRevision:savedConfirmation.affectedReviewRevision
+        });
         assert.equal(appliedSaved.status,'applied',JSON.stringify({appliedSaved,trace}));
         const appliedStatus=await scopeStatus();
         assert.equal(appliedStatus.requested.scope.scopeRevision,appliedStatus.effective.scopeRevision);
