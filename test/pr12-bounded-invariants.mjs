@@ -26,6 +26,7 @@ export function registerPR12BoundedInvariants(h) {
         const previousFolders=vscode.workspace.workspaceFolders;
         const previousGet=vscode.workspace.getWorkspaceFolder;
         const dir=file('pr12-audit'); fs.mkdirSync(dir,{recursive:true});
+        const storage=file('pr12-audit-storage');
         fs.writeFileSync(path.join(dir,'ProbeName'),'probe');
         const folder={uri:Uri.file(dir),name:'pr12-audit'};
         try {
@@ -35,14 +36,21 @@ export function registerPR12BoundedInvariants(h) {
                 const relative=path.relative(dir,uri.fsPath);
                 return relative===''||relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative)?folder:undefined;
             };
-            const tracker=new DiffTracker(Uri.file(file('pr12-audit-storage'))); setTracker(tracker);
+            const tracker=new DiffTracker(Uri.file(storage)); setTracker(tracker);
             tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
             const scope=scopeFor(tracker,mode,excludes); tracker.effectiveMonitoringScope=scope;
             await run({tracker,scope,dir,folder});
         } finally {
-            await getTracker().dispose();
-            vscode.workspace.workspaceFolders=previousFolders;
-            vscode.workspace.getWorkspaceFolder=previousGet;
+            try { await getTracker().dispose(); }
+            finally {
+                vscode.workspace.workspaceFolders=previousFolders;
+                vscode.workspace.getWorkspaceFolder=previousGet;
+                // Later tests use the harness root as their workspace. Do not
+                // make them traverse every previous scoped test's snapshots and
+                // large synthetic trees against a production work budget.
+                fs.rmSync(dir,{recursive:true,force:true});
+                fs.rmSync(storage,{recursive:true,force:true});
+            }
         }
     }
     registerPR12LiteralEntryRegressions(h, fixture, scopeFor);

@@ -500,7 +500,8 @@
       {
         "command": "diffTracker.recheckObservationCoverage",
         "title": "Recheck Observation Coverage",
-        "category": "Code Diff Tracker"
+        "category": "Code Diff Tracker",
+        "icon": "$(refresh)"
       },
       {
         "command": "diffTracker.migrateLegacyWatchRules",
@@ -562,6 +563,26 @@
     ],
     "menus": {
       "view/item/context": [
+        {
+          "command": "diffTracker.recheckObservationCoverage",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
+          "group": "inline@1"
+        },
+        {
+          "command": "diffTracker.recheckObservationCoverage",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
+          "group": "1_actions@0"
+        },
+        {
+          "command": "diffTracker.excludeCoverageSubtree",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
+          "group": "inline@2"
+        },
+        {
+          "command": "diffTracker.excludeCoverageSubtree",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
+          "group": "1_actions@1"
+        },
         {
           "command": "diffTracker.excludeCoverageSubtree",
           "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtree",

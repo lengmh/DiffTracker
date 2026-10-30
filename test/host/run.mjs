@@ -135,6 +135,27 @@ try {
     rmSync(nativeOpaquePath);
     assert.equal(existsSync(nativeOpaquePath), false, 'Native-only opaque fixture must not enter the main Host');
 
+    // A single-folder workspace stores Workspace configuration inside its
+    // monitored root. Keep this real settings/notification checkpoint separate
+    // from the original 150-second main scenario and its restart fixture.
+    const settingsWorkspace = path.join(tempRoot,'scope-settings-workspace');
+    mkdirSync(path.join(settingsWorkspace,'.vscode'),{recursive:true});
+    for (const name of ['prior-cache','generated-cache','second-cache']) {
+        mkdirSync(path.join(settingsWorkspace,name));
+        writeFileSync(path.join(settingsWorkspace,name,'existing.txt'),'cache baseline\n');
+    }
+    writeFileSync(path.join(settingsWorkspace,'watched.txt'),'baseline\n');
+    writeFileSync(path.join(settingsWorkspace,'.vscode','settings.json'),JSON.stringify({
+        'diffTracker.watchExclude':[{scope:'all',pattern:'/prior-cache/'}]
+    }));
+    await runTests({
+        ...hostOptions,
+        launchArgs:hostOptions.launchArgs.map((argument,index)=>index===0?settingsWorkspace:
+            argument.startsWith('--user-data-dir=')?`--user-data-dir=${path.join(tempRoot,'scope-settings-user-data')}`:argument),
+        extensionTestsEnv:{...hostOptions.extensionTestsEnv,DIFF_TRACKER_HOST_WORKSPACE:settingsWorkspace,
+            DIFF_TRACKER_HOST_PHASE:'scope-settings'}
+    });
+
     // Seed the final S4 folder configuration only after Native has exited and
     // restored its fixtures. A live settings update in prepare can deliver late
     // create/save events during Whole Workspace Apply. Keep these writes offline.

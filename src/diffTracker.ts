@@ -12,6 +12,9 @@ import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, conf
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
+const UNNAMED_SUPPLEMENTAL_REASON = 'Supplemental watcher returned an unnamed event; observation coverage for the current subtree is unverified.';
+const UNNAMED_IMPORTED_REASON = 'Directory watcher returned an unnamed event; observation coverage for the current subtree is unverified.';
+
 export interface ObservationCoverageRecheckResult {
     status: 'rechecked' | 'limited' | 'conflict' | 'failed';
     reason?: string;
@@ -1349,6 +1352,25 @@ export class DiffTracker {
         return this.queueObservationCoverageRecheck();
     }
 
+    public getObservationCoverageRecheckBlocker(): string | undefined {
+        if (this.coverageRecheckEpoch !== undefined) { return 'Observation coverage is already being rechecked.'; }
+        return this.observationCoverageRecheckBlocker(this.sessionEpoch,
+            () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty),
+            () => this.pausedGitRepositories.size > 0);
+    }
+
+    private observationCoverageRecheckBlocker(epoch: number, dirty: () => boolean, gitPaused: () => boolean): string | undefined {
+        if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
+            this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
+            this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
+            gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
+            this.effectiveMonitoringScope.kind !== 'configured') {
+            return 'Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.';
+        }
+        if (dirty()) { return 'Save or discard unsaved editor changes before rechecking observation coverage.'; }
+        return undefined;
+    }
+
     public recheckScopeOperationCoverage(targets: readonly ScopeCoverageTarget[], revision: string): Promise<ObservationCoverageRecheckResult> {
         if (this.getEffectiveMonitoringScope().scopeRevision !== revision || targets.length === 0 ||
             targets.some(target => this.coverageGaps.get(target.path)?.[target.kind]?.scopeOperationRevision !== revision)) {
@@ -1392,17 +1414,11 @@ export class DiffTracker {
         const gitPaused = () => [...this.pausedGitRepositories.keys()].some(root => !targets || targets.some(target =>
             this.pathBelongsToRoot(target.path,root) || (target.kind==='subtree' && this.pathBelongsToRoot(root,target.path))));
         const conflict = (reason: string): ObservationCoverageRecheckResult => ({ status: 'conflict', reason });
-        if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
-            this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
-            this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
-            gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
-            this.effectiveMonitoringScope.kind !== 'configured') {
-            return conflict('Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.');
-        }
-        if (dirty()) {
-            return conflict('Save or discard unsaved editor changes before rechecking observation coverage.');
-        }
+        const blocker = this.observationCoverageRecheckBlocker(epoch,dirty,gitPaused);
+        if (blocker) { return conflict(blocker); }
         const scope = this.effectiveMonitoringScope;
+        // Keep the configured-scope type explicit after the shared UI guard.
+        if (scope.kind !== 'configured') { return conflict('Recheck requires a configured monitoring scope.'); }
         const watcherRevision = this.watcherCoverageRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
         const policyRevision = this.ignorePolicyRevision;
@@ -2803,7 +2819,7 @@ export class DiffTracker {
                 this.setSubtreeCoverageGap(
                     coverageRoot,
                     'supplemental-watcher-runtime-gap',
-                    'Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild.',
+                    UNNAMED_SUPPLEMENTAL_REASON,
                     true,this.scopeOwnerFailureRevision(current)
                 );
                 return;
@@ -3149,7 +3165,7 @@ export class DiffTracker {
             const entry = this.importedDirectoryWatchers.get(directory)!;
             if (!filename) {
                 entry.eventRevision = (entry.eventRevision ?? 0) + 1;
-                reportFailure('Directory watcher returned an unnamed event; recheck observation coverage to reconcile the current scope');
+                reportFailure(UNNAMED_IMPORTED_REASON);
                 return;
             }
             this.dispatchNamedDirectoryEvent(directory, directory, kind, filename, epoch, () => {
@@ -6493,11 +6509,24 @@ export class DiffTracker {
             this.isDormantClearedStoppedImportRestartGap(targetPath, evidence);
     }
 
+    private coverageReasonForDisplay(reason: string): string {
+        // Older sessions retain their exact diagnostic evidence. Correct known
+        // obsolete recovery advice only in its presentation, including when an
+        // imported restart or pending-control record wraps the native reason.
+        return reason.replace(
+            'Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild.',
+            UNNAMED_SUPPLEMENTAL_REASON
+        ).replace(
+            'Directory watcher returned an unnamed event; rebuild the baseline to reconcile',
+            UNNAMED_IMPORTED_REASON
+        );
+    }
+
     public getCoverageGaps(): Array<[string, string]> {
         const result: Array<[string, string]> = [];
         for (const [targetPath, record] of this.coverageGaps) {
-            if (record.file && !this.isDormantCoverageGap(targetPath, record.file)) { result.push([targetPath, record.file.reason]); }
-            if (record.subtree && !this.isDormantCoverageGap(targetPath, record.subtree)) { result.push([targetPath, record.subtree.reason]); }
+            if (record.file && !this.isDormantCoverageGap(targetPath, record.file)) { result.push([targetPath, this.coverageReasonForDisplay(record.file.reason)]); }
+            if (record.subtree && !this.isDormantCoverageGap(targetPath, record.subtree)) { result.push([targetPath, this.coverageReasonForDisplay(record.subtree.reason)]); }
         }
         return result.sort(([leftPath, leftReason], [rightPath, rightReason]) =>
             leftPath.localeCompare(rightPath) || leftReason.localeCompare(rightReason)
@@ -6619,7 +6648,7 @@ export class DiffTracker {
             result.push({
                 targetPath,
                 reasonCode: record.subtree.reasonCode,
-                reason: record.subtree.reason
+                reason: this.coverageReasonForDisplay(record.subtree.reason)
             });
         }
         return result.sort((left, right) =>

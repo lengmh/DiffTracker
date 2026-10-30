@@ -114,6 +114,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
     }
 
     private createCoverageDiagnosticItem(diagnostics: SubtreeCoverageDiagnostic[]): TreeItem {
+        const recheckBlocker = this.diffTracker.getObservationCoverageRecheckBlocker();
         const item = new TreeItem('Monitoring Coverage Limited', vscode.TreeItemCollapsibleState.Expanded);
         item.iconPath = new vscode.ThemeIcon('warning');
         item.description = `${diagnostics.length} subtree(s)`;
@@ -123,10 +124,13 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             const relative = this.toWorkspaceRelative(diagnostic.targetPath).join('/');
             const child = new TreeItem(relative || displayFileName(diagnostic.targetPath), vscode.TreeItemCollapsibleState.None);
             child.iconPath = new vscode.ThemeIcon('warning');
-            child.contextValue = 'coverageDiagnosticSubtree';
+            child.contextValue = recheckBlocker ? 'coverageDiagnosticSubtree' : 'coverageDiagnosticSubtreeRecheck';
             child.coveragePath = diagnostic.targetPath;
             child.description = diagnostic.reasonCode;
-            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\nRight-click or use the inline action to save and apply a narrow exclusion. Affected pending reviews require confirmation.`;
+            const recovery = recheckBlocker
+                ? `${recheckBlocker}\nOpen Manage Monitoring Scope to review this requirement.`
+                : 'To keep monitoring, use Recheck Observation Coverage in the inline actions or right-click menu. Original review baselines are preserved.';
+            child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\n${recovery}\nTo stop monitoring, right-click or use the inline action to save and apply a narrow exclusion. Affected pending reviews require confirmation.`;
             child.command = {
                 command: 'diffTracker.manageMonitoringScope',
                 title: 'Manage Monitoring Scope'

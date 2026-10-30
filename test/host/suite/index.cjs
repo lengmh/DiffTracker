@@ -20,6 +20,10 @@ async function bounded(description, scenario, milliseconds) {
 exports.run = async () => {
     const restart = require('./s4d-restart.test.cjs');
     const phase = process.env.DIFF_TRACKER_HOST_PHASE;
+    if (phase === 'scope-settings') {
+        await bounded('Scope settings publication checkpoint', require('./scope-settings.test.cjs'), 60_000);
+        return;
+    }
     if (phase === 'native') {
         await bounded('Native Review UI checkpoint', require('./native-review.test.cjs'), 90_000);
         return;

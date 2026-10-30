@@ -187,6 +187,15 @@ test('S4 settings are seeded after Native exits and restores its files, before t
                 assert.equal(fs.existsSync(target), false, 'wait for Native exit before seeding the target');
                 assert.equal(fs.existsSync(path.join(workspace, 'native-opaque.bin')), true,
                     'wait for Native exit before removing its fixture');
+            } else if (phase === 'scope-settings') {
+                assert.equal(path.resolve(options.launchArgs[0]),path.resolve(workspace),
+                    'the configuration checkpoint must use a real single-folder workspace');
+                assert.deepEqual(JSON.parse(fs.readFileSync(settings,'utf8')),{
+                    'diffTracker.watchExclude':[{scope:'all',pattern:'/prior-cache/'}]
+                });
+                assert.equal(fs.existsSync(path.join(workspace,'native-a.txt')),false,
+                    'scope configuration work must not share Native or restart fixture files');
+                assert.equal(fs.readFileSync(path.join(workspace,'watched.txt'),'utf8'),'baseline\\n');
             } else if (phase === 'prepare') {
                 assert.equal(fs.existsSync(path.join(workspace, 'native-opaque.bin')), false,
                     'Native fixture cleanup must finish first');
@@ -223,7 +232,7 @@ test('S4 settings are seeded after Native exits and restores its files, before t
         encoding: 'utf8', timeout: 15000
     });
     assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
-    assert.deepEqual(result.stdout.match(/FIXTURE-PHASE \w+/g), [
-        'FIXTURE-PHASE native', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
+    assert.deepEqual(result.stdout.match(/FIXTURE-PHASE [\w-]+/g), [
+        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
     ]);
 });

@@ -114,6 +114,11 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         const writes = [];
         const hooks = {};
         const settings = new Map();
+        const configurationPublications = [];
+        const notifyConfiguration = key => {
+            h.fireConfigurationChanged(`diffTracker.${key}`);
+            for (const handler of [...handlers]) { handler({ affectsConfiguration: name => name === `diffTracker.${key}` }); }
+        };
         vscode.workspace.onDidChangeConfiguration = handler => { handlers.push(handler); return { dispose() {} }; };
         vscode.workspace.getConfiguration = (...args) => ({
             ...oldConfig(...args),
@@ -123,10 +128,16 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 writes.push([key, value]);
                 await hooks.beforeWrite?.(key, value);
                 await new Promise(resolve => setImmediate(resolve));
-                config[key] = structuredClone(value);
-                await hooks.afterWrite?.(key, value);
-                h.fireConfigurationChanged(`diffTracker.${key}`);
-                for (const handler of handlers) { handler({ affectsConfiguration: name => name === `diffTracker.${key}` }); }
+                const publish = async () => {
+                    config[key] = structuredClone(value);
+                    await hooks.afterWrite?.(key, value);
+                    notifyConfiguration(key);
+                };
+                if (options.deferConfigurationReadback?.(key)) {
+                    configurationPublications.push(new Promise((resolve, reject) => {
+                        setImmediate(() => { void publish().then(resolve, reject); });
+                    }));
+                } else { await publish(); }
             }
         });
         const oldLoad = Module._load;
@@ -142,8 +153,9 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
                 await hooks.afterStateUpdate?.(key, value);
             }
         } }, tracker);
-        try { await run({ controller, config, writes, hooks }); }
+        try { await run({ controller, config, writes, hooks, notifyConfiguration }); }
         finally {
+            await Promise.all(configurationPublications);
             controller.dispose();
             try { await tracker.ignoreRefreshPromise; }
             catch (error) {
@@ -154,6 +166,131 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             vscode.workspace.onDidChangeConfiguration = oldEvent;
         }
     }
+
+    test('EXCLUDES owned configuration publication completes Save and Apply without another user action', () => fixture(async ({tracker,scope,dir}) => {
+        fs.mkdirSync(path.join(dir,'generated-cache'));
+        await withController(tracker,scope,async ({controller}) => {
+            const outcome = await controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[
+                {scope:'all',pattern:'/prior-cache/'},
+                {scope:'all',pattern:'/generated-cache/'}
+            ]},async()=>true);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            const status = controller.getStatus();
+            assert.equal(status.requested.scope.scopeRevision,status.effective.scopeRevision);
+            assert.deepEqual(status.effective.excludes,[
+                {scope:'all',pattern:'/generated-cache/'},
+                {scope:'all',pattern:'/prior-cache/'}
+            ]);
+        },{deferConfigurationReadback:key=>key==='watchExclude'});
+    },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
+    test('EXCLUDES coverage shortcut settles its saved exclusion and retires only its target gap', () => fixture(async ({tracker,scope,dir}) => {
+        const selected = path.join(dir,'generated-cache');
+        fs.mkdirSync(selected);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior observation interval is unverified');
+        await withController(tracker,scope,async ({controller}) => {
+            const outcome = await controller.excludeCoverageSubtree(selected,async()=>true);
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(controller.getStatus().requested.scope.scopeRevision,controller.getStatus().effective.scopeRevision);
+            assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
+        },{deferConfigurationReadback:key=>key==='watchExclude'});
+    },'wholeWorkspace',[{scope:'all',pattern:'/prior-cache/'}]));
+
+    test('EXCLUDES an observed competing edit cannot be compensated away when its final value matches the proposal', () => fixture(async ({tracker,scope}) => {
+        const proposal = {mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+        await withController(tracker,scope,async ({controller,config,hooks,notifyConfiguration}) => {
+            let injected = false;
+            hooks.afterWrite = (key,value) => {
+                if (key !== 'watchExclude' || injected) { return; }
+                injected = true;
+                config.watchExclude = [{scope:'all',pattern:'/independent-choice/'}];
+                notifyConfiguration('watchExclude');
+                // A second external edit chooses the same value as the pending
+                // operation. It does not renew that operation's write ownership.
+                config.watchExclude = structuredClone(value);
+            };
+            const outcome = await controller.saveAndApplyScope(proposal,async()=>true);
+            assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,false);
+            assert.deepEqual(config.watchExclude,proposal.excludes,'the last external choice must survive compensation');
+            assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+        });
+    }));
+
+    test('EXCLUDES shortcut preserves an observed external choice even when it matches the exclusion it proposed', () => fixture(async ({tracker,scope,dir}) => {
+        const selected = path.join(dir,'generated-cache');
+        fs.mkdirSync(selected);
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap','Prior observation interval is unverified');
+        await withController(tracker,scope,async ({controller,config,hooks,notifyConfiguration}) => {
+            let injected = false;
+            let externalChoice;
+            hooks.afterWrite = (key,value) => {
+                if (key !== 'watchExclude' || injected) { return; }
+                injected = true;
+                config.watchExclude = [{scope:'all',pattern:'/independent-choice/'}];
+                notifyConfiguration('watchExclude');
+                externalChoice = structuredClone(value);
+                config.watchExclude = externalChoice;
+            };
+            const outcome = await controller.excludeCoverageSubtree(selected,async()=>true);
+            assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,false);
+            assert.deepEqual(config.watchExclude,externalChoice,'the shortcut must not restore over observed external intent');
+            assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+        });
+    }));
+
+    test('EXCLUDES compensation settles its owned configuration publication before reporting restored settings', () => fixture(async ({tracker,scope}) => {
+        await withController(tracker,scope,async ({controller,config,hooks}) => {
+            const before=structuredClone(config);
+            let failed=false;
+            hooks.beforeWrite=key=>{
+                if(key==='watchInclude'&&!failed){failed=true;throw new Error('Controlled write rejection');}
+            };
+            const outcome=await controller.saveAndApplyScope({mode:'rules',includes:[],
+                excludes:[{scope:'all',pattern:'/generated-cache/'}]},async()=>true);
+            assert.equal(outcome.status,'failed',JSON.stringify(outcome));
+            assert.equal(outcome.settingsStatus,'restored',JSON.stringify(outcome));
+            assert.deepEqual(config,before);
+            assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+        },{deferConfigurationReadback:key=>key==='monitoringScope'});
+    }));
+
+    test('EXCLUDES an external withdrawal after owned publication cannot renew save authority', () => fixture(async ({tracker,scope}) => {
+        await withController(tracker,scope,async ({controller,config,hooks,notifyConfiguration}) => {
+            hooks.afterWrite=(key,value)=>{
+                if(key!=='watchExclude'){return;}
+                notifyConfiguration(key);
+                config.watchExclude=scope.excludes;
+                notifyConfiguration(key);
+                config.watchExclude=structuredClone(value);
+            };
+            const proposal={mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/generated-cache/'}]};
+            const outcome=await controller.saveAndApplyScope(proposal,async()=>true);
+            assert.equal(outcome.status,'partial',JSON.stringify(outcome));
+            assert.equal(outcome.scopeCommitted,false);
+            assert.deepEqual(config.watchExclude,proposal.excludes);
+            assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+        });
+    }));
+
+    test('EXCLUDES legacy unnamed diagnostic stops prescribing a rebuild without changing saved evidence', () => fixture(async ({tracker,dir}) => {
+        const selected = path.join(dir,'generated-cache');
+        fs.mkdirSync(selected);
+        const oldReason = 'Supplemental watcher returned an unnamed event; current subtree state requires a baseline rebuild.';
+        tracker.setSubtreeCoverageGap(selected,'supplemental-watcher-runtime-gap',oldReason);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const persistedReason = () => new Map(JSON.parse(fs.readFileSync(
+            path.join(tracker.storageUri.fsPath,'session-state.json'),'utf8')).coverageGaps).get(selected).subtree.reason;
+        assert.equal(persistedReason(),oldReason);
+        const diagnostic = tracker.getSubtreeCoverageGaps().find(gap=>gap.targetPath===selected);
+        assert.equal(diagnostic.reasonCode,'supplemental-watcher-runtime-gap');
+        assert.match(diagnostic.reason,/unnamed event/);
+        assert.doesNotMatch(diagnostic.reason,/baseline rebuild/);
+        assert.doesNotMatch(tracker.getCoverageGaps().find(([target])=>target===selected)[1],/baseline rebuild/);
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        assert.equal(persistedReason(),oldReason,'presentation must not rewrite or retire historical evidence');
+    }));
 
     test('SCOPE-RECOVERY Restore completes withdrawn-exclusion observation in one action', () => fixture(async context => {
         const files = await paused(context);

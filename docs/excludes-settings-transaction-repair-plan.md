@@ -26,7 +26,7 @@ readback. Immediate publication succeeds with the same proposal. This establishe
 a controller boundary weakness, not a proven field or real Extension Host cause.
 The activated field build and VS Code version have not been independently obtained.
 
-Structured exclusion sorting is expected: a draft containing `/archive-cache/`
+Structured exclusion sorting is expected: a draft containing `/prior-cache/`
 then `/generated-cache/` may be saved in canonical order. Owned write expectations
 already use that canonical proposal. Raw settings fingerprints also distinguish
 unset values from explicit empty arrays, unlike equivalent canonical scopes.
@@ -87,3 +87,49 @@ real Host evidence. Public examples and evidence use synthetic directories only.
 - [ ] R2 separate ignore-preparation reproduction and repair.
 - [ ] R3/R4 interaction and recovery matrix.
 - [ ] R5 complete real Host, quality, package and review acceptance.
+
+The first implementation checkpoint settles an acknowledged configuration write
+against its observable Workspace request before proceeding to the next key or
+Apply. It listens before updating, accepts only the owned before/expected
+snapshots, stops on an observed competing request, and bounds missing
+publication without repeated writes or polling. The same settlement applies to
+Save and Apply compensation. An observed competing edit cannot regain old
+compensation authority by choosing the same final value as the proposal.
+
+Seven production controller/tracker boundary regressions cover delayed Save and
+Apply, the coverage shortcut, competing changes in both paths, delayed
+compensation, withdrawal after owned publication, and old unnamed-event
+diagnostic presentation. The scope settings
+Host checkpoint uses actual VS Code update/notification APIs in an isolated
+single-folder workspace, including stopped and active Save and Apply and
+continued real file observation. Its cross-platform execution remains pending.
+
+Unnamed-event recovery uses the existing guarded Recheck action; no baseline
+rebuild is prescribed or added. Ready coverage rows expose Recheck alongside
+exclusion. Blocked rows explain the current guard and retain scope management.
+Known obsolete persisted advice is corrected only for display; stored evidence
+and before-images are retained. The separately reported unnamed-event case was
+identified as 0.8.10; this does not establish the activated build for the
+exclusion-save failures, nor identify which gap remained after its Recheck.
+
+R1 is not yet complete: missing/rejected update publication, partial saves and
+the broader conflict/restart matrix need further qualification. An independent
+R2 boundary probe now reproduces the exact ignore-policy invalidation when a
+notification for the settings file written by the action arrives during Apply
+preparation. The failed transaction compensates its exclusion request. This is
+separate from stale configuration readback and does not prove the field cause;
+causal, bounded handling remains unimplemented. The initial
+documentation-head Verification run also failed Windows Stable Host during
+automatic moved-directory observation; that failure remains under diagnosis
+and is not established as repaired by the settings settlement changes.
+
+Full-regression diagnosis also exposed scoped test fixtures accumulating under
+the shared harness root until later Rules scans exhausted the production entry
+budget. Scoped fixture disposal now removes only its own workspace and storage.
+Production limits and the failing assertions remain intact.
+
+Local checkpoint validation passed: compile, lint, complete `npm test` (1,712
+tracker cases, 193 review UI cases, 28 real temporary Git scenarios and 10 Host
+fixture tests), performance smoke checks, and the actual 75-entry VSIX privacy
+inspection. Version remains 0.8.11. Real Host and exact-head CI results are not
+established by these local checks.
