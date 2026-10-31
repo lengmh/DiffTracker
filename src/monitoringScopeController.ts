@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DiffTracker, ObservationCoverageRecheckResult, ScopeOperationObservation } from './diffTracker';
+import { DiffTracker, MonitoringLifecycleStatus, ObservationCoverageRecheckResult, ScopeOperationObservation } from './diffTracker';
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
@@ -49,6 +49,8 @@ interface LegacySourceSnapshot {
 
 export interface MonitoringScopeStatus {
     operationOutcome?: MonitoringScopeActionOutcome;
+    lifecycle: MonitoringLifecycleStatus & {settingsWritePending:boolean;scopeActionPending:boolean;controllerDisposed:boolean};
+    migration: {stage:'configured'|'legacy-compatible'|'legacy-rule-review-required'|'legacy-reviewed-awaiting-apply'|'legacy-awaiting-apply';reason:string};
     requested: ScopeValidationResult;
     rawRequested: { mode: unknown; includes: unknown; excludes: unknown };
     effective: EffectiveMonitoringScope;
@@ -93,6 +95,8 @@ export interface ScopeOperationReportToken {
 
 export class MonitoringScopeController implements vscode.Disposable {
     private lastOperationOutcome?: MonitoringScopeActionOutcome;
+    private readonly _onDidChangeStatus = new vscode.EventEmitter<void>();
+    public readonly onDidChangeStatus = this._onDidChangeStatus.event;
 
     private operationSequence=0;
 
@@ -117,7 +121,9 @@ export class MonitoringScopeController implements vscode.Disposable {
     ):Promise<T> {
         const sequence=++this.operationSequence;
         try {
-            const result=await operation();
+            const pending=operation();
+            this._onDidChangeStatus.fire();
+            const result=await pending;
             // The latest user initiation owns diagnostics. A late completion
             // or a closed panel cannot overwrite a newer operation's result.
             if(sequence===this.operationSequence){
@@ -129,7 +135,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                 this.lastOperationOutcome={status:'failed',reason:`Scope operation did not complete: ${String(error)} Check requested and effective state in Status.`};
             }
             throw error;
-        }
+        } finally { this._onDidChangeStatus.fire(); }
     }
     private readonly disposables: vscode.Disposable[] = [];
     private scopeSettingsWriteQueue: Promise<void> = Promise.resolve();
@@ -147,6 +153,9 @@ export class MonitoringScopeController implements vscode.Disposable {
         private readonly tracker: DiffTracker
     ) {
         this.reconcileRequestedScope();
+        this.disposables.push(this.tracker.onDidChangeLifecycleState(() => this._onDidChangeStatus.fire()));
+        this.disposables.push(this.tracker.onDidChangeBaselineState(() => this._onDidChangeStatus.fire()));
+        this.disposables.push(this.tracker.onDidChangeRecordingState(() => this._onDidChangeStatus.fire()));
         this.disposables.push(vscode.workspace.onDidChangeConfiguration(event => {
             if (
                 event.affectsConfiguration('diffTracker.monitoringScope') ||
@@ -154,6 +163,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                 event.affectsConfiguration('diffTracker.watchExclude')
             ) {
                 this.reconcileRequestedScope();
+                this._onDidChangeStatus.fire();
             }
         }));
     }
@@ -179,8 +189,10 @@ export class MonitoringScopeController implements vscode.Disposable {
 
     public dispose(): void {
         this.disposed = true;
+        this._onDidChangeStatus.fire();
         this.unsettledScopeSetting?.();
         for (const disposable of this.disposables.splice(0)) { disposable.dispose(); }
+        this._onDidChangeStatus.dispose();
     }
 
     public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
@@ -392,18 +404,32 @@ export class MonitoringScopeController implements vscode.Disposable {
         const legacyCommittedRules = this.getCommittedLegacyRules();
         const migrationRequired = effective.kind === 'legacyV3' &&
             (legacyGlobalRules.length > 0 || legacyCommittedRules.some(([, patterns]) => patterns.length > 0));
+        const legacyMigrationComplete = !migrationRequired ||
+            (!!canonical && this.migrationRecordMatches(canonical.scopeRevision));
+        const workspaceRequestPresent = this.hasWorkspaceScopeRequest();
+        const migration: MonitoringScopeStatus['migration'] = effective.kind === 'configured'
+            ? {stage:'configured',reason:'Configured monitoring scope is effective.'}
+            : migrationRequired && !legacyMigrationComplete
+                ? {stage:'legacy-rule-review-required',reason:'Legacy compatibility scope is active. Review and migrate the saved legacy rules, then Apply the saved request. Existing review remains preserved until an authorized change is committed.'}
+                : migrationRequired
+                    ? {stage:'legacy-reviewed-awaiting-apply',reason:'Legacy rule migration was reviewed for this request, but configured scope is not effective yet. Apply Saved Request to finish; the legacy policy remains active until Apply succeeds.'}
+                    : workspaceRequestPresent
+                        ? {stage:'legacy-awaiting-apply',reason:'The saved Workspace request has not been applied. No legacy rule migration is needed. Apply Saved Request after resolving any lifecycle blocker below.'}
+                        : {stage:'legacy-compatible',reason:'Legacy compatibility mode is valid and has no rules requiring migration. Recording may continue in this mode. Save and Apply a Workspace scope only when you want to adopt configured monitoring.'};
         return {
             operationOutcome: this.lastOperationOutcome,
+            lifecycle:{...this.tracker.getMonitoringLifecycleStatus(),settingsWritePending:this.pendingScopeSettingsWrites>0 || this.unsettledScopeSetting!==undefined,
+                scopeActionPending:this.scopeActionInProgress,controllerDisposed:this.disposed},
+            migration,
             requested,
             rawRequested: this.getRequestedRawScope(),
             effective,
             consented: !!canonical && scopeConsentMatches(this.context.workspaceState.get(CONSENT_KEY), canonical),
             dismissed: !!canonical && dismissedRevision === canonical.scopeRevision,
-            legacyMigrationComplete: !migrationRequired ||
-                (!!canonical && this.migrationRecordMatches(canonical.scopeRevision)),
+            legacyMigrationComplete,
             legacyGlobalRules,
             legacyCommittedRules,
-            workspaceRequestPresent: this.hasWorkspaceScopeRequest(),
+            workspaceRequestPresent,
             expansionReasons,
             explicitlyExcludedPendingReviews: canonical ? this.tracker.getExplicitlyExcludedPendingReviewPaths(canonical) : []
         };
@@ -433,12 +459,14 @@ export class MonitoringScopeController implements vscode.Disposable {
         // Ownership starts before the queue runs and lasts through settlement,
         // including after an editor closes while its settings save is pending.
         this.pendingScopeSettingsWrites++;
+        this._onDidChangeStatus.fire();
         const operation = this.scopeSettingsWriteQueue.then(() => {
             const pending=this.getScopeSettingsWriteBlocker();
             if (pending) { throw new Error(pending); }
             return write();
         }).finally(() => {
             this.pendingScopeSettingsWrites--;
+            this._onDidChangeStatus.fire();
         });
         this.scopeSettingsWriteQueue = operation.then(() => undefined, () => undefined);
         return operation;
@@ -834,6 +862,8 @@ export class MonitoringScopeController implements vscode.Disposable {
     ): Promise<MonitoringScopeApplyOutcome> {
         const conflict = (reason: string): MonitoringScopeApplyOutcome => ({status:'conflict',reason,
             settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'});
+        const lifecycleBlocker = this.tracker.getMonitoringLifecycleStatus().blocker;
+        if (lifecycleBlocker) { return conflict(lifecycleBlocker.reason); }
         if (this.hasActiveScopeAction()) { return conflict('Another monitoring-scope action is in progress.'); }
         if (expectedRequestVersion !== this.getRequestVersion()) {
             return conflict('Settings changed after this editor draft was loaded. Your draft is preserved; review the current settings before retrying.');
@@ -874,6 +904,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                 return {status:'cancelled',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'};
             }
             return await this.enqueueScopeSettingsWrite(async () => {
+                const blocker = this.tracker.getMonitoringLifecycleStatus().blocker;
+                if (blocker) { return conflict(blocker.reason); }
                 if (!current() || !reviewCurrent() || !proposalStillCurrent()) { return conflict('Scope, workspace, settings or affected review changed during confirmation. Your draft is preserved.'); }
                 this.confirmedSettings = {expected,roots,effective:effectiveFingerprint};
                 let outcome: MonitoringScopeApplyOutcome = {status:'failed',scopeCommitted:false,coverageStatus:'notRun'};
@@ -894,6 +926,8 @@ export class MonitoringScopeController implements vscode.Disposable {
                             if (this.settingsFingerprint() === this.settingsFingerprint(unchanged)) { expected[key] = previous; }
                             throw error;
                         }
+                        const blocker = this.tracker.getMonitoringLifecycleStatus().blocker;
+                        if (blocker) { throw new Error(blocker.reason); }
                         if (!current() || !reviewCurrent() || !proposalStillCurrent()) { throw new Error('Settings, scope, draft or affected review changed during the save.'); }
                     }
                     // Approval can outlive independent directory activity. Pin
@@ -1053,6 +1087,8 @@ export class MonitoringScopeController implements vscode.Disposable {
         expectedScopeRevision?: string;
         expectedAffectedReviewRevision?: string;
     }): Promise<MonitoringScopeApplyOutcome> {
+        const lifecycleBlocker = this.tracker.getMonitoringLifecycleStatus().blocker;
+        if (lifecycleBlocker) { return {status:'conflict',reason:lifecycleBlocker.reason,settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'}; }
         if (this.hasActiveScopeAction()) {
             return { status: 'conflict', reason: this.getScopeSettingsWriteBlocker() ?? 'A monitoring-scope action is awaiting confirmation or being applied; finish it before applying another scope.' };
         }

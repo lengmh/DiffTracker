@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const selected = process.argv[2];
-if (!['scope-settings', 'workspace-edit', 'deleted-coverage'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit or deleted-coverage'); }
+if (!['scope-settings', 'workspace-edit', 'deleted-coverage', 'lifecycle-diagnostics'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit, deleted-coverage or lifecycle-diagnostics'); }
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-host-isolation-'));
 const workspace = path.join(temporary, 'workspace');
@@ -18,7 +18,11 @@ for (const name of ['prior-cache', 'generated-cache', 'second-cache', 'quick-cac
     fs.writeFileSync(path.join(workspace, name, 'existing.txt'), 'cache baseline\n');
 }
 fs.writeFileSync(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({
-    'diffTracker.watchExclude': selected === 'scope-settings' ? [{ scope: 'all', pattern: '/prior-cache/' }] : []
+    'diffTracker.watchExclude': selected === 'scope-settings' ? [{ scope: 'all', pattern: '/prior-cache/' }] : [],
+    ...(selected === 'lifecycle-diagnostics' ? {
+        'diffTracker.monitoringScope':'rules',
+        'diffTracker.watchInclude':[]
+    } : {})
 }));
 try {
     console.log('HOST-LIFECYCLE isolated launch:', JSON.stringify({ scenario: selected, version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable' }));

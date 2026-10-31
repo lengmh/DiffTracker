@@ -292,6 +292,16 @@
         "icon": "$(record)"
       },
       {
+        "command": "diffTracker.retrySavedSessionRecovery",
+        "title": "Retry Saved Review Recovery",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.discardSavedSessionRecovery",
+        "title": "Discard Saved Session Recovery Files",
+        "category": "Code Diff Tracker"
+      },
+      {
         "command": "diffTracker.stopRecording",
         "title": "Stop Recording",
         "category": "Code Diff Tracker",

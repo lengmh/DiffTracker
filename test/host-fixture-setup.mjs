@@ -196,6 +196,16 @@ test('S4 settings are seeded after Native exits and restores its files, before t
                 assert.equal(fs.existsSync(path.join(workspace,'native-a.txt')),false,
                     'scope configuration work must not share Native or restart fixture files');
                 assert.equal(fs.readFileSync(path.join(workspace,'watched.txt'),'utf8'),'baseline\\n');
+            } else if (phase === 'lifecycle-diagnostics') {
+                assert.equal(path.resolve(options.launchArgs[0]),path.resolve(workspace));
+                assert.deepEqual(JSON.parse(fs.readFileSync(settings,'utf8')),{
+                    'diffTracker.monitoringScope':'rules','diffTracker.watchInclude':[],'diffTracker.watchExclude':[]
+                });
+                assert.equal(fs.existsSync(path.join(workspace,'native-a.txt')),false,
+                    'recovery diagnostics must not share Native review or restart fixture files');
+                assert.equal(fs.existsSync(offlineFile),false);
+                assert.ok(options.launchArgs.some(value=>value.includes('lifecycle-user-data')),
+                    'recovery diagnostics need a fresh host profile');
             } else if (phase === 'prepare') {
                 assert.equal(fs.existsSync(path.join(workspace, 'native-opaque.bin')), false,
                     'Native fixture cleanup must finish first');
@@ -233,6 +243,6 @@ test('S4 settings are seeded after Native exits and restores its files, before t
     });
     assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
     assert.deepEqual(result.stdout.match(/FIXTURE-PHASE [\w-]+/g), [
-        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
+        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE lifecycle-diagnostics', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
     ]);
 });

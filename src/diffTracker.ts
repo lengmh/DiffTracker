@@ -99,6 +99,27 @@ export interface ChangeBlock {
     changes: LineChange[];
 }
 
+export interface MonitoringLifecycleStatus {
+    disposed: boolean;
+    sessionEpoch: number;
+    recoveryBlocked: boolean;
+    recoveryRequiresReload: boolean;
+    baselineTransactionActive: boolean;
+    baselineScanActive: boolean;
+    recoveryRetryActive: boolean;
+    recording: boolean;
+    baselineState: 'idle' | 'building' | 'ready';
+    persistenceIssue?: string;
+    persistenceFailed: boolean;
+    transactionPhase?: 'durable-preparation' | 'baseline-scan' | 'scope-or-review-update';
+    blocker?: {code:'disposed'|'recovery-reload-required'|'recovery-blocked'|'recovery-retry'|'baseline-transaction'|'baseline-scan';reason:string};
+}
+
+export interface SavedSessionRecoveryRetryResult {
+    status: 'restored' | 'recovered' | 'incomplete' | 'blocked' | 'absent' | 'conflict';
+    reason?: string;
+}
+
 export interface TrackChangesEvent {
     changedFiles: string[];
     removedFiles: string[];
@@ -517,12 +538,40 @@ export class DiffTracker {
     // create event. Restored or scan-time uncertainty still requires a rebuild.
     private postBaselineUnknownFiles = new Set<string>();
 
+    private readonly _onDidChangeLifecycleState = new vscode.EventEmitter<void>();
+    public readonly onDidChangeLifecycleState = this._onDidChangeLifecycleState.event;
+    private recoveryRequiresReload = false;
+    private savedSessionRetryActive = false;
+    private savedSessionRetryTask?: Promise<SavedSessionRecoveryRetryResult>;
+
+    public getMonitoringLifecycleStatus(): MonitoringLifecycleStatus {
+        const status: MonitoringLifecycleStatus = {
+            disposed:this.disposed,sessionEpoch:this.sessionEpoch,recoveryBlocked:this.recoveryBlocked,recoveryRequiresReload:this.recoveryRequiresReload,
+            baselineTransactionActive:!!this.baselineTransaction,baselineScanActive:this.baselineBuilding && this.isRecording,
+            recoveryRetryActive:this.savedSessionRetryActive,recording:this.isRecording,baselineState:this.getBaselineState(),
+            persistenceIssue:this.persistenceIssue,persistenceFailed:this.persistenceFailed,
+            transactionPhase:this.baselineTransaction
+                ? this.baselineTransaction.baselineRecovery?.prepared ? 'durable-preparation'
+                    : this.baselineTransaction.deferReady ? 'baseline-scan' : 'scope-or-review-update'
+                : undefined
+        };
+        if (status.disposed) { status.blocker={code:'disposed',reason:'This tracker instance is closed. Reopen Monitoring Scope after reloading the window.'}; }
+        else if (status.recoveryRequiresReload) { status.blocker={code:'recovery-reload-required',reason:'Baseline acceptance was interrupted during durable preparation. Preserve any unsaved scope draft, then reload the window to recover the saved review.'}; }
+        else if (status.recoveryRetryActive) { status.blocker={code:'recovery-retry',reason:'Saved review recovery is running and will finish in paused mode. Wait before other scope actions; the requested scope and before-images remain preserved.'}; }
+        else if (status.baselineTransactionActive) { status.blocker={code:'baseline-transaction',reason:`A ${status.transactionPhase==='durable-preparation'?'durable baseline preparation':'baseline or scope update'} is in progress. Wait for it to finish before retrying.`}; }
+        else if (status.recoveryBlocked) { status.blocker={code:'recovery-blocked',reason:`Saved review recovery is blocked${status.persistenceIssue ? ': '+status.persistenceIssue : '.'} Use Retry Saved Review Recovery in Monitoring Scope. Discarding the saved session is a separate, destructive action.`}; }
+        else if (status.baselineScanActive) { status.blocker={code:'baseline-scan',reason:'The recording baseline scan is still building. Wait for the scan to finish before applying monitoring scope.'}; }
+        return status;
+    }
+
     private beginBaselineTransaction(rollback: () => void): BaselineTransaction {
         if (this.baselineTransaction) { throw new Error('Baseline transaction already active'); }
         if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
         let finish!: () => void;
         const done = new Promise<void>(resolve => { finish = resolve; });
-        return this.baselineTransaction = { epoch: this.sessionEpoch, rollback, done, finish };
+        this.baselineTransaction = { epoch: this.sessionEpoch, rollback, done, finish };
+        this._onDidChangeLifecycleState.fire();
+        return this.baselineTransaction;
     }
 
     private endBaselineTransaction(transaction: BaselineTransaction, commit: boolean): void {
@@ -530,6 +579,7 @@ export class DiffTracker {
         if (!commit && !transaction.durablyCommitted) { transaction.rollback(); }
         this.baselineTransaction = undefined;
         transaction.finish();
+        this._onDidChangeLifecycleState.fire();
     }
     private cancelBaselineForReplacement(): () => void {
         const transaction = this.baselineTransaction;
@@ -618,6 +668,7 @@ export class DiffTracker {
             // An in-flight intent write may still finish after cancellation. Do
             // not let a new baseline overwrite its recovery source before reload.
             this.recoveryBlocked = true;
+            this.recoveryRequiresReload = true;
             this.persistenceIssue = 'Baseline acceptance was interrupted during durable preparation; reload to recover the saved review before starting a new baseline.';
         }
         if (this.baselineTransaction) { this.endBaselineTransaction(this.baselineTransaction, false); }
@@ -642,7 +693,9 @@ export class DiffTracker {
         this.workspaceRootCaseSensitivityCache.clear();
         this.activeWriteFiles.clear();
         this.pendingWriteFiles.clear();
-        return ++this.sessionEpoch;
+        const epoch = ++this.sessionEpoch;
+        this._onDidChangeLifecycleState.fire();
+        return epoch;
     }
 
     private revision(content: string, exists: boolean): string {
@@ -1127,6 +1180,7 @@ export class DiffTracker {
                 this.restoringEpoch = undefined;
                 this.restoreEvents.clear();
             }
+            this._onDidChangeLifecycleState.fire();
         }
     }
 
@@ -1282,7 +1336,7 @@ export class DiffTracker {
             this.recoveryBlocked = true;
             this.isRecording = false;
             this.disposeFileWatchers();
-            this.persistenceIssue = 'Cannot restore ignore rules; persisted review is preserved.';
+            this.persistenceIssue = `Cannot restore ignore rules; persisted review is preserved. ${error instanceof Error ? error.message : String(error)}`;
             return 'blocked';
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
@@ -1863,7 +1917,7 @@ export class DiffTracker {
 
     public startRecording(): boolean {
         if (this.getWorkspaceRoots().length === 0) { return false; }
-        if (this.disposed || this.recoveryBlocked || this.archiveRestoreTask ||
+        if (this.disposed || this.recoveryBlocked || this.savedSessionRetryActive || this.archiveRestoreTask ||
             (this.baselineTransaction?.baselineRecovery?.prepared && !this.baselineTransaction.durablyCommitted)) { return false; }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) {
@@ -2014,6 +2068,9 @@ export class DiffTracker {
     }
 
     public stopRecording() {
+        // Retry already promises a paused review. As with archive recovery,
+        // let the finite restore finish before freezing/persisting its projection.
+        if (this.savedSessionRetryActive && this.restoringEpoch !== undefined) { return; }
         if (this.archiveRestoreTask) { this.archiveRestoreStopRequested = true; return; }
         this.advanceEpoch();
         this.isRecording = false;
@@ -4098,6 +4155,7 @@ export class DiffTracker {
     private reportPersistenceIssue(message: string, error?: unknown): void {
         this.persistenceIssue = message;
         this.persistenceFailed = true;
+        this._onDidChangeLifecycleState.fire();
         console.error(message, error);
     }
 
@@ -4220,6 +4278,7 @@ export class DiffTracker {
                     if (!transactionCurrent()) { return false; }
                     this.persistenceIssue = undefined;
                     this.persistenceFailed = false;
+                    this._onDidChangeLifecycleState.fire();
                     return true;
                 } catch (error) {
                     if (epoch === this.sessionEpoch) { this.reportPersistenceIssue('Failed to clear Code Diff Tracker persisted session state.', error); }
@@ -4258,6 +4317,7 @@ export class DiffTracker {
                 }
                 this.persistenceIssue = undefined;
                 this.persistenceFailed = false;
+                this._onDidChangeLifecycleState.fire();
                 return true;
             } catch (error) {
                 try { await this.deletePersistedFile(tempUri); } catch { /* Retain the primary failure. */ }
@@ -5211,9 +5271,8 @@ export class DiffTracker {
         const failed = (reason: string): MonitoringScopePreflightResult => ({
             ...result, status: 'failed', reason
         });
-        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
-            return conflict('Monitoring scope preflight is blocked by recovery or another baseline transaction.');
-        }
+        const lifecycleBlocker = this.getMonitoringLifecycleStatus().blocker;
+        if (lifecycleBlocker) { return conflict(lifecycleBlocker.reason); }
         if (!requestStillCurrent()) {
             return conflict('Monitoring scope request changed before preflight started.');
         }
@@ -5236,9 +5295,8 @@ export class DiffTracker {
             if (pendingRefresh === this.ignoreRefreshPromise) { break; }
             pendingRefresh = this.ignoreRefreshPromise;
         }
-        if (this.disposed || this.recoveryBlocked || this.baselineTransaction) {
-            return conflict('Monitoring scope preflight was invalidated while waiting for ignore-policy refresh.');
-        }
+        const latestLifecycleBlocker = this.getMonitoringLifecycleStatus().blocker;
+        if (latestLifecycleBlocker) { return conflict(latestLifecycleBlocker.reason); }
         const refreshedIdentityIssue = this.getPathIdentityIssue();
         if (refreshedIdentityIssue) { return conflict(refreshedIdentityIssue); }
         if (!this.sameWorkspaceRootIdentities(scope.roots, this.currentWorkspaceRootIdentities())) {
@@ -6417,13 +6475,8 @@ export class DiffTracker {
         const empty = (status: MonitoringScopeApplyResult['status'], reason?: string): MonitoringScopeApplyResult => ({
             status, reason, retainedReviews: 0, discardedReviews: 0, releasedBaselines: 0, capturedBaselines: 0
         });
-        const activeBaselineScan = this.baselineBuilding && this.isRecording;
-        if (this.disposed || this.recoveryBlocked || this.baselineTransaction || activeBaselineScan) {
-            return empty('conflict',
-                activeBaselineScan
-                    ? 'Monitoring scope cannot change while a baseline scan is still building.'
-                    : 'Monitoring scope cannot change while recovery or another baseline transaction is active.');
-        }
+        const lifecycleBlocker = this.getMonitoringLifecycleStatus().blocker;
+        if (lifecycleBlocker) { return empty('conflict',lifecycleBlocker.reason); }
         if (!requestStillCurrent()) {
             return empty('conflict', 'Monitoring scope request changed before preparation started.');
         }
@@ -7186,18 +7239,62 @@ export class DiffTracker {
 
     public isRecoveryBlocked(): boolean { return this.recoveryBlocked; }
 
+    public retrySavedSessionRecovery(): Promise<SavedSessionRecoveryRetryResult> {
+        const status = this.getMonitoringLifecycleStatus();
+        if (!status.recoveryBlocked || status.disposed || status.recoveryRequiresReload || status.recoveryRetryActive ||
+            status.baselineTransactionActive || this.archiveRestoreTask || this.coverageRecheckEpoch !== undefined) {
+            return Promise.resolve({status:'conflict',reason:status.blocker?.reason ?? 'There is no blocked saved review to retry.'});
+        }
+        this.savedSessionRetryActive = true;
+        this._onDidChangeLifecycleState.fire();
+        const epoch = this.sessionEpoch;
+        const task = this.queueRecoveryAction(async () => {
+            if (!this.isCurrentEpoch(epoch) || !this.recoveryBlocked || this.baselineTransaction || this.archiveRestoreTask) {
+                return {status:'conflict' as const,reason:'Saved review recovery changed before retry began. Existing review and storage are preserved.'};
+            }
+            const restoration = this.restorePersistedState();
+            const restoreEpoch = this.sessionEpoch;
+            const outcome = await restoration;
+            if (!this.isCurrentEpoch(restoreEpoch)) {
+                return {status:'conflict' as const,reason:'Saved review recovery was superseded by a recording lifecycle change.'};
+            }
+            // A successful retry restores review in paused mode. Starting a new
+            // baseline still needs the current scope and replacement confirmations.
+            if (this.isRecording) { this.stopRecording(); }
+            if (outcome === 'blocked' || outcome === 'absent') {
+                return {status:outcome,reason:this.persistenceIssue ?? 'No recoverable saved review was found. Preserve extension storage before considering a separate discard.'};
+            }
+            const pausedEpoch = this.sessionEpoch;
+            const saved = await this.flushPendingPersistence();
+            if (!this.isCurrentEpoch(pausedEpoch)) { return {status:'conflict' as const,reason:'Recording changed while the restored review was being saved.'}; }
+            if (!saved) {
+                this.recoveryBlocked = true;
+                return {status:'blocked' as const,reason:this.persistenceIssue ?? 'The restored paused review could not be saved.'};
+            }
+            return {status:outcome,reason:'The saved review was restored in paused mode. Review pending changes and apply the current monitoring request before starting a new recording.'};
+        }).finally(() => {
+            this.savedSessionRetryActive=false;
+            if (this.savedSessionRetryTask === task) { this.savedSessionRetryTask=undefined; }
+            this._onDidChangeLifecycleState.fire();
+        });
+        this.savedSessionRetryTask=task;
+        return task;
+    }
+
     public discardRecoveryState(): Promise<boolean> {
         // Refuse an active archive restore before joining its queue.
         if (this.archiveRestoreTask) { return Promise.resolve(false); }
         // In-flight Keep intent writes must settle before an explicit discard;
         // otherwise a late marker could resurrect a session the user discarded.
-        return this.queueRecoveryAction(() => this.performDiscardRecoveryState());
+        return this.queueRecoveryAction(() => this.performDiscardRecoveryState())
+            .finally(() => this._onDidChangeLifecycleState.fire());
     }
 
     private async performDiscardRecoveryState(): Promise<boolean> {
         if (this.archiveRestoreTask) { return false; }
         if (!this.storageUri) {
             this.recoveryBlocked = false;
+            this.recoveryRequiresReload = false;
             this.persistenceIssue = undefined;
             return true;
         }
@@ -7207,6 +7304,7 @@ export class DiffTracker {
                 if (uri) { await this.deletePersistedFile(uri); }
             }
             this.recoveryBlocked = false;
+            this.recoveryRequiresReload = false;
             this.persistenceFailed = false;
             this.persistenceIssue = undefined;
             return true;
@@ -13546,6 +13644,7 @@ export class DiffTracker {
             const backup = await this.readPersistedCandidate(backupUri, true);
             if (!current() || backup.kind !== 'valid' || backup.digest !== recovery.digest) { return false; }
             recovery.prepared = true;
+            this._onDidChangeLifecycleState.fire();
             await vscode.workspace.fs.writeFile(intentUri, new TextEncoder().encode(JSON.stringify({ version: 1, backupSha256: recovery.digest })));
             return current();
         } catch (error) {
@@ -15222,12 +15321,14 @@ export class DiffTracker {
     }
 
     public async dispose(): Promise<void> {
+        if (this.savedSessionRetryTask) { await this.savedSessionRetryTask; }
         if (this.archiveRestoreTask) {
             this.archiveRestoreStopRequested = true;
             await this.archiveRestoreTask;
         }
         this.advanceEpoch();
         this.disposed = true;
+        this._onDidChangeLifecycleState.fire();
         this.creationTempExpiryTimers.forEach(timer => clearTimeout(timer));
         this.creationTempExpiryTimers.clear();
         this.creationTempRoots.clear();
@@ -15245,5 +15346,6 @@ export class DiffTracker {
         this._onDidChangeRecordingState.dispose();
         this._onDidTrackChanges.dispose();
         this._onDidChangeBaselineState.dispose();
+        this._onDidChangeLifecycleState.dispose();
     }
 }
