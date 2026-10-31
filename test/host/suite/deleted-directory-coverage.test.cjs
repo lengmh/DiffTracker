@@ -33,7 +33,9 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         tracker.commitSupplementalCoverageTargets([root]);
         assert.equal(tracker.fileWatchers.length,0,'native filesystem callbacks alone must observe this lifecycle');
         const old = tracker.supplementalDirectoryWatchers.get(root);
-        fs.rmSync(container,{recursive:true});
+        // Let Windows deliver native self-delete callbacks while descendant
+        // handles are removed. This is one asynchronous delete, with no retry.
+        await fs.promises.rm(container,{recursive:true});
         await until('native ancestor deletion must retain review and certify reconstruction',()=>
             old.epoch === -1 && tracker.getTrackedChange(file)?.isDeleted &&
             tracker.supplementalDirectoryWatchers.get(root)?.observationDirectory === workspace &&
@@ -56,7 +58,7 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         console.log('PASS HOST-DELETED-COVERAGE native ancestor deletion, chain reconstruction, empty recreation and continued edits preserve baseline');
         // Save a certified absent state, then reconstruct its OS owner in a new
         // tracker. No live handle or missing-directory fact crosses this boundary.
-        fs.rmSync(root,{recursive:true});
+        await fs.promises.rm(root,{recursive:true});
         await until('second native deletion',()=>tracker.getTrackedChange(file)?.isDeleted && !tracker.getSubtreeCoverageGaps().length &&
             tracker.supplementalDirectoryWatchers.get(root)?.observationDirectory === parent,tracker);
         assert.equal(await tracker.flushPendingPersistence(),true);
@@ -107,7 +109,7 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
             }
             await batch.installSupplementalCoverageTargets(roots,batch.sessionEpoch,true);batch.commitSupplementalCoverageTargets(roots);
             assert.equal(batch.fileWatchers.length,0);
-            for(const directory of roots){fs.rmSync(directory,{recursive:true});}
+            for(const directory of roots){await fs.promises.rm(directory,{recursive:true});}
             await until('seven real native deletions must all finish durable retirement',()=>roots.every(directory=>
                 batch.getTrackedChange(path.join(directory,'review.txt'))?.isDeleted &&
                 batch.supplementalDirectoryWatchers.get(directory)?.observationDirectory===batchParent) &&
@@ -120,6 +122,6 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
 
     } finally {
         await tracker.dispose();
-        fs.rmSync(container,{recursive:true,force:true}); fs.rmSync(storage,{recursive:true,force:true});
+        await fs.promises.rm(container,{recursive:true,force:true}); await fs.promises.rm(storage,{recursive:true,force:true});
     }
 };

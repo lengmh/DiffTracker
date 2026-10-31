@@ -170,6 +170,11 @@ interface SupplementalDirectoryWatch {
     scopeOperation?: {revision: string; activity: {active: boolean}};
 }
 
+interface DirectoryRetirementEvent {
+    path: string;
+    deleted: boolean;
+}
+
 interface ImportedCoverageHandoff {
     bridges: Map<string, ImportedDirectoryWatch>;
     owners: Map<string, SupplementalDirectoryWatch>;
@@ -887,8 +892,8 @@ export class DiffTracker {
     private supplementalDirectoryWatchers = new Map<string, SupplementalDirectoryWatch>();
     private supplementalIdentityTimer?: NodeJS.Timeout;
     private supplementalIdentitySweepRunning = false;
-    private missingDirectoryRetirement?: {epoch:number; targets:string[]; dirty:Set<string>};
-    private missingDirectoryRetirementQueue: Promise<readonly string[]> = Promise.resolve([]);
+    private missingDirectoryRetirement?: {epoch:number; targets:string[]; dirty:Map<string,DirectoryRetirementEvent>};
+    private missingDirectoryRetirementQueue: Promise<readonly DirectoryRetirementEvent[]> = Promise.resolve([]);
     private supplementalCoverageRoots = new Set<string>();
     // Historical kind only; never coverage proof or child absence provenance.
     private excludedDirectoryKinds = new Map<string, {epoch:number; workspaceRoot:string; parent:fs.BigIntStats}>();
@@ -2470,16 +2475,22 @@ export class DiffTracker {
             this.effectiveMonitoringScope.mode !== 'wholeWorkspace';
     }
 
-    private deferMissingDirectoryRetirementEvent(uri: vscode.Uri): boolean {
+    private deferMissingDirectoryRetirementEvent(uri: vscode.Uri, kind: StartupEvent['kind']): boolean {
         const retirement = this.missingDirectoryRetirement;
         if (!retirement || retirement.epoch !== this.sessionEpoch || uri.scheme !== 'file') { return false; }
         let deferred = false;
         for (const target of retirement.targets) {
             if (this.pathBelongsToRoot(uri.fsPath,target) || this.pathBelongsToRoot(target,uri.fsPath)) {
-                // At most one bit per already-retained coverage target.
-                // Replay the subtree's current state, never infer
-                // child creation or before-images from this coalesced signal.
-                retirement.dirty.add(target);
+                // One record per retained target. Preserve a wider ancestor
+                // notification: narrowing it would lose known sibling changes.
+                // Descendant signals still reconcile the target's current state
+                // without inventing child creation or before-images.
+                const observed = this.pathBelongsToRoot(target,uri.fsPath) ? uri.fsPath : target;
+                const previous = retirement.dirty.get(target);
+                retirement.dirty.set(target,{
+                    path: previous && this.pathBelongsToRoot(observed,previous.path) ? previous.path : observed,
+                    deleted: previous?.deleted === true || kind === 'delete'
+                });
                 deferred = true;
             }
         }
@@ -2504,7 +2515,7 @@ export class DiffTracker {
             }
             this.refreshIgnoreMatchersAfterLivePolicyChange();
         }
-        if (this.deferMissingDirectoryRetirementEvent(uri)) { return; }
+        if (this.deferMissingDirectoryRetirementEvent(uri,kind)) { return; }
         if (this.restoringEpoch === epoch) {
             if (this.deferCoverageRecheckEvent(uri, kind)) { return; }
             // A change does not invalidate the evidence that a path
@@ -3418,16 +3429,18 @@ export class DiffTracker {
         const replay = await operation;
         // Release the queue before replay: a missing reconstruction ancestor can
         // require a new proof. A nested replay must never wait on its own turn.
-        for (const target of replay) {
+        for (const {path:target,deleted} of replay) {
             if (!this.isCurrentEpoch(epoch)) { break; }
-            if (this.confirmedMissingDirectory(target)) { await this.onExternalFileDeleted(vscode.Uri.file(target)); }
-            else { await this.onExternalFileChanged(vscode.Uri.file(target)); }
+            if (deleted || this.confirmedMissingDirectory(target)) { await this.onExternalFileDeleted(vscode.Uri.file(target)); }
+            if (this.isCurrentEpoch(epoch) && !this.confirmedMissingDirectory(target)) {
+                await this.onExternalFileChanged(vscode.Uri.file(target));
+            }
         }
     }
 
     private async performMissingDirectoryRetirement(
         install: SupplementalCoverageInstall, epoch: number, deletedPath?: string
-    ): Promise<readonly string[]> {
+    ): Promise<readonly DirectoryRetirementEvent[]> {
         if (!this.isCurrentEpoch(epoch) || this.baselineTransaction || this.scopeApplyPreflight ||
             this.pendingMonitoringScope || this.activeScopeApplications > 0) { return []; }
         const scope = this.effectiveMonitoringScope;
@@ -3435,7 +3448,7 @@ export class DiffTracker {
         const policy = this.watcherCoverageRevision;
         const ignore = this.ignorePolicyRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
-        const retirement = {epoch,targets:[] as string[],dirty:new Set<string>()};
+        const retirement = {epoch,targets:[] as string[],dirty:new Map<string,DirectoryRetirementEvent>()};
         const owners = new Map<string,{owner:SupplementalDirectoryWatch;revision:number}>();
         const missingProofs = new Map<string,{parent:string;workspaceRoot:string}>();
         for (const [directory,owner] of this.supplementalDirectoryWatchers) {
@@ -3496,7 +3509,14 @@ export class DiffTracker {
                 await this.pauseRecordingForUnpersistableCoverage('Deleted directory coverage could not be saved; original review is preserved.');
             }
         }
-        return [...retirement.dirty];
+        const replay = new Map<string,DirectoryRetirementEvent>();
+        for (const [target,event] of retirement.dirty) {
+            replay.set(event.path,{path:event.path,deleted:event.deleted || replay.get(event.path)?.deleted === true});
+            // The wider parent may be ignored or independently owned. Retain
+            // the exact authorized target's discovery as a separate obligation.
+            if (!replay.has(target)) { replay.set(target,{path:target,deleted:false}); }
+        }
+        return [...replay.values()];
     }
 
     private watchImportedDirectory(directory: string, epoch: number, inheritedAbsence = false): boolean {
@@ -10228,7 +10248,7 @@ export class DiffTracker {
             return;
         }
 
-        if (this.deferMissingDirectoryRetirementEvent(uri) || this.deferCoverageRecheckEvent(uri, 'change')) { return; }
+        if (this.deferMissingDirectoryRetirementEvent(uri,'change') || this.deferCoverageRecheckEvent(uri, 'change')) { return; }
         if (this.deferInitialIgnoreEvent(uri)) { return; }
         const filePath = uri.fsPath;
         this.recordBaselineTransactionEvent(uri, 'change');
@@ -10474,8 +10494,8 @@ export class DiffTracker {
     }
 
     private async onExternalFileCreatedEvent(uri: vscode.Uri): Promise<void> {
-        if (this.deferMissingDirectoryRetirementEvent(uri)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
+        if (this.deferMissingDirectoryRetirementEvent(uri,'create')) { return; }
         const filePath = uri.fsPath;
         if (uri.scheme === 'file' && this.isRecording && this.externalWatcherEnabled &&
             this.effectiveMonitoringScope.kind === 'configured' && this.snapshotInitialized &&
@@ -10513,7 +10533,7 @@ export class DiffTracker {
             return;
         }
 
-        if (this.deferMissingDirectoryRetirementEvent(uri) || this.deferCoverageRecheckEvent(uri, 'create')) { return; }
+        if (this.deferMissingDirectoryRetirementEvent(uri,'create') || this.deferCoverageRecheckEvent(uri, 'create')) { return; }
 
         if (this.deferInitialIgnoreEvent(uri, 'create')) { return; }
         const filePath = uri.fsPath;
@@ -10862,7 +10882,7 @@ export class DiffTracker {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
         if (((!this.isRecording || !this.externalWatcherEnabled) && !observeStopped) || uri.scheme !== 'file' ||
-            this.deferMissingDirectoryRetirementEvent(uri) || this.deferCoverageRecheckEvent(uri, 'delete') || this.deferInitialIgnoreEvent(uri, 'delete')) {
+            this.deferMissingDirectoryRetirementEvent(uri,'delete') || this.deferCoverageRecheckEvent(uri, 'delete') || this.deferInitialIgnoreEvent(uri, 'delete')) {
             return;
         }
         this.recordBaselineTransactionEvent(uri, 'delete');

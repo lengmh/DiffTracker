@@ -370,4 +370,23 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
     }));
 
+    test('DELETED-COVERAGE ancestor deletion during retirement preserves sibling deletion review', () => fixture(async ({tracker,dir,scope}) => {
+        const {root,file}=await seed(tracker,dir,scope,'container/temporary');
+        const container=path.dirname(root),sibling=path.join(container,'sibling.txt');
+        fs.writeFileSync(sibling,'sibling baseline');await tracker.onExternalFileCreated(Uri.file(sibling));
+        assert.equal((await tracker.keepAllChangesInFile(sibling)).status,'success');
+        fs.rmSync(root,{recursive:true});
+        const gate=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const deleted=tracker.onExternalFileDeleted(Uri.file(root));
+        try {
+            await gate.entered;fs.rmSync(container,{recursive:true});
+            tracker.dispatchExternalEvent(Uri.file(container),'delete',tracker.sessionEpoch);
+            gate.release();await deleted;
+            assert.equal(tracker.getTrackedChange(sibling)?.isDeleted,true);
+            assert.equal(tracker.getOriginalContent(sibling),'sibling baseline');
+            assert.equal(tracker.getTrackedChange(file)?.isDeleted,true);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+        } finally {gate.release();await deleted;}
+    }));
+
 }
