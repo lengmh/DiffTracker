@@ -730,8 +730,9 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {fs.realpathSync=realpath;fs.statSync=stat;}
     }));
 
-    for(const replacement of ['directory','file','budget','budget0','budget-file','new-epoch','ignored'])
-    test(`P2-RECHECK-TYPE-FALLBACK ${replacement}`,()=>fixture(async({tracker,dir,scope})=>{
+    for(const replacement of ['directory','file','budget','budget0','budget-file','budget-reload','budget-reload-wrapped','budget-reload-proof','new-epoch','ignored'])
+    test(`P2-RECHECK-TYPE-FALLBACK ${replacement}`,()=>fixture(async({tracker:initialTracker,dir,scope})=>{
+        let tracker=initialTracker;
         const {root,file}=await seed(tracker,dir,scope),target=path.join(root,'introduced'),child=path.join(target,'unproven.txt');
         // Deliver the notification at the existing Recheck handoff, after its
         // certification result is computed and before the final replay snapshot.
@@ -741,7 +742,7 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                 delivered=true;fs.writeFileSync(target,'independent file');
                 tracker.dispatchExternalEvent(Uri.file(target),'create',restoring);
                 if(replacement.startsWith('budget')){
-                    tracker.maxScopePreflightEntries=replacement==='budget'?1:0;
+                    tracker.maxScopePreflightEntries=replacement==='budget'||replacement.startsWith('budget-reload')?1:0;
                     if(replacement==='budget0'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
                 }
             }
@@ -768,6 +769,41 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                 assert.equal(tracker.coverageGaps.get(target)?.[kind]?.reasonCode,'coverage-recheck-incomplete');
                 assert.ok(JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.some(([name,gap])=>name===target&&gap[kind]?.reasonCode==='coverage-recheck-incomplete'));
                 tracker.maxScopePreflightEntries=allowance;
+                if(replacement.startsWith('budget-reload')){
+                    const storage=tracker.storageUri;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;
+                    await tracker.dispose();
+                    if(replacement==='budget-reload-wrapped'){
+                        const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json')));
+                        const record=saved.coverageGaps.find(([name])=>name===target)[1];
+                        record.importedCoverageRequired=true;record.subtree.reasonCode='imported-coverage-restart-required';
+                        fs.writeFileSync(path.join(storage.fsPath,'session-state.json'),JSON.stringify(saved));
+                    }
+                    const unrelated=path.join(dir,'unrelated-after-stop.txt');fs.writeFileSync(unrelated,'independent offline path');
+                    tracker=new DiffTracker(storage);setTracker(tracker);
+                    const proof=replacement==='budget-reload-proof';const classification=proof?h.pause(child,'stat'):undefined;
+                    const restored=tracker.restorePersistedState();
+                    try{
+                        if(classification){await classification.entered;tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch);classification.release();}
+                        assert.equal(await restored,'restored');
+                    }finally{classification?.release();await restored;}
+                    assert.equal(tracker.fileSnapshots.has(child),proof,'restore must preserve durable directory provenance before certification');
+                    assert.equal(tracker.getOriginalContent(unrelated),'','target uncertainty must not downgrade unrelated offline additions');
+                    await tracker.recheckObservationCoverage();await tracker.recheckObservationCoverage();
+                    assert.equal(tracker.getOriginalContent(file),'original');
+                    if(proof){assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}
+                    else{
+                        const doc=h.document(child),before=doc.getText();assert.equal(doc.isDirty,false);
+                        assert.equal((await tracker.revertBlock(child,0)).status,'conflict');assert.equal(doc.getText(),before);assert.equal(doc.isDirty,false);
+                        assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);
+                    }
+                    assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+                    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+                    tracker=new DiffTracker(storage);setTracker(tracker);assert.equal(await tracker.restorePersistedState(),'restored');
+                    assert.equal(tracker.fileSnapshots.has(child),proof,'certification and a second reload retain before-image provenance');
+                    assert.equal(tracker.unresolvedBaselineFiles.has(child),!proof);
+                    if(!proof){assert.equal((await tracker.revertBlock(child,0)).status,'conflict');assert.equal(tracker.getReviewToken(child),undefined);}
+                    return;
+                }
                 if(replacement==='budget'){
                     const owners=tracker.maxImportedDirectoryWatchers;tracker.maxImportedDirectoryWatchers=0;
                     try{assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked');assert.ok(tracker.getSubtreeCoverageGaps().length>0);}
@@ -783,6 +819,8 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                     try{
                         assert.equal((await tracker.recheckObservationCoverage()).status,'failed');assert.equal(rejected,true);
                         assert.equal(tracker.coverageGaps.get(target)?.subtree?.reasonCode,'coverage-recheck-incomplete','failed certification restores target evidence');
+                        const persisted=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.find(([name])=>name===target)[1];
+                        assert.equal(persisted.importedCoverageRequired,true);assert.equal(persisted.subtree.reasonCode,'coverage-recheck-incomplete','ownership serialization must retain directory provenance');
                     }finally{tracker.flushPersistState=flush;}
                 }
                 await tracker.recheckObservationCoverage();await tracker.recheckObservationCoverage();
@@ -797,5 +835,30 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             if(!replacement.startsWith('budget')){assert.equal(tracker.restoreEvents.size,0,'Recheck must consume its fallback observation');}
         }finally{metadata.release();await recheck;tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;}
     },'wholeWorkspace',replacement==='ignored'?[{scope:'all',pattern:'/temporary/introduced/'}]:[]));
+
+    for(const {mode,historical=false} of [{mode:'runtime'},{mode:'restore'},{mode:'retry'},{mode:'restore',historical:true}])
+    test(`P2-RETIREMENT-SAVE-PROOF mode=${mode} historical=${historical}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'saved-create.txt');
+        if(historical){tracker.recordUnresolvedBaseline(child,'Historical before-image is unknown');}
+        fs.rmSync(root,{recursive:true});
+        if(mode!=='runtime'){
+            tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Historical missing root');
+            await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
+            tracker=new DiffTracker(storage);setTracker(tracker);if(mode==='retry'){tracker.recoveryBlocked=true;}
+        }
+        const gate=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const operation=mode==='runtime'?tracker.onExternalFileDeleted(Uri.file(root)):mode==='retry'?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try{
+            await gate.entered;fs.mkdirSync(root);fs.writeFileSync(file,'recreated known');fs.writeFileSync(child,'independent saved creation');
+            await tracker.onExternalFileCreatedEvent(Uri.file(child));
+            tracker.onDidSaveDocument(h.document(child));
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename',path.basename(root));gate.release();await operation;
+            assert.equal(tracker.getOriginalContent(file),'original');
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),historical,'save delivery must not convert valid current creation proof into historical Unknown');
+            if(historical){assert.equal(tracker.getReviewToken(child),undefined);assert.equal((await tracker.revertBlock(child,0)).status,'conflict');}
+            else{assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}
+        }finally{gate.release();await operation;}
+    }));
 
 }

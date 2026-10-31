@@ -18,13 +18,23 @@ async function until(description,predicate){
 module.exports=async function restoredDirectoryRecreationHost(workspace){
     workspace=vscode.Uri.file(workspace).fsPath;
     assert.equal(vscode.workspace.getConfiguration('files').get('watcherExclude')['restored-recreate-host/**'],true);
-    for(const retry of [false,true]){
+    for(const {retry,saveDuringRetirement=false} of [{retry:false},{retry:true},{retry:false,saveDuringRetirement:true},{retry:true,saveDuringRetirement:true}]){
         const root=path.join(workspace,'restored-recreate-host'),file=path.join(root,'review.txt');
-        const unknown=path.join(root,'unproven.txt'),proven=path.join(root,`proven-${retry?'retry':'restore'}.txt`);
+        const unknown=path.join(root,'unproven.txt'),proven=path.join(root,`proven-${retry?'retry':'restore'}-${saveDuringRetirement?'saved':'direct'}.txt`);
         const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-restored-directory-host-')));
         let tracker=new DiffTracker(storage);
-        const exactCreates=[];
-        const created=vscode.workspace.onDidCreateFiles(event=>{for(const uri of event.files){exactCreates.push(uri.fsPath);}});
+        const exactCreates=[],evidenceTrace=[];let recheckCalls=0;
+        const trace=(action,extra={})=>{
+            if(evidenceTrace.length>=96){return;}
+            const queued=tracker.restoreEvents.get(proven);
+            evidenceTrace.push({action,...extra,retirement:!!tracker.missingDirectoryRetirement,
+                restoring:tracker.restoringEpoch===tracker.sessionEpoch,
+                queued:queued?{kind:queued.kind,observation:!!queued.reconcileDirectory,revoked:!!queued.revoked}:undefined,
+                retained:tracker.missingDirectoryRetirement?.createdFiles.has(proven),
+                baseline:tracker.fileSnapshots.has(proven),unknown:tracker.unresolvedBaselineFiles.get(proven)});
+        };
+        const created=vscode.workspace.onDidCreateFiles(event=>{for(const uri of event.files){exactCreates.push(uri.fsPath);if(uri.fsPath===proven){trace('api-create-observer');}}});
+        const saved=vscode.workspace.onDidSaveTextDocument(doc=>{if(doc.uri.fsPath===proven){trace('api-save-observer');}});
         try{
             fs.mkdirSync(root);fs.writeFileSync(file,'original host baseline');
             const requested=validateAndCanonicalizeScope({mode:'rules',includes:[{scope:'all',path:'restored-recreate-host'}],
@@ -42,11 +52,22 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             tracker=new DiffTracker(storage);if(retry)tracker.recoveryBlocked=true;
             const notifications=[],dispatch=tracker.dispatchExternalEvent;
             tracker.dispatchExternalEvent=function(uri,kind,epoch,...metadata){
-                if(notifications.length<32&&path.dirname(uri.fsPath)===root){
-                    notifications.push({name:path.basename(uri.fsPath),kind,retirement:!!this.missingDirectoryRetirement});
+                if(notifications.length<64&&(this.pathBelongsToRoot(uri.fsPath,root)||this.pathBelongsToRoot(root,uri.fsPath))){
+                    notifications.push({name:uri.fsPath===root?'[root]':path.dirname(uri.fsPath)===root?path.basename(uri.fsPath):'[ancestor]',kind,retirement:!!this.missingDirectoryRetirement,observation:!!metadata[0]});
+                    trace('dispatch',{name:notifications.at(-1).name,kind});
                 }
                 return dispatch.call(this,uri,kind,epoch,...metadata);
             };
+            const queue=tracker.queueRestoreEvent,unresolved=tracker.recordUnresolvedBaseline;
+            tracker.queueRestoreEvent=function(uri,...args){const result=queue.call(this,uri,...args);if(uri.fsPath===proven){trace('queue',{kind:args[0]});}return result;};
+            tracker.recordUnresolvedBaseline=function(filePath,...args){if(filePath===proven){trace('record-unknown',{reason:args[0]});}return unresolved.call(this,filePath,...args);};
+            const unavailable=tracker.markFileUnavailable;
+            tracker.markFileUnavailable=function(filePath,reason){
+                if(filePath===proven){trace('unavailable',{reason,callers:new Error().stack.split('\n').slice(1,5).map(line=>line.trim().replace(/ \(.*$/,''))});}
+                return unavailable.call(this,filePath,reason);
+            };
+            const recheck=tracker.performObservationCoverageRecheck;
+            tracker.performObservationCoverageRecheck=function(...args){recheckCalls++;return recheck.apply(this,args);};
             const save=tracker.flushPersistState.bind(tracker);let reconstructed=false;
             tracker.flushPersistState=async(...args)=>{
                 if(tracker.missingDirectoryRetirement&&!reconstructed){
@@ -55,7 +76,12 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                     fs.writeFileSync(unknown,'unproven child before-image');
                     const edit=new vscode.WorkspaceEdit();edit.createFile(vscode.Uri.file(proven));
                     assert.equal(await vscode.workspace.applyEdit(edit),true);
-                    await vscode.workspace.fs.writeFile(vscode.Uri.file(proven),Buffer.from('independently created during certification'));
+                    if(saveDuringRetirement){
+                        const document=await vscode.workspace.openTextDocument(vscode.Uri.file(proven));
+                        const content=new vscode.WorkspaceEdit();content.insert(document.uri,new vscode.Position(0,0),'independently created during certification');
+                        assert.equal(await vscode.workspace.applyEdit(content),true);assert.equal(document.isDirty,true);
+                        trace('before-document-save');assert.equal(await document.save(),true);trace('after-document-save');
+                    }else{await vscode.workspace.fs.writeFile(vscode.Uri.file(proven),Buffer.from('independently created during certification'));}
                     await until('real onDidCreateFiles must deliver exact file proof during retirement',()=>exactCreates.includes(proven));
                     // The workspace Host cannot see this watcher-excluded tree.
                     // Wait for the installed native parent owner's real callback.
@@ -70,7 +96,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             assert.equal(tracker.getOriginalContent(file),'original host baseline');
             assert.equal(tracker.getTrackedChange(file)?.currentContent,'reconstructed during host certification');
             assert.equal(tracker.getTrackedChange(file)?.isDeleted,false);
-            assert.equal(tracker.getOriginalContent(proven),'','actual independent file-create proof must survive retirement');
+            assert.equal(tracker.getOriginalContent(proven),'',`actual independent file-create proof must survive retirement: ${JSON.stringify({retry,saveDuringRetirement,recheckCalls,apiCreateObserved:exactCreates.includes(proven),notifications,evidenceTrace,unknown:tracker.unresolvedBaselineFiles.get(proven),gaps:tracker.getSubtreeCoverageGaps().map(gap=>({name:path.basename(gap.targetPath),reasonCode:gap.reasonCode}))})}`);
             assert.equal(tracker.unresolvedBaselineFiles.has(proven),false);assert.ok(tracker.getReviewToken(proven));
             assert.equal(tracker.getTrackedChange(proven)?.currentContent,'independently created during certification');
             assert.equal(tracker.unresolvedBaselineFiles.has(unknown),true,JSON.stringify({
@@ -89,9 +115,9 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                 await until('new persistent owner must observe later edits in the blind subtree',()=>
                     tracker.getTrackedChange(file)?.currentContent==='later native host edit');
             }
-            console.log(`PASS HOST-RESTORE-RECREATE retry=${retry} real reconstruction reconciles known review and preserves historical Unknown; childCreates=${notifications.filter(item=>item.name==='unproven.txt'&&item.kind==='create').length}`);
+            console.log(`PASS HOST-RESTORE-RECREATE retry=${retry} saved=${saveDuringRetirement} real reconstruction reconciles known review and preserves historical Unknown; rechecks=${recheckCalls}; childCreates=${notifications.filter(item=>item.name==='unproven.txt'&&item.kind==='create').length}`);
         }finally{
-            created.dispose();await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
+            created.dispose();saved.dispose();await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
             await fs.promises.rm(storage.fsPath,{recursive:true,force:true});
         }
     }

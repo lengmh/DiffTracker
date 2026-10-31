@@ -210,6 +210,8 @@ interface DirectoryObservation {
     budget: { remainingEntries: number };
 }
 
+const DEFERRED_RECHECK_REASON = 'The bounded Recheck replay left a deferred observation; original before-images are preserved and this target remains unverified.';
+
 const dormantExcludedDirectoryGapCodes = new Set([
     'directory-scan-coverage-gap', 'directory-runtime-coverage-gap',
     'supplemental-watcher-directory-change-gap', 'supplemental-watcher-target-missing-gap',
@@ -1675,8 +1677,7 @@ export class DiffTracker {
             // A deferred target needs the same independent owner repair and
             // transaction as a failed import. Workspace-root markers retain
             // their existing enclosing Recheck certification path.
-            const deferredDirectory = record.subtree?.reasonCode==='coverage-recheck-incomplete' &&
-                !this.sessionWorkspaceRoots.some(root=>path.resolve(root)===path.resolve(target));
+            const deferredDirectory = this.isDeferredDirectoryCoverageGap(target,record);
             if (record.subtree && (this.isImportedDirectoryCoverageGap(record) || deferredDirectory) &&
                 !this.scopeExplicitlyExcludesDirectory(target) &&
                 !this.isPathIgnored(vscode.Uri.file(target), true, false, false)) {
@@ -2044,7 +2045,7 @@ export class DiffTracker {
                             const targetKind=this.queuedEventNeedsObservation(event) || this.hasHistoricalDirectoryProvenance(target) ? 'subtree' : 'file';
                             if (this.coverageGaps.get(target)?.[targetKind]) { continue; }
                             const evidence:CoverageGapEvidence={targetKind,reasonCode:'coverage-recheck-incomplete',
-                                reason:'The bounded Recheck replay left a deferred observation; original before-images are preserved and this target remains unverified.',
+                                reason:DEFERRED_RECHECK_REASON,
                                 ...(targets && selected(target) ? {scopeOperationRevision:scope.scopeRevision} : {})};
                             this.reserveCandidateCoverageGap(target,evidence,budget);
                             retained.set(target,evidence);
@@ -3044,13 +3045,24 @@ export class DiffTracker {
         });
     }
 
+    private isDeferredDirectoryCoverageGap(target: string, record: CoverageGapRecord | undefined): boolean {
+        const evidence=record?.subtree;
+        // Older candidate writers wrapped imported obligations while retaining
+        // this exact deferred-observation reason. Keep that narrow migration
+        // distinguishable from unrelated imported/restart uncertainty.
+        return !!evidence && !this.sessionWorkspaceRoots.some(root=>path.resolve(root)===path.resolve(target)) &&
+            (evidence.reasonCode==='coverage-recheck-incomplete' ||
+                (evidence.reasonCode===this.importedCoverageRestartCode && evidence.reason===DEFERRED_RECHECK_REASON));
+    }
+
     private persistedCoverageGap(
         record: CoverageGapRecord | undefined,
         importedCoverageRequired: boolean
     ): PersistedCoverageGapRecord {
         if (!importedCoverageRequired) { return { ...record }; }
         return { ...record, importedCoverageRequired: true, subtree:
-            record?.subtree?.reasonCode.startsWith('pending-scope-') ? record.subtree : {
+            record?.subtree?.reasonCode.startsWith('pending-scope-') ||
+            record?.subtree?.reasonCode==='coverage-recheck-incomplete' ? record.subtree : {
                 targetKind: 'subtree',
                 reasonCode: this.importedCoverageRestartCode,
                 ...(record?.subtree?.scopeOperationRevision ? {scopeOperationRevision:record.subtree.scopeOperationRevision} : {}),
@@ -7586,8 +7598,17 @@ export class DiffTracker {
     }
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
-        if (this.deferArchiveRestoreEvent(doc.uri, 'change')) { return; }
-        if (this.deferCoverageRecheckEvent(doc.uri, 'change')) { return; }
+        const uri=doc.uri.scheme==='file' ? vscode.Uri.file(this.canonicalTrackingPath(doc.uri.fsPath)) : doc.uri;
+        if (this.deferArchiveRestoreEvent(uri, 'change')) { return; }
+        if (this.deferMissingDirectoryRetirementEvent(uri, 'change')) { return; }
+        if (this.deferCoverageRecheckEvent(uri, 'change')) { return; }
+        // A save can follow an independently observed creation before recovery
+        // has replayed it. Preserve that proof rather than publishing a new
+        // historical Unknown from an intentionally absent in-memory baseline.
+        if (this.isRecording && uri.scheme==='file' && this.restoringEpoch===this.sessionEpoch) {
+            this.queueRestoreEvent(uri,'change');
+            return;
+        }
         if (this.isRecording && !this.activeWriteFiles.has(this.canonicalTrackingPath(doc.uri.fsPath))) {
             this.processDocumentChange(doc);
         }
@@ -10137,10 +10158,13 @@ export class DiffTracker {
         }
     }
 
-    private hasQueuedDirectoryObservation(filePath: string): boolean {
+    private hasUnprovenDirectoryObservation(filePath: string): boolean {
+        const owner=this.owningWorkspaceFolderForTraversal(filePath)?.uri.toString();
         for (let current = filePath; ; current = path.dirname(current)) {
             const event = this.restoreEvents.get(current);
             if (event && this.queuedEventNeedsObservation(event)) { return true; }
+            if (owner && this.owningWorkspaceFolderForTraversal(current)?.uri.toString()===owner &&
+                this.isDeferredDirectoryCoverageGap(current,this.coverageGaps.get(current))) { return true; }
             const parent = path.dirname(current);
             if (parent === current) { return false; }
         }
@@ -10231,7 +10255,7 @@ export class DiffTracker {
                 // inference for its children. Only independent creation proof
                 // can establish an empty before-image during this discovery.
                 : observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint &&
-                    !this.hasQueuedDirectoryObservation(filePath))
+                    !this.hasUnprovenDirectoryObservation(filePath))
                     ? { kind: 'text', content: '', baselineExists: false }
                     : {
                         kind: 'unresolved',
