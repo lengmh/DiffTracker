@@ -5,7 +5,7 @@ validates its exact bytes through installed acceptance, and only then may publis
 the tag, GitHub Release, VSIX and checksum. Marketplace publication remains a
 separate manual maintainer step.
 
-The source is prepared for **0.8.12**. Version preparation alone does not publish a
+The source is prepared for **0.8.13**. Version preparation alone does not publish a
 tag, GitHub Release or Marketplace package. Review and verify the exact release
 commit and its final VSIX through the gates below before publication.
 
@@ -60,7 +60,7 @@ opaque migration, Marketplace installation or a wider platform matrix. See the
 
 Open **GitHub → Actions → Release → Run workflow**, select `main`, and explicitly
 set the source version and `dry_run: true`. For this preparation the version is
-`0.8.12`. An existing release tag does not block a dry run because it does not
+`0.8.13`. An existing release tag does not block a dry run because it does not
 modify release state.
 
 A dry run executes the full exact-VSIX installed gate and uploads validated build
