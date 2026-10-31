@@ -36,7 +36,7 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
     const outside = path.join(outerPath, 'recheck-independent.txt');
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-recheck-nested-'));
     const open = fs.promises.open;
-    let tracker, release, action;
+    let tracker, release, action, setupWatcher;
     const events = [];
     const diagnostics = () => ({ recording: tracker?.isRecording, enabled: tracker?.externalWatcherEnabled,
         epoch: tracker?.sessionEpoch, watchers: tracker?.fileWatchers.length, events });
@@ -44,12 +44,19 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         fs.mkdirSync(path.dirname(files[0]), { recursive: true });
         fs.writeFileSync(path.join(inner, 'ProbeName'), 'synthetic');
         for (const [index, file] of files.entries()) { fs.writeFileSync(file, `baseline ${index}`); }
-        fs.writeFileSync(outside, 'independent baseline');
         await changeFolders(event => event.added.some(folder => folder.uri.fsPath === inner), () =>
             vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length, 0,
                 { uri: vscode.Uri.file(inner), name: 'nested-recheck' }));
         const nested = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(files[0]));
         assert.equal(nested.uri.fsPath, inner);
+        // Fence the setup writes through the real host service before starting
+        // the recording. Late setup creates must not turn these known fixture
+        // before-images into a legitimately unknown creation interval.
+        let setupDelivered = false;
+        setupWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(outer, '**/*'));
+        setupWatcher.onDidCreate(event => { if (event.fsPath === outside) { setupDelivered = true; } });
+        await vscode.workspace.fs.writeFile(vscode.Uri.file(outside), Buffer.from('independent baseline'));
+        await until('setup notification round trip before tracker construction', () => setupDelivered);
         tracker = new DiffTracker(vscode.Uri.file(storage));
         const dispatch = tracker.dispatchExternalEvent;
         tracker.dispatchExternalEvent = function(event, kind, epoch) {
@@ -67,14 +74,31 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         assert.equal(applied.status, 'applied', JSON.stringify(applied));
         assert.equal(tracker.startRecording(), true);
         await until('nested Recheck baseline', () => tracker.getBaselineState() === 'ready');
-        // Seed the precise pending-review state through the production reader.
-        // The deletion under test and the subsequent edit use real watchers.
+        const pendingReads = new Set();
+        const reader = tracker.readFileAndUpdate;
+        tracker.readFileAndUpdate = async function(file, ...args) {
+            const result = await reader.call(this, file, ...args);
+            const index = files.indexOf(file);
+            if (index >= 0 && this.getTrackedChange(file)?.currentContent === `pending ${index}`) { pendingReads.add(file); }
+            return result;
+        };
         for (const [index, file] of files.entries()) {
             assert.equal(tracker.getOriginalContent(file), `baseline ${index}`);
             fs.writeFileSync(file, `pending ${index}`);
-            await tracker.readFileAndUpdate(file, vscode.Uri.file(file));
-            assert.equal(tracker.getTrackedChange(file)?.currentContent, `pending ${index}`);
         }
+        await until('real pending reads and directory preparation complete', () =>
+            files.every(file => pendingReads.has(file) && !tracker.externalChangeTimers.has(file)) &&
+            tracker.pendingSnapshotReads.size === 0 && tracker.activeCreations.size === 0 &&
+            tracker.directoryObservations.size === 0, diagnostics);
+        tracker.readFileAndUpdate = reader;
+        for (const [index, file] of files.entries()) {
+            const review = tracker.getTrackedChange(file);
+            assert.equal(review?.currentContent, `pending ${index}`);
+            assert.equal(review?.reviewKind, 'text');
+            assert.equal(review?.unavailableReason, undefined);
+        }
+        setupWatcher.dispose();
+        setupWatcher = undefined;
         for (const file of files) {
             tracker.setFileCoverageGap(file, 'pending-scope-gap', 'Synthetic earlier interval');
             tracker.markFileUnavailable(file, 'Synthetic earlier interval');
@@ -120,6 +144,7 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         console.log('PASS HOST-NESTED-RECHECK excluded ancestor deletion preserves nested review and independent observation');
     } finally {
         release?.();
+        setupWatcher?.dispose();
         if (action) { await action; }
         fs.promises.open = open;
         if (tracker) { await tracker.dispose(); }
