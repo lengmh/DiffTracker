@@ -389,4 +389,18 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {gate.release();await deleted;}
     }));
 
+    for(const sameIdentity of [true,false]) test(`DELETED-COVERAGE missing target validates alternate real-root spelling by physical identity (same=${sameIdentity})`,()=>fixture(async({tracker,dir})=>{
+        const missing=path.join(dir,'missing','temporary');
+        const other=path.join(dir,'other');fs.mkdirSync(other);
+        const alias=path.join(path.dirname(dir),'synthetic-root-spelling');
+        const realpath=fs.realpathSync,stat=fs.statSync;let rootReads=0;
+        fs.realpathSync=(target,...args)=>String(target)===dir && ++rootReads%2===0?alias:realpath(target,...args);
+        fs.statSync=(target,...args)=>stat(String(target)===alias?(sameIdentity?dir:other):target,...args);
+        try {
+            const issue=tracker.validateResourceTarget(missing);
+            if(sameIdentity)assert.equal(issue,undefined);
+            else assert.match(issue??'',/outside the workspace/);
+        } finally {fs.realpathSync=realpath;fs.statSync=stat;}
+    }));
+
 }

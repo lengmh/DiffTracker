@@ -2956,7 +2956,9 @@ export class DiffTracker {
             try {
                 const identity = fs.lstatSync(parent, {bigint:true});
                 if (!identity.isDirectory() || identity.isSymbolicLink()) { throw new Error('Reconstruction ancestor is not a direct directory'); }
-                if (path.resolve(parent) !== path.resolve(folder.uri.fsPath) && this.validateResourceTarget(parent)) {
+                const workspaceRoot = path.relative(folder.uri.fsPath,parent) === '' &&
+                    this.supplementalIdentityMatches(identity,fs.statSync(folder.uri.fsPath,{bigint:true}));
+                if (!workspaceRoot && this.validateResourceTarget(parent)) {
                     throw new Error('Reconstruction ancestor identity is unverified');
                 }
                 return parent;
@@ -12152,7 +12154,14 @@ export class DiffTracker {
             }
             const realExisting = fs.realpathSync(existing);
             if (realExisting !== realRoot && !isWithin(realRoot, realExisting)) {
-                return 'Symbolic link resolves outside the workspace; action blocked';
+                // Native Windows paths can spell the same root differently
+                // (drive casing or short/long names), especially when the
+                // nearest existing target is the workspace root itself. Prove
+                // that exact physical directory instead of folding path text.
+                const sameRoot = this.supplementalIdentityMatches(
+                    fs.statSync(realExisting,{bigint:true}),fs.statSync(realRoot,{bigint:true})
+                );
+                if (!sameRoot) { return 'Symbolic link resolves outside the workspace; action blocked'; }
             }
         } catch {
             return 'Cannot verify the resource workspace boundary; action blocked';
