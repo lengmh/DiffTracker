@@ -359,7 +359,7 @@ export class WebviewDiffPanel {
     }
 
     private visibleSourceNote(note?: string): string | undefined {
-        return vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false) ? note : undefined;
+        return note && vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false) ? note : undefined;
     }
 
     private getHtmlContent(): string {
