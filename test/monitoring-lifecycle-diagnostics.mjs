@@ -178,4 +178,35 @@ export function registerMonitoringLifecycleDiagnostics(h,fixture) {
             assert.equal(fs.readFileSync(child,'utf8'),'unproven contents');
         }finally{gate.release();await retry;}
     }));
+    for(const policy of ['explicit','gitignore'])for(const retry of [false,true])
+    test(`P2-IGNORED-DIRECTORY-RESTORE policy=${policy} retry=${retry}`,()=>fixture(async({tracker,dir,scope})=>{
+        const file=path.join(dir,'review.txt'),ignored=path.join(dir,'ignored'),child=path.join(ignored,'unread.txt');
+        const ignoreFile=path.join(dir,'.gitignore');
+        fs.writeFileSync(file,'original');
+        if(policy==='gitignore'){fs.writeFileSync(ignoreFile,'ignored/\n');h.setListedIgnores([Uri.file(ignoreFile)]);}
+        h.setListedFiles([Uri.file(file),...(policy==='gitignore'?[Uri.file(ignoreFile)]:[])]);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.fileSnapshots.set(file,'original');tracker.baselineExistingFiles.add(file);
+        assert.equal(tracker.getOriginalContent(file),'original');
+        fs.writeFileSync(file,'pending known edit');await tracker.readFileAndUpdate(file,Uri.file(file));
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri.fsPath,saved=fs.readFileSync(path.join(storage,'session-state.json'));
+        const intent=path.join(storage,'session-state.keep-in-progress.json');
+        fs.writeFileSync(path.join(storage,'session-state.pre-keep.json'),saved);
+        fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        tracker.isRecording=false;tracker.disposeFileWatchers();tracker.recoveryBlocked=retry;
+        const gate=h.pause(intent,'delete'),restore=retry?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try{
+            await gate.entered;fs.mkdirSync(ignored);fs.writeFileSync(child,'excluded contents');
+            assert.equal(tracker.isPathIgnored(Uri.file(ignored),true),true);
+            assert.equal(tracker.isPathIgnored(Uri.file(ignored)),false,'exercise a directory-only rule');
+            tracker.dispatchExternalEvent(Uri.file(ignored),'create',tracker.sessionEpoch);
+            gate.release();const result=await restore;assert.equal(retry?result.status:result,'recovered');
+            assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getTrackedChange(file)?.currentContent,'pending known edit');
+            assert.equal(tracker.fileSnapshots.has(child),false);assert.equal(tracker.unresolvedBaselineFiles.has(child),false);
+            assert.equal(h.nativeDirectoryWatchers.some(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(ignored)),false);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);assert.equal(fs.readFileSync(child,'utf8'),'excluded contents');
+        }finally{gate.release();await restore;h.setListedIgnores([]);}
+    },'rules',policy==='explicit'?[{scope:'all',pattern:'/ignored/'}]:[]));
+
 }

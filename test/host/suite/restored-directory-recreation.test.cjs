@@ -89,13 +89,15 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
     for(const operation of ['keep','restore'])for(const retry of [false,true]){
         const root=path.join(workspace,'restored-recreate-host'),file=path.join(root,'review.txt');
         const child=path.join(root,`unproven-${operation}-${retry?'retry':'restore'}.txt`);
+        const ignored=path.join(workspace,`ignored-${operation}-${retry?'retry':'restore'}`);
+        const observeIgnored=operation==='keep'&&!retry;
         const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-cleanup-provenance-host-')));
         const stage=fs.mkdtempSync(path.join(workspace,'.vscode','cleanup-stage-'));
         let tracker=new DiffTracker(storage);
         try{
             fs.mkdirSync(root);fs.writeFileSync(file,'original cleanup baseline');
             const requested=validateAndCanonicalizeScope({mode:'rules',includes:[{scope:'all',path:'restored-recreate-host'}],
-                excludes:[{scope:'all',pattern:'/.vscode/'}]},tracker.currentWorkspaceRootIdentities());
+                excludes:[{scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:`/${path.basename(ignored)}/`}]},tracker.currentWorkspaceRootIdentities());
             assert.equal(requested.ok,true);
             tracker.effectiveMonitoringScope={kind:'configured',...requested.scope};
             tracker.sessionWorkspaceRoots=tracker.getWorkspaceRoots();tracker.isRecording=true;
@@ -114,7 +116,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             tracker=new DiffTracker(storage);if(retry)tracker.recoveryBlocked=true;
             const notifications=[],dispatch=tracker.dispatchExternalEvent;
             tracker.dispatchExternalEvent=function(uri,kind,epoch,...metadata){
-                if(notifications.length<32&&(uri.fsPath===root||path.dirname(uri.fsPath)===root)){
+                if(notifications.length<32&&(uri.fsPath===root||uri.fsPath===ignored||path.dirname(uri.fsPath)===root)){
                     notifications.push({name:path.basename(uri.fsPath),kind,observationOnly:!!metadata[0]});
                 }
                 return dispatch.call(this,uri,kind,epoch,...metadata);
@@ -126,6 +128,12 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                     // Move an already populated tree under a real watcher-excluded
                     // root. No installed child owner can see individual creations.
                     fs.renameSync(stage,root);
+                    if(observeIgnored){
+                        fs.mkdirSync(ignored);fs.writeFileSync(path.join(ignored,'unread.txt'),'excluded contents');
+                        await until('real directory-ignored Host create must arrive during intent cleanup',()=>tracker.restoreEvents.has(ignored));
+                        assert.equal(tracker.isPathIgnored(vscode.Uri.file(ignored),true),true);
+                        assert.equal(tracker.isPathIgnored(vscode.Uri.file(ignored)),false);
+                    }
                     await until('real parent notification must arrive during intent cleanup',()=>tracker.restoreEvents.has(root));
                 }
                 return remove(uri);
@@ -148,6 +156,12 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             assert.equal(document.getText(),'unproven contents');assert.equal(document.isDirty,false);
             assert.equal(fs.readFileSync(child,'utf8'),'unproven contents');
             assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);
+            if(observeIgnored){
+                const excludedChild=path.join(ignored,'unread.txt');
+                assert.equal(tracker.fileSnapshots.has(excludedChild),false);assert.equal(tracker.unresolvedBaselineFiles.has(excludedChild),false);
+                assert.equal(tracker.supplementalDirectoryWatchers.has(ignored),false);assert.equal(tracker.importedDirectoryWatchers.has(ignored),false);
+                console.log('PASS HOST-IGNORED-DIRECTORY real directory-only excluded create cannot block preserved-review recovery');
+            }
             if(retry){
                 const paused=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json')));
                 assert.ok(new Map(paused.unresolvedBaselineFiles).has(child));
@@ -156,7 +170,8 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             console.log(`PASS HOST-INTENT-PROVENANCE operation=${operation} retry=${retry} real parent-only notification preserves Unknown and block Revert leaves buffer/disk unchanged`);
         }finally{
             await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
-            await fs.promises.rm(stage,{recursive:true,force:true});await fs.promises.rm(storage.fsPath,{recursive:true,force:true});
+            await fs.promises.rm(stage,{recursive:true,force:true});await fs.promises.rm(ignored,{recursive:true,force:true});
+            await fs.promises.rm(storage.fsPath,{recursive:true,force:true});
         }
     }
 

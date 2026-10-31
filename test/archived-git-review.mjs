@@ -19,7 +19,7 @@ export function registerArchivedGitReview(h) {
         waitUntil, watcherInstances, nativeDirectoryWatchers, setVsCodeExcludes, getTracker, setTracker, setListedFiles } = h;
 
     async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false,
-        ignoredBaseline = false, ignorePolicyFile = '.gitignore', blindDirectory = false } = {}) {
+        ignoredBaseline = false, ignorePolicyFile = '.gitignore', blindDirectory = false, ignoredDirectory = false } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -51,7 +51,7 @@ export function registerArchivedGitReview(h) {
         if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
         if (ignoredBaseline) {
             fs.mkdirSync(path.dirname(ignoreFile), { recursive: true });
-            fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n');
+            fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n'+(ignoredDirectory?'ignored/\n':''));
             fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
         }
         setListedFiles([Uri.file(target), Uri.file(opaque), ...(blindDirectory ? [Uri.file(blindFile)] : []), ...(stoppedArchive ? [Uri.file(deleted)] : []),
@@ -125,6 +125,24 @@ export function registerArchivedGitReview(h) {
             assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),true);assert.equal(ctx.tracker.getReviewToken(child),undefined);
         }finally{gate.release();await operation;}
     },{configured:true,blindDirectory:true,stoppedArchive}));
+
+    for(const stoppedArchive of [false,true])test(`P2-IGNORED-DIRECTORY-ARCHIVE stopped=${stoppedArchive}`,()=>fixture(async ctx=>{
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const ignored=path.join(ctx.workspace,'ignored'),child=path.join(ignored,'unread.txt');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        try{
+            await Promise.race([gate.entered,operation.then(result=>{throw new Error(`Restore finished before directory barrier: ${JSON.stringify(result)}`);})]);
+            fs.mkdirSync(ignored);fs.writeFileSync(child,'excluded contents');
+            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ignored),true),true);
+            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ignored)),false);
+            emitWatcher('create',Uri.file(ignored));gate.release();
+            assert.equal((await operation).status,'restored');
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main before-image\n');
+            assert.equal(ctx.tracker.fileSnapshots.has(child),false);assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),false);
+            assert.equal(nativeDirectoryWatchers.some(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(ignored)),false);
+            assert.equal(fs.readFileSync(child,'utf8'),'excluded contents');
+        }finally{gate.release();await operation;}
+    },{configured:true,ignoredBaseline:true,ignoredDirectory:true,stoppedArchive}));
 
     async function assertDirectoryChildProvenance(tracker,child,knownAbsence,contents) {
         assert.equal(fs.readFileSync(child,'utf8'),contents);
