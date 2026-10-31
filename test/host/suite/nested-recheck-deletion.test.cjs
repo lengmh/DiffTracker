@@ -36,27 +36,19 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
     const outside = path.join(outerPath, 'recheck-independent.txt');
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-recheck-nested-'));
     const open = fs.promises.open;
-    let tracker, release, action, setupWatcher;
+    let tracker, release, action;
     const events = [];
     const diagnostics = () => ({ recording: tracker?.isRecording, enabled: tracker?.externalWatcherEnabled,
-        epoch: tracker?.sessionEpoch, watchers: tracker?.fileWatchers.length, events });
+        epoch: tracker?.sessionEpoch, watchers: tracker?.fileWatchers.length,
+        independentBaseline: tracker?.fileSnapshots.has(outside), independentUnknown: tracker?.unresolvedBaselineFiles.get(outside),
+        independentReview: tracker?.getTrackedChange(outside)?.reviewKind, events });
     try {
-        fs.mkdirSync(path.dirname(files[0]), { recursive: true });
-        fs.writeFileSync(path.join(inner, 'ProbeName'), 'synthetic');
-        for (const [index, file] of files.entries()) { fs.writeFileSync(file, `baseline ${index}`); }
+        // run.mjs creates these before-images before launching VS Code.
         await changeFolders(event => event.added.some(folder => folder.uri.fsPath === inner), () =>
             vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length, 0,
                 { uri: vscode.Uri.file(inner), name: 'nested-recheck' }));
         const nested = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(files[0]));
         assert.equal(nested.uri.fsPath, inner);
-        // Fence the setup writes through the real host service before starting
-        // the recording. Late setup creates must not turn these known fixture
-        // before-images into a legitimately unknown creation interval.
-        let setupDelivered = false;
-        setupWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(outer, '**/*'));
-        setupWatcher.onDidCreate(event => { if (event.fsPath === outside) { setupDelivered = true; } });
-        await vscode.workspace.fs.writeFile(vscode.Uri.file(outside), Buffer.from('independent baseline'));
-        await until('setup notification round trip before tracker construction', () => setupDelivered);
         tracker = new DiffTracker(vscode.Uri.file(storage));
         const dispatch = tracker.dispatchExternalEvent;
         tracker.dispatchExternalEvent = function(event, kind, epoch) {
@@ -74,6 +66,7 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         assert.equal(applied.status, 'applied', JSON.stringify(applied));
         assert.equal(tracker.startRecording(), true);
         await until('nested Recheck baseline', () => tracker.getBaselineState() === 'ready');
+        assert.equal(tracker.getOriginalContent(outside), 'independent baseline', JSON.stringify(diagnostics()));
         const pendingReads = new Set();
         const reader = tracker.readFileAndUpdate;
         tracker.readFileAndUpdate = async function(file, ...args) {
@@ -97,8 +90,6 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
             assert.equal(review?.reviewKind, 'text');
             assert.equal(review?.unavailableReason, undefined);
         }
-        setupWatcher.dispose();
-        setupWatcher = undefined;
         for (const file of files) {
             tracker.setFileCoverageGap(file, 'pending-scope-gap', 'Synthetic earlier interval');
             tracker.markFileUnavailable(file, 'Synthetic earlier interval');
@@ -108,13 +99,14 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         const gate = new Promise(resolve => { release = resolve; });
         let entered = false, settled = false;
         fs.promises.open = async (file, ...args) => {
-            const handle = await open(file, ...args);
+            // The post-certification read is pending before a handle is opened.
+            // Holding our own Windows file handle would obstruct the deletion.
             if (!entered && String(file) === files[1] && !tracker.baselineTransaction &&
                 !tracker.coverageGaps.get(files[1])?.file && tracker.restoringEpoch === tracker.sessionEpoch) {
                 entered = true;
                 await gate;
             }
-            return handle;
+            return open(file, ...args);
         };
         action = tracker.recheckScopeOperationCoverage(targets, scope.scopeRevision);
         action.finally(() => { settled = true; });
@@ -144,7 +136,6 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         console.log('PASS HOST-NESTED-RECHECK excluded ancestor deletion preserves nested review and independent observation');
     } finally {
         release?.();
-        setupWatcher?.dispose();
         if (action) { await action; }
         fs.promises.open = open;
         if (tracker) { await tracker.dispose(); }

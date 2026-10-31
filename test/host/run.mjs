@@ -70,6 +70,15 @@ try {
             writeFileSync(path.join(folder, name), 'scope baseline\n');
         }
     }
+    // Known before-images for the later nested recovery scenario must exist
+    // before any Host watcher starts; in-Host setup creates may arrive late.
+    const nestedRecheckRoot = path.join(secondRoot, 'excluded-recheck', 'container', 'nested');
+    mkdirSync(path.join(nestedRecheckRoot, 'selected'), { recursive: true });
+    writeFileSync(path.join(nestedRecheckRoot, 'ProbeName'), 'synthetic');
+    for (const [index, name] of ['one.txt', 'two.txt'].entries()) {
+        writeFileSync(path.join(nestedRecheckRoot, 'selected', name), `baseline ${index}`);
+    }
+    writeFileSync(path.join(secondRoot, 'recheck-independent.txt'), 'independent baseline');
     writeFileSync(path.join(secondRoot, '.vscode', 'settings.json'), JSON.stringify({
         'files.exclude': { 'scope-files.txt': true },
         'files.watcherExclude': {
