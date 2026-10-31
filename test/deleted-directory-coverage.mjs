@@ -730,7 +730,7 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {fs.realpathSync=realpath;fs.statSync=stat;}
     }));
 
-    for(const replacement of ['directory','file','budget','new-epoch','ignored'])
+    for(const replacement of ['directory','file','budget','budget0','budget-file','new-epoch','ignored'])
     test(`P2-RECHECK-TYPE-FALLBACK ${replacement}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope),target=path.join(root,'introduced'),child=path.join(target,'unproven.txt');
         // Deliver the notification at the existing Recheck handoff, after its
@@ -740,14 +740,18 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             if(!delivered&&restoring!==undefined&&value===undefined){
                 delivered=true;fs.writeFileSync(target,'independent file');
                 tracker.dispatchExternalEvent(Uri.file(target),'create',restoring);
-                if(replacement==='budget'){tracker.maxScopePreflightEntries=1;}
+                if(replacement.startsWith('budget')){
+                    tracker.maxScopePreflightEntries=replacement==='budget'?1:0;
+                    if(replacement==='budget0'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
+                }
             }
             restoring=value;
         }});
         const metadata=h.pause(target,'stat'),recheck=tracker.recheckObservationCoverage();
         try{
-            await metadata.entered;assert.equal(delivered,true);
-            if(replacement!=='file'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
+            if(replacement==='budget0'||replacement==='budget-file'){metadata.release();await recheck;}else{await metadata.entered;}
+            assert.equal(delivered,true);
+            if(replacement!=='file'&&replacement!=='budget0'&&replacement!=='budget-file'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
             if(replacement==='new-epoch'){tracker.advanceEpoch();}
             metadata.release();const result=await recheck;
             assert.equal(tracker.getOriginalContent(file),'original');
@@ -758,13 +762,39 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                 assert.equal(tracker.fileSnapshots.has(child),false);assert.equal(tracker.getReviewToken(child),undefined);
                 assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
             }else if(replacement==='file'){assert.equal(tracker.getOriginalContent(target),'');assert.ok(tracker.getReviewToken(target));}
-            else if(replacement==='budget'){
+            else if(replacement.startsWith('budget')){
                 assert.equal(result.status,'limited');
-                assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===target&&gap.reasonCode==='coverage-recheck-incomplete'));
-                assert.ok(JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.some(([name,gap])=>name===target&&gap.subtree?.reasonCode==='coverage-recheck-incomplete'));
+                const kind=replacement==='budget-file'?'file':'subtree';
+                assert.equal(tracker.coverageGaps.get(target)?.[kind]?.reasonCode,'coverage-recheck-incomplete');
+                assert.ok(JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.some(([name,gap])=>name===target&&gap[kind]?.reasonCode==='coverage-recheck-incomplete'));
+                tracker.maxScopePreflightEntries=allowance;
+                if(replacement==='budget'){
+                    const owners=tracker.maxImportedDirectoryWatchers;tracker.maxImportedDirectoryWatchers=0;
+                    try{assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked');assert.ok(tracker.getSubtreeCoverageGaps().length>0);}
+                    finally{tracker.maxImportedDirectoryWatchers=owners;}
+                }
+                if(replacement==='budget0'){
+                    await tracker.recheckObservationCoverage(); // Reconcile the retained file-to-directory notification first.
+                    const flush=tracker.flushPersistState.bind(tracker);let rejected=false;
+                    tracker.flushPersistState=async(...args)=>{
+                        if(!rejected&&args[1]&&!tracker.coverageGaps.get(target)?.subtree){rejected=true;return false;}
+                        return flush(...args);
+                    };
+                    try{
+                        assert.equal((await tracker.recheckObservationCoverage()).status,'failed');assert.equal(rejected,true);
+                        assert.equal(tracker.coverageGaps.get(target)?.subtree?.reasonCode,'coverage-recheck-incomplete','failed certification restores target evidence');
+                    }finally{tracker.flushPersistState=flush;}
+                }
+                await tracker.recheckObservationCoverage();await tracker.recheckObservationCoverage();
+                const quiet=await tracker.recheckObservationCoverage();
+                assert.equal(tracker.restoreEvents.size,0);if(replacement!=='budget-file'){assert.equal(currentOwner(tracker,target)?.epoch,tracker.sessionEpoch);}
+                assert.equal(quiet.status,'rechecked','quiet verified Recheck must retire deferred target evidence');
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+                if(replacement!=='budget-file'){assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);}
+                assert.equal(tracker.getOriginalContent(file),'original');
             }else if(replacement==='new-epoch'){assert.equal(result.status,'conflict');assert.equal(tracker.fileSnapshots.has(child),false);}
             else{assert.equal(result.status,'rechecked');assert.equal(tracker.unresolvedBaselineFiles.has(child),false);assert.equal(tracker.supplementalDirectoryWatchers.has(target),false);}
-            if(replacement!=='budget'){assert.equal(tracker.restoreEvents.size,0,'Recheck must consume its fallback observation');}
+            if(!replacement.startsWith('budget')){assert.equal(tracker.restoreEvents.size,0,'Recheck must consume its fallback observation');}
         }finally{metadata.release();await recheck;tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;}
     },'wholeWorkspace',replacement==='ignored'?[{scope:'all',pattern:'/temporary/introduced/'}]:[]));
 

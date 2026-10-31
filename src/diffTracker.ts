@@ -1672,13 +1672,19 @@ export class DiffTracker {
         const importedDirectoryGaps: Array<[string, CoverageGapEvidence]> = [];
         for (const [target, record] of this.coverageGaps) {
             if (!selected(target)) { continue; }
-            if (record.subtree && this.isImportedDirectoryCoverageGap(record) &&
+            // A deferred target needs the same independent owner repair and
+            // transaction as a failed import. Workspace-root markers retain
+            // their existing enclosing Recheck certification path.
+            const deferredDirectory = record.subtree?.reasonCode==='coverage-recheck-incomplete' &&
+                !this.sessionWorkspaceRoots.some(root=>path.resolve(root)===path.resolve(target));
+            if (record.subtree && (this.isImportedDirectoryCoverageGap(record) || deferredDirectory) &&
                 !this.scopeExplicitlyExcludesDirectory(target) &&
                 !this.isPathIgnored(vscode.Uri.file(target), true, false, false)) {
                 importedDirectoryGaps.push([target, record.subtree]);
             }
             for (const evidence of [record.file, record.subtree]) {
-                if (evidence && this.isPendingScopeRecoveryEvidence(evidence) &&
+                if (evidence && (this.isPendingScopeRecoveryEvidence(evidence) ||
+                    (evidence.targetKind==='file' && evidence.reasonCode==='coverage-recheck-incomplete')) &&
                     !this.isPathIgnored(vscode.Uri.file(target), evidence.targetKind === 'subtree', false, false)) {
                     controlGaps.push([target, evidence]);
                 }
