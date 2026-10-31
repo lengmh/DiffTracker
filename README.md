@@ -262,6 +262,7 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.watchExclude` | `[]` | Structured explicit exclusions without `!` negation; legacy string entries retain compatibility until migration |
 | `diffTracker.onlyRecordReviewableText` | `false` | Skip new unsupported resources using safe content classification; preserve existing review and Undo |
 | `diffTracker.autoOpenNextPendingFile` | `false` | Open the next pending file after successful single-file review, only when the current file has no remaining review |
+| `diffTracker.enableSourceTracking` | `false` | Opt in to experimental source hints for Vibe Coding Only; baseline and coverage warnings remain visible when off |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits while retaining uncertain editor edits for explicit review |
 
 Choose the opening mode in **Settings → Display → Default open mode**, through **Select Default Open Mode**, or in VS Code settings. The values are `webview`, `inline`, `sideBySide`, `original`, `splitOriginalWebview` and `nativeReview`. Display/highlight settings remain in the sidebar Settings panel; monitoring rules are in **Manage Monitoring Scope**.
@@ -278,7 +279,7 @@ Automatic navigation uses a stable path order and the configured default open mo
 
 When `diffTracker.onlyTrackAutomatedChanges` is enabled:
 
-- Editor events without reliable source information remain visible with an uncertainty notice.
+- Editor events without reliable source information remain pending. Optional source hints require `diffTracker.enableSourceTracking`, which is off by default. Switching it on affects new observations; it does not reconstruct source attribution for earlier edits.
 - External tools or CLI processes that modify files on disk are still tracked through file watchers.
 - VS Code extensions should call `diffTracker.beginAutomationSession` before applying edits and `diffTracker.endAutomationSession` after they finish.
 

@@ -1039,6 +1039,11 @@ export class DiffTracker {
 
         this.disposables.push(
             vscode.workspace.onDidChangeConfiguration(e => {
+                if (e.affectsConfiguration('diffTracker.enableSourceTracking')) {
+                    // Presentation only: retain reviews, baselines, Undo and
+                    // the sessions used by archive-restore concurrency guards.
+                    this.emitTrackChangesEvent({fullRefresh:true});
+                }
                 const automationPolicyChanged =
                     e.affectsConfiguration('diffTracker.onlyTrackAutomatedChanges') ||
                     e.affectsConfiguration('diffTracker.onlyTrackVSCodeChanges');
@@ -11107,7 +11112,8 @@ export class DiffTracker {
         this.setTrackedChange(filePath, {
             filePath,
             fileName,
-            sourceNote: this.shouldTrackOnlyAutomatedChanges() && !this.isAutomationChangeAllowed(filePath)
+            sourceNote: vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false) &&
+                this.shouldTrackOnlyAutomatedChanges() && !this.isAutomationChangeAllowed(filePath)
                 ? 'Change source is uncertain; manual, formatter, reload and external edits remain pending until reviewed.'
                 : undefined,
             originalContent,

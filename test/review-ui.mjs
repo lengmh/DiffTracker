@@ -104,7 +104,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         ownedScopeSettingsAreCurrent:()=>undefined,
         getObservationCoverageRecheckBlocker:()=>state.recheckBlocker,
         getIsRecording:()=>true,
-        onDidTrackChanges:()=>({dispose(){}})
+        onDidTrackChanges:listener=>{state.trackListeners??=[];state.trackListeners.push(listener);return {dispose(){state.trackListeners=state.trackListeners.filter(item=>item!==listener);}};}
     };
     const panel = Object.create(load('webviewDiffPanel.ts').WebviewDiffPanel.prototype);
     Object.assign(panel, {
@@ -169,6 +169,41 @@ async function test(name, fn) {
     count++;
     console.log(`PASS ${name}`);
 }
+
+await test('SOURCE-PREFERENCE hides persisted source hints by default in tree and initial/incremental WebView',async()=>{
+    const sourceNote='Historical optional source attribution';
+    const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after',reviewKind:'text',sourceNote});
+    const provider=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const item=provider.createFileItem(h.state.changes[0]);
+    assert.equal(item.description,undefined);assert.equal(item.tooltip.includes(sourceNote),false);
+    const html=h.panel.getHtmlContent();const ui=runInline(html);
+    assert.equal(ui.elements.get('source-note').textContent,'');assert.equal(ui.elements.get('source-note').hidden,true);
+    h.panel.isInitialized=true;h.panel.update(filePath);
+    assert.equal(h.messages.at(-1).sourceNote,undefined);
+    h.state.configuration.enableSourceTracking=true;
+    const shown=provider.createFileItem(h.state.changes[0]);
+    assert.equal(shown.description,'Source uncertain');assert.ok(shown.tooltip.includes(sourceNote));
+});
+
+await test('SOURCE-PREFERENCE toggles an already open WebView while keeping Unknown and coverage safety visible',async()=>{
+    const sourceNote='Historical optional attribution';
+    const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after',reviewKind:'unknown',reviewReason:'Baseline identity remains unverified',sourceNote});
+    const provider=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    assert.match(provider.createFileItem(h.state.changes[0]).description,/Unknown.*Baseline identity/);
+    h.state.subtreeCoverageGaps=[{targetPath:'/synthetic/coverage',reasonCode:'directory-runtime-coverage-gap',reason:'Observation coverage remains unverified'}];
+    assert.ok((await provider.getChildren()).some(item=>String(item.label).includes('Coverage')));
+    const panel=h.open();
+    const initial=runInline(h.state.createdPanels[0].webview.html);
+    assert.equal(initial.elements.get('source-note').hidden,true);
+    h.state.configuration.enableSourceTracking=true;
+    for(const listener of h.state.trackListeners){listener({fullRefresh:true,changedFiles:[],removedFiles:[],baselineChanged:false});}
+    assert.equal(h.messages.at(-1).sourceNote,sourceNote);
+    assert.equal(h.messages.at(-1).reviewReason,'Baseline identity remains unverified');
+    h.state.configuration.enableSourceTracking=false;
+    for(const listener of h.state.trackListeners){listener({fullRefresh:true,changedFiles:[],removedFiles:[],baselineChanged:false});}
+    assert.equal(h.messages.at(-1).sourceNote,undefined);
+    assert.equal(h.messages.at(-1).reviewKind,'unknown');panel.dispose();
+});
 
 for (const status of ['success', 'failed', 'conflict', 'cancelled', undefined]) {
     await test(`production action ack reports ${status ?? 'missing result'} and refreshes after ack`, async () => {

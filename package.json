@@ -192,6 +192,12 @@
           "deprecationMessage": "Deprecated. Use diffTracker.onlyTrackAutomatedChanges instead.",
           "description": "Deprecated alias for automation-only tracking."
         },
+        "diffTracker.enableSourceTracking": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Enable experimental change-source hints for Vibe Coding Only. Uncertain changes remain pending for review. Turning this off hides source hints while preserving baseline and observation warnings."
+        },
         "diffTracker.onlyTrackAutomatedChanges": {
           "type": "boolean",
           "default": false,

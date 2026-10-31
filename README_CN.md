@@ -233,6 +233,7 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.watchExclude` | `[]` | 不支持 `!` 否定的结构化显式排除；旧字符串规则在迁移前保留兼容语义 |
 | `diffTracker.onlyRecordReviewableText` | `false` | 按安全内容分类跳过新的不支持资源，保留既有待审内容和 Undo |
 | `diffTracker.autoOpenNextPendingFile` | `false` | 单文件审阅成功且无剩余待审内容后，自动打开下一个待审文件 |
+| `diffTracker.enableSourceTracking` | `false` | 为 Vibe Coding Only 开启实验性来源提示；关闭时仍保留基线未知和观察覆盖警告 |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
 
 显示设置位于侧边栏 **Settings**。默认打开方式可从 **Display → Default open mode**、**Select Default Open Mode** 命令或 VS Code 设置修改；监控规则由 **Manage Monitoring Scope** 管理。
@@ -262,7 +263,7 @@ Explorer 和待审文件／目录右键菜单中的「Stop Recording This File o
 
 当 `diffTracker.onlyTrackAutomatedChanges` 为 `true` 时：
 
-- 无法可靠确认来源的编辑会保留待审，并显示来源不确定提示
+- 无法可靠确认来源的编辑仍保留待审。可选来源提示由 `diffTracker.enableSourceTracking` 控制，默认关闭；开启只影响新的观察，不追溯推断此前修改的来源
 - 外部 CLI、脚本或其他直接写磁盘的工具仍会通过文件监听被记录
 - 其他 VS Code 扩展可以通过显式开启自动化会话，将自己的编辑纳入记录范围
 
