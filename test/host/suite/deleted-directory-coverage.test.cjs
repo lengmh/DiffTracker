@@ -93,9 +93,9 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         const token = tracker.getReviewToken(file);
         const notifications=[];
         const defer=tracker.deferCoverageRecheckEvent;
-        tracker.deferCoverageRecheckEvent=function(uri,kind) {
+        tracker.deferCoverageRecheckEvent=function(uri,kind,...metadata) {
             if(this.coverageRecheckEpoch===this.sessionEpoch){notifications.push({name:path.relative(workspace,uri.fsPath),kind});}
-            return defer.call(this,uri,kind);
+            return defer.call(this,uri,kind,...metadata);
         };
         const rechecked=await tracker.recheckObservationCoverage();
         tracker.deferCoverageRecheckEvent=defer;
