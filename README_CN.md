@@ -100,6 +100,10 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 从 **Settings → Tools → Manage Monitoring Scope** 或同名命令打开范围管理器。旧 **Edit Watch Ignores** 命令也会打开同一管理器。管理器显示请求范围、有效范围、待处理变更、准备错误和当前监听覆盖。
 
+**Status** 随恢复、基线事务、基线扫描和设置写入的开始或结束实时更新，分别显示实际阻断原因和下一步操作。持久化准备中断时，须先保留未保存的范围草稿，再执行 **Reload Window**；不能强制清除事务锁。状态更新保留未保存的范围草稿。
+
+`legacyV3` 表示兼容的监控策略，不表示会话损坏。没有旧规则和待应用 Workspace 请求时，可继续在兼容模式下录制。存在旧规则时，先通过迁移预览审查规则；规则迁移完成后，仍须执行 **Apply Saved Request** 才能使配置范围生效。Status 分别显示这些迁移阶段和实际恢复失败。
+
 - **Rules** 遵循普通忽略策略；显式包含可以加入被普通规则忽略的路径，显式排除仍优先。
 - **Whole Workspace** 请求监控工作区内所有可监控资源，包括被普通策略忽略的文件；仍遵守显式排除和安全边界，不承诺所有路径均可安全覆盖。
 - 范围扩展需要受信任工作区，以及绑定工作区根集合和请求范围的本机确认。共享设置不会把授权带到另一台机器或扩展宿主。保存请求不等于范围已经生效。
@@ -114,6 +118,8 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 - **Apply Pending Scope** 确认并应用请求范围；**Retry Scope Preparation** 重试已授权范围的准备。
 - **Recheck Observation Coverage** 修复监听并按原审阅基线核对，具体条件见上文。
+- **Retry Saved Review Recovery** 位于范围管理器和命令面板，重新核验保留的会话及上一有效副本。成功后恢复为暂停审阅，保留原始 before-image 和 Undo；不应用范围设置，也不建立新基线。请求范围与有效范围不一致时，Start 仍可进入此恢复流程。
+- **Discard Saved Session…** 单独确认删除已保存会话、待审内容和 Undo 恢复文件，包括中断操作记录。若仍需这些数据，先保留扩展存储。丢弃不修改工作区文件或监控设置，也不自动重建基线。核验失败仍可能需要人工恢复，重试不保证恢复成功。
 - **Restore Effective Scope Configuration** 经明确选择后将上一有效范围写回 Workspace Settings；**Migrate Legacy Watch Rules** 打开旧规则迁移预览。
 - **Clear Diffs** 在录制中重建基线，停止后清除保存的审阅状态，不能代替 Recheck。
 
@@ -233,6 +239,7 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.watchExclude` | `[]` | 不支持 `!` 否定的结构化显式排除；旧字符串规则在迁移前保留兼容语义 |
 | `diffTracker.onlyRecordReviewableText` | `false` | 按安全内容分类跳过新的不支持资源，保留既有待审内容和 Undo |
 | `diffTracker.autoOpenNextPendingFile` | `false` | 单文件审阅成功且无剩余待审内容后，自动打开下一个待审文件 |
+| `diffTracker.enableSourceTracking` | `false` | 为 Vibe Coding Only 开启实验性来源提示；关闭时仍保留基线未知和观察覆盖警告 |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
 
 显示设置位于侧边栏 **Settings**。默认打开方式可从 **Display → Default open mode**、**Select Default Open Mode** 命令或 VS Code 设置修改；监控规则由 **Manage Monitoring Scope** 管理。
@@ -262,7 +269,7 @@ Explorer 和待审文件／目录右键菜单中的「Stop Recording This File o
 
 当 `diffTracker.onlyTrackAutomatedChanges` 为 `true` 时：
 
-- 无法可靠确认来源的编辑会保留待审，并显示来源不确定提示
+- 无法可靠确认来源的编辑仍保留待审。可选来源提示由 `diffTracker.enableSourceTracking` 控制，默认关闭；开启只影响新的观察，不追溯推断此前修改的来源
 - 外部 CLI、脚本或其他直接写磁盘的工具仍会通过文件监听被记录
 - 其他 VS Code 扩展可以通过显式开启自动化会话，将自己的编辑纳入记录范围
 

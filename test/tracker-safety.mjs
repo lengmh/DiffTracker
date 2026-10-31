@@ -1205,6 +1205,64 @@ test('existing automation session interface balances overlapping resource sessio
     assert.equal(tracker.isAutomationChangeAllowed(p),true); tracker.endAutomationSession(second);
     assert.equal(tracker.isAutomationChangeAllowed(p),false);
 });
+test('SOURCE-PREFERENCE defaults off independently of Vibe Coding and keeps session protection',async()=>{
+    assert.equal(JSON.parse(fs.readFileSync('package.json','utf8')).contributes.configuration.properties['diffTracker.enableSourceTracking'].default,false);
+    automationOnly=true;const p=file();seed(p,'baseline','changed');
+    let attributionReads=0;const allowed=tracker.isAutomationChangeAllowed;
+    tracker.isAutomationChangeAllowed=function(...args){attributionReads++;return allowed.apply(this,args);};
+    const session=tracker.beginAutomationSession({filePaths:[p]});
+    assert.equal(tracker.automationSessions.size,1);tracker.endAutomationSession(session);
+    await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    assert.equal(attributionReads,0);
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.ok(tracker.getReviewToken(p));
+});
+
+test('SOURCE-PREFERENCE on off on refreshes presentation without changing review or history',async()=>{
+    automationOnly=true;vscodeExcludes.enableSourceTracking=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    assert.match(pending(p)?.sourceNote??'',/source is uncertain/);
+    const before={token:tracker.getReviewToken(p),snapshots:[...tracker.fileSnapshots],history:structuredClone(tracker.revertHistory),epoch:tracker.sessionEpoch};
+    const events=[];const disposable=tracker.onDidTrackChanges(event=>events.push(event));
+    vscodeExcludes.enableSourceTracking=false;configurationChanged({affectsConfiguration:key=>key==='diffTracker.enableSourceTracking'});
+    assert.equal(events.at(-1)?.fullRefresh,true);
+    assert.equal(events.at(-1)?.baselineChanged,false);
+    assert.deepEqual(tracker.getReviewToken(p),before.token);
+    assert.deepEqual([...tracker.fileSnapshots],before.snapshots);
+    assert.deepEqual(tracker.revertHistory,before.history);assert.equal(tracker.sessionEpoch,before.epoch);
+    fs.writeFileSync(p,'edited while off');await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    vscodeExcludes.enableSourceTracking=true;configurationChanged({affectsConfiguration:key=>key==='diffTracker.enableSourceTracking'});
+    assert.equal(pending(p)?.sourceNote,undefined,'enabling never retroactively classifies off-period edits');
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.ok(succeeded(await tracker.revertFile(p)));
+    assert.equal((await tracker.undoLastRevert()).succeeded,1);
+    assert.equal(disk(p),'edited while off');disposable.dispose();
+});
+
+test('SOURCE-PREFERENCE legacy automation alias still requires explicit source opt in',async()=>{
+    vscodeExcludes.onlyTrackVSCodeChanges=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    vscodeExcludes.enableSourceTracking=true;fs.writeFileSync(p,'later');await scan(p);
+    assert.match(pending(p)?.sourceNote??'',/source is uncertain/);
+});
+
+test('SOURCE-PREFERENCE stopped historical source metadata remains recoverable while default off',async()=>{
+    automationOnly=true;vscodeExcludes.enableSourceTracking=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    const note=pending(p)?.sourceNote;assert.ok(note);
+    const storage=Uri.file(file('source-preference-storage'));tracker.storageUri=storage;
+    tracker.stopRecording();assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    vscodeExcludes.enableSourceTracking=false;tracker=new DiffTracker(storage);
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getIsRecording(),false);
+    assert.equal(pending(p)?.sourceNote,note,'legacy persisted metadata remains intact for opt-in display');
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.equal(pending(p)?.currentContent,'changed');
+});
+
 test('DT-02 Keep hunk after new file vanishes cannot accept existence',async()=>{
     const p=file(); fs.writeFileSync(p,'new\n'); await tracker.onExternalFileCreated(Uri.file(p));
     const block=tracker.getChangeBlocks(p)[0]; fs.unlinkSync(p);
@@ -5744,7 +5802,7 @@ test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted
 });
 
 registerPR12BoundedInvariants({
-    test, vscode, Uri, DiffTracker, file, document, pause,
+    test, vscode, Uri, DiffTracker, file, document, pause, faults,
     createStatusBarManager: current => {
         const boundary = {StatusBarAlignment:{Right:2},ThemeColor:class {constructor(id){this.id=id;}},
             window:{createStatusBarItem:()=>({show(){},dispose(){}})}};
@@ -5786,6 +5844,7 @@ registerCrossBranchKeep({
 
 registerArchivedGitReview({
     test, Uri, DiffTracker, vscode, file, document, faults, counters, pause, emitWatcher, waitUntil, watcherInstances,
+    nativeDirectoryWatchers, setVsCodeExcludes: value => { vscodeExcludes = value; },
     emitWorkspaceFilesCreated: event => workspaceFilesCreated(event),
     fireConfigurationChanged: key => configurationChanged({ affectsConfiguration: name => name === key }),
     getTracker: () => tracker,

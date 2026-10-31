@@ -22,7 +22,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
             file: value => ({ fsPath: value }),
             joinPath: (uri, ...parts) => ({ toString: () => [uri.fsPath, ...parts].join('/') })
         },
-        EventEmitter: class { event() {} fire() {} dispose() {} },
+        EventEmitter: class {listeners=new Set();event=listener=>{this.listeners.add(listener);return {dispose:()=>this.listeners.delete(listener)};};fire(value){for(const listener of this.listeners)listener(value);}dispose(){this.listeners.clear();}},
         TreeItem: class { constructor(label) { this.label = label; } },
         TreeItemCollapsibleState: { None: 0, Expanded: 2 },
         Range:class {constructor(...args){this.args=args;}},
@@ -73,6 +73,9 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         return module.exports;
     }
     const tracker = {
+        getMonitoringLifecycleStatus:()=>state.lifecycle ?? {disposed:false,recoveryBlocked:false,recoveryRequiresReload:false,baselineTransactionActive:false,baselineScanActive:false,recoveryRetryActive:false,recording:true,baselineState:'ready'},
+        onDidChangeLifecycleState:listener=>{state.lifecycleListeners??=[];state.lifecycleListeners.push(listener);return {dispose(){state.lifecycleListeners=state.lifecycleListeners.filter(item=>item!==listener);}};},
+        onDidChangeBaselineState:()=>({dispose(){}}),onDidChangeRecordingState:()=>({dispose(){}}),
         getTrackedChanges: () => state.changes,
         getOriginalContent: () => '',
         getChangeBlocks: () => [],
@@ -104,7 +107,7 @@ function harness(change = { filePath, fileName: 'empty.m', originalContent: '', 
         ownedScopeSettingsAreCurrent:()=>undefined,
         getObservationCoverageRecheckBlocker:()=>state.recheckBlocker,
         getIsRecording:()=>true,
-        onDidTrackChanges:()=>({dispose(){}})
+        onDidTrackChanges:listener=>{state.trackListeners??=[];state.trackListeners.push(listener);return {dispose(){state.trackListeners=state.trackListeners.filter(item=>item!==listener);}};}
     };
     const panel = Object.create(load('webviewDiffPanel.ts').WebviewDiffPanel.prototype);
     Object.assign(panel, {
@@ -169,6 +172,41 @@ async function test(name, fn) {
     count++;
     console.log(`PASS ${name}`);
 }
+
+await test('SOURCE-PREFERENCE hides persisted source hints by default in tree and initial/incremental WebView',async()=>{
+    const sourceNote='Historical optional source attribution';
+    const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after',reviewKind:'text',sourceNote});
+    const provider=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    const item=provider.createFileItem(h.state.changes[0]);
+    assert.equal(item.description,undefined);assert.equal(item.tooltip.includes(sourceNote),false);
+    const html=h.panel.getHtmlContent();const ui=runInline(html);
+    assert.equal(ui.elements.get('source-note').textContent,'');assert.equal(ui.elements.get('source-note').hidden,true);
+    h.panel.isInitialized=true;h.panel.update(filePath);
+    assert.equal(h.messages.at(-1).sourceNote,undefined);
+    h.state.configuration.enableSourceTracking=true;
+    const shown=provider.createFileItem(h.state.changes[0]);
+    assert.equal(shown.description,'Source uncertain');assert.ok(shown.tooltip.includes(sourceNote));
+});
+
+await test('SOURCE-PREFERENCE toggles an already open WebView while keeping Unknown and coverage safety visible',async()=>{
+    const sourceNote='Historical optional attribution';
+    const h=harness({filePath,fileName:'empty.m',originalContent:'before',currentContent:'after',reviewKind:'unknown',reviewReason:'Baseline identity remains unverified',sourceNote});
+    const provider=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
+    assert.match(provider.createFileItem(h.state.changes[0]).description,/Unknown.*Baseline identity/);
+    h.state.subtreeCoverageGaps=[{targetPath:'/synthetic/coverage',reasonCode:'directory-runtime-coverage-gap',reason:'Observation coverage remains unverified'}];
+    assert.ok((await provider.getChildren()).some(item=>String(item.label).includes('Coverage')));
+    const panel=h.open();
+    const initial=runInline(h.state.createdPanels[0].webview.html);
+    assert.equal(initial.elements.get('source-note').hidden,true);
+    h.state.configuration.enableSourceTracking=true;
+    for(const listener of h.state.trackListeners){listener({fullRefresh:true,changedFiles:[],removedFiles:[],baselineChanged:false});}
+    assert.equal(h.messages.at(-1).sourceNote,sourceNote);
+    assert.equal(h.messages.at(-1).reviewReason,'Baseline identity remains unverified');
+    h.state.configuration.enableSourceTracking=false;
+    for(const listener of h.state.trackListeners){listener({fullRefresh:true,changedFiles:[],removedFiles:[],baselineChanged:false});}
+    assert.equal(h.messages.at(-1).sourceNote,undefined);
+    assert.equal(h.messages.at(-1).reviewKind,'unknown');panel.dispose();
+});
 
 for (const status of ['success', 'failed', 'conflict', 'cancelled', undefined]) {
     await test(`production action ack reports ${status ?? 'missing result'} and refreshes after ack`, async () => {
@@ -439,6 +477,7 @@ await test('coverage exclude quick action stages an exact root-local request wit
     const controller=Object.create(h.load('monitoringScopeController.ts').MonitoringScopeController.prototype);
     let saveCount=0,reconcileCount=0;
     Object.assign(controller,{
+        _onDidChangeStatus:new h.vscode.EventEmitter(),
         tracker:h.tracker,
         scopeSettingsWriteQueue:Promise.resolve(),
         pendingScopeSettingsWrites:0,
@@ -656,6 +695,59 @@ function connectScopeEditor(h) {
     waiting.forEach(message=>ui.receive(message));
     return {...ui,action:()=>lastAction};
 }
+
+await test('LIFECYCLE-DIAGNOSTICS legacy compatibility, rule review and uncommitted migration have distinct status',async()=>{
+    const h=monitoringScopeCommandHarness(),roots=h.tracker.getEffectiveMonitoringScope().roots;
+    assert.equal(h.controller.getStatus().migration.stage,'configured');
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots,scopeRevision:'legacy'});
+    h.state.workspaceConfiguration={};
+    assert.equal(h.controller.getStatus().migration.stage,'legacy-compatible');
+    assert.equal(h.controller.getStatus().legacyMigrationComplete,true);
+    h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[]};
+    assert.equal(h.controller.getStatus().migration.stage,'legacy-awaiting-apply');
+    h.state.configuration.watchExclude=['legacy/'];
+    assert.equal(h.controller.getStatus().migration.stage,'legacy-rule-review-required');
+    h.state.configuration.watchExclude=[];
+    h.tracker.getCommittedLegacyCompatibilityPolicy=()=>[[roots[0].uri,['committed-only/']]];
+    assert.equal(h.controller.getStatus().migration.stage,'legacy-rule-review-required');
+});
+
+await test('LIFECYCLE-DIAGNOSTICS live scope status preserves unsaved draft and distinguishes busy and recovery',async()=>{
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes','[ unsaved invalid draft');
+    const base=h.tracker.getMonitoringLifecycleStatus();
+    for(const code of ['baseline-transaction','recovery-blocked','disposed']){
+        h.state.lifecycle={...base,baselineTransactionActive:code==='baseline-transaction',recoveryBlocked:code==='recovery-blocked',disposed:code==='disposed',blocker:{code,reason:`Synthetic ${code} reason`}};
+        for(const listener of h.state.lifecycleListeners){listener();}
+        assert.equal(ui.elements.get('excludes').value,'[ unsaved invalid draft');
+        assert.equal(ui.elements.get('lifecycle-status').textContent,`Synthetic ${code} reason`);
+        assert.equal(ui.elements.get('apply').disabled,true);
+        const status=JSON.parse(ui.elements.get('status').textContent);assert.equal(status.lifecycle.blocker.code,code);
+    }
+    h.state.lifecycle=base;for(const listener of h.state.lifecycleListeners){listener();}
+    assert.equal(ui.elements.get('apply').disabled,false);panel.dispose();
+});
+
+await test('LIFECYCLE-DIAGNOSTICS Save and Apply reports the lifecycle cause before writing settings or prompting',async()=>{
+    for(const code of ['disposed','recovery-blocked','baseline-transaction']){
+        const h=monitoringScopeCommandHarness(),before=JSON.stringify(h.state.workspaceConfiguration);
+        h.state.lifecycle={...h.tracker.getMonitoringLifecycleStatus(),blocker:{code,reason:`Exact ${code} blocker`}};
+        let confirmations=0;
+        const saved=await h.controller.saveAndApplyScope({mode:'invalid',includes:[],excludes:[]},async()=>{confirmations++;return true;});
+        const applied=await h.controller.applyPendingScope();
+        assert.equal(saved.reason,`Exact ${code} blocker`);assert.equal(applied.reason,saved.reason);
+        assert.equal(saved.settingsStatus,'unchanged');assert.equal(confirmations,0);
+        assert.equal(JSON.stringify(h.state.workspaceConfiguration),before);
+    }
+    const h=monitoringScopeCommandHarness(),before=JSON.stringify(h.state.workspaceConfiguration);
+    const result=await h.controller.saveAndApplyScope({mode:'wholeWorkspace',includes:[],excludes:[]},async()=>{
+        h.state.lifecycle={...h.tracker.getMonitoringLifecycleStatus(),blocker:{code:'baseline-transaction',reason:'A newer baseline transaction started.'}};
+        return true;
+    });
+    assert.equal(result.reason,'A newer baseline transaction started.');assert.equal(result.settingsStatus,'unchanged');
+    assert.equal(JSON.stringify(h.state.workspaceConfiguration),before);assert.equal(h.controller.getStatus().lifecycle.scopeActionPending,false);
+});
 
 await test('a clean open scope editor allows one quick exclusion and refreshes after its bounded draft lock', async () => {
     const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
@@ -988,6 +1080,8 @@ for (const kind of ['automatic', 'manual']) {
         assert.equal(h.controller.hasPendingScopeSettingsWrites(), false);
         assert.deepEqual(h.state.updates.map(([key]) => key), ['monitoringScope', 'watchInclude', 'watchExclude']);
         assert.equal(h.controller.getStatus().legacyMigrationComplete, true);
+        assert.equal(h.controller.getStatus().migration.stage,'legacy-reviewed-awaiting-apply');
+        assert.equal(h.controller.getStatus().effective.kind,'legacyV3');
         await h.run('manageMonitoringScope');
         assert.ok(h.WatchExcludePanel.currentPanel);
         h.WatchExcludePanel.currentPanel.dispose();
@@ -1763,9 +1857,9 @@ function commandHarness(options={}) {
         startResult:true,starts:0,baselineGitContexts:[],recordingContexts:[],gitReady:true,gitSnapshots:[],archiveEvents:[],reconciliations:[],restoreTokens:[],previews:0,reviewRefreshes:0,...options};
     const source=ts.createSourceFile('extension.ts',fs.readFileSync('src/extension.ts','utf8'),ts.ScriptTarget.Latest,true);
     const helpers=[],callbacks=[];
-    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.showSideBySideDiff','diffTracker.showSideBySideDiffActive','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode','diffTracker.selectWebviewDiffStyle',archiveRestoreCommand]);
+    const names=new Set(['diffTracker.openDiffDefault','diffTracker.showOriginalAndWebviewSplit','diffTracker.showWebviewDiff','diffTracker.showSideBySideDiff','diffTracker.showSideBySideDiffActive','diffTracker.clearDiffs','diffTracker.selectDefaultOpenMode','diffTracker.selectWebviewDiffStyle','diffTracker.retrySavedSessionRecovery','diffTracker.discardSavedSessionRecovery',archiveRestoreCommand]);
     function visit(node){
-        if(ts.isVariableDeclaration(node)&&['startRecordingAfterPrechecks','startRecordingFlow','stopRecordingFlow'].includes(node.name.getText(source)))helpers.push(`const ${node.getText(source)};`);
+        if(ts.isVariableDeclaration(node)&&['startRecordingAfterPrechecks','reviewSavedSessionRecovery','startRecordingFlow','stopRecordingFlow'].includes(node.name.getText(source)))helpers.push(`const ${node.getText(source)};`);
         if(ts.isFunctionDeclaration(node)&&['extractFilePath','extractIsDeleted','getDefaultOpenMode','isDeletedReview'].includes(node.name?.text))helpers.push(node.getText(source));
         if(ts.isCallExpression(node)&&node.expression.getText(source)==='vscode.commands.registerCommand'&&names.has(node.arguments[0]?.text))callbacks.push(`${JSON.stringify(node.arguments[0].text)}:${node.arguments[1].getText(source)}`);
         ts.forEachChild(node,visit);
@@ -1777,7 +1871,7 @@ function commandHarness(options={}) {
         workspace:{workspaceFolders:[{uri:Uri.file('/workspace')}],getConfiguration:()=>({get:(_key,fallback)=>state.mode??fallback,inspect:key=>({workspaceValue:state.workspaceConfiguration?.[key]}),update:async(...args)=>state.updates.push(args)}),openTextDocument:async()=>{state.opened++;if(state.deleted)throw Object.assign(new Error('FileNotFound'),{code:'FileNotFound'});return{};}},
         window:{
             get activeTextEditor(){return state.activeTextEditor;},
-            showErrorMessage:()=>{state.recoveryPrompts=(state.recoveryPrompts??0)+1;return state.recoveryGate??'Discard Saved Session and Rebuild';},
+            showErrorMessage:()=>{state.recoveryPrompts=(state.recoveryPrompts??0)+1;return state.recoveryGate??'Retry Saved Review Recovery';},
             showTextDocument:async()=>{},
             showQuickPick:async items=>{state.pickerItems=items;return items.find(item=>item.value===state.chooseMode);},
             showInformationMessage:m=>{state.archiveEvents.push('information');state.info.push(m);},
@@ -1791,6 +1885,7 @@ function commandHarness(options={}) {
                     }
                     if(args.includes('Replace Review and Start')) return state.replaceAnswer ?? 'Replace Review and Start';
                     if(args.includes('Rebuild Baseline')) return state.rebuildGate??'Rebuild Baseline';
+                    if(args.includes('Discard Saved Session')){state.onDiscardConfirmation?.();return state.discardConfirmationGate??state.discardAnswer;}
                     if(state.clearGate) return state.clearGate;
                     if(state.toggleRecordingOnConfirm) state.recording=!state.recording;
                     return state.confirmClear?'Clear Diffs':undefined;
@@ -1803,8 +1898,10 @@ function commandHarness(options={}) {
         commands:{executeCommand:async(name,...args)=>{state.executed.push([name,...args]);return sandbox.callbacks[name]?.(...args);}}};
     const tracker={getTrackedChanges:()=>[{filePath,isDeleted:state.deleted}],getIsRecording:()=>state.recording,
         isRecoveryBlocked:()=>state.recoveryBlocked??false,getBaselineState:()=>state.baselineState??'ready',
-        discardRecoveryState:async()=>{state.discards=(state.discards??0)+1;await state.discardGate;return state.discardResult??true;},
-        stopRecording:()=>{state.recording=false;},
+        getMonitoringLifecycleStatus:()=>({disposed:state.lifecycleBlocker?.code==='disposed',recording:state.recording,sessionEpoch:state.sessionEpoch??1,recoveryBlocked:state.recoveryBlocked??false,recoveryRetryActive:false,baselineTransactionActive:state.baselineTransactionActive??false,persistenceIssue:state.persistenceIssue,blocker:state.lifecycleBlocker}),
+        retrySavedSessionRecovery:async()=>{state.recoveryRetries=(state.recoveryRetries??0)+1;await state.recoveryRetryGate;if(state.retrySucceeds)state.recoveryBlocked=false;return state.retryOutcome??{status:state.retrySucceeds?'restored':'blocked',reason:'Synthetic recovery outcome'};},
+        discardRecoveryState:async()=>{state.discards=(state.discards??0)+1;await state.discardGate;if(state.discardResult!==false)state.recoveryBlocked=false;return state.discardResult??true;},
+        stopRecording:()=>{state.recording=false;state.sessionEpoch=(state.sessionEpoch??1)+1;},
         startRecording:()=>{state.archiveEvents.push('start');state.starts++;if(state.startResult)state.recording=true;return state.startResult;},
         setBaselineGitContexts:contexts=>{state.archiveEvents.push('setBaselineGitContexts');state.baselineGitContexts.push(contexts);},
         resetBaselineToCurrentState:async()=>{state.resets++;await state.resetGate;return state.resetResult;},clearDiffs:()=>{state.legacyClears++;},
@@ -1817,7 +1914,7 @@ function commandHarness(options={}) {
         isReady:()=>{state.archiveEvents.push('ready');return state.gitReady;},
         getSnapshots:()=>{state.archiveEvents.push('snapshots');return state.gitSnapshots;}
     };
-    sandbox={monitoringScopeController:{getStatus:()=>({requested:{ok:true},expansionReasons:[],consented:true,effective:{kind:'legacyV3'},workspaceRequestPresent:false})},recordingRequest:0,vscode,diffTracker:tracker,displayFileName:path.basename,context:{extensionUri:{}},WebviewDiffPanel:{createOrShow:()=>state.panels++},
+    sandbox={savedSessionRecoveryAction:false,monitoringScopeController:{hasActiveScopeAction:()=>state.scopeActionPending??false,getRequestVersion:()=>state.requestVersion??'request-1',reconcileRequestedScope:()=>{state.reconciledVersions??=[];state.reconciledVersions.push(state.requestVersion);},getStatus:()=>state.scopeStatus??({requested:{ok:true},expansionReasons:[],consented:true,effective:{kind:'legacyV3'},workspaceRequestPresent:false})},recordingRequest:0,vscode,diffTracker:tracker,displayFileName:path.basename,context:{extensionUri:{}},WebviewDiffPanel:{createOrShow:()=>state.panels++},
         settingsTreeDataProvider:{refresh(){}},refreshChangesTree:()=>{},decorationManager:{clearAllDecorations:()=>{}},
         setRecordingContext:value=>{state.archiveEvents.push('setRecordingContext');state.recordingContexts.push(value);},
         gitContextMonitor,refreshReview:()=>{state.archiveEvents.push('refresh');state.reviewRefreshes++;},console};
@@ -2347,12 +2444,12 @@ await test('Clear completion does not cancel a newer Start waiting for Git',asyn
 for (const boundary of ['rebuild','recovery','discard']) {
     for (const cancel of ['clear','stop']) {
         await test(`Start ${boundary} continuation obeys later ${cancel}`,async()=>{
-            const gate=deferred();const options=boundary==='rebuild'?{baselineState:'building',rebuildGate:gate.promise}:boundary==='recovery'?{recoveryBlocked:true,recoveryGate:gate.promise}:{recoveryBlocked:true,discardGate:gate.promise};
+            const gate=deferred();const options=boundary==='rebuild'?{baselineState:'building',rebuildGate:gate.promise}:boundary==='recovery'?{recoveryBlocked:true,recoveryGate:gate.promise}:{recoveryBlocked:true,recoveryGate:'Discard Saved Session…',discardAnswer:'Discard Saved Session',discardGate:gate.promise};
             const h=commandHarness(options);const start=h.startFlow();
             await Promise.resolve();await Promise.resolve();await Promise.resolve();
             if(boundary==='discard')assert.equal(h.state.discards,1);
             if(cancel==='clear')assert.equal(await h.run('diffTracker.clearDiffs'),true);else h.stopFlow();
-            gate.resolve(boundary==='rebuild'?'Rebuild Baseline':'Discard Saved Session and Rebuild');
+            gate.resolve(boundary==='rebuild'?'Rebuild Baseline':'Discard Saved Session…');
             assert.equal(await start,false);assert.equal(h.state.starts,0);
             if(boundary==='recovery')assert.equal(h.state.discards??0,0,'stale confirmation must not discard recovery');
         });
@@ -2852,14 +2949,117 @@ await test('Start with a stopped review preserves it when replacement is cancell
     assert.equal(h.state.prompts.length, 1);
 });
 
-await test('Start recovery uses only its dedicated confirmation with pending review', async () => {
-    for (const answer of ['Cancel', 'Discard Saved Session and Rebuild']) {
-        const h = commandHarness({ recoveryBlocked: true, recoveryGate: answer, replaceAnswer: 'Cancel' });
-        const approved = answer === 'Discard Saved Session and Rebuild';
-        assert.equal(await h.startFlow(), approved);
-        assert.equal(h.state.recoveryPrompts, 1);
-        assert.equal(h.state.prompts.length, 0, 'do not ask to replace review again after recovery discard');
-        assert.equal(h.state.discards ?? 0, approved ? 1 : 0);
-        assert.equal(h.state.starts, approved ? 1 : 0);
+await test('Start recovery diagnostics are reachable before scope mismatch without discarding or starting',async()=>{
+    for(const kind of ['legacyV3','configured']) {
+        const h=commandHarness({recoveryBlocked:true,recoveryGate:'Retry Saved Review Recovery',retrySucceeds:true,
+            scopeStatus:{requested:{ok:true,scope:{scopeRevision:'requested'}},effective:{kind,scopeRevision:'effective'},workspaceRequestPresent:true,expansionReasons:[],consented:true}});
+        assert.equal(await h.startFlow(),false);assert.equal(h.state.recoveryRetries,1);
+        assert.equal(h.state.discards??0,0);assert.equal(h.state.starts,0);assert.equal(h.state.recording,false);
+        assert.equal(h.state.recoveryBlocked,false);
     }
+});
+await test('Saved recovery discard is separate, explicit and bound to current settings',async()=>{
+    for(const answer of [undefined,'Discard Saved Session']) {
+        const h=commandHarness({recoveryBlocked:true,recoveryGate:'Discard Saved Session…',discardAnswer:answer});
+        assert.equal(await h.startFlow(),false);assert.equal(h.state.starts,0);
+        assert.equal(h.state.discards??0,answer?1:0);assert.match(h.state.prompts[0].args.find(value=>value?.detail).detail,/Undo recovery files/);
+    }
+    const changed=commandHarness({recoveryBlocked:true,discardAnswer:'Discard Saved Session'});
+    changed.state.onDiscardConfirmation=()=>{changed.state.requestVersion='newer';};
+    assert.equal(await changed.run('diffTracker.discardSavedSessionRecovery'),false);
+    assert.equal(changed.state.discards??0,0);
+});
+
+await test('LIFECYCLE-DIAGNOSTICS Start reports closed or busy before a scope mismatch',async()=>{
+    for(const code of ['disposed','baseline-transaction','recovery-retry']){
+        const h=commandHarness({lifecycleBlocker:{code,reason:`Exact ${code} blocker`},scopeStatus:{requested:{ok:false},workspaceRequestPresent:true}});
+        assert.equal(await h.startFlow(),false);assert.deepEqual(h.state.warnings,[`Exact ${code} blocker`]);
+        assert.equal(h.state.discards??0,0);assert.equal(h.state.starts,0);
+    }
+});
+await test('LIFECYCLE-DIAGNOSTICS duplicate discard uses one confirmation and cancellation releases the action',async()=>{
+    const gate=deferred();const h=commandHarness({recoveryBlocked:true,discardConfirmationGate:gate.promise});
+    const first=h.run('diffTracker.discardSavedSessionRecovery');await Promise.resolve();
+    assert.equal(await h.run('diffTracker.discardSavedSessionRecovery'),false);assert.equal(h.state.prompts.length,1);
+    gate.resolve(undefined);assert.equal(await first,false);assert.equal(h.state.discards??0,0);
+    h.state.discardConfirmationGate=undefined;h.state.discardAnswer='Discard Saved Session';
+    assert.equal(await h.run('diffTracker.discardSavedSessionRecovery'),true);assert.equal(h.state.discards,1);
+});
+await test('LIFECYCLE-DIAGNOSTICS retry reconciles newer requested settings without applying or starting them',async()=>{
+    const gate=deferred();const h=commandHarness({recoveryBlocked:true,retrySucceeds:true,recoveryRetryGate:gate.promise,requestVersion:'old'});
+    const retry=h.run('diffTracker.retrySavedSessionRecovery');await Promise.resolve();await Promise.resolve();
+    assert.equal(await h.run('diffTracker.discardSavedSessionRecovery'),false);assert.equal(h.state.prompts.length,0);
+    h.state.requestVersion='newer';h.state.gitSnapshots=[{repoRoot:'/synthetic/repository',head:'newer-head'}];
+    gate.resolve();assert.equal((await retry).status,'restored');
+    assert.deepEqual(h.state.reconciledVersions,['newer']);assert.equal(h.state.starts,0);assert.equal(h.state.discards??0,0);
+    assert.deepEqual(h.state.reconciliations,[h.state.gitSnapshots],'restored Git baselines are checked against the latest monitor snapshots');
+});
+
+function lateSettingsStatusFixture(){
+    const h=monitoringScopeCommandHarness();h.controller.dispose();
+    const changes=new h.vscode.EventEmitter();h.vscode.workspace.onDidChangeConfiguration=changes.event;
+    const getConfiguration=h.vscode.workspace.getConfiguration,late=deferred();
+    h.vscode.workspace.getConfiguration=(...args)=>({...getConfiguration(...args),update:()=>late.promise});
+    const controller=new (h.load('monitoringScopeController.ts').MonitoringScopeController)(h.controller.context,h.tracker);
+    const panel=h.WatchExcludePanel.createOrShow({fsPath:'/synthetic/extension'},h.tracker,controller);
+    const ui=connectScopeEditor(h),draft='[ synthetic unsaved draft';ui.input('excludes',draft);
+    return {h,changes,getConfiguration,late,controller,panel,ui,draft};
+}
+
+await test('P2-LATE-SETTINGS settlement publishes the released fence without replacing a draft',async()=>{
+    const {h,changes,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    try{
+        const result=await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]});
+        assert.equal(result.ok,false);assert.equal(controller.getStatus().lifecycle.settingsWritePending,true);
+        assert.equal(ui.elements.get('apply').disabled,true);
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:key=>key==='diffTracker.monitoringScope'});
+        late.resolve();await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(controller.getStatus().lifecycle.settingsWritePending,false);
+        assert.equal(ui.elements.get('excludes').value,draft);
+        const latest=h.messages.filter(message=>message.command==='scopeStatus').at(-1);
+        assert.equal(latest.lifecycle.settingsWritePending,false,'publish the released write fence');
+        assert.equal(ui.elements.get('apply').disabled,false);assert.equal(ui.elements.get('save-apply').disabled,false);
+    }finally{late.resolve();panel.dispose();controller.dispose();}
+});
+
+await test('P2-LATE-SETTINGS disposed controller cannot publish or apply a late settlement',async()=>{
+    const {h,changes,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    try{
+        assert.equal((await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]})).ok,false);
+        panel.dispose();controller.dispose();
+        const count=h.messages.length,effective=JSON.stringify(h.tracker.getEffectiveMonitoringScope());
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:()=>true});late.resolve();
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(h.messages.length,count);assert.equal(controller.getStatus().lifecycle.controllerDisposed,true);
+        assert.equal(JSON.stringify(h.tracker.getEffectiveMonitoringScope()),effective);
+        assert.equal(ui.elements.get('excludes').value,draft);
+    }finally{late.resolve();panel.dispose();controller.dispose();}
+});
+
+await test('P2-LATE-SETTINGS released old fence cannot clear a new queued write status',async()=>{
+    const {h,changes,getConfiguration,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    const next=deferred();let newer,subscription,started=false,held=false;
+    try{
+        assert.equal((await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]})).ok,false);
+        h.vscode.workspace.getConfiguration=(...args)=>{
+            const config=getConfiguration(...args);
+            return {...config,update:async(...values)=>{if(!held){held=true;await next.promise;}return config.update(...values);}};
+        };
+        subscription=controller.onDidChangeStatus(()=>{
+            if(!started && !controller.getStatus().lifecycle.settingsWritePending){
+                started=true;newer=controller.saveRequestedScope({mode:'wholeWorkspace',includes:[],excludes:[]});
+            }
+        });
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:()=>true});late.resolve();
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.ok(newer);assert.equal(controller.getStatus().lifecycle.settingsWritePending,true);
+        assert.equal(h.messages.filter(message=>message.command==='scopeStatus').at(-1).lifecycle.settingsWritePending,true);
+        assert.equal(ui.elements.get('apply').disabled,true);assert.equal(ui.elements.get('excludes').value,draft);
+        next.resolve();assert.equal((await newer).ok,true);
+        assert.equal(h.messages.filter(message=>message.command==='scopeStatus').at(-1).lifecycle.settingsWritePending,false);
+        assert.equal(ui.elements.get('apply').disabled,false);assert.equal(ui.elements.get('excludes').value,draft);
+    }finally{late.resolve();next.resolve();await newer;subscription?.dispose();panel.dispose();controller.dispose();}
 });

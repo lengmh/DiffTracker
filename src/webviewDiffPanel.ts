@@ -219,7 +219,7 @@ export class WebviewDiffPanel {
             currentSize: fileChange?.currentSize,
             baselineFingerprint: fileChange?.baselineFingerprint,
             currentFingerprint: fileChange?.currentFingerprint,
-            sourceNote: fileChange?.sourceNote,
+            sourceNote: this.visibleSourceNote(fileChange?.sourceNote),
             lang,
             oldContents: logicalOriginalContent,
             newContents: logicalCurrentContent,
@@ -356,6 +356,10 @@ export class WebviewDiffPanel {
             'zig': 'zig',
         };
         return langMap[ext] || 'plaintext';
+    }
+
+    private visibleSourceNote(note?: string): string | undefined {
+        return note && vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false) ? note : undefined;
     }
 
     private getHtmlContent(): string {
@@ -601,7 +605,7 @@ export class WebviewDiffPanel {
         let currentSize = ${this.serializeForInlineScript(fileChange?.currentSize ?? null)};
         let baselineFingerprint = ${this.serializeForInlineScript(fileChange?.baselineFingerprint ?? '')};
         let currentFingerprint = ${this.serializeForInlineScript(fileChange?.currentFingerprint ?? '')};
-        let sourceNote = ${this.serializeForInlineScript(fileChange?.sourceNote ?? '')};
+        let sourceNote = ${this.serializeForInlineScript(this.visibleSourceNote(fileChange?.sourceNote) ?? '')};
 
         const oldFile = {
             name: ${serializedFileName},

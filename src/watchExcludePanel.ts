@@ -42,6 +42,9 @@ export class WatchExcludePanel {
         this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
         this.panel.webview.onDidReceiveMessage(async message => this.handleMessage(message), null, this.disposables);
         this.panel.webview.html = this.getHtmlContent();
+        this.disposables.push(this.scopeController.onDidChangeStatus(() => {
+            if (!this.disposed) { void this.postStatus(); }
+        }));
     }
 
     public static createOrShow(
@@ -92,6 +95,15 @@ export class WatchExcludePanel {
                 this.draftDirty = message.dirty !== false;
                 this.draftKnown = true;
             }
+            return;
+        }
+        if (message.command === 'retryRecovery' || message.command === 'discardRecovery') {
+            if (this.actionInProgress) { return; }
+            this.actionInProgress=true;
+            try {
+                await vscode.commands.executeCommand(message.command==='retryRecovery'
+                    ? 'diffTracker.retrySavedSessionRecovery' : 'diffTracker.discardSavedSessionRecovery');
+            } finally {this.actionInProgress=false;await this.postStatus();}
             return;
         }
         if (message.command === 'reload') {
@@ -410,6 +422,8 @@ export class WatchExcludePanel {
             command: 'scopeStatus',
             requestVersion: this.scopeController.getRequestVersion(),
             operationOutcome: status.operationOutcome,
+            lifecycle: status.lifecycle,
+            migration: status.migration,
             rawRequested: status.rawRequested,
             requested: {
                 ok: status.requested.ok,
@@ -480,7 +494,14 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeB
 <button id="restore" class="secondary">Restore Effective Configuration</button>
 <button id="dismiss" class="secondary">Dismiss Consent Prompt</button>
 </div>
-<h2>Status</h2><pre id="status">Loading…</pre>
+<h2>Status</h2>
+<p id="lifecycle-status" role="status"></p>
+<p id="migration-status"></p>
+<div class="actions">
+<button id="retry-recovery" class="secondary">Retry Saved Review Recovery</button>
+<button id="discard-recovery" class="secondary">Discard Saved Session…</button>
+</div>
+<pre id="status">Loading…</pre>
 <h2>Test effective path</h2>
 <div class="test"><input id="test-path" placeholder="e.g. src/app.ts"><button id="test-btn" class="secondary">Test</button><span id="test-result"></span></div>
 <script src="${scriptUri}"></script>

@@ -16,10 +16,10 @@ const PRIMARY = 'session-state.json';
 export function registerArchivedGitReview(h) {
     const { test, Uri, DiffTracker, vscode, file, document, faults, counters,
         pause, emitWatcher, emitWorkspaceFilesCreated, fireConfigurationChanged,
-        waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
+        waitUntil, watcherInstances, nativeDirectoryWatchers, setVsCodeExcludes, getTracker, setTracker, setListedFiles } = h;
 
     async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false,
-        ignoredBaseline = false, ignorePolicyFile = '.gitignore' } = {}) {
+        ignoredBaseline = false, ignorePolicyFile = '.gitignore', blindDirectory = false, ignoredDirectory = false } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -41,15 +41,20 @@ export function registerArchivedGitReview(h) {
         const deleted = path.join(workspace, 'deleted-after-archive.txt');
         const ignoreFile = path.join(workspace, ignorePolicyFile);
         const ignored = path.join(workspace, 'policy-hidden.txt');
+        const blindRoot=path.join(workspace,'temporary'),blindFile=path.join(blindRoot,'review.txt');
+        if(blindDirectory){
+            fs.mkdirSync(blindRoot);fs.writeFileSync(blindFile,'archived original');
+            setVsCodeExcludes({'files.watcherExclude':{'temporary/**':true}});
+        }
         fs.writeFileSync(target, 'main before-image\n');
         fs.writeFileSync(opaque, Buffer.from([0, 1, 2]));
         if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
         if (ignoredBaseline) {
             fs.mkdirSync(path.dirname(ignoreFile), { recursive: true });
-            fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n');
+            fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n'+(ignoredDirectory?'ignored/\n':''));
             fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
         }
-        setListedFiles([Uri.file(target), Uri.file(opaque), ...(stoppedArchive ? [Uri.file(deleted)] : []),
+        setListedFiles([Uri.file(target), Uri.file(opaque), ...(blindDirectory ? [Uri.file(blindFile)] : []), ...(stoppedArchive ? [Uri.file(deleted)] : []),
             ...(ignoredBaseline ? [Uri.file(ignoreFile), Uri.file(ignored)] : [])]);
         let tracker = new DiffTracker(Uri.file(storage));
         setTracker(tracker);
@@ -61,7 +66,7 @@ export function registerArchivedGitReview(h) {
         try {
             assert.equal(await tracker.resetBaselineToCurrentState(), true, tracker.getPersistenceIssue());
             if (configured) {
-                const requested = validateAndCanonicalizeScope({ mode: 'rules', includes: [], excludes: [] }, tracker.effectiveMonitoringScope.roots);
+                const requested = validateAndCanonicalizeScope({ mode: blindDirectory ? 'wholeWorkspace' : 'rules', includes: [], excludes: [] }, tracker.effectiveMonitoringScope.roots);
                 assert.equal(requested.ok, true);
                 const applied = await tracker.applyConfiguredMonitoringScope(requested.scope, false, () => true);
                 assert.equal(applied.status, 'applied', applied.reason);
@@ -100,6 +105,57 @@ export function registerArchivedGitReview(h) {
             await tracker.dispose();
             vscode.workspace.workspaceFolders = previousFolders;
             vscode.workspace.getWorkspaceFolder = previousGetFolder;
+        }
+    }
+
+    for(const stoppedArchive of [false,true])test(`P1-ARCHIVE-REPLAY-PROVENANCE stopped=${stoppedArchive}`,()=>fixture(async ctx=>{
+        const parentRoot=path.join(ctx.workspace,'temporary'),known=path.join(parentRoot,'review.txt');
+        const root=path.join(parentRoot,'incoming'),child=path.join(root,'unproven.txt');
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        try{
+            await Promise.race([gate.entered,operation.then(result=>{throw new Error(`Restore finished before cleanup: ${JSON.stringify(result)}`);})]);
+            fs.mkdirSync(root);fs.writeFileSync(child,'unproven contents');
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(parentRoot));
+            assert.ok(parent);parent.listener('rename','incoming');
+            gate.release();const result=await operation;
+            assert.equal(result.status,'restored',result.reason);
+            assert.equal(ctx.tracker.getOriginalContent(known),'archived original');
+            assert.equal((await ctx.tracker.revertBlock(child,0)).status,'conflict');
+            assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),true);assert.equal(ctx.tracker.getReviewToken(child),undefined);
+        }finally{gate.release();await operation;}
+    },{configured:true,blindDirectory:true,stoppedArchive}));
+
+    for(const stoppedArchive of [false,true])test(`P2-IGNORED-DIRECTORY-ARCHIVE stopped=${stoppedArchive}`,()=>fixture(async ctx=>{
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const ignored=path.join(ctx.workspace,'ignored'),child=path.join(ignored,'unread.txt');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        try{
+            await Promise.race([gate.entered,operation.then(result=>{throw new Error(`Restore finished before directory barrier: ${JSON.stringify(result)}`);})]);
+            fs.mkdirSync(ignored);fs.writeFileSync(child,'excluded contents');
+            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ignored),true),true);
+            assert.equal(ctx.tracker.isPathIgnored(Uri.file(ignored)),false);
+            emitWatcher('create',Uri.file(ignored));gate.release();
+            assert.equal((await operation).status,'restored');
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main before-image\n');
+            assert.equal(ctx.tracker.fileSnapshots.has(child),false);assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),false);
+            assert.equal(nativeDirectoryWatchers.some(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(ignored)),false);
+            assert.equal(fs.readFileSync(child,'utf8'),'excluded contents');
+        }finally{gate.release();await operation;}
+    },{configured:true,ignoredBaseline:true,ignoredDirectory:true,stoppedArchive}));
+
+    async function assertDirectoryChildProvenance(tracker,child,knownAbsence,contents) {
+        assert.equal(fs.readFileSync(child,'utf8'),contents);
+        if(knownAbsence){
+            assert.equal(tracker.getOriginalContent(child),'');
+            assert.equal(changeFor(tracker,child)?.currentContent,contents);
+        }else{
+            assert.equal(tracker.getOriginalContent(child),undefined,'a directory-only notification cannot prove every child was absent');
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),true);
+            assert.equal(changeFor(tracker,child)?.reviewKind,'unknown');
+            assert.equal(tracker.getReviewToken(child),undefined);
+            assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            assert.equal(fs.readFileSync(child,'utf8'),contents);
         }
     }
 
@@ -357,8 +413,9 @@ export function registerArchivedGitReview(h) {
         }, { stoppedArchive: true }));
     }
 
-    for (const configured of [false, true]) {
-        test(`ARCHIVE-RESTORE recording-state stopped directory create at final intent deletion preserves children (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
+    for (const configured of [false, true])for(const childCreate of configured?[false,true]:[false]) {
+        test(`ARCHIVE-RESTORE recording-state stopped directory create at final intent deletion preserves children (${configured ? 'configured' : 'legacy'} Rules, childCreate=${childCreate})`, () => fixture(async ctx => {
+            const knownAbsence=!configured||childCreate;
             const preview = await ready(ctx.tracker);
             const imported = path.join(ctx.workspace, 'directory-created-at-stopped-commit');
             const child = path.join(imported, 'child.txt');
@@ -374,14 +431,15 @@ export function registerArchivedGitReview(h) {
                 fs.writeFileSync(child, 'child created during stopped archive commit\n');
                 setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(ctx.deleted), Uri.file(child)]);
                 emitWatcher('create', Uri.file(imported));
+                if(childCreate){emitWatcher('create',Uri.file(child));}
                 disk = tree(ctx.workspace);
             } finally { gate.release(); }
             const result = await operation;
             assert.equal(result.status, 'restored', result.reason);
             assert.equal(ctx.tracker.getIsRecording(), false);
-            assert.equal(ctx.tracker.getOriginalContent(child), '', 'the directory event proves child creation after the archived baseline');
-            assert.equal(changeFor(ctx.tracker, child)?.currentContent, 'child created during stopped archive commit\n');
-            assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === child)?.[1], '');
+            await assertDirectoryChildProvenance(ctx.tracker,child,knownAbsence,'child created during stopped archive commit\n');
+            assert.equal(readState(ctx.storage).fileSnapshots.find(([filePath]) => filePath === child)?.[1], knownAbsence?'':undefined);
+            if(!knownAbsence){assert.ok(new Map(readState(ctx.storage).unresolvedBaselineFiles).has(child));}
             assert.equal(readState(ctx.storage).isRecording, false);
             assert.equal(watcherInstances.some(watcher => watcher.active), false);
             assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
@@ -389,8 +447,7 @@ export function registerArchivedGitReview(h) {
             assert.deepEqual(tree(ctx.workspace), disk);
             assert.equal(await ctx.restart(), 'restored');
             assert.equal(ctx.currentTracker().getIsRecording(), false);
-            assert.equal(ctx.currentTracker().getOriginalContent(child), '');
-            assert.equal(changeFor(ctx.currentTracker(), child)?.currentContent, 'child created during stopped archive commit\n');
+            await assertDirectoryChildProvenance(ctx.currentTracker(),child,knownAbsence,'child created during stopped archive commit\n');
             assert.equal(watcherInstances.some(watcher => watcher.active), false);
         }, { stoppedArchive: true, configured }));
     }
@@ -1234,8 +1291,9 @@ export function registerArchivedGitReview(h) {
         }));
     }
 
-    for (const configured of [false, true]) {
-        test(`ARCHIVE-RESTORE directory creation during final commit keeps child provenance (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
+    for (const configured of [false, true])for(const childCreate of configured?[false,true]:[false]) {
+        test(`ARCHIVE-RESTORE directory creation during final commit keeps child provenance (${configured ? 'configured' : 'legacy'} Rules, childCreate=${childCreate})`, () => fixture(async ctx => {
+            const knownAbsence=!configured||childCreate;
             const preview = await ready(ctx.tracker);
             const gate = pause(path.join(ctx.storage, INTENT), 'delete');
             const imported = path.join(ctx.workspace, 'imported-after-preview');
@@ -1251,15 +1309,15 @@ export function registerArchivedGitReview(h) {
                 // the newly created child; configured Rules discovers it directly.
                 if (!configured) { setListedFiles([Uri.file(ctx.target), Uri.file(ctx.opaque), Uri.file(child)]); }
                 emitWatcher('create', Uri.file(imported));
+                if(childCreate){emitWatcher('create',Uri.file(child));}
             } finally { gate.release(); }
             const result = await operation;
             assert.equal(result.status, 'restored', result.reason);
-            assert.equal(ctx.tracker.getOriginalContent(child), '',
-                'an observed directory create must preserve known-absence provenance for its children');
-            assert.equal(changeFor(ctx.tracker, child)?.currentContent, 'new child after archive reconciliation\n');
+            await assertDirectoryChildProvenance(ctx.tracker,child,knownAbsence,'new child after archive reconciliation\n');
             const saved = readState(ctx.storage);
-            assert.equal(saved.fileSnapshots.find(([p]) => p === child)?.[1], '',
-                'post-commit imported child before-image must be durable before completion');
+            assert.equal(saved.fileSnapshots.find(([p]) => p === child)?.[1], knownAbsence?'':undefined,
+                'post-commit child provenance must be durable before completion');
+            if(!knownAbsence){assert.ok(new Map(saved.unresolvedBaselineFiles).has(child));}
             assert.equal(saved.baselineExistingFiles.includes(child), false);
             if (configured) {
                 assert.ok(saved.coverageGaps.some(([p, record]) => p === imported &&
@@ -1268,8 +1326,7 @@ export function registerArchivedGitReview(h) {
             }
             assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
             assert.equal(await ctx.restart(), 'restored');
-            assert.equal(ctx.currentTracker().getOriginalContent(child), '');
-            assert.equal(changeFor(ctx.currentTracker(), child)?.currentContent, 'new child after archive reconciliation\n');
+            await assertDirectoryChildProvenance(ctx.currentTracker(),child,knownAbsence,'new child after archive reconciliation\n');
             assert.equal(fs.readFileSync(child, 'utf8'), 'new child after archive reconciliation\n');
         }, { configured }));
     }

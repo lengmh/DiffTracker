@@ -138,8 +138,28 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     let recordingRequest = 0;
+    let savedSessionRecoveryAction = false;
+    const reviewSavedSessionRecovery = async (stillCurrent: () => boolean): Promise<void> => {
+        const lifecycle = diffTracker.getMonitoringLifecycleStatus();
+        const choice = await vscode.window.showErrorMessage(
+            lifecycle.blocker?.reason ?? 'The saved review session needs recovery. Monitoring preferences and before-images remain preserved.',
+            ...(lifecycle.recoveryRequiresReload
+                ? ['Open Monitoring Scope','Discard Saved Session…']
+                : ['Retry Saved Review Recovery','Open Monitoring Scope','Discard Saved Session…'])
+        );
+        if (!stillCurrent()) { return; }
+        if (choice === 'Retry Saved Review Recovery') { await vscode.commands.executeCommand('diffTracker.retrySavedSessionRecovery'); }
+        else if (choice === 'Open Monitoring Scope') { await vscode.commands.executeCommand('diffTracker.manageMonitoringScope'); }
+        else if (choice === 'Discard Saved Session…') { await vscode.commands.executeCommand('diffTracker.discardSavedSessionRecovery'); }
+    };
+
     const startRecordingFlow = async (): Promise<boolean> => {
-        if (diffTracker.getIsRecording()) { return true; }
+        const initialLifecycle = diffTracker.getMonitoringLifecycleStatus();
+        if (initialLifecycle.disposed || initialLifecycle.recoveryRetryActive) {
+            void vscode.window.showWarningMessage(initialLifecycle.blocker?.reason ?? 'Saved review recovery is in progress.');
+            return false;
+        }
+        if (diffTracker.getIsRecording() && !initialLifecycle.recoveryBlocked) { return true; }
         const request = ++recordingRequest;
         // Empty windows have no supported monitoring scope or baseline to recover.
         if (!vscode.workspace.workspaceFolders?.some(folder => folder.uri.scheme === 'file')) { return false; }
@@ -147,6 +167,17 @@ export async function activate(context: vscode.ExtensionContext) {
         // a late context onto snapshots that might predate a checkout.
         if (gitContextMonitor && !await gitContextMonitor.whenReady()) { return false; }
         if (request !== recordingRequest) { return false; }
+        const lifecycle = diffTracker.getMonitoringLifecycleStatus();
+        if (lifecycle.blocker && !['recovery-blocked','recovery-reload-required'].includes(lifecycle.blocker.code)) {
+            void vscode.window.showWarningMessage(lifecycle.blocker.reason);
+            return false;
+        }
+        // Recovery diagnostics must remain reachable even when a saved
+        // Workspace request differs from the recovered effective scope.
+        if (diffTracker.isRecoveryBlocked()) {
+            await reviewSavedSessionRecovery(() => request === recordingRequest);
+            return false;
+        }
         const scopeStatus = monitoringScopeController.getStatus();
         if (!scopeStatus.requested.ok) {
             void vscode.window.showWarningMessage(
@@ -173,17 +204,7 @@ export async function activate(context: vscode.ExtensionContext) {
             );
             return false;
         }
-        if (diffTracker.isRecoveryBlocked()) {
-            const answer = await vscode.window.showErrorMessage(
-                'Code Diff Tracker could not validate the saved review session. It remains preserved and recording is paused.',
-                { modal: true },
-                'Discard Saved Session and Rebuild'
-            );
-            if (request !== recordingRequest || answer !== 'Discard Saved Session and Rebuild') { return false; }
-            if (!await diffTracker.discardRecoveryState() || request !== recordingRequest) {
-                return false;
-            }
-        } else if (!diffTracker.getIsRecording() && diffTracker.getBaselineState() === 'building') {
+        if (!diffTracker.getIsRecording() && diffTracker.getBaselineState() === 'building') {
             const answer = await vscode.window.showWarningMessage(
                 'Code Diff Tracker recovered an incomplete or different-workspace baseline. Starting will discard that review and build a new baseline.',
                 { modal: true },
@@ -456,6 +477,69 @@ export async function activate(context: vscode.ExtensionContext) {
             } else {
                 return startRecordingFlow();
             }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('diffTracker.retrySavedSessionRecovery', async () => {
+            if (savedSessionRecoveryAction) { return {status:'conflict',reason:'A saved review recovery action is already in progress.'}; }
+            savedSessionRecoveryAction = true;
+            try {
+                if (monitoringScopeController.hasActiveScopeAction()) {
+                    void vscode.window.showWarningMessage('A scope action or settings write is pending. Wait before retrying saved review recovery.');
+                    return {status:'conflict',reason:'A monitoring scope action is pending.'};
+                }
+                if (gitContextMonitor && !await gitContextMonitor.whenReady()) {
+                    return {status:'conflict',reason:'Git identity is not ready for saved review reconciliation.'};
+                }
+                const outcome = await diffTracker.retrySavedSessionRecovery();
+                if (['restored','recovered','incomplete'].includes(outcome.status) && gitContextMonitor?.isReady()) {
+                    diffTracker.reconcileRestoredGitContexts(gitContextMonitor.getSnapshots());
+                }
+                monitoringScopeController.reconcileRequestedScope();
+                refreshReview();
+                if (outcome.status === 'restored' || outcome.status === 'recovered' || outcome.status === 'incomplete') {
+                    void vscode.window.showInformationMessage(`Code Diff Tracker: ${outcome.reason}`);
+                } else { void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`); }
+                return outcome;
+            } finally { savedSessionRecoveryAction = false; }
+        }),
+        vscode.commands.registerCommand('diffTracker.discardSavedSessionRecovery', async () => {
+            if (savedSessionRecoveryAction) { return false; }
+            savedSessionRecoveryAction = true;
+            try {
+                const lifecycle = diffTracker.getMonitoringLifecycleStatus();
+                if (lifecycle.recording) {
+                    void vscode.window.showWarningMessage('Stop recording before discarding saved recovery files. The loaded review remains preserved.');
+                    return false;
+                }
+                if (!lifecycle.recoveryBlocked || lifecycle.disposed || lifecycle.baselineTransactionActive || lifecycle.recoveryRetryActive ||
+                    monitoringScopeController.hasActiveScopeAction()) {
+                    void vscode.window.showWarningMessage(lifecycle.blocker?.reason ?? 'Saved session discard is unavailable while another action is active.');
+                    return false;
+                }
+                const requestVersion = monitoringScopeController.getRequestVersion();
+                const answer = await vscode.window.showWarningMessage(
+                    'Permanently discard the saved review recovery files?',
+                    {modal:true,detail:'This deletes stored session baselines, pending review and Undo recovery files, including interrupted baseline/archived-review recovery records. Copy extension storage first if you may need it. Workspace files and monitoring preferences are not changed. Any loaded review is not replaced; rebuilding a baseline is a separate action.'},
+                    'Discard Saved Session'
+                );
+                const latest = diffTracker.getMonitoringLifecycleStatus();
+                if (answer !== 'Discard Saved Session') { return false; }
+                if (!latest.recoveryBlocked || latest.sessionEpoch !== lifecycle.sessionEpoch || latest.persistenceIssue !== lifecycle.persistenceIssue ||
+                    latest.disposed || latest.recording || latest.baselineTransactionActive || latest.recoveryRetryActive ||
+                    monitoringScopeController.hasActiveScopeAction() || monitoringScopeController.getRequestVersion() !== requestVersion) {
+                    void vscode.window.showWarningMessage('Recovery state or monitoring settings changed during confirmation. Saved review and newer settings are preserved; review the current status again.');
+                    return false;
+                }
+                const discarded = await diffTracker.discardRecoveryState();
+                if (discarded) {
+                    monitoringScopeController.reconcileRequestedScope();
+                    refreshReview();
+                    void vscode.window.showInformationMessage('Saved recovery files were discarded. Recording remains stopped. Review and apply the current monitoring request before starting a new baseline.');
+                } else { void vscode.window.showWarningMessage('Saved recovery files could not be discarded completely. Preserve extension storage and inspect Monitoring Scope Status.'); }
+                return discarded;
+            } finally { savedSessionRecoveryAction = false; }
         })
     );
 

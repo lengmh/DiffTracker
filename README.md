@@ -103,6 +103,10 @@ When stopped, opening Side-by-Side Diff uses a read-only Review Snapshot. Alread
 
 Open **Settings → Tools → Manage Monitoring Scope**, or run **Code Diff Tracker: Manage Monitoring Scope**. The old **Edit Watch Ignores** command opens this same manager. It shows the requested scope, effective scope, pending changes, preparation errors and current observation coverage.
 
+**Status** updates as recovery, baseline transactions, baseline scans and settings writes start or finish. It reports the actual blocking reason and available next step; interrupted durable baseline preparation requires **Reload Window**, not forcing a transaction lock clear. Unsaved scope drafts remain preserved during status updates.
+
+`legacyV3` identifies compatible monitoring policy, not a corrupt session. With no legacy rules and no pending Workspace request, recording can continue in compatibility mode. Legacy rules require review through migration preview; a completed rule migration still needs **Apply Saved Request** before configured scope becomes effective. Status distinguishes these stages from recovery failures.
+
 - **Rules** follows ordinary ignore policy. Explicit workspace-relative includes can add ignored paths; explicit exclusions still take precedence.
 - **Whole Workspace** requests all monitorable resources in the workspace, including ordinarily ignored files. Explicit exclusions and safety boundaries still apply; it does not mean every path is safely observable.
 - Scope expansion requires a trusted workspace and local consent tied to the workspace roots and requested scope. Shared settings do not transfer consent to another machine or extension host. Saving a request alone does not make it effective.
@@ -117,6 +121,8 @@ Recovery controls have distinct purposes:
 
 - **Apply Pending Scope** reviews and applies a requested scope; **Retry Scope Preparation** retries preparation of an already authorized scope.
 - **Recheck Observation Coverage** repairs observation and compares against the original baselines, as described above.
+- **Retry Saved Review Recovery**, available in Monitoring Scope and the Command Palette, retries validation of preserved session/last-good recovery data. Success restores a paused review with its original before-images and Undo; it does not apply scope settings or start a new baseline. Start exposes this recovery choice even when requested and effective scopes differ.
+- **Discard Saved Session…** separately confirms deletion of stored session, pending review and Undo recovery files, including interrupted-operation records. Preserve extension storage first if needed. It leaves workspace files and preferences unchanged and does not automatically rebuild. Failed validation may still require manual recovery; retry is not a guarantee of recovery.
 - **Restore Effective Scope Configuration** explicitly writes the previous effective scope back to Workspace Settings; **Migrate Legacy Watch Rules** opens migration preview.
 - **Clear Diffs** rebuilds the baseline while recording, or clears saved review state while stopped. It is not a substitute for Recheck.
 
@@ -262,6 +268,7 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.watchExclude` | `[]` | Structured explicit exclusions without `!` negation; legacy string entries retain compatibility until migration |
 | `diffTracker.onlyRecordReviewableText` | `false` | Skip new unsupported resources using safe content classification; preserve existing review and Undo |
 | `diffTracker.autoOpenNextPendingFile` | `false` | Open the next pending file after successful single-file review, only when the current file has no remaining review |
+| `diffTracker.enableSourceTracking` | `false` | Opt in to experimental source hints for Vibe Coding Only; baseline and coverage warnings remain visible when off |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | Track external/tagged automation edits while retaining uncertain editor edits for explicit review |
 
 Choose the opening mode in **Settings → Display → Default open mode**, through **Select Default Open Mode**, or in VS Code settings. The values are `webview`, `inline`, `sideBySide`, `original`, `splitOriginalWebview` and `nativeReview`. Display/highlight settings remain in the sidebar Settings panel; monitoring rules are in **Manage Monitoring Scope**.
@@ -278,7 +285,7 @@ Automatic navigation uses a stable path order and the configured default open mo
 
 When `diffTracker.onlyTrackAutomatedChanges` is enabled:
 
-- Editor events without reliable source information remain visible with an uncertainty notice.
+- Editor events without reliable source information remain pending. Optional source hints require `diffTracker.enableSourceTracking`, which is off by default. Switching it on affects new observations; it does not reconstruct source attribution for earlier edits.
 - External tools or CLI processes that modify files on disk are still tracked through file watchers.
 - VS Code extensions should call `diffTracker.beginAutomationSession` before applying edits and `diffTracker.endAutomationSession` after they finish.
 

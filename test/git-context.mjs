@@ -208,7 +208,7 @@ test('production start blocks invalid monitoring scope configuration',async()=>{
             consented:false
         })},
         diffTracker:{
-            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
+            getMonitoringLifecycleStatus:()=>({disposed:false,recoveryBlocked:false}),isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
@@ -237,13 +237,12 @@ test('production start revalidates scope after rebuild confirmation',async()=>{
         gitContextMonitor:{whenReady:async()=>true,isReady:()=>true,getSnapshots:()=>[]},
         monitoringScopeController:{getStatus:()=>status},
         diffTracker:{
-            isRecoveryBlocked:()=>true,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
-            discardRecoveryState:async()=>{calls.push('discard');return true;},
+            getMonitoringLifecycleStatus:()=>({disposed:false,recoveryBlocked:false}),isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'building',getTrackedChanges:()=>[],
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{
-            showWarningMessage:async()=>undefined,
-            showErrorMessage:async()=>{
+            showWarningMessage:async(_message,options)=>{
+                if (!options?.modal) { return undefined; }
                 status={
                     requested:{ok:true,scope:{scopeRevision:'scope-b'}},
                     effective:{kind:'configured',scopeRevision:'scope-a'},
@@ -251,14 +250,14 @@ test('production start revalidates scope after rebuild confirmation',async()=>{
                     expansionReasons:[],
                     consented:true
                 };
-                return 'Discard Saved Session and Rebuild';
+                return 'Rebuild Baseline';
             }
         }}
     };
     vm.createContext(sandbox);
     vm.runInContext(ts.transpileModule(`let recordingRequest=0;${declarations.join('\n')}globalThis.startRecordingFlow=startRecordingFlow;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,sandbox);
     assert.equal(await sandbox.startRecordingFlow(),false);
-    assert.deepEqual(calls,['discard']);
+    assert.deepEqual(calls,[]);
 });
 
 test('production start blocks reset Workspace scope when configured effective differs',async()=>{
@@ -278,7 +277,7 @@ test('production start blocks reset Workspace scope when configured effective di
             consented:false
         })},
         diffTracker:{
-            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
+            getMonitoringLifecycleStatus:()=>({disposed:false,recoveryBlocked:false}),isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
@@ -306,7 +305,7 @@ test('production start blocks an unapplied configured scope revision',async()=>{
             consented:true
         })},
         diffTracker:{
-            isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
+            getMonitoringLifecycleStatus:()=>({disposed:false,recoveryBlocked:false}),isRecoveryBlocked:()=>false,getIsRecording:()=>false,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
             startRecording:()=>{calls.push('start');return true;},setBaselineGitContexts:()=>calls.push('capture')
         },
         vscode:{workspace:vscode.workspace,commands:{executeCommand:async()=>{}},window:{showWarningMessage:async()=>undefined}}
@@ -324,7 +323,7 @@ for(const scenario of ['fresh','stopped','restored']) test(`production activatio
     assert.equal(declarations.length,5);
     let release;const ready=new Promise(resolve=>{release=resolve;});const calls=[];let recording=scenario==='restored';
     const sandbox={restoreOutcome:scenario==='restored'?'restored':'absent',runningExtensionTests:true,
-        diffTracker:{isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
+        diffTracker:{getMonitoringLifecycleStatus:()=>({disposed:false,recoveryBlocked:false}),isRecoveryBlocked:()=>false,getIsRecording:()=>recording,getBaselineState:()=> 'idle',getTrackedChanges:()=>[],
             startRecording:()=>{recording=true;calls.push('start');return true;},stopRecording:()=>{recording=false;calls.push('stop');},
             setBaselineGitContexts:()=>calls.push('capture'),reconcileRestoredGitContexts:()=>calls.push('reconcile'),
             setGitContextPending:()=>calls.push('release')},

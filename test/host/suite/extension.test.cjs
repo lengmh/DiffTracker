@@ -926,6 +926,7 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await state()).reviewTokens.length, 0);
         assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
+        await require('./deleted-directory-coverage.test.cjs')(workspacePath);
         await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./s4c-handoff.test.cjs')(workspacePath);
         await require('./s4d-handoff-refusal.test.cjs')(workspacePath);

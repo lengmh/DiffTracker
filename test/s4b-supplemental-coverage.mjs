@@ -33,7 +33,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
     const {test, Uri, DiffTracker, file, getTracker, setTracker, setVsCodeExcludes, nativeDirectoryWatchers,
         fireConfigurationChanged} = h;
 
-    test('Issue #39 deleted supplemental target retires only after committed exclusion and keeps review evidence', () => fixture(async ({tracker,dir,scope}) => {
+    test('Issue #39 deleted target without reconstruction coverage retires after committed exclusion and keeps review evidence', () => fixture(async ({tracker,dir,scope}) => {
         const blind = path.join(dir, '.aws');
         const pending = path.join(dir, 'pending.txt');
         const gitHead = path.join(dir, '.git', 'HEAD');
@@ -49,10 +49,16 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         await tracker.onExternalFileChanged(Uri.file(pending));
         await h.waitUntil(() => tracker.getReviewToken(pending));
         fs.rmdirSync(blind);
-        await tracker.onExternalFileDeleted(Uri.file(blind));
+        const watch = fs.watch;
+        fs.watch = (directory,...args) => {
+            if (path.resolve(String(directory)) === path.resolve(dir)) { throw Object.assign(new Error('guard quota'),{code:'ENOSPC'}); }
+            return watch(directory,...args);
+        };
+        try { await tracker.onExternalFileDeleted(Uri.file(blind)); }
+        finally { fs.watch = watch; }
         assert.equal(oldOwner.active, false, 'confirmed deletion closes the dead native owner');
         assert.equal(tracker.getSubtreeCoverageGaps().find(gap => gap.targetPath === blind)?.reasonCode,
-            'supplemental-watcher-target-missing-gap');
+            'supplemental-watcher-system-limit-gap');
         const before = {
             snapshots: [...tracker.fileSnapshots], reviews: structuredClone(tracker.getTrackedChanges()),
             token: tracker.getReviewToken(pending), head: fs.readFileSync(gitHead, 'utf8')
@@ -2134,8 +2140,14 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             }
             owner.listener('rename', 'child');
             await settle(tracker);
-            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
-                'a named directory self-event cannot certify a handle bound to the old inode');
+            if (replacement === 'missing') {
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],
+                    'verified absence retires the old inode while the live direct parent observes reconstruction');
+                assert.equal(tracker.getTrackedChange(target)?.isDeleted,true);
+            } else {
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
+                    'a named directory self-event cannot certify a handle bound to the old inode');
+            }
             assert.equal(owner.active, false);
             assert.equal(tracker.getOriginalContent(target), 'before');
             const before = tracker.getSubtreeCoverageGaps();

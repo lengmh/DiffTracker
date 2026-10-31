@@ -192,6 +192,12 @@
           "deprecationMessage": "Deprecated. Use diffTracker.onlyTrackAutomatedChanges instead.",
           "description": "Deprecated alias for automation-only tracking."
         },
+        "diffTracker.enableSourceTracking": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Enable experimental change-source hints for Vibe Coding Only. Uncertain changes remain pending for review. Turning this off hides source hints while preserving baseline and observation warnings."
+        },
         "diffTracker.onlyTrackAutomatedChanges": {
           "type": "boolean",
           "default": false,
@@ -284,6 +290,16 @@
         "title": "Start Recording",
         "category": "Code Diff Tracker",
         "icon": "$(record)"
+      },
+      {
+        "command": "diffTracker.retrySavedSessionRecovery",
+        "title": "Retry Saved Review Recovery",
+        "category": "Code Diff Tracker"
+      },
+      {
+        "command": "diffTracker.discardSavedSessionRecovery",
+        "title": "Discard Saved Session Recovery Files",
+        "category": "Code Diff Tracker"
       },
       {
         "command": "diffTracker.stopRecording",
