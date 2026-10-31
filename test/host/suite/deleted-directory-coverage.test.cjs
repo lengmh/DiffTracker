@@ -100,13 +100,17 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         const rechecked=await tracker.recheckObservationCoverage();
         tracker.deferCoverageRecheckEvent=defer;
         if (rechecked.status === 'limited') {
-            // The real Host can deliver the preceding native deletion to a
-            // newly registered recursive listener during this explicit Recheck.
+            // The real Host can deliver the preceding native deletion or the
+            // deliberate sibling edit again during this explicit Recheck.
             // That is real concurrent evidence: preserve its root marker. Do
             // not sleep/retry or weaken the production event barrier to force Full.
             assert.ok(notifications.length > 0);
-            assert.ok(notifications.every(event=>event.name===path.relative(workspace,root) && event.kind==='delete'),JSON.stringify(notifications));
+            assert.ok(notifications.every(event=>
+                event.name===path.relative(workspace,root) && event.kind==='delete' ||
+                event.name===path.relative(workspace,sibling) && event.kind==='change'),JSON.stringify(notifications));
             assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===workspace && gap.reasonCode==='coverage-recheck-incomplete'));
+            assert.equal(tracker.getOriginalContent(sibling),'original sibling baseline');
+            assert.equal(tracker.getTrackedChange(sibling)?.currentContent,'sibling edited during restore certification');
             console.log('PASS HOST-DELETED-COVERAGE public Recheck preserves Limited for real concurrent deletion callbacks');
         } else { assert.equal(rechecked.status,'rechecked',JSON.stringify({rechecked,gaps:tracker.getSubtreeCoverageGaps()})); }
         assert.deepEqual(tracker.getReviewToken(file),token);

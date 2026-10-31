@@ -1155,12 +1155,28 @@ export class DiffTracker {
             if (interrupted.kind === 'valid') {
                 const outcome = await this.reconcilePersistedState(epoch, interrupted.state);
                 if ((outcome !== 'restored' && outcome !== 'incomplete') || !this.isCurrentEpoch(epoch)) { return 'blocked'; }
-                if (!await this.flushPendingPersistence() || !this.isCurrentEpoch(epoch)) {
+                const recoverySaved = await this.flushPendingPersistence();
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                if (!recoverySaved) {
                     this.recoveryBlocked = true;
                     return 'blocked';
                 }
                 await this.deletePersistedFile(this.getPersistedStateUri(recoveringKeep ? this.keepIntentFileName : this.archiveRestoreIntentFileName)!);
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
                 if (recoveringKeep) { this.cleanupResolvedBaselineBackup(); }
+                // Intent cleanup and its preceding save can receive more real
+                // notifications after the inner reconciliation completed. Drain
+                // and save them before returning a projection that retry freezes.
+                while (this.restoreEvents.size > 0) {
+                    if (!await this.drainRestoreEvents(epoch)) { return 'blocked'; }
+                    const eventsSaved = await this.flushPendingPersistence();
+                    if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+                    if (!eventsSaved) {
+                        this.recoveryBlocked = true;
+                        return 'blocked';
+                    }
+                }
+                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
                 this.persistenceIssue = recoveringKeep
                     ? 'An interrupted baseline acceptance was rolled back to its saved before-images; review remains pending.'
                     : 'An interrupted archived review restore was rolled back to the pre-restore session. The original archive is unchanged.';
@@ -1403,23 +1419,7 @@ export class DiffTracker {
             await this.certifyMissingDirectoryCoverage(restoredSupplemental,epoch);
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         }
-        while (this.restoreEvents.size > 0) {
-            if (failOnActivity) { throw new Error('Workspace activity interrupted archive reconciliation; retry after writes settle'); }
-            if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
-                await this.refreshIgnoreMatchers();
-                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
-            }
-            const restoreEvents = [...this.restoreEvents.values()];
-            this.restoreEvents.clear();
-            for (const { uri, kind } of restoreEvents) {
-                if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-                if (this.isPathIgnored(uri)) { continue; }
-                if (kind === 'create') { await this.onExternalFileCreated(uri); }
-                else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
-                else { await this.readFileAndUpdate(uri.fsPath, uri); }
-            }
-        }
+        if (!await this.drainRestoreEvents(epoch,failOnActivity)) { return 'blocked'; }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
             this.persistenceIssue = missingStoppedReview
@@ -1436,6 +1436,29 @@ export class DiffTracker {
             return 'incomplete';
         }
         return recovered ? 'recovered' : 'restored';
+    }
+
+    private async drainRestoreEvents(epoch: number, failOnActivity = false): Promise<boolean> {
+        while (this.restoreEvents.size > 0) {
+            if (!this.isCurrentEpoch(epoch)) { return false; }
+            if (failOnActivity) { throw new Error('Workspace activity interrupted archive reconciliation; retry after writes settle'); }
+            if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
+                await this.refreshIgnoreMatchers();
+                if (!this.isCurrentEpoch(epoch)) { return false; }
+                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
+                if (!this.isCurrentEpoch(epoch)) { return false; }
+            }
+            const restoreEvents = [...this.restoreEvents.values()];
+            this.restoreEvents.clear();
+            for (const { uri, kind } of restoreEvents) {
+                if (!this.isCurrentEpoch(epoch)) { return false; }
+                if (this.isPathIgnored(uri)) { continue; }
+                if (kind === 'create') { await this.onExternalFileCreated(uri); }
+                else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
+                else { await this.readFileAndUpdate(uri.fsPath, uri); }
+            }
+        }
+        return this.isCurrentEpoch(epoch);
     }
 
     private shouldTrackOnlyAutomatedChanges(): boolean {

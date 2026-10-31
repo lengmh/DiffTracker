@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const vscode = require('vscode');
+const {createHash} = require('node:crypto');
 const {DiffTracker} = require('../../../out/diffTracker.js');
 const {MonitoringScopeController} = require('../../../out/monitoringScopeController.js');
 
@@ -61,6 +62,29 @@ module.exports = async function monitoringLifecycleStatusHost(workspace) {
         assert.equal(JSON.stringify(controller.getStatus().rawRequested),requestedBefore);
         assert.ok(observed.some(item=>item.lifecycle.recoveryRetryActive));
         assert.equal(observed.at(-1).lifecycle.recoveryRetryActive,false);
+        const intent=path.join(storage,'session-state.keep-in-progress.json');
+        fs.writeFileSync(path.join(storage,'session-state.pre-keep.json'),saved);
+        fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        const remove=tracker.deletePersistedFile.bind(tracker);let cleanupEdit=false;
+        tracker.deletePersistedFile=async uri=>{
+            if(uri.fsPath===intent && !cleanupEdit){
+                cleanupEdit=true;fs.writeFileSync(file,'newer edit during intent cleanup');
+                const deadline=Date.now()+15000;
+                while(!tracker.restoreEvents.has(file)){
+                    assert.ok(Date.now()<deadline,'real Host must deliver the intent-cleanup edit before its barrier is released');
+                    await new Promise(resolve=>setTimeout(resolve,25));
+                }
+            }
+            return remove(uri);
+        };
+        tracker.recoveryBlocked=true;
+        assert.equal((await tracker.retrySavedSessionRecovery()).status,'recovered');
+        tracker.deletePersistedFile=remove;
+        assert.equal(cleanupEdit,true);assert.equal(tracker.getIsRecording(),false);
+        assert.equal(tracker.getOriginalContent(file),'original lifecycle baseline');
+        assert.equal(tracker.getTrackedChange(file)?.currentContent,'newer edit during intent cleanup');
+        assert.equal(JSON.parse(fs.readFileSync(primary)).stoppedReviews.find(review=>review.filePath===file)?.currentContent,'newer edit during intent cleanup');
+        console.log('PASS HOST-LIFECYCLE-DIAGNOSTICS real edit during interrupted Keep intent cleanup is reconciled before retry saves the paused review');
         subscription.dispose();
         console.log('PASS HOST-LIFECYCLE-DIAGNOSTICS distinct recovery/transaction status, valid legacy compatibility and last-good retry preserve original review in paused mode');
         await vscode.extensions.getExtension('lengmh.code-diff-tracker').activate();

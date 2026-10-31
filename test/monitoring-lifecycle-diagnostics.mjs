@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 
 export function registerMonitoringLifecycleDiagnostics(h,fixture) {
     const {test,Uri,waitUntil}=h;
@@ -104,6 +105,48 @@ export function registerMonitoringLifecycleDiagnostics(h,fixture) {
             assert.match(tracker.getMonitoringLifecycleStatus().persistenceIssue,/Failed to discard/);
             assert.equal(tracker.getMonitoringLifecycleStatus().persistenceFailed,true);
         } finally {h.faults.clear();}
+    }));
+
+    for(const operation of ['keep','restore'])for(const kind of operation==='keep'?['change','delete','new-epoch','save-failure']:['change','delete'])
+    test(`LIFECYCLE-DIAGNOSTICS interrupted ${operation} recovery drains ${kind} at intent cleanup before pausing`,()=>fixture(async({tracker,dir,scope})=>{
+        const file=path.join(dir,'review.txt');fs.writeFileSync(file,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri.fsPath,saved=fs.readFileSync(path.join(storage,'session-state.json'));
+        const backup=path.join(storage,operation==='keep'?'session-state.pre-keep.json':'session-state.pre-restore.json');
+        const intent=path.join(storage,operation==='keep'?'session-state.keep-in-progress.json':'session-state.restore-in-progress.json');
+        fs.writeFileSync(backup,saved);fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        tracker.isRecording=false;tracker.disposeFileWatchers();tracker.recoveryBlocked=true;
+        const gate=h.pause(intent,'delete'),retry=tracker.retrySavedSessionRecovery();
+        try {
+            await gate.entered;
+            if(kind==='new-epoch'){
+                tracker.advanceEpoch();tracker.recoveryBlocked=false;tracker.isRecording=false;
+                gate.release();assert.equal((await retry).status,'conflict');
+                assert.equal(tracker.isRecoveryBlocked(),false,'late cleanup cannot block a newer lifecycle');
+                return;
+            }
+            if(kind==='delete')fs.unlinkSync(file);else fs.writeFileSync(file,'edited at cleanup');
+            tracker.dispatchExternalEvent(Uri.file(file),kind==='delete'?'delete':'change',tracker.sessionEpoch);
+            assert.equal(tracker.restoreEvents.size,1);
+            if(kind==='save-failure')h.faults.set(path.join(storage,'session-state.json'),{copy:new Error('synthetic late recovery save failure')});
+            gate.release();const result=await retry;
+            if(kind==='save-failure'){
+                assert.equal(result.status,'blocked');assert.equal(tracker.isRecoveryBlocked(),true);
+                assert.equal(tracker.getOriginalContent(file),'original');
+                assert.equal(fs.readFileSync(file,'utf8'),'edited at cleanup');
+                assert.equal(new Map(JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'))).fileSnapshots).get(file),'original');
+                assert.ok(fs.existsSync(path.join(storage,'session-state.unsaved')));
+                return;
+            }
+            assert.equal(result.status,'recovered');
+            assert.equal(tracker.getIsRecording(),false);assert.equal(tracker.getOriginalContent(file),'original');
+            const change=tracker.getTrackedChange(file);assert.ok(change,'intent cleanup must not discard a known notification');
+            assert.equal(change.isDeleted,kind==='delete');
+            if(kind==='change')assert.equal(change.currentContent,'edited at cleanup');
+            const paused=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+            assert.ok(paused.stoppedReviews.some(review=>review.filePath===file));
+        } finally {gate.release();await retry;h.faults.clear();}
     }));
 
 }
