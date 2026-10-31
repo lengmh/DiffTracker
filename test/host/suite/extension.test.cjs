@@ -911,14 +911,23 @@ module.exports = async function runExtensionHostScenario() {
         }
 
 
-        await filesConfig.update('watcherExclude', previousWatcherExclude,
-            vscode.ConfigurationTarget.Workspace);
-        await scopeConfig.update('watchInclude', [privateInclude],
-            vscode.ConfigurationTarget.Workspace);
-        await delay(250);
-
+        const clearCheckpoint = async () => {
+            const current = await state();
+            const scope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+            return {isRecording:current.isRecording,baselineState:current.baselineState,
+                lifecycle:scope.lifecycle,pendingScope:scope.hasPendingChanges,
+                review:current.trackedChanges.find(item=>item.filePath===uri('batch-a.txt').fsPath),
+                gaps:current.subtreeCoverageGaps.map(gap=>({target:path.relative(workspacePath,gap.targetPath),reasonCode:gap.reasonCode}))};
+        };
+        // Keep this Clear test on the observation configuration just verified
+        // above. Updating watcherExclude can reinstall the Host watcher; a
+        // fixed delay does not certify delivery of the next filesystem event.
+        const beforeClear=await clearCheckpoint();
+        assert.equal(beforeClear.isRecording,true,JSON.stringify(beforeClear));
+        assert.equal(beforeClear.baselineState,'ready',JSON.stringify(beforeClear));
         await write('batch-a.txt', 'stopped clear preserves disk\n');
-        await untilStable('stopped clear pending', () => pending('batch-a.txt'));
+        try {await untilStable('stopped clear pending', () => pending('batch-a.txt'));}
+        catch(error){throw new Error(`${error.message}; checkpoint=${JSON.stringify(await clearCheckpoint())}`);}
         await vscode.commands.executeCommand('diffTracker.stopRecording');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
         assert.equal((await state()).isRecording, false);
@@ -926,6 +935,15 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await state()).reviewTokens.length, 0);
         assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
+        // Restore the fixture configuration after observation has stopped,
+        // before the independent coverage fixtures acquire their own owners.
+        await filesConfig.update('watcherExclude', previousWatcherExclude,
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [privateInclude],
+            vscode.ConfigurationTarget.Workspace);
+        assert.equal((await state()).isRecording,false);
+        assert.deepEqual(filesConfig.inspect('watcherExclude')?.workspaceValue,previousWatcherExclude);
+        assert.deepEqual(scopeConfig.inspect('watchInclude')?.workspaceValue,[privateInclude]);
         await require('./deleted-directory-coverage.test.cjs')(workspacePath);
         await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./s4c-handoff.test.cjs')(workspacePath);

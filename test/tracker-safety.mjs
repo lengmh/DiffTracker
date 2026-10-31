@@ -314,7 +314,9 @@ test(`PR60 lifecycle creation reconciles unstable first snapshot once (${activit
         const storage=file('creation-superseded-storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
         publication=pause(path.join(storage,'session-state.tmp.json'),'write');
     }
-    fs.writeFileSync(p,'');let opens=0;
+    // VS Code metadata may expose a coarse mtime. Size changes make ongoing
+    // writes observable without relying on the platform clock's resolution.
+    fs.writeFileSync(p,'');faults.set(p,{mtime:1});let opens=0;
     fs.promises.open=async(target,...args)=>{
         const handle=await open(target,...args);
         if(String(target)===p){
@@ -322,7 +324,7 @@ test(`PR60 lifecycle creation reconciles unstable first snapshot once (${activit
             handle.read=async(...input)=>{
                 const result=await read(...input);
                 if(!changed&&(pass===1||activity==='continues-through-read')){
-                    changed=true;fs.writeFileSync(p,`settled creation text ${pass}`);
+                    changed=true;fs.writeFileSync(p,`settled creation text ${pass}${'!'.repeat(pass-1)}`);
                 }
                 return result;
             };
