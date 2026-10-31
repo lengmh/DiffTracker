@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.13
+
+- Apply exclusions when the settings file or its directory is already excluded. Require verified exclusion evidence before ignoring notifications, and preserve competing edits, drafts, pending reviews and Undo when identity or scope changes.
+- Restore older imported-directory coverage obligations through guarded Recheck without replacing original baselines. Release overlapping watcher bridges only after their replacement is verified, and continue observing later changes.
+- Reconcile buffered directory changes and deletions before reporting Recheck completion, including independent nested workspace roots below an excluded ancestor. Preserve revision-bound recovery evidence when activity exceeds the bounded queue or verification cannot finish.
+- Keep final scope-operation results available across commands and closed panels. Reject stale migration confirmations instead of overwriting newer settings or drafts.
+- Reconcile newly created files when the first read races a write, without depending on another notification. Continuing instability and read failures remain unverified rather than becoming accepted baselines.
+- Known limitation: an earlier Windows settings-publication timeout was not reproduced by final verification; its underlying cause remains unconfirmed.
+
 ## 0.8.12
 
 - Coordinate exclusion settings saves and Apply across single-folder configuration aliases, delayed readback and missing notifications. Quick exclusions, Save and Apply, Save Request Only and Restore retain their existing confirmation and safety guards.
