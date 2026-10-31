@@ -24,8 +24,12 @@ async function changeFolders(matches, change) {
     finally { listener.dispose(); }
 }
 
-module.exports = async function nestedRecheckDeletionHost(outerPath) {
-    const outer = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(outerPath));
+module.exports = async function nestedRecheckDeletionHost(workspacePath) {
+    const outer = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workspacePath));
+    assert.ok(outer, 'outer workspace must be registered');
+    // Use VS Code's fsPath spelling (including Windows drive normalization)
+    // for all later comparisons with workspace and watcher notification paths.
+    const outerPath = outer.uri.fsPath;
     const ancestor = path.join(outerPath, 'excluded-recheck', 'container');
     const inner = path.join(ancestor, 'nested');
     const files = ['one.txt', 'two.txt'].map(name => path.join(inner, 'selected', name));
