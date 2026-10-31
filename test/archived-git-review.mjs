@@ -160,6 +160,36 @@ export function registerArchivedGitReview(h) {
         }finally{gate.release();await operation;}
     },{configured:true,stoppedArchive:true}));
 
+    for(const newProof of [false,true])test(`P2-INFLIGHT-CREATE-ANCESTOR newProof=${newProof}`,()=>fixture(async ctx=>{
+        const root=path.join(ctx.workspace,'incoming'),child=path.join(root,'created.txt');fs.mkdirSync(root);
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);let classification;
+        try{
+            await gate.entered;fs.writeFileSync(child,'first incarnation');classification=pause(child,'stat');
+            emitWatcher('create',Uri.file(child));gate.release();
+            await Promise.race([classification.entered,operation.then(result=>{throw new Error(`Restore finished before file classification: ${JSON.stringify(result)}`);})]);
+            fs.rmSync(root,{recursive:true});emitWatcher('delete',Uri.file(root));
+            fs.mkdirSync(root);fs.writeFileSync(child,'unproven replacement');emitWatcher('create',Uri.file(root));
+            if(newProof){emitWatcher('create',Uri.file(child));}
+            classification.release();assert.equal((await operation).status,'restored');
+            await assertDirectoryChildProvenance(ctx.tracker,child,newProof,'unproven replacement');
+        }finally{gate.release();classification?.release();await operation;}
+    },{configured:true,stoppedArchive:true}));
+
+    test('P2-INFLIGHT-CREATE-TYPE change observes a directory after file proof expires',()=>fixture(async ctx=>{
+        const root=path.join(ctx.workspace,'incoming'),target=path.join(root,'created.txt'),child=path.join(target,'child.txt');fs.mkdirSync(root);
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);let classification;
+        try{
+            await gate.entered;fs.writeFileSync(target,'first file');classification=pause(target,'stat');
+            emitWatcher('create',Uri.file(target));gate.release();await classification.entered;
+            fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');emitWatcher('change',Uri.file(target));
+            classification.release();assert.equal((await operation).status,'restored');
+            assert.equal(ctx.tracker.getOriginalContent(child),undefined);assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),true);
+            assert.equal(ctx.tracker.getReviewToken(child),undefined);assert.equal((await ctx.tracker.revertBlock(child,0)).status,'conflict');
+        }finally{gate.release();classification?.release();await operation;}
+    },{configured:true,stoppedArchive:true}));
+
     async function assertDirectoryChildProvenance(tracker,child,knownAbsence,contents) {
         assert.equal(fs.readFileSync(child,'utf8'),contents);
         if(knownAbsence){

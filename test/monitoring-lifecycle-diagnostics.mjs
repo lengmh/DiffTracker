@@ -247,4 +247,29 @@ export function registerMonitoringLifecycleDiagnostics(h,fixture) {
         }finally{gate.release();await restore;}
     }));
 
+    for(const operation of ['keep','restore']) for(const notify of [false,true])
+    test(`INDEPENDENT-TYPE-AWAIT ${operation} notify=${notify}`,()=>fixture(async({tracker,dir,scope})=>{
+        const known=path.join(dir,'known.txt'),target=path.join(dir,'introduced'),child=path.join(target,'child.txt');
+        fs.writeFileSync(known,'original');assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.fileSnapshots.set(known,'original');tracker.baselineExistingFiles.add(known);assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri.fsPath,saved=fs.readFileSync(path.join(storage,'session-state.json'));
+        const intent=path.join(storage,`session-state.${operation}-in-progress.json`);
+        fs.writeFileSync(path.join(storage,`session-state.pre-${operation}.json`),saved);
+        fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        tracker.isRecording=false;tracker.disposeFileWatchers();tracker.recoveryBlocked=true;
+        const cleanup=h.pause(intent,'delete'),retry=tracker.retrySavedSessionRecovery();let classification;
+        try{
+            await cleanup.entered;fs.writeFileSync(target,'independently created file');
+            tracker.dispatchExternalEvent(Uri.file(target),'create',tracker.sessionEpoch);
+            classification=h.pause(target,'stat');cleanup.release();await classification.entered;
+            fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven contents');
+            if(notify)tracker.dispatchExternalEvent(Uri.file(target),'change',tracker.sessionEpoch);
+            classification.release();assert.equal((await retry).status,'recovered');
+            assert.equal(tracker.getOriginalContent(known),'original');
+            assert.equal((await tracker.revertBlock(child,0)).status,'conflict','file proof cannot authorize replacement-directory children');
+            assert.equal(tracker.fileSnapshots.has(child),false);assert.equal(tracker.unresolvedBaselineFiles.has(child),true);
+            assert.equal(tracker.getReviewToken(child),undefined);assert.equal(fs.readFileSync(child,'utf8'),'unproven contents');
+        }finally{cleanup.release();classification?.release();await retry;}
+    }));
+
 }
