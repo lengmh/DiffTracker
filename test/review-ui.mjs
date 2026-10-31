@@ -2994,3 +2994,72 @@ await test('LIFECYCLE-DIAGNOSTICS retry reconciles newer requested settings with
     assert.deepEqual(h.state.reconciledVersions,['newer']);assert.equal(h.state.starts,0);assert.equal(h.state.discards??0,0);
     assert.deepEqual(h.state.reconciliations,[h.state.gitSnapshots],'restored Git baselines are checked against the latest monitor snapshots');
 });
+
+function lateSettingsStatusFixture(){
+    const h=monitoringScopeCommandHarness();h.controller.dispose();
+    const changes=new h.vscode.EventEmitter();h.vscode.workspace.onDidChangeConfiguration=changes.event;
+    const getConfiguration=h.vscode.workspace.getConfiguration,late=deferred();
+    h.vscode.workspace.getConfiguration=(...args)=>({...getConfiguration(...args),update:()=>late.promise});
+    const controller=new (h.load('monitoringScopeController.ts').MonitoringScopeController)(h.controller.context,h.tracker);
+    const panel=h.WatchExcludePanel.createOrShow({fsPath:'/synthetic/extension'},h.tracker,controller);
+    const ui=connectScopeEditor(h),draft='[ synthetic unsaved draft';ui.input('excludes',draft);
+    return {h,changes,getConfiguration,late,controller,panel,ui,draft};
+}
+
+await test('P2-LATE-SETTINGS settlement publishes the released fence without replacing a draft',async()=>{
+    const {h,changes,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    try{
+        const result=await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]});
+        assert.equal(result.ok,false);assert.equal(controller.getStatus().lifecycle.settingsWritePending,true);
+        assert.equal(ui.elements.get('apply').disabled,true);
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:key=>key==='diffTracker.monitoringScope'});
+        late.resolve();await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(controller.getStatus().lifecycle.settingsWritePending,false);
+        assert.equal(ui.elements.get('excludes').value,draft);
+        const latest=h.messages.filter(message=>message.command==='scopeStatus').at(-1);
+        assert.equal(latest.lifecycle.settingsWritePending,false,'publish the released write fence');
+        assert.equal(ui.elements.get('apply').disabled,false);assert.equal(ui.elements.get('save-apply').disabled,false);
+    }finally{late.resolve();panel.dispose();controller.dispose();}
+});
+
+await test('P2-LATE-SETTINGS disposed controller cannot publish or apply a late settlement',async()=>{
+    const {h,changes,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    try{
+        assert.equal((await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]})).ok,false);
+        panel.dispose();controller.dispose();
+        const count=h.messages.length,effective=JSON.stringify(h.tracker.getEffectiveMonitoringScope());
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:()=>true});late.resolve();
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(h.messages.length,count);assert.equal(controller.getStatus().lifecycle.controllerDisposed,true);
+        assert.equal(JSON.stringify(h.tracker.getEffectiveMonitoringScope()),effective);
+        assert.equal(ui.elements.get('excludes').value,draft);
+    }finally{late.resolve();panel.dispose();controller.dispose();}
+});
+
+await test('P2-LATE-SETTINGS released old fence cannot clear a new queued write status',async()=>{
+    const {h,changes,getConfiguration,late,controller,panel,ui,draft}=lateSettingsStatusFixture();
+    const next=deferred();let newer,subscription,started=false,held=false;
+    try{
+        assert.equal((await controller.saveRequestedScope({mode:'rules',includes:[],excludes:[]})).ok,false);
+        h.vscode.workspace.getConfiguration=(...args)=>{
+            const config=getConfiguration(...args);
+            return {...config,update:async(...values)=>{if(!held){held=true;await next.promise;}return config.update(...values);}};
+        };
+        subscription=controller.onDidChangeStatus(()=>{
+            if(!started && !controller.getStatus().lifecycle.settingsWritePending){
+                started=true;newer=controller.saveRequestedScope({mode:'wholeWorkspace',includes:[],excludes:[]});
+            }
+        });
+        h.state.workspaceConfiguration.monitoringScope='rules';
+        changes.fire({affectsConfiguration:()=>true});late.resolve();
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.ok(newer);assert.equal(controller.getStatus().lifecycle.settingsWritePending,true);
+        assert.equal(h.messages.filter(message=>message.command==='scopeStatus').at(-1).lifecycle.settingsWritePending,true);
+        assert.equal(ui.elements.get('apply').disabled,true);assert.equal(ui.elements.get('excludes').value,draft);
+        next.resolve();assert.equal((await newer).ok,true);
+        assert.equal(h.messages.filter(message=>message.command==='scopeStatus').at(-1).lifecycle.settingsWritePending,false);
+        assert.equal(ui.elements.get('apply').disabled,false);assert.equal(ui.elements.get('excludes').value,draft);
+    }finally{late.resolve();next.resolve();await newer;subscription?.dispose();panel.dispose();controller.dispose();}
+});

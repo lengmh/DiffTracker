@@ -529,6 +529,7 @@ export class MonitoringScopeController implements vscode.Disposable {
                         // ordinary pending-request privacy pause. Restore that
                         // projection without applying or writing anything.
                         this.reconcileRequestedScope();
+                        if (!this.disposed) { this._onDidChangeStatus.fire(); }
                     }
                 } else if (conflict) { finish(conflict); }
                 else if (responseError) {
