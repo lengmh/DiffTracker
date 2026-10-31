@@ -1998,11 +1998,11 @@ export class DiffTracker {
             }
             if (this.isCurrentEpoch(epoch)) {
                 this.restoringEpoch = undefined;
-                // One bounded replay only. A busy workspace is a visible limited
-                // result, not an unbounded rescan/retry loop.
-                const events = [...this.restoreEvents.values()];
+                // Consume replacements produced by a handler as well as the
+                // initial batch, within the same fixed notification allowance.
                 const deletedTargets = new Set<ScopeCoverageTarget>();
-                for (const event of events) {
+                for (let replayed=0; replayed<this.maxScopePreflightEntries && this.restoreEvents.size>0; replayed++) {
+                    const event = this.restoreEvents.values().next().value!;
                     const { uri, kind } = event;
                     const reconcileDirectory = this.queuedEventNeedsObservation(event);
                     if (!this.isCurrentEpoch(epoch)) { break; }
@@ -2026,6 +2026,30 @@ export class DiffTracker {
                         if (this.isCurrentEpoch(epoch)) { await this.reconcileDirectoryObservation(uri,epoch); }
                     } else if (this.isCurrentEpoch(epoch)) {
                         await this.readFileAndUpdate(uri.fsPath,uri,()=>this.isCurrentEpoch(epoch));
+                    }
+                }
+                if (this.isCurrentEpoch(epoch) && this.restoreEvents.size>0) {
+                    completion.overflow ||= [...this.restoreEvents.keys()].some(selected);
+                    try {
+                        const budget=this.createCandidatePersistenceBudget();
+                        const retained=new Map<string,CoverageGapEvidence>();
+                        for (const event of this.restoreEvents.values()) {
+                            const target=event.uri.fsPath;
+                            const targetKind=this.queuedEventNeedsObservation(event) || this.hasHistoricalDirectoryProvenance(target) ? 'subtree' : 'file';
+                            if (this.coverageGaps.get(target)?.[targetKind]) { continue; }
+                            const evidence:CoverageGapEvidence={targetKind,reasonCode:'coverage-recheck-incomplete',
+                                reason:'The bounded Recheck replay left a deferred observation; original before-images are preserved and this target remains unverified.',
+                                ...(targets && selected(target) ? {scopeOperationRevision:scope.scopeRevision} : {})};
+                            this.reserveCandidateCoverageGap(target,evidence,budget);
+                            retained.set(target,evidence);
+                        }
+                        for (const [target,evidence] of retained) {
+                            this.setCoverageGap(target,evidence,false);
+                            if (evidence.targetKind==='file') { this.markFileUnavailable(target,evidence.reason); }
+                        }
+                    } catch (error) {
+                        completion.failureReason=`Deferred Recheck uncertainty could not be retained: ${String(error)}`;
+                        await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                     }
                 }
                 if (this.isCurrentEpoch(epoch) && deletedTargets.size > 0) {

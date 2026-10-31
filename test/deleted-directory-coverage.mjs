@@ -730,4 +730,42 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {fs.realpathSync=realpath;fs.statSync=stat;}
     }));
 
+    for(const replacement of ['directory','file','budget','new-epoch','ignored'])
+    test(`P2-RECHECK-TYPE-FALLBACK ${replacement}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope),target=path.join(root,'introduced'),child=path.join(target,'unproven.txt');
+        // Deliver the notification at the existing Recheck handoff, after its
+        // certification result is computed and before the final replay snapshot.
+        let restoring=tracker.restoringEpoch,delivered=false;const allowance=tracker.maxScopePreflightEntries;
+        Object.defineProperty(tracker,'restoringEpoch',{configurable:true,get:()=>restoring,set:value=>{
+            if(!delivered&&restoring!==undefined&&value===undefined){
+                delivered=true;fs.writeFileSync(target,'independent file');
+                tracker.dispatchExternalEvent(Uri.file(target),'create',restoring);
+                if(replacement==='budget'){tracker.maxScopePreflightEntries=1;}
+            }
+            restoring=value;
+        }});
+        const metadata=h.pause(target,'stat'),recheck=tracker.recheckObservationCoverage();
+        try{
+            await metadata.entered;assert.equal(delivered,true);
+            if(replacement!=='file'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
+            if(replacement==='new-epoch'){tracker.advanceEpoch();}
+            metadata.release();const result=await recheck;
+            assert.equal(tracker.getOriginalContent(file),'original');
+            if(replacement==='directory'){
+                assert.equal(tracker.unresolvedBaselineFiles.has(child),true,JSON.stringify({result,queued:[...tracker.restoreEvents.keys()],gaps:tracker.getSubtreeCoverageGaps()}));
+                assert.equal(result.status,'rechecked');assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+                assert.equal(currentOwner(tracker,target)?.epoch,tracker.sessionEpoch);
+                assert.equal(tracker.fileSnapshots.has(child),false);assert.equal(tracker.getReviewToken(child),undefined);
+                assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            }else if(replacement==='file'){assert.equal(tracker.getOriginalContent(target),'');assert.ok(tracker.getReviewToken(target));}
+            else if(replacement==='budget'){
+                assert.equal(result.status,'limited');
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===target&&gap.reasonCode==='coverage-recheck-incomplete'));
+                assert.ok(JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.some(([name,gap])=>name===target&&gap.subtree?.reasonCode==='coverage-recheck-incomplete'));
+            }else if(replacement==='new-epoch'){assert.equal(result.status,'conflict');assert.equal(tracker.fileSnapshots.has(child),false);}
+            else{assert.equal(result.status,'rechecked');assert.equal(tracker.unresolvedBaselineFiles.has(child),false);assert.equal(tracker.supplementalDirectoryWatchers.has(target),false);}
+            if(replacement!=='budget'){assert.equal(tracker.restoreEvents.size,0,'Recheck must consume its fallback observation');}
+        }finally{metadata.release();await recheck;tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;}
+    },'wholeWorkspace',replacement==='ignored'?[{scope:'all',pattern:'/temporary/introduced/'}]:[]));
+
 }
