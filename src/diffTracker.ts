@@ -1455,9 +1455,13 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return false; }
             }
             const restoreEvents = [...this.restoreEvents.values()];
-            this.restoreEvents.clear();
-            for (const { uri, kind, reconcileDirectory } of restoreEvents) {
+            for (const event of restoreEvents) {
+                const { uri, kind, reconcileDirectory } = event;
                 if (!this.isCurrentEpoch(epoch)) { return false; }
+                if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                // Keep unconsumed child notifications visible to a directory
+                // scan. A later replacement supersedes the exact queued proof.
+                this.restoreEvents.delete(uri.fsPath);
                 if (this.isPathIgnored(uri)) { continue; }
                 if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
                     if (!await this.reconcileRestoredDirectory(uri,epoch)) {
@@ -1967,10 +1971,12 @@ export class DiffTracker {
                 // One bounded replay only. A busy workspace is a visible limited
                 // result, not an unbounded rescan/retry loop.
                 const events = [...this.restoreEvents.values()];
-                this.restoreEvents.clear();
                 const deletedTargets = new Set<ScopeCoverageTarget>();
-                for (const { uri, kind, reconcileDirectory } of events) {
+                for (const event of events) {
+                    const { uri, kind, reconcileDirectory } = event;
                     if (!this.isCurrentEpoch(epoch)) { break; }
+                    if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                    this.restoreEvents.delete(uri.fsPath);
                     if (reconcileDirectory && kind !== 'delete') {
                         if (await this.isUntrackedDirectory(uri)) {
                             if (this.isCurrentEpoch(epoch)) { await this.reconcileDirectoryObservation(uri,epoch); }
@@ -12041,11 +12047,13 @@ export class DiffTracker {
                 throw new Error('Post-restore activity exceeded the bounded reconciliation allowance');
             }
             remainingEvents -= work;
-            this.restoreEvents.clear();
-            for (const { uri, kind, reconcileDirectory } of events) {
+            for (const event of events) {
+                const { uri, kind, reconcileDirectory } = event;
                 if (!contextCurrent() || this.recoveryBlocked) {
                     throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
                 }
+                if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                this.restoreEvents.delete(uri.fsPath);
                 if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
                     if (!contextCurrent() || !await this.reconcileRestoredDirectory(uri,this.sessionEpoch,true)) {
                         throw new Error('Post-restore directory reconstruction could not be verified without inventing child before-images');
