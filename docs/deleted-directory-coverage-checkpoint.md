@@ -108,3 +108,19 @@ A subsequent automatic P2 on the same chain confirmed that a directory-only igno
 
 
 The final epoch audit found one more availability race at the asynchronous directory classification boundary: if the target becomes a file and a newer paused epoch is established during metadata I/O, the old restore callback could enter the ordinary file reader using that newer epoch and update its frozen review. A deterministic extension of the existing late-epoch case reproduces the unexpected new tracked change, without a baseline or disk write. Restore and final archive replay now revalidate their owning epoch/context immediately after classification for both directory and non-directory results. The two classification outcomes pass together, and the 26 provenance/ignore controls remain green. No lifecycle guard is bypassed.
+
+
+## Final retirement counterpart: exact file notification retention
+
+Automatic review and the original independent ultra review confirmed one remaining P2 on 7ce724f: during the retirement save, an exact file-create was collapsed into a coarse target observation. Runtime, restore and Retry then lost a legitimate empty before-image. The same notification after the barrier worked. This was an availability loss, with no demonstrated incorrect acceptance or disk write.
+
+Retirement now retains independently reported regular-file events from the same workspace owner in the existing replay queue, alongside the coarse target records. That queue supplies exact creation evidence while the directory handoff scans, then consumes the events through the existing runtime or restore guard. Change preserves create evidence; delete supersedes it. Directory notifications never grant child absence, and historical Unknown remains protected. Retention and runtime replay use the existing traversal allowance. Overflow preserves a precise subtree diagnostic and the original baseline, saves uncertainty and pauses through the existing durable failure path; it cannot silently drop proofs and report Full or increase the watcher budget.
+
+| Lifecycle stage | Coarse directory signal | Exact independent file create | Historical Unknown / invalidation |
+| --- | --- | --- | --- |
+| Certification / retirement, runtime + restore + Retry | Observe and preserve Unknown | Keep empty before-image and text token | Unknown stays; delete supersedes proof; bounded overflow pauses |
+| Intent cleanup, Keep / archive | Observe and refuse unproven block Revert | Shared queued file evidence remains separate | Durable Unknown survives paused retry |
+| Generic / final archive drain | No blanket child absence | Remaining batch evidence stays visible until consumed | Superseded events and newer epochs cannot publish |
+| Directory ignore | No obligation or traversal outside policy | Excluded children are not adopted | Dormant uncertainty is retained |
+
+The eleven added retirement cases include runtime/restore/Retry positive and historical-Unknown controls, an after-barrier comparison, create+change, create+delete and two bounded-overflow cases. The three positive during-barrier cases fail on 7ce724f and all eleven pass after the correction. The preceding 26 provenance/ignore cases and both epoch outcomes still pass. A real Host test uses WorkspaceEdit.createFile, waits for actual onDidCreateFiles delivery during certification, writes through the real provider and verifies the child has its correct empty baseline and review token; its historical-Unknown sibling stays Unknown. Normal restore and Retry pass on official 1.80.2 and Stable. The actual 1.80.2 case fails against 7ce724f at the exact-file baseline assertion. This positive case and the parent-only block-Revert negatives run together, without callback injection or retries.

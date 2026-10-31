@@ -460,6 +460,79 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{gate.release();await restoration;}
     }));
 
+    for(const {mode,priorUnknown,after=false,later} of [
+        ...['runtime','restore','retry'].flatMap(mode=>[false,true].map(priorUnknown=>({mode,priorUnknown}))),
+        {mode:'runtime',priorUnknown:false,after:true},
+        {mode:'runtime',priorUnknown:false,later:'change'},
+        {mode:'restore',priorUnknown:false,later:'delete'}
+    ])test(`P2-RETIREMENT-FILE-PROOF mode=${mode} priorUnknown=${priorUnknown} after=${after} later=${later??'none'}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'created.txt');
+        if(priorUnknown){tracker.recordUnresolvedBaseline(child,'Historical child before-image was not recorded');}
+        fs.rmSync(root,{recursive:true});
+        if(mode!=='runtime'){
+            tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Historical missing root');
+            assert.equal(await tracker.flushPendingPersistence(),true);const storage=tracker.storageUri;await tracker.dispose();
+            tracker=new DiffTracker(storage);setTracker(tracker);if(mode==='retry'){tracker.recoveryBlocked=true;}
+        }
+        const gate=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const operation=mode==='runtime'?tracker.onExternalFileDeleted(Uri.file(root)):
+            mode==='retry'?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try{
+            await gate.entered;assert.ok(tracker.missingDirectoryRetirement);
+            fs.mkdirSync(root);fs.writeFileSync(file,'recreated known');
+            if(!after){fs.writeFileSync(child,'independent new file');await tracker.onExternalFileCreatedEvent(Uri.file(child));}
+            if(later==='change'){fs.writeFileSync(child,'changed independent file');await tracker.onExternalFileChanged(Uri.file(child));}
+            if(later==='delete'){
+                fs.unlinkSync(child);await tracker.onExternalFileDeleted(Uri.file(child));
+                fs.writeFileSync(child,'unproven replacement');
+            }
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename',path.basename(root));
+            gate.release();const result=await operation;
+            if(mode!=='runtime'){assert.equal(mode==='retry'?result.status:result,'restored');}
+            if(after){fs.writeFileSync(child,'independent new file');await tracker.onExternalFileCreatedEvent(Uri.file(child));}
+            assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getTrackedChange(file)?.currentContent,'recreated known');
+            if(priorUnknown||later==='delete'){
+                assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.fileSnapshots.has(child),false);
+                assert.equal(tracker.getReviewToken(child),undefined);assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            }else{
+                assert.equal(tracker.getOriginalContent(child),'','exact file-create proof must survive retirement');
+                assert.equal(tracker.unresolvedBaselineFiles.has(child),false);assert.ok(tracker.getReviewToken(child));
+                assert.equal(tracker.getTrackedChange(child)?.currentContent,later==='change'?'changed independent file':'independent new file');
+            }
+            if(mode==='retry'){
+                const saved=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json')));
+                assert.equal(new Map(saved.fileSnapshots).get(child),priorUnknown?undefined:'');
+                assert.equal(new Map(saved.unresolvedBaselineFiles).has(child),priorUnknown);
+            }
+            assert.equal(tracker.restoreEvents.size,0,'retirement must not leave an unconsumed proof queue');
+        }finally{gate.release();await operation;}
+    }));
+
+    for(const mode of ['runtime','restore'])test(`P2-RETIREMENT-FILE-PROOF bounded overflow mode=${mode}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope);fs.rmSync(root,{recursive:true});
+        if(mode==='restore'){
+            tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Historical missing root');
+            await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
+            tracker=new DiffTracker(storage);setTracker(tracker);
+        }
+        const gate=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+        const operation=mode==='runtime'?tracker.onExternalFileDeleted(Uri.file(root)):tracker.restorePersistedState();
+        try{
+            await gate.entered;tracker.maxScopePreflightEntries=1;fs.mkdirSync(root);fs.writeFileSync(file,'recreated known');
+            for(const name of ['first.txt','second.txt']){
+                const child=path.join(root,name);fs.writeFileSync(child,'independent new file');
+                await tracker.onExternalFileCreatedEvent(Uri.file(child));
+            }
+            assert.equal(tracker.missingDirectoryRetirement.createdFiles.size,1,'proof retention shares the existing bounded traversal allowance');
+            gate.release();const result=await operation;if(mode==='restore'){assert.equal(result,'blocked');}
+            assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getIsRecording(),false);
+            assert.match(tracker.getPersistenceIssue(),/Independent file notifications exceeded the bounded/);
+            assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.reasonCode==='supplemental-watcher-reconstruction-overflow-gap'));
+            assert.equal(tracker.restoreEvents.size,0);assert.equal(fs.readFileSync(path.join(root,'second.txt'),'utf8'),'independent new file');
+        }finally{gate.release();await operation;}
+    }));
+
     for(const failure of ['quota','budget','stop','late-epoch','late-epoch-file']) test(`P2-RESTORE-RECREATE failure=${failure}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope);fs.rmSync(root,{recursive:true});
         tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Synthetic historical gap');

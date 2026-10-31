@@ -20,9 +20,11 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
     assert.equal(vscode.workspace.getConfiguration('files').get('watcherExclude')['restored-recreate-host/**'],true);
     for(const retry of [false,true]){
         const root=path.join(workspace,'restored-recreate-host'),file=path.join(root,'review.txt');
-        const unknown=path.join(root,'unproven.txt');
+        const unknown=path.join(root,'unproven.txt'),proven=path.join(root,`proven-${retry?'retry':'restore'}.txt`);
         const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-restored-directory-host-')));
         let tracker=new DiffTracker(storage);
+        const exactCreates=[];
+        const created=vscode.workspace.onDidCreateFiles(event=>{for(const uri of event.files){exactCreates.push(uri.fsPath);}});
         try{
             fs.mkdirSync(root);fs.writeFileSync(file,'original host baseline');
             const requested=validateAndCanonicalizeScope({mode:'rules',includes:[{scope:'all',path:'restored-recreate-host'}],
@@ -51,6 +53,10 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                     reconstructed=true;fs.mkdirSync(root);
                     fs.writeFileSync(file,'reconstructed during host certification');
                     fs.writeFileSync(unknown,'unproven child before-image');
+                    const edit=new vscode.WorkspaceEdit();edit.createFile(vscode.Uri.file(proven));
+                    assert.equal(await vscode.workspace.applyEdit(edit),true);
+                    await vscode.workspace.fs.writeFile(vscode.Uri.file(proven),Buffer.from('independently created during certification'));
+                    await until('real onDidCreateFiles must deliver exact file proof during retirement',()=>exactCreates.includes(proven));
                     // The workspace Host cannot see this watcher-excluded tree.
                     // Wait for the installed native parent owner's real callback.
                     await until('real reconstruction notification must reach the certification barrier',()=>
@@ -64,6 +70,9 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             assert.equal(tracker.getOriginalContent(file),'original host baseline');
             assert.equal(tracker.getTrackedChange(file)?.currentContent,'reconstructed during host certification');
             assert.equal(tracker.getTrackedChange(file)?.isDeleted,false);
+            assert.equal(tracker.getOriginalContent(proven),'','actual independent file-create proof must survive retirement');
+            assert.equal(tracker.unresolvedBaselineFiles.has(proven),false);assert.ok(tracker.getReviewToken(proven));
+            assert.equal(tracker.getTrackedChange(proven)?.currentContent,'independently created during certification');
             assert.equal(tracker.unresolvedBaselineFiles.has(unknown),true,JSON.stringify({
                 reason:'historical Unknown must survive any later file-create notification',notifications,
                 adoptedBaseline:tracker.fileSnapshots.has(unknown),baselineExisted:tracker.baselineExistingFiles.has(unknown)
@@ -82,7 +91,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             }
             console.log(`PASS HOST-RESTORE-RECREATE retry=${retry} real reconstruction reconciles known review and preserves historical Unknown; childCreates=${notifications.filter(item=>item.name==='unproven.txt'&&item.kind==='create').length}`);
         }finally{
-            await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
+            created.dispose();await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
             await fs.promises.rm(storage.fsPath,{recursive:true,force:true});
         }
     }

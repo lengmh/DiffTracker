@@ -949,7 +949,8 @@ export class DiffTracker {
     private supplementalDirectoryWatchers = new Map<string, SupplementalDirectoryWatch>();
     private supplementalIdentityTimer?: NodeJS.Timeout;
     private supplementalIdentitySweepRunning = false;
-    private missingDirectoryRetirement?: {epoch:number; targets:string[]; dirty:Map<string,DirectoryRetirementEvent>};
+    private missingDirectoryRetirement?: {epoch:number; targets:string[]; dirty:Map<string,DirectoryRetirementEvent>;
+        createdFiles:Set<string>; overflow:boolean};
     private missingDirectoryRetirementQueue: Promise<readonly DirectoryRetirementEvent[]> = Promise.resolve([]);
     private supplementalCoverageRoots = new Set<string>();
     // Historical kind only; never coverage proof or child absence provenance.
@@ -1445,8 +1446,16 @@ export class DiffTracker {
     }
 
     private async drainRestoreEvents(epoch: number, failOnActivity = false): Promise<boolean> {
+        let runtimeAllowance = this.restoringEpoch === epoch ? undefined : this.maxScopePreflightEntries;
         while (this.restoreEvents.size > 0) {
             if (!this.isCurrentEpoch(epoch)) { return false; }
+            if (runtimeAllowance !== undefined) {
+                if (this.restoreEvents.size > runtimeAllowance) {
+                    await this.pauseRecordingForUnpersistableCoverage('Directory reconstruction exceeded its bounded file-notification replay; recording is paused with original baselines preserved.');
+                    return false;
+                }
+                runtimeAllowance -= this.restoreEvents.size;
+            }
             if (failOnActivity) { throw new Error('Workspace activity interrupted archive reconciliation; retry after writes settle'); }
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
                 await this.refreshIgnoreMatchers();
@@ -1467,6 +1476,10 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch)) { return false; }
                 if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
+                    if (this.restoringEpoch !== epoch) {
+                        await this.reconcileDirectoryObservation(uri,epoch);
+                        continue;
+                    }
                     if (!await this.reconcileRestoredDirectory(uri,epoch)) {
                         if (this.isCurrentEpoch(epoch)) {
                             this.recoveryBlocked = true;
@@ -2640,6 +2653,7 @@ export class DiffTracker {
         const retirement = this.missingDirectoryRetirement;
         if (!retirement || retirement.epoch !== this.sessionEpoch || uri.scheme !== 'file') { return false; }
         let deferred = false;
+        let ownedDescendant = false;
         for (const target of retirement.targets) {
             if (this.pathBelongsToRoot(uri.fsPath,target) || this.pathBelongsToRoot(target,uri.fsPath)) {
                 // One record per retained target. Preserve a wider ancestor
@@ -2652,7 +2666,26 @@ export class DiffTracker {
                     path: previous && this.pathBelongsToRoot(observed,previous.path) ? previous.path : observed,
                     deleted: previous?.deleted === true || kind === 'delete'
                 });
+                if (uri.fsPath !== target && this.pathBelongsToRoot(uri.fsPath,target) &&
+                    this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString() ===
+                    this.owningWorkspaceFolderForTraversal(target)?.uri.toString()) { ownedDescendant = true; }
                 deferred = true;
+            }
+        }
+        let retain = retirement.createdFiles.has(uri.fsPath);
+        if (!retain && deferred && ownedDescendant && kind === 'create' && !this.isPathIgnored(uri)) {
+            try { retain = fs.lstatSync(uri.fsPath).isFile(); }
+            catch { /* Unverified metadata cannot establish a file before-image. */ }
+        }
+        if (retain) {
+            if (!retirement.createdFiles.has(uri.fsPath) && retirement.createdFiles.size >= this.maxScopePreflightEntries) {
+                retirement.overflow = true;
+            } else {
+                retirement.createdFiles.add(uri.fsPath);
+                // Preserve the exact file evidence in the same queue consumed
+                // by restore and runtime replay. Coarse directory notifications
+                // stay in dirty and never grant child absence.
+                this.queueRestoreEvent(uri,kind);
             }
         }
         return deferred;
@@ -3615,6 +3648,9 @@ export class DiffTracker {
                 } else { await this.onExternalFileChanged(vscode.Uri.file(target)); }
             }
         }
+        if (this.isCurrentEpoch(epoch) && this.restoringEpoch !== epoch && this.restoreEvents.size > 0) {
+            await this.drainRestoreEvents(epoch);
+        }
     }
 
     private async performMissingDirectoryRetirement(
@@ -3627,7 +3663,8 @@ export class DiffTracker {
         const policy = this.watcherCoverageRevision;
         const ignore = this.ignorePolicyRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
-        const retirement = {epoch,targets:[] as string[],dirty:new Map<string,DirectoryRetirementEvent>()};
+        const retirement = {epoch,targets:[] as string[],dirty:new Map<string,DirectoryRetirementEvent>(),
+            createdFiles:new Set<string>(),overflow:false};
         const owners = new Map<string,{owner:SupplementalDirectoryWatch;revision:number}>();
         const missingProofs = new Map<string,{parent:string;workspaceRoot:string}>();
         for (const [directory,owner] of this.supplementalDirectoryWatchers) {
@@ -3682,6 +3719,15 @@ export class DiffTracker {
         } finally {
             this.endBaselineTransaction(transaction,committed);
             if (this.missingDirectoryRetirement === retirement) { this.missingDirectoryRetirement = undefined; }
+        }
+        if (retirement.overflow && this.isCurrentEpoch(epoch)) {
+            const reason = 'Independent file notifications exceeded the bounded directory reconstruction allowance; original baselines are preserved and observation remains unverified.';
+            for (const target of retirement.targets) {
+                this.setSubtreeCoverageGap(target,'supplemental-watcher-reconstruction-overflow-gap',reason);
+            }
+            await this.flushPendingPersistence();
+            if (this.isCurrentEpoch(epoch)) { await this.pauseRecordingForUnpersistableCoverage(reason); }
+            return [];
         }
         if (!committed && this.isCurrentEpoch(epoch)) {
             if (!await this.flushPendingPersistence() && this.isCurrentEpoch(epoch)) {
