@@ -309,8 +309,16 @@ async function directoryChangeHost(workspace) {
                 await until(`continued retained-parent native observation ${round}`, () =>
                     (nativeFileNotifications.get(sibling)??0)>siblingEvents &&
                     tracker.getTrackedChange(sibling)?.currentContent === `later native sibling edit ${round}\n`);
-                await until(`bounded directory work after round ${round}`, () => tracker.directoryObservations.size === 0);
-                assert.deepEqual(tracker.getSubtreeCoverageGaps(), [], `Limited must not recur after round ${round}`);
+                // Classification and the native/Host sources can publish a new
+                // verification job between an awaited idle check and a separate
+                // gap assertion. Require idle AND Full in the same observation;
+                // a retained failure still times out with its exact evidence.
+                await until(`bounded directory work returns to Full after round ${round}`, () =>
+                    tracker.directoryObservations.size === 0 && tracker.getSubtreeCoverageGaps().length === 0,
+                    () => ({jobs:[...tracker.directoryObservations].map(([directory,job])=>
+                        ({path:relativeTracePath(directory),dirty:job.dirty,current:job.current()})),
+                        gaps:tracker.getSubtreeCoverageGaps().map(gap=>({path:relativeTracePath(gap.targetPath),reasonCode:gap.reasonCode})),
+                        directoryTrace,providerTrace,policyTrace,runtimePublicationCallers}));
                 assert.equal(tracker.coverageGaps.get(child)?.subtree, excludedEvidence);
                 assert.deepEqual(excludedEvidence, originalEvidence);
                 assert.deepEqual(reactivated, [], 'the same old excluded gap must stay inactive throughout native callbacks');
