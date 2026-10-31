@@ -1396,6 +1396,13 @@ export class DiffTracker {
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         this.reconcilePendingScopeSuspendedPaths();
+        if (observeForReconciliation && restoredSupplemental && !incomplete) {
+            // Certification awaits durable storage while restore callbacks are
+            // still queued. Keep it inside the reconciliation boundary so edits
+            // outside the retiring subtree are drained before review can freeze.
+            await this.certifyMissingDirectoryCoverage(restoredSupplemental,epoch);
+            if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
+        }
         while (this.restoreEvents.size > 0) {
             if (failOnActivity) { throw new Error('Workspace activity interrupted archive reconciliation; retry after writes settle'); }
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
@@ -1414,10 +1421,6 @@ export class DiffTracker {
             }
         }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-        if (observeForReconciliation && restoredSupplemental && !incomplete) {
-            await this.certifyMissingDirectoryCoverage(restoredSupplemental,epoch);
-            if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
-        }
         if (incomplete) {
             this.persistenceIssue = missingStoppedReview
                 ? 'This older stopped session did not save its pending review snapshots. Baselines are preserved, but post-Stop edits were not imported. Start or rebuild explicitly to capture a new baseline.'

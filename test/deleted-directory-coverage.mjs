@@ -389,6 +389,40 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {gate.release();await deleted;}
     }));
 
+    for(const retry of [false,true]) for(const kind of ['change','delete'])
+    test(`DELETED-COVERAGE restore certification drains sibling ${kind} before completion (retry=${retry})`,()=>fixture(async({tracker,dir,scope})=>{
+        const sibling=path.join(dir,'sibling.txt');fs.writeFileSync(sibling,'sibling baseline');
+        const {root}=await seed(tracker,dir,scope);
+        fs.rmSync(root,{recursive:true});
+        tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Prior deletion');
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri;await tracker.dispose();
+        tracker=new DiffTracker(storage);setTracker(tracker);
+        if(retry)tracker.recoveryBlocked=true;
+        const gate=h.pause(path.join(storage.fsPath,'session-state.tmp.json'),'write');
+        const restoration=retry?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try {
+            await gate.entered;
+            assert.ok(tracker.missingDirectoryRetirement,'the real missing-directory certification owns this persistence barrier');
+            if(kind==='delete')fs.unlinkSync(sibling);else fs.writeFileSync(sibling,'edited during certification');
+            tracker.dispatchExternalEvent(Uri.file(sibling),kind,tracker.sessionEpoch);
+            assert.equal(tracker.restoreEvents.size,1,'unrelated notification waits in the restore queue');
+            gate.release();const result=await restoration;
+            assert.equal(retry?result.status:result,'restored');
+            const change=tracker.getTrackedChange(sibling);
+            assert.ok(change,'restore must reconcile the sibling notification before returning or freezing review');
+            assert.equal(change.isDeleted,kind==='delete');
+            if(kind==='change')assert.equal(change.currentContent,'edited during certification');
+            assert.equal(tracker.getOriginalContent(sibling),'sibling baseline');
+            assert.equal(tracker.restoreEvents.size,0);
+            if(retry){
+                assert.equal(tracker.getIsRecording(),false);
+                const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json'),'utf8'));
+                assert.ok(saved.stoppedReviews.some(review=>review.filePath===sibling));
+            }
+        } finally {gate.release();await restoration;}
+    }));
+
     for(const sameIdentity of [true,false]) test(`DELETED-COVERAGE missing target validates alternate real-root spelling by physical identity (same=${sameIdentity})`,()=>fixture(async({tracker,dir})=>{
         const missing=path.join(dir,'missing','temporary');
         const other=path.join(dir,'other');fs.mkdirSync(other);

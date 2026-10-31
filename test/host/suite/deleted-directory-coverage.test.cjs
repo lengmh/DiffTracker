@@ -21,10 +21,12 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
     const parent = path.join(container,'deep');
     const root = path.join(parent,'selected');
     const file = path.join(root,'review.txt');
+    const sibling = path.join(workspace,'deleted-coverage-sibling-host.txt');
     const storage = fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-deleted-host-'));
     let tracker = new DiffTracker(vscode.Uri.file(storage));
     try {
         fs.mkdirSync(root,{recursive:true}); fs.writeFileSync(file,'original host baseline');
+        fs.writeFileSync(sibling,'original sibling baseline');
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(root));
         const requested = validateAndCanonicalizeScope({mode:'rules',includes:[{scope:'folder',folder:folder.name,path:'deleted-coverage-host/deep/selected'}],excludes:[]},tracker.currentWorkspaceRootIdentities());
         assert.equal(requested.ok,true);
@@ -32,6 +34,7 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         tracker.sessionWorkspaceRoots = tracker.getWorkspaceRoots();
         tracker.isRecording = true; tracker.externalWatcherEnabled = true; tracker.snapshotInitialized = true;
         tracker.fileSnapshots.set(file,'original host baseline'); tracker.baselineExistingFiles.add(file);
+        tracker.fileSnapshots.set(sibling,'original sibling baseline'); tracker.baselineExistingFiles.add(sibling);
         await tracker.installSupplementalCoverageTargets([root],tracker.sessionEpoch,true);
         tracker.commitSupplementalCoverageTargets([root]);
         assert.equal(tracker.fileWatchers.length,0,'native filesystem callbacks alone must observe this lifecycle');
@@ -67,7 +70,23 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
         assert.equal(await tracker.flushPendingPersistence(),true);
         await tracker.dispose();
         tracker = new DiffTracker(vscode.Uri.file(storage));
+        const save=tracker.flushPersistState.bind(tracker);let certificationEdit=false;
+        tracker.flushPersistState=async(...args)=>{
+            if(tracker.missingDirectoryRetirement && !certificationEdit){
+                certificationEdit=true;
+                fs.writeFileSync(sibling,'sibling edited during restore certification');
+                // Hold the real persistence boundary until the real Host watcher
+                // reports this unrelated edit. Do not inject its callback.
+                await until('native sibling notification during restore certification',()=>tracker.restoreEvents.has(sibling),tracker);
+            }
+            return save(...args);
+        };
         assert.equal(await tracker.restorePersistedState(),'restored');
+        tracker.flushPersistState=save;
+        assert.equal(certificationEdit,true);
+        assert.equal(tracker.getOriginalContent(sibling),'original sibling baseline');
+        assert.equal(tracker.getTrackedChange(sibling)?.currentContent,'sibling edited during restore certification');
+        console.log('PASS HOST-DELETED-COVERAGE real unrelated edit during restore certification is drained before recovery returns');
         assert.equal(tracker.getOriginalContent(file),'original host baseline');
         assert.equal(tracker.getTrackedChange(file)?.isDeleted,true);
         assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
@@ -125,6 +144,7 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
 
     } finally {
         await tracker.dispose();
+        await fs.promises.rm(sibling,{force:true});
         await fs.promises.rm(container,{recursive:true,force:true}); await fs.promises.rm(storage,{recursive:true,force:true});
     }
 };
