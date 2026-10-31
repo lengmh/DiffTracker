@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const selected = process.argv[2];
-if (!['scope-settings', 'workspace-edit'].includes(selected)) { throw new Error('Select scope-settings or workspace-edit'); }
+if (!['scope-settings', 'workspace-edit', 'deleted-coverage'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit or deleted-coverage'); }
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-host-isolation-'));
 const workspace = path.join(temporary, 'workspace');
@@ -24,6 +24,7 @@ try {
     console.log('HOST-LIFECYCLE isolated launch:', JSON.stringify({ scenario: selected, version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable' }));
     await runTests({
         version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
+        vscodeExecutablePath: process.env.DIFF_TRACKER_VSCODE_EXECUTABLE,
         extensionDevelopmentPath: repository,
         extensionTestsPath: path.join(repository, 'test/host/suite/index.cjs'),
         extensionTestsEnv: { DIFF_TRACKER_HOST_WORKSPACE: workspace, DIFF_TRACKER_HOST_PHASE: selected,

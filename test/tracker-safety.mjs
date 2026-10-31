@@ -5744,7 +5744,7 @@ test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted
 });
 
 registerPR12BoundedInvariants({
-    test, vscode, Uri, DiffTracker, file, document, pause,
+    test, vscode, Uri, DiffTracker, file, document, pause, faults,
     createStatusBarManager: current => {
         const boundary = {StatusBarAlignment:{Right:2},ThemeColor:class {constructor(id){this.id=id;}},
             window:{createStatusBarItem:()=>({show(){},dispose(){}})}};

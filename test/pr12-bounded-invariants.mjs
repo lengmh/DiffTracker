@@ -1,3 +1,4 @@
+import { registerDeletedDirectoryCoverage } from './deleted-directory-coverage.mjs';
 import { registerScopeExclusionRecovery } from './scope-exclusion-recovery.mjs';
 import { registerPR12RuntimeBudgetRegressions } from './pr12-runtime-identity-budget.mjs';
 import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
@@ -55,6 +56,7 @@ export function registerPR12BoundedInvariants(h) {
     }
     registerPR12LiteralEntryRegressions(h, fixture, scopeFor);
     registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
+    registerDeletedDirectoryCoverage(h, fixture);
     registerS4BSupplementalCoverage(h, fixture, scopeFor);
     registerS4CImportHandoff(h, fixture);
     registerRecheckObservationCoverage(h, fixture);

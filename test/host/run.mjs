@@ -106,6 +106,7 @@ try {
     const cdpPort = await availableLoopbackPort();
     const hostOptions = {
         version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable',
+        vscodeExecutablePath: process.env.DIFF_TRACKER_VSCODE_EXECUTABLE,
         extensionDevelopmentPath,
         extensionTestsPath,
         extensionTestsEnv: {
