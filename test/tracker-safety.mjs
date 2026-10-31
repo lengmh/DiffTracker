@@ -306,6 +306,52 @@ test('DT-02 VS Code create event repairs a change-first new text file',async()=>
     assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
     assert.ok(succeeded(await tracker.keepAllChangesInFile(p)));
 });
+for(const activity of ['settles-after-read','continues-through-read','superseded-creation'])
+test(`PR60 lifecycle creation reconciles unstable first snapshot once (${activity})`,async()=>{
+    const p=file('creation-release.txt'),open=fs.promises.open;
+    let publication;
+    if(activity==='superseded-creation'){
+        const storage=file('creation-superseded-storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
+        publication=pause(path.join(storage,'session-state.tmp.json'),'write');
+    }
+    fs.writeFileSync(p,'');let opens=0;
+    fs.promises.open=async(target,...args)=>{
+        const handle=await open(target,...args);
+        if(String(target)===p){
+            const pass=++opens,read=handle.read.bind(handle);let changed=false;
+            handle.read=async(...input)=>{
+                const result=await read(...input);
+                if(!changed&&(pass===1||activity==='continues-through-read')){
+                    changed=true;fs.writeFileSync(p,`settled creation text ${pass}`);
+                }
+                return result;
+            };
+        }
+        return handle;
+    };
+    const creating=tracker.onExternalFileCreatedEvent(Uri.file(p));
+    try{
+        if(publication){
+            await publication.entered;await tracker.onExternalFileCreatedEvent(Uri.file(p));
+            assert.equal(pending(p)?.reviewKind,'text');assert.equal(pending(p)?.currentContent,'settled creation text 1');
+        }
+    }finally{try{publication?.release();await creating;}finally{fs.promises.open=open;}}
+    assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.ok(opens<=(publication?3:2),'creation recovery must remain bounded without an extra notification');
+    if(activity!=='continues-through-read'){
+        assert.equal(pending(p)?.reviewKind,'text');assert.equal(pending(p)?.unavailableReason,undefined);
+        assert.equal(pending(p)?.currentContent,'settled creation text 1');assert.ok(tracker.getReviewToken(p));
+    }else{assert.equal(pending(p)?.reviewKind,'unknown');assert.ok(pending(p)?.unavailableReason);}
+});
+test('PR60 lifecycle creation rechecks a stable snapshot after publication',async()=>{
+    const p=file('creation-release-stable.txt'),storage=file('creation-release-storage');
+    tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();fs.writeFileSync(p,'');
+    const gate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const creating=tracker.onExternalFileCreated(Uri.file(p));
+    try{await gate.entered;fs.writeFileSync(p,'text written during publication');}finally{gate.release();await creating;}
+    assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
+    assert.equal(pending(p)?.currentContent,'text written during publication');assert.ok(tracker.getReviewToken(p));
+});
 test('S1 change-first binary addition stays unknown until create provenance upgrades it to opaque',async()=>{
     const p=file('change-first-image.png');fs.writeFileSync(p,Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]));
     await tracker.onExternalFileChanged(Uri.file(p));

@@ -11,6 +11,8 @@ module.exports = async function scopeSettingsCheckpoint() {
     const trace = [];
     const {DiffTracker}=require('../../../out/diffTracker.js');
     const {MonitoringScopeController}=require('../../../out/monitoringScopeController.js');
+    const lifecycle=require('./host-lifecycle-trace.cjs').createHostLifecycleTrace(vscode,workspace,['.vscode/settings.json']);
+    lifecycle.hookTracker(DiffTracker);
     const updateSetting=MonitoringScopeController.prototype.updateOwnedScopeSetting;
     MonitoringScopeController.prototype.updateOwnedScopeSetting=function(config,key,value,before,expected){
         const details=()=>{
@@ -23,7 +25,15 @@ module.exports = async function scopeSettingsCheckpoint() {
                     kind:tracker.getTrackedChange(file)?.reviewKind,reason:tracker.coverageGaps.get(file)?.file})):[]};
         };
         const entry={stage,kind:'owned-setting',key,before:details()};trace.push(entry);
-        return Promise.resolve(updateSetting.apply(this,arguments)).finally(()=>{entry.after=details();});
+        lifecycle.attachController(this);
+        lifecycle.setExpected(expected);
+        lifecycle.add('owned-setting-start',{stage,key,inspect:lifecycle.inspect(),state:lifecycle.snapshot()});
+        // Observe the actual API promise, returning it unchanged to production.
+        const observedConfig=Object.create(config);
+        Object.defineProperty(observedConfig,'update',{value:(...args)=>lifecycle.observeApi(config,...args)});
+        return Promise.resolve(updateSetting.call(this,observedConfig,key,value,before,expected)).finally(()=>{
+            entry.after=details();lifecycle.add('owned-setting-return',{stage,key,inspect:lifecycle.inspect(),state:lifecycle.snapshot()});
+        });
     };
     const wrapped=new Map();
     let stage = 'activation';
@@ -97,6 +107,13 @@ module.exports = async function scopeSettingsCheckpoint() {
             mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:'/prior-cache/'},{scope:'all',pattern:'/generated-cache/'}]
         });
         trace.push({stage,kind:'sources-after',...configurationSources()});
+        lifecycle.add('first-action-return',{status:first.status,scopeCommitted:first.scopeCommitted});
+        if(first.status!=='applied'){
+            // Observe only the already-issued write after failure; do not retry
+            // or resume Apply. The original assertion below remains failing.
+            await lifecycle.observeAfterFailure();
+            console.error('HOST-LIFECYCLE settings failure:',JSON.stringify(lifecycle.dump()));
+        }
         assert.equal(first.status,'applied',JSON.stringify({first,trace}));
         assert.equal(first.scopeCommitted,true);
         assert.equal((await state()).isRecording,false,'saving exclusions must not start recording');
@@ -175,7 +192,8 @@ module.exports = async function scopeSettingsCheckpoint() {
         for(const folder of ['quick-cache','saved-cache']){
             assert.equal(final.trackedChanges.some(change=>change.filePath===uri(`${folder}/existing.txt`).fsPath),false);
         }
+        console.log('HOST-LIFECYCLE settings success:',JSON.stringify(lifecycle.dump()));
         console.log(`PASS HOST-EXCLUDES real configuration with excluded settings: Save and Apply, shortcut, Apply Saved Request, Restore and continued observation: ${JSON.stringify({vscodeVersion:vscode.version,trace})}`);
-    } finally { observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;}
+    } finally { lifecycle.dispose();observe.dispose();for(const [method,original] of wrapped){DiffTracker.prototype[method]=original;}
         MonitoringScopeController.prototype.updateOwnedScopeSetting=updateSetting; }
 };

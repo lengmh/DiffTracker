@@ -48,8 +48,12 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a npm run test:host
       - name: Extension Host (Windows)
+        id: windows_host
         if: runner.os == 'Windows'
         run: npm run test:host
+      - name: Isolated settings lifecycle comparison
+        if: ${{ always() && runner.os == 'Windows' && (steps.windows_host.outcome == 'success' || steps.windows_host.outcome == 'failure') }}
+        run: node test/host/diagnose.mjs scope-settings
 
   minimum-extension-host:
     name: VS Code 1.80 Host (Ubuntu)
@@ -63,9 +67,15 @@ jobs:
       - run: npm ci
       - run: npm run compile
       - name: Extension Host (VS Code 1.80.2)
+        id: minimum_host
         env:
           DIFF_TRACKER_VSCODE_VERSION: 1.80.2
         run: xvfb-run -a npm run test:host
+      - name: Isolated WorkspaceEdit lifecycle comparison
+        if: ${{ always() && (steps.minimum_host.outcome == 'success' || steps.minimum_host.outcome == 'failure') }}
+        env:
+          DIFF_TRACKER_VSCODE_VERSION: 1.80.2
+        run: xvfb-run -a node test/host/diagnose.mjs workspace-edit
 
   installed-extension-host:
     name: Installed RC VSIX (Ubuntu Stable)

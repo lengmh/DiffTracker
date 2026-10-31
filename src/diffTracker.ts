@@ -10577,6 +10577,16 @@ export class DiffTracker {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
                 } else if (!await this.completeRuntimeBaseline(epoch, observeStopped)) {
                     return;
+                } else if (state.kind === 'unavailable' &&
+                    state.reason === 'File changed while being read; refresh before review') {
+                    // Creation proved the absent before-image, but its first
+                    // snapshot raced the writer. Reconcile once at the durable
+                    // release boundary, as for a stable text snapshot below.
+                    // A second native callback is not guaranteed. The normal
+                    // reader retains policy, identity, editor and epoch guards;
+                    // another unstable read remains Unknown without a loop.
+                    if (creationIsCurrent()) { await this.readFileAndUpdate(filePath, uri, creationIsCurrent); }
+                    return;
                 }
             }
             if (this.reconcileLargeFileReminder(filePath, state)) { return; }

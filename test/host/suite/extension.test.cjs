@@ -602,13 +602,9 @@ module.exports = async function runExtensionHostScenario() {
 
         // VS Code's create-file event supplies creation provenance even when the
         // filesystem watcher reports a change before (or instead of) a create.
-        const createEdit = new vscode.WorkspaceEdit();
-        createEdit.createFile(uri('workspace-created.txt'));
-        assert.equal(await vscode.workspace.applyEdit(createEdit), true);
-        await write('workspace-created.txt', 'created through WorkspaceEdit\n');
-        await untilStable('WorkspaceEdit-created text review', () => reviewablePending('workspace-created.txt'));
-        await vscode.workspace.fs.delete(uri('workspace-created.txt'));
-        await untilStable('WorkspaceEdit-created review cleared', async () => !(await pending('workspace-created.txt')));
+        await require('./workspace-edit-creation.test.cjs')({
+            workspace:workspacePath,uri,write,untilStable,reviewablePending,pending
+        });
 
         await vscode.workspace.fs.writeFile(uri('new-image.png'), Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
         const binaryReview = await untilStable('binary addition read-only review', async () => {
