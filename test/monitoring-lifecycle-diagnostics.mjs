@@ -149,4 +149,33 @@ export function registerMonitoringLifecycleDiagnostics(h,fixture) {
         } finally {gate.release();await retry;h.faults.clear();}
     }));
 
+    for(const operation of ['keep','restore'])test(`INDEPENDENT-CLEANUP-PROVENANCE ${operation}`,()=>fixture(async({tracker,dir,scope})=>{
+        const root=path.join(dir,'temporary'),known=path.join(root,'known.txt'),child=path.join(root,'unproven.txt');
+        fs.mkdirSync(root);fs.writeFileSync(known,'original');
+        h.setVsCodeExcludes({'files.watcherExclude':{'temporary/**':true}});
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        fs.rmSync(root,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(root));
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri.fsPath,saved=fs.readFileSync(path.join(storage,'session-state.json'));
+        const intent=path.join(storage,`session-state.${operation}-in-progress.json`);
+        fs.writeFileSync(path.join(storage,`session-state.pre-${operation}.json`),saved);
+        fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        tracker.isRecording=false;tracker.disposeFileWatchers();tracker.recoveryBlocked=true;
+        const gate=h.pause(intent,'delete'),retry=tracker.retrySavedSessionRecovery();
+        try{
+            await gate.entered;assert.equal(tracker.missingDirectoryRetirement,undefined);
+            fs.mkdirSync(root);fs.writeFileSync(known,'recreated known');fs.writeFileSync(child,'unproven contents');
+            const parent=[...h.nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename','temporary');
+            gate.release();assert.equal((await retry).status,'recovered');
+            assert.equal(tracker.getOriginalContent(known),'original');
+            const result=await tracker.revertBlock(child,0);
+            assert.equal(result.status,'conflict',JSON.stringify({
+                reason:'unproven before-images must not enable block Revert',status:result.status,
+                disk:fs.readFileSync(child,'utf8'),buffer:h.vscode.workspace.textDocuments.find(doc=>doc.uri.fsPath===child)?.getText()
+            }));
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);
+            assert.equal(fs.readFileSync(child,'utf8'),'unproven contents');
+        }finally{gate.release();await retry;}
+    }));
 }

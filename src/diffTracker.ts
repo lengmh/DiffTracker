@@ -1474,7 +1474,7 @@ export class DiffTracker {
                     }
                     continue;
                 }
-                if (kind === 'create') { await this.onExternalFileCreated(uri); }
+                if (kind === 'create' && !reconcileDirectory) { await this.onExternalFileCreated(uri); }
                 else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
                 else { await this.readFileAndUpdate(uri.fsPath, uri); }
             }
@@ -1482,7 +1482,7 @@ export class DiffTracker {
         return this.isCurrentEpoch(epoch);
     }
 
-    private async reconcileRestoredDirectory(uri: vscode.Uri, epoch: number): Promise<boolean> {
+    private async reconcileRestoredDirectory(uri: vscode.Uri, epoch: number, observeStopped = false): Promise<boolean> {
         if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== epoch) { return false; }
         const scope = this.effectiveMonitoringScope;
         const folder = this.owningWorkspaceFolderForTraversal(uri.fsPath);
@@ -1498,7 +1498,8 @@ export class DiffTracker {
         this.restoreDirectoryBudget ??= {remainingEntries:this.maxScopePreflightEntries};
         const generation = this.coverageGeneration, policy = this.watcherCoverageRevision;
         const current = () => this.isCurrentEpoch(epoch) && this.restoringEpoch === epoch &&
-            this.isRecording && this.externalWatcherEnabled && this.snapshotInitialized && !this.baselineBuilding &&
+            (this.isRecording || (observeStopped && !!this.archiveRestoreTask)) &&
+            this.externalWatcherEnabled && this.snapshotInitialized && !this.baselineBuilding &&
             this.effectiveMonitoringScope === scope && this.coverageGeneration === generation &&
             this.watcherCoverageRevision === policy && !this.baselineTransaction && !this.scopeApplyPreflight &&
             this.activeScopeApplications === 0 && !this.pendingMonitoringScope && !this.recoveryBlocked &&
@@ -1519,7 +1520,7 @@ export class DiffTracker {
             }
         };
         if (!current()) { return false; }
-        await this.onExternalFileCreated(uri,false,undefined,false,observation);
+        await this.onExternalFileCreated(uri,false,undefined,observeStopped,observation);
         return current() && this.canReuseSupplementalDirectoryOwner(uri.fsPath,epoch) &&
             !this.coverageGaps.get(uri.fsPath)?.subtree;
     }
@@ -1968,9 +1969,14 @@ export class DiffTracker {
                 const events = [...this.restoreEvents.values()];
                 this.restoreEvents.clear();
                 const deletedTargets = new Set<ScopeCoverageTarget>();
-                for (const { uri, kind } of events) {
+                for (const { uri, kind, reconcileDirectory } of events) {
                     if (!this.isCurrentEpoch(epoch)) { break; }
-                    if (kind === 'create') { await this.onExternalFileCreated(uri); }
+                    if (reconcileDirectory && kind !== 'delete') {
+                        if (await this.isUntrackedDirectory(uri)) {
+                            if (this.isCurrentEpoch(epoch)) { await this.reconcileDirectoryObservation(uri,epoch); }
+                        } else if (this.isCurrentEpoch(epoch)) { await this.readFileAndUpdate(uri.fsPath,uri,()=>this.isCurrentEpoch(epoch)); }
+                    }
+                    else if (kind === 'create') { await this.onExternalFileCreated(uri); }
                     else if (kind === 'delete') {
                         await this.onExternalFileDeleted(uri);
                         for (const target of targets ?? []) {
@@ -2643,7 +2649,22 @@ export class DiffTracker {
         return deferred;
     }
 
-    private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number): void {
+    private queueRestoreEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', reconcileDirectory = false): void {
+        if (kind === 'create' && !reconcileDirectory && this.effectiveMonitoringScope.kind === 'configured') {
+            // Host watchers can also report only a populated directory's create.
+            // Classify before queueing: discovery and concurrent directory scans
+            // consult this queue before the event itself reaches the drain.
+            try { reconcileDirectory = fs.lstatSync(uri.fsPath).isDirectory(); }
+            catch { reconcileDirectory = true; /* Unverified metadata cannot prove an empty before-image. */ }
+        }
+        const previous = this.restoreEvents.get(uri.fsPath);
+        this.restoreEvents.set(uri.fsPath,{
+            uri, kind:kind==='change' && previous?.kind==='create' ? 'create' : kind,
+            reconcileDirectory:reconcileDirectory || previous?.reconcileDirectory
+        });
+    }
+
+    private dispatchExternalEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', epoch: number, reconcileDirectory = false): void {
         if (!this.isCurrentEpoch(epoch)) { return; }
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         // Both matcher implementations also read workspace-root repository
@@ -2663,17 +2684,14 @@ export class DiffTracker {
         }
         if (this.deferMissingDirectoryRetirementEvent(uri,kind)) { return; }
         if (this.restoringEpoch === epoch) {
-            if (this.deferCoverageRecheckEvent(uri, kind)) { return; }
+            if (this.deferCoverageRecheckEvent(uri, kind, reconcileDirectory)) { return; }
             // A change does not invalidate the evidence that a path
             // was created. Delete replaces it; a later create starts
-            // a new incarnation and establishes absence again.
-            const previous = this.restoreEvents.get(uri.fsPath);
-            if (kind !== 'change' || previous?.kind !== 'create') {
-                this.restoreEvents.set(uri.fsPath, { uri, kind, reconcileDirectory:previous?.reconcileDirectory });
-            }
+            // a new incarnation. Directory-only notifications still need proof.
+            this.queueRestoreEvent(uri,kind,reconcileDirectory);
             return;
         }
-        if (kind === 'create') { void this.onExternalFileCreatedEvent(uri); }
+        if (kind === 'create' && !reconcileDirectory) { void this.onExternalFileCreatedEvent(uri); }
         else if (kind === 'delete') { void this.onExternalFileDeleted(uri); }
         else { void this.onExternalFileChanged(uri); }
     }
@@ -2687,7 +2705,7 @@ export class DiffTracker {
         return true;
     }
 
-    private deferCoverageRecheckEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete'): boolean {
+    private deferCoverageRecheckEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', reconcileDirectory = false): boolean {
         if (this.coverageRecheckEpoch !== this.sessionEpoch || this.restoringEpoch !== this.sessionEpoch) { return false; }
         const scope=this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
         const parts=uri.fsPath.split(path.sep).map(part=>part.toLowerCase());
@@ -2702,8 +2720,7 @@ export class DiffTracker {
             else{for(const root of this.sessionWorkspaceRoots){this.coverageRecheckOverflowRoots.add(root);}}
             return true;
         }
-        const previous = this.restoreEvents.get(uri.fsPath);
-        if (kind !== 'change' || previous?.kind !== 'create') { this.restoreEvents.set(uri.fsPath, { uri, kind }); }
+        this.queueRestoreEvent(uri,kind,reconcileDirectory);
         return true;
     }
 
@@ -3079,7 +3096,10 @@ export class DiffTracker {
         // A native handle follows the old inode. Reconcile the path even when
         // Windows omits the corresponding Host/self-rename notification.
         if (missing || entry.observationDirectory) {
-            this.dispatchExternalEvent(vscode.Uri.file(directory), missing ? 'delete' : 'create', epoch);
+            // A reconstruction witness proves a directory needs observation,
+            // not that each child had an empty before-image. Retain that source
+            // even after certification, while restoration awaits intent cleanup.
+            this.dispatchExternalEvent(vscode.Uri.file(directory), missing ? 'delete' : 'create', epoch, !!entry.observationDirectory);
         }
     }
 
@@ -3314,7 +3334,7 @@ export class DiffTracker {
             if (this.pathBelongsToRoot(filePath, job.directory)) { job.dirty = true; }
         }
         this.dispatchExternalEvent(vscode.Uri.file(filePath), configuredDirectory || kind === 'change'
-            ? 'change' : exists ? 'create' : 'delete', epoch);
+            ? 'change' : exists ? 'create' : 'delete', epoch, configuredDirectory);
     }
 
     private rememberExcludedDirectoryKind(directory: string): void {
@@ -3582,8 +3602,7 @@ export class DiffTracker {
             if (deleted || this.confirmedMissingDirectory(target)) { await this.onExternalFileDeleted(vscode.Uri.file(target)); }
             if (this.isCurrentEpoch(epoch) && !this.confirmedMissingDirectory(target)) {
                 if (this.restoringEpoch === epoch) {
-                    const uri = vscode.Uri.file(target), previous = this.restoreEvents.get(target);
-                    this.restoreEvents.set(target,{uri,kind:previous?.kind==='create'?'create':'change',reconcileDirectory:true});
+                    this.queueRestoreEvent(vscode.Uri.file(target),'change',true);
                 } else { await this.onExternalFileChanged(vscode.Uri.file(target)); }
             }
         }
@@ -9950,7 +9969,9 @@ export class DiffTracker {
 
     private hasObservedCreation(filePath: string): boolean {
         for (let current = filePath; ; current = path.dirname(current)) {
-            if (this.activeCreations.get(current)?.duringScan === false || this.restoreEvents.get(current)?.kind === 'create') { return true; }
+            const restored = this.restoreEvents.get(current);
+            if (this.activeCreations.get(current)?.duringScan === false ||
+                (restored?.kind === 'create' && !restored.reconcileDirectory)) { return true; }
             for (const job of this.directoryObservations.values()) {
                 if (!job.current()) { continue; }
                 const identity = job.creations.get(current);
@@ -9960,6 +9981,14 @@ export class DiffTracker {
                 } catch { /* A missing/replaced creation cannot prove absence. */ }
             }
             if (path.dirname(current) === current) { return false; }
+        }
+    }
+
+    private hasQueuedDirectoryObservation(filePath: string): boolean {
+        for (let current = filePath; ; current = path.dirname(current)) {
+            if (this.restoreEvents.get(current)?.reconcileDirectory) { return true; }
+            const parent = path.dirname(current);
+            if (parent === current) { return false; }
         }
     }
 
@@ -10044,7 +10073,11 @@ export class DiffTracker {
             const observedCreation = this.hasObservedCreation(filePath);
             const plan: CandidateBaselinePlan = this.mayHaveSuppressedResource(filePath)
                 ? { kind: 'unresolved', reason: 'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review' }
-                : observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint)
+                // A queued reconstruction interrupts the older scan's absence
+                // inference for its children. Only independent creation proof
+                // can establish an empty before-image during this discovery.
+                : observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint &&
+                    !this.hasQueuedDirectoryObservation(filePath))
                     ? { kind: 'text', content: '', baselineExists: false }
                     : {
                         kind: 'unresolved',
@@ -12009,11 +12042,16 @@ export class DiffTracker {
             }
             remainingEvents -= work;
             this.restoreEvents.clear();
-            for (const { uri, kind } of events) {
+            for (const { uri, kind, reconcileDirectory } of events) {
                 if (!contextCurrent() || this.recoveryBlocked) {
                     throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
                 }
-                if (kind === 'create') { await this.onExternalFileCreated(uri, false, undefined, true); }
+                if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
+                    if (!contextCurrent() || !await this.reconcileRestoredDirectory(uri,this.sessionEpoch,true)) {
+                        throw new Error('Post-restore directory reconstruction could not be verified without inventing child before-images');
+                    }
+                }
+                else if (kind === 'create' && !reconcileDirectory) { await this.onExternalFileCreated(uri, false, undefined, true); }
                 else if (kind === 'delete') { await this.onExternalFileDeleted(uri, true); }
                 else { await this.readFileAndUpdate(uri.fsPath, uri); }
             }
@@ -14237,9 +14275,7 @@ export class DiffTracker {
         if (this.deferCoverageRecheckEvent(uri, 'change')) { return; }
         if (this.retainCoverageGapReview(filePath)) { return; }
         if (this.restoringEpoch === epoch) {
-            if (this.restoreEvents.get(filePath)?.kind !== 'create') {
-                this.restoreEvents.set(filePath, { uri, kind: 'change' });
-            }
+            this.queueRestoreEvent(uri,'change');
             return;
         }
         if (this.deferInitialIgnoreEvent(uri)) { return; }

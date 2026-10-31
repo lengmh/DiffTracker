@@ -16,10 +16,10 @@ const PRIMARY = 'session-state.json';
 export function registerArchivedGitReview(h) {
     const { test, Uri, DiffTracker, vscode, file, document, faults, counters,
         pause, emitWatcher, emitWorkspaceFilesCreated, fireConfigurationChanged,
-        waitUntil, watcherInstances, getTracker, setTracker, setListedFiles } = h;
+        waitUntil, watcherInstances, nativeDirectoryWatchers, setVsCodeExcludes, getTracker, setTracker, setListedFiles } = h;
 
     async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false,
-        ignoredBaseline = false, ignorePolicyFile = '.gitignore' } = {}) {
+        ignoredBaseline = false, ignorePolicyFile = '.gitignore', blindDirectory = false } = {}) {
         await getTracker().dispose();
         const previousFolders = vscode.workspace.workspaceFolders;
         const previousGetFolder = vscode.workspace.getWorkspaceFolder;
@@ -41,6 +41,11 @@ export function registerArchivedGitReview(h) {
         const deleted = path.join(workspace, 'deleted-after-archive.txt');
         const ignoreFile = path.join(workspace, ignorePolicyFile);
         const ignored = path.join(workspace, 'policy-hidden.txt');
+        const blindRoot=path.join(workspace,'temporary'),blindFile=path.join(blindRoot,'review.txt');
+        if(blindDirectory){
+            fs.mkdirSync(blindRoot);fs.writeFileSync(blindFile,'archived original');
+            setVsCodeExcludes({'files.watcherExclude':{'temporary/**':true}});
+        }
         fs.writeFileSync(target, 'main before-image\n');
         fs.writeFileSync(opaque, Buffer.from([0, 1, 2]));
         if (stoppedArchive) { fs.writeFileSync(deleted, 'archived deleted-file before-image\n'); }
@@ -49,7 +54,7 @@ export function registerArchivedGitReview(h) {
             fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n');
             fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
         }
-        setListedFiles([Uri.file(target), Uri.file(opaque), ...(stoppedArchive ? [Uri.file(deleted)] : []),
+        setListedFiles([Uri.file(target), Uri.file(opaque), ...(blindDirectory ? [Uri.file(blindFile)] : []), ...(stoppedArchive ? [Uri.file(deleted)] : []),
             ...(ignoredBaseline ? [Uri.file(ignoreFile), Uri.file(ignored)] : [])]);
         let tracker = new DiffTracker(Uri.file(storage));
         setTracker(tracker);
@@ -61,7 +66,7 @@ export function registerArchivedGitReview(h) {
         try {
             assert.equal(await tracker.resetBaselineToCurrentState(), true, tracker.getPersistenceIssue());
             if (configured) {
-                const requested = validateAndCanonicalizeScope({ mode: 'rules', includes: [], excludes: [] }, tracker.effectiveMonitoringScope.roots);
+                const requested = validateAndCanonicalizeScope({ mode: blindDirectory ? 'wholeWorkspace' : 'rules', includes: [], excludes: [] }, tracker.effectiveMonitoringScope.roots);
                 assert.equal(requested.ok, true);
                 const applied = await tracker.applyConfiguredMonitoringScope(requested.scope, false, () => true);
                 assert.equal(applied.status, 'applied', applied.reason);
@@ -102,6 +107,24 @@ export function registerArchivedGitReview(h) {
             vscode.workspace.getWorkspaceFolder = previousGetFolder;
         }
     }
+
+    for(const stoppedArchive of [false,true])test(`P1-ARCHIVE-REPLAY-PROVENANCE stopped=${stoppedArchive}`,()=>fixture(async ctx=>{
+        const parentRoot=path.join(ctx.workspace,'temporary'),known=path.join(parentRoot,'review.txt');
+        const root=path.join(parentRoot,'incoming'),child=path.join(root,'unproven.txt');
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        try{
+            await Promise.race([gate.entered,operation.then(result=>{throw new Error(`Restore finished before cleanup: ${JSON.stringify(result)}`);})]);
+            fs.mkdirSync(root);fs.writeFileSync(child,'unproven contents');
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(parentRoot));
+            assert.ok(parent);parent.listener('rename','incoming');
+            gate.release();const result=await operation;
+            assert.equal(result.status,'restored',result.reason);
+            assert.equal(ctx.tracker.getOriginalContent(known),'archived original');
+            assert.equal((await ctx.tracker.revertBlock(child,0)).status,'conflict');
+            assert.equal(ctx.tracker.unresolvedBaselineFiles.has(child),true);assert.equal(ctx.tracker.getReviewToken(child),undefined);
+        }finally{gate.release();await operation;}
+    },{configured:true,blindDirectory:true,stoppedArchive}));
 
     const readState = (storage, name = PRIMARY) => JSON.parse(fs.readFileSync(path.join(storage, name), 'utf8'));
     const changeFor = (tracker, target) => tracker.getTrackedChanges().find(change => change.filePath === target);

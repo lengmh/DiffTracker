@@ -5844,6 +5844,7 @@ registerCrossBranchKeep({
 
 registerArchivedGitReview({
     test, Uri, DiffTracker, vscode, file, document, faults, counters, pause, emitWatcher, waitUntil, watcherInstances,
+    nativeDirectoryWatchers, setVsCodeExcludes: value => { vscodeExcludes = value; },
     emitWorkspaceFilesCreated: event => workspaceFilesCreated(event),
     fireConfigurationChanged: key => configurationChanged({ affectsConfiguration: name => name === key }),
     getTracker: () => tracker,
