@@ -10,7 +10,9 @@ const {MonitoringScopeController} = require('../../../out/monitoringScopeControl
 module.exports = async function monitoringLifecycleStatusHost(workspace) {
     workspace=vscode.Uri.file(workspace).fsPath;
     const file=path.join(workspace,'lifecycle-state-host.txt');
-    const storage=fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-lifecycle-host-'));
+    // Persistence callbacks use VS Code Uri.fsPath, including Windows drive
+    // normalization. Match the controlled barrier on that same boundary.
+    const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-lifecycle-host-'))).fsPath;
     const primary=path.join(storage,'session-state.json'),backup=path.join(storage,'session-state.last-good.json');
     let tracker=new DiffTracker(vscode.Uri.file(storage)),controller;
     try {
