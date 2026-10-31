@@ -650,7 +650,7 @@ function connectScopeEditor(h) {
     };
     ui=scopeEditorScriptHarness(message=>{
         const action=panel.handleMessage(message);
-        if(['saveAndApply','saveRequest','restoreEffective','discardDraft','reviewConflict','apply'].includes(message.command))lastAction=action;
+        if(['saveAndApply','saveRequest','restoreEffective','discardDraft','reviewConflict','apply','completeLegacyMigration'].includes(message.command))lastAction=action;
         return action;
     });
     waiting.forEach(message=>ui.receive(message));
@@ -993,6 +993,67 @@ for (const kind of ['automatic', 'manual']) {
         h.WatchExcludePanel.currentPanel.dispose();
     });
 }
+
+for(const changed of ['external-settings','closed-panel','newer-draft','unchanged']) await test(`PR60 REVIEW manual migration preserves ${changed} during confirmation`,async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope(),waits=[];
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];
+    h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[{scope:'all',pattern:'/old/'}]};
+    h.controller.reconcileRequestedScope();
+    h.vscode.window.showWarningMessage=(message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):h.state.warnings.push(message);
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/old/'}]));
+    ui.click('complete-migration');const action=ui.action();assert.equal(waits.length,1);
+    if(changed==='external-settings'){
+        h.state.workspaceConfiguration.watchExclude=[{scope:'all',pattern:'/newer/'}];h.controller.reconcileRequestedScope();
+    }else if(changed==='closed-panel'){panel.dispose();}
+    else if(changed==='newer-draft'){ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/newer-draft/'}]));}
+    waits[0]('Save and Mark Migration Complete');await action;
+    if(changed!=='closed-panel'){assert.equal(ui.elements.get('complete-migration').disabled,false,'every terminal acknowledgement releases the editor');}
+    if(changed==='unchanged'){
+        assert.equal(h.state.updates.length,3);assert.equal(h.controller.getStatus().legacyMigrationComplete,true);panel.dispose();return;
+    }
+    assert.equal(h.state.updates.length,0,'a stale or closed confirmation cannot write settings');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:changed==='external-settings'?'/newer/':'/old/'}]);
+    assert.equal(h.controller.getStatus().legacyMigrationComplete,false);
+    assert.equal(h.tracker.getEffectiveMonitoringScope().kind,'legacyV3');panel.dispose();
+});
+
+await test('PR60 REVIEW a closed migration confirmation cannot overwrite a newer panel result',async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope(),waits=[];
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[]};
+    h.vscode.window.showWarningMessage=(_message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):undefined;
+    await h.run('manageMonitoringScope');const oldPanel=h.WatchExcludePanel.currentPanel,oldUI=connectScopeEditor(h);
+    oldUI.input('excludes',JSON.stringify([{scope:'all',pattern:'/old/'}]));oldUI.click('complete-migration');const old=oldUI.action();oldPanel.dispose();
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/newer/'}]));ui.click('complete-migration');const newer=ui.action();
+    assert.equal(waits.length,2);waits[1]('Save and Mark Migration Complete');await newer;
+    const diagnostic=JSON.stringify(h.controller.getStatus().operationOutcome);
+    waits[0]('Save and Mark Migration Complete');await old;
+    assert.equal(JSON.stringify(h.controller.getStatus().operationOutcome),diagnostic);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:'/newer/'}]);
+    assert.equal(h.state.updates.length,3);panel.dispose();
+});
+
+await test('PR60 REVIEW a queued manual migration cannot replace a newer completed request',async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope();
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[]};
+    const entered=deferred(),gate=deferred();let held=false;
+    h.state.beforeConfigurationUpdate=async()=>{if(!held){held=true;entered.resolve();await gate.promise;}};
+    const proposal=pattern=>({mode:'rules',includes:[],excludes:[{scope:'all',pattern}]});
+    const first=h.controller.completeLegacyMigrationUsingCurrentScope(proposal('/newer/'));let second;
+    try{await entered.promise;second=h.controller.completeLegacyMigrationUsingCurrentScope(proposal('/old/'));}
+    finally{gate.resolve();await first;}
+    const outcome=await second;
+    assert.equal(outcome.status,'conflict',JSON.stringify(outcome));
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:'/newer/'}]);
+    assert.equal(h.state.updates.length,3);
+});
 
 for (const first of ['restore', 'quick']) {
     await test(`${first}-first restore and quick commands serialize complete settings writes`, async () => {
@@ -2476,6 +2537,133 @@ function quickExclusionHarness(coverage = false) {
         ? h.run('excludeCoverageSubtree', { coveragePath: target })
         : h.run('excludeResource', { exclusionPath: target }) };
 }
+
+for (const coverage of [false,true]) await test(`quick exclusion diagnostics retain failure before opening the scope panel (coverage=${coverage})`,async()=>{
+    const h=quickExclusionHarness(coverage);
+    h.state.confirm=true;h.state.applyFailure=true;
+    const outcome=await h.exclude();
+    assert.equal(outcome.status,'failed');
+    assert.equal(outcome.settingsStatus,'restored');
+    assert.equal(outcome.scopeCommitted,false);
+    assert.equal(outcome.coverageStatus,'notRun');
+    assert.deepEqual(h.controller.getStatus().operationOutcome,outcome);
+    await h.run('manageMonitoringScope');
+    await h.WatchExcludePanel.currentPanel.handleMessage({command:'reload'});
+    const status=h.messages.filter(message=>message.command==='scopeStatus').at(-1);
+    assert.deepEqual(status.operationOutcome,outcome);
+    h.WatchExcludePanel.currentPanel.dispose();
+});
+
+for(const next of ['restoreEffectiveScopeConfiguration','recheckObservationCoverage','migrateLegacyWatchRules'])
+await test(`command ${next} replaces an older quick failure in scope diagnostics`,async()=>{
+    const h=quickExclusionHarness(true);h.state.confirm=true;h.state.applyFailure=true;
+    assert.equal((await h.exclude()).status,'failed');h.state.applyFailure=false;
+    if(next==='recheckObservationCoverage'){h.tracker.recheckObservationCoverage=async()=>({status:'rechecked'});}
+    const result=await h.run(next);
+    const expected=next==='restoreEffectiveScopeConfiguration'?'restored':result.status;
+    assert.equal(h.controller.getStatus().operationOutcome.status,expected);
+    await h.run('manageMonitoringScope');await h.WatchExcludePanel.currentPanel.handleMessage({command:'reload'});
+    assert.equal(h.messages.filter(message=>message.command==='scopeStatus').at(-1).operationOutcome.status,expected);
+    h.WatchExcludePanel.currentPanel.dispose();
+});
+
+for(const action of ['saved','draft']) await test(`scope ${action} completion remains diagnostic after its panel closes`,async()=>{
+    const h=quickExclusionHarness(true);h.state.confirm=true;h.state.applyFailure=true;
+    assert.equal((await h.exclude()).status,'failed');h.state.applyFailure=false;
+    if(action==='saved'){
+        h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/a/'});h.controller.reconcileRequestedScope();
+    }
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+    const update=h.controller.context.workspaceState.update;
+    h.controller.context.workspaceState.update=async(key,value)=>{
+        if(key.endsWith('dismissedRevision.v1')&&!held){held=true;enter();await gate;}
+        return update(key,value);
+    };
+    let operation;
+    if(action==='saved'){operation=panel.applyInteractively();}
+    else{ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/a/'}]));ui.click('save-apply');operation=ui.action();}
+    try{await Promise.race([entered,operation.then(()=>assert.fail('Scope never reached its committed-state boundary'))]);panel.dispose();}
+    finally{release();await operation;}
+    assert.equal(h.controller.getStatus().operationOutcome.status,'applied');
+    assert.equal(h.controller.getStatus().operationOutcome.scopeCommitted,true);
+});
+
+for(const newer of ['operation','settings']) await test(`late read-only scope feedback cannot replace ${newer}`,async()=>{
+    const h=quickExclusionHarness(true);h.state.confirm=true;h.state.applyFailure=true;
+    await h.exclude();h.state.applyFailure=false;
+    const token=h.controller.captureOperationOutcomeToken();
+    if(newer==='operation'){assert.equal(await h.run('restoreEffectiveScopeConfiguration'),true);}
+    else{h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/external/'});h.controller.reconcileRequestedScope();}
+    const before=JSON.stringify(h.controller.getStatus().operationOutcome);
+    h.controller.recordUnchangedOperationOutcome({status:'restored',settingsStatus:'unchanged',scopeCommitted:false,
+        coverageStatus:'notRun',reason:'An old settings review completed'},token);
+    assert.equal(JSON.stringify(h.controller.getStatus().operationOutcome),before);
+});
+
+await test('a late scope completion cannot replace a newer initiated diagnostic',async()=>{
+    const h=quickExclusionHarness(true);h.state.confirm=true;
+    let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+    const update=h.controller.context.workspaceState.update;
+    h.controller.context.workspaceState.update=async(key,value)=>{
+        if(key.endsWith('dismissedRevision.v1')&&!held){held=true;enter();await gate;}return update(key,value);
+    };
+    const first=h.exclude();
+    try{
+        await Promise.race([entered,first.then(()=>assert.fail('First action did not reach its committed boundary'))]);
+        const newer=await h.controller.saveAndApplyScope(h.controller.getRequestedRawScope(),async()=>true);
+        assert.equal(newer.status,'conflict');
+        assert.deepEqual(h.controller.getStatus().operationOutcome,newer);
+    }finally{release();await first;}
+    assert.equal(h.controller.getStatus().operationOutcome.status,'conflict');
+});
+
+for(const action of ['saveAndApply','apply']) await test(`a duplicate in-flight panel ${action} cannot consume its completion diagnostic`,async()=>{
+    const h=quickExclusionHarness(true);h.state.confirm=true;
+    if(action==='apply'){h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:'/a/'});h.controller.reconcileRequestedScope();}
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel;
+    let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+    const update=h.controller.context.workspaceState.update;
+    h.controller.context.workspaceState.update=async(key,value)=>{
+        if(key.endsWith('dismissedRevision.v1')&&!held){held=true;enter();await gate;}return update(key,value);
+    };
+    const message={command:action,mode:'rules',includes:[],excludes:[{scope:'all',pattern:'/a/'}],
+        baseVersion:h.controller.getRequestVersion(),draftRevision:1,actionId:109};
+    const first=panel.handleMessage(message);
+    try{
+        await Promise.race([entered,first.then(()=>assert.fail('Action did not reach its committed boundary'))]);
+        await panel.handleMessage(message);
+    }finally{release();await first;}
+    assert.equal(h.state.applies,1);
+    assert.equal(h.controller.getStatus().operationOutcome.status,'applied');
+    assert.equal(h.messages.filter(message=>message.command==='scopeOperation'&&message.actionId===109).length,1);panel.dispose();
+});
+
+await test('duplicate migration confirmation retains one initiation and cancellation outcome',async()=>{
+    const h=quickExclusionHarness(true),waits=[];
+    h.vscode.window.showWarningMessage=(_message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):undefined;
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel;
+    const message={command:'completeLegacyMigration',actionId:110,mode:'rules',includes:[],excludes:[],draftRevision:0};
+    const action=panel.handleMessage(message);assert.equal(waits.length,1);
+    await panel.handleMessage(message);assert.equal(waits.length,1);
+    waits[0](undefined);await action;
+    assert.equal(h.controller.getStatus().operationOutcome.status,'cancelled');
+    assert.equal(h.state.updates.length,0);assert.equal(h.state.applies,0);panel.dispose();
+});
+
+await test('read-only scope confirmations retain the latest panel initiation',async()=>{
+    const h=quickExclusionHarness(true),waits=[];
+    h.vscode.window.showWarningMessage=(_message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):undefined;
+    await h.run('manageMonitoringScope');const firstPanel=h.WatchExcludePanel.currentPanel;
+    const first=firstPanel.handleMessage({command:'discardDraft',actionId:101,draftRevision:0});
+    assert.equal(waits.length,1);firstPanel.dispose();
+    await h.run('manageMonitoringScope');const secondPanel=h.WatchExcludePanel.currentPanel;
+    const second=secondPanel.handleMessage({command:'discardDraft',actionId:102,draftRevision:0});assert.equal(waits.length,2);
+    waits[0]('Discard Draft and Reload');await first;
+    waits[1]('Discard Draft and Reload');await second;
+    assert.equal(h.messages.filter(message=>message.command==='scopeOperation'&&message.actionId===102).at(-1).outcome.status,'restored');
+    assert.equal(h.controller.getStatus().operationOutcome.status,'restored');secondPanel.dispose();
+});
 
 for (const answer of [false, true]) await test(`coverage-row single action ${answer ? 'applies' : 'cancels'} one bound review confirmation`, async () => {
     const h = quickExclusionHarness(true); h.state.confirm = answer;

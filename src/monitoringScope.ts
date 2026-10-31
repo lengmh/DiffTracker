@@ -712,7 +712,8 @@ function explicitExcludeMatches(
     directory: boolean,
     root: WorkspaceRootIdentity,
     workBudget?: PathIdentityWorkBudget,
-    runtimeContext?: PathIdentityRuntimeContext
+    runtimeContext?: PathIdentityRuntimeContext,
+    requireProof = false
 ): boolean {
     const body = pattern.replace(/^\//, '').replace(/\/$/, '');
     const components = body.split('/');
@@ -745,7 +746,7 @@ function explicitExcludeMatches(
             const requestedComponentCount = index + 1;
             const targetComponentCount = target.length;
             if (identityUnavailableForSafety(requested, requestedComponentCount) ||
-                identityUnavailableForSafety(resolved, targetComponentCount)) { return true; }
+                identityUnavailableForSafety(resolved, targetComponentCount)) { return !requireProof; }
             if (requested.identity === target.slice(0, index + 1).join('/')) { return true; }
             // Runtime spelling recovery may be bounded while both lookups still
             // exist. Preserve genuine aliases, but never equate hard-link names
@@ -755,16 +756,17 @@ function explicitExcludeMatches(
                     runtimeBoundedExistingIdentity(resolved, targetComponentCount)) &&
                 requested.lookupVerifiedPrefixLength >= requestedComponentCount &&
                 (resolved?.lookupVerifiedPrefixLength ?? 0) >= requestedComponentCount) {
-                return sameExistingDirectoryEntry(
+                const sameEntry = sameExistingDirectoryEntry(
                     path.join(rootPath, ...target.slice(0, index), literal),
                     path.join(rootPath, ...target.slice(0, index + 1))
-                ) !== false;
+                );
+                return requireProof ? sameEntry === true : sameEntry !== false;
             }
             return false;
         }
         const parent = rootPath ? path.join(rootPath, ...target.slice(0, index)) : undefined;
         const sensitive = parent ? cachedExclusionDirectoryCaseSensitivity(parent, workBudget) : root.caseSensitive;
-        return sensitive !== true && ignore({ ignorecase: true })
+        return (requireProof ? sensitive === false : sensitive !== true) && ignore({ ignorecase: true })
             .add('/' + explicitPatternForIgnore(component)).ignores(target[index]);
     };
     const memo = new Map<string, boolean>();
@@ -798,7 +800,8 @@ export function configuredScopeExplicitlyExcludesSubtree(
     scope: CanonicalMonitoringScope,
     rootIdentity: string | WorkspaceRootIdentity,
     relativeDirectory: string,
-    workBudget?: PathIdentityWorkBudget
+    workBudget?: PathIdentityWorkBudget,
+    requireProof = false
 ): boolean {
     const rel = relativeDirectory.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
     const root = typeof rootIdentity === 'string'
@@ -813,7 +816,7 @@ export function configuredScopeExplicitlyExcludesSubtree(
 
         // A rule that excludes the directory node itself necessarily makes its
         // descendants unreachable to configured-scope discovery.
-        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root, workBudget)) {
+        if (rel && explicitExcludeMatches(rule.pattern, directoryPath, true, root, workBudget, undefined, requireProof)) {
             return true;
         }
 
@@ -836,11 +839,25 @@ export function configuredScopeExplicitlyExcludesSubtree(
             continue;
         }
         if (!prefix) { continue; }
-        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root, workBudget)) {
+        if (explicitExcludeMatches(`/${prefix}/`, directoryPath, true, root, workBudget, undefined, requireProof)) {
             return true;
         }
     }
     return false;
+}
+
+/** Positive rule evidence, excluding conservative identity-failure refusals. */
+export function configuredScopeExplicitlyExcludesPath(
+    scope: CanonicalMonitoringScope,
+    root: WorkspaceRootIdentity,
+    relativePath: string,
+    directory = false
+): boolean {
+    if (typeof root.caseSensitive !== 'boolean') { return false; }
+    // Reuse the ordinary decision's bounded identity allowance across rules.
+    const runtimeContext = createPathIdentityRuntimeContext();
+    return scope.excludes.some(rule => ruleAppliesToRoot(rule, root.name) &&
+        explicitExcludeMatches(rule.pattern, relativePath, directory, root, undefined, runtimeContext, true));
 }
 
 export function evaluateConfiguredScope(

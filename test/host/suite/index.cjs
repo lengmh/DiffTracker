@@ -24,6 +24,43 @@ exports.run = async () => {
         await bounded('Scope settings publication checkpoint', require('./scope-settings.test.cjs'), 60_000);
         return;
     }
+    if (phase === 'workspace-edit') {
+        await bounded('Isolated WorkspaceEdit lifecycle', async () => {
+            const assert = require('node:assert/strict');
+            const path = require('node:path');
+            const vscode = require('vscode');
+            const root = process.env.DIFF_TRACKER_HOST_WORKSPACE;
+            const uri = name => vscode.Uri.file(path.join(root, name));
+            const state = () => vscode.commands.executeCommand('diffTracker._testState');
+            await vscode.extensions.getExtension('lengmh.code-diff-tracker').activate();
+            assert.equal(await vscode.commands.executeCommand('diffTracker.startRecording'), true);
+            const untilStable = async (description, predicate, stableMilliseconds = 750, timeout = 30000) => {
+                const deadline = Date.now() + timeout;
+                let since;
+                while (Date.now() < deadline) {
+                    const result = await predicate();
+                    if (result) {
+                        since ??= Date.now();
+                        if (Date.now() - since >= stableMilliseconds) { return result; }
+                    } else { since = undefined; }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                throw new Error(`Timed out waiting for stable ${description}`);
+            };
+            await untilStable('isolated baseline ready', async () => (await state()).baselineState === 'ready', 0);
+            const pending = async name => (await state()).trackedChanges.find(change => change.filePath === uri(name).fsPath);
+            await require('./workspace-edit-creation.test.cjs')({ workspace: root, uri,
+                write: (name, text) => vscode.workspace.fs.writeFile(uri(name), new TextEncoder().encode(text)), untilStable, pending,
+                reviewablePending: async name => {
+                    const current = await state();
+                    const file = uri(name).fsPath;
+                    const change = current.trackedChanges.find(item => item.filePath === file);
+                    return change && !change.unavailableReason && current.reviewTokens.some(token => token.filePath === file) ? change : undefined;
+                }
+            });
+        }, 45000);
+        return;
+    }
     if (phase === 'native') {
         await bounded('Native Review UI checkpoint', require('./native-review.test.cjs'), 90_000);
         return;

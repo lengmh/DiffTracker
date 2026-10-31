@@ -78,18 +78,7 @@
   document.getElementById('apply').addEventListener('click', () => submitAction('apply'));
   document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ command: 'reload' }));
   document.getElementById('migrate').addEventListener('click', () => vscode.postMessage({ command: 'migrateLegacy' }));
-  document.getElementById('complete-migration').addEventListener('click', () => {
-    try {
-      vscode.postMessage({
-        command: 'completeLegacyMigration',
-        mode: mode.value,
-        includes: parseArray(includes.value, 'Includes'),
-        excludes: parseArray(excludes.value, 'Excludes')
-      });
-    } catch (error) {
-      status.textContent = error instanceof Error ? error.message : String(error);
-    }
-  });
+  document.getElementById('complete-migration').addEventListener('click',()=>submitDraft('completeLegacyMigration'));
   document.getElementById('restore').addEventListener('click', () => submitAction('restoreEffective'));
   document.getElementById('discard-draft').addEventListener('click', () => submitAction('discardDraft'));
   document.getElementById('review-conflict').addEventListener('click', () => submitAction('reviewConflict'));

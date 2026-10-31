@@ -4,6 +4,7 @@ import path from 'node:path';
 import Module, { createRequire } from 'node:module';
 import { registerScopeSingleActionCrashes } from './scope-single-action-crash.mjs';
 import { registerScopeSingleActionAcceptance } from './scope-single-action-acceptance.mjs';
+import { validateAndCanonicalizeScope } from '../out/monitoringScope.js';
 const require = createRequire(import.meta.url);
 
 // Exercise the production tracker through the normal pause/withdraw/recheck
@@ -1136,6 +1137,251 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
             assert.equal(fs.existsSync(target), situation !== 'missing');
         });
     }));
+
+    for(const boundary of ['directory','file','gitignore','files-exclude']) for(const action of ['shortcut','save'])
+    test(`EXCLUDES ${action} ignores an already excluded settings notification without reading excluded content (${boundary})`, () => fixture(async ({tracker,scope,dir}) => {
+        const selected=path.join(dir,'tests','cache');fs.mkdirSync(selected,{recursive:true});
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));
+        fs.writeFileSync(settingsFile,'{}');
+        const other=path.join(dir,'kept.txt');fs.writeFileSync(other,'original');
+        if(boundary==='gitignore'){fs.writeFileSync(path.join(dir,'.gitignore'),'/.vscode/\n');}
+        if(boundary==='files-exclude'){h.setVsCodeExcludes({'files.exclude':{'.vscode':true}});}
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(other)]);
+        tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        fs.writeFileSync(other,'pending');await tracker.readFileAndUpdate(other,Uri.file(other));
+        const token=tracker.getReviewToken(other);
+        tracker.setSubtreeCoverageGap(selected,'directory-runtime-coverage-gap','Prior imported interval');
+        await withController(tracker,scope,async({controller,hooks,config,writes})=>{
+            let wrote=false,injected=false;
+            hooks.afterWrite=()=>{fs.writeFileSync(settingsFile,JSON.stringify(config));wrote=true;};
+            const opendir=fs.promises.opendir,open=fs.openSync,asyncOpen=fs.promises.open;
+            fs.openSync=(file,...args)=>{
+                assert.notEqual(path.resolve(String(file)),settingsFile,'excluded settings content must not be read');
+                return open(file,...args);
+            };
+            fs.promises.open=(file,...args)=>{
+                assert.notEqual(path.resolve(String(file)),settingsFile,'excluded settings must not be opened asynchronously');
+                return asyncOpen(file,...args);
+            };
+            fs.promises.opendir=async(directory,...args)=>{
+                if(boundary!=='file'){assert.notEqual(path.resolve(String(directory)),path.dirname(settingsFile),'excluded directory must not be enumerated');}
+                const result=await opendir(directory,...args);
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                }
+                return result;
+            };
+            try{
+                const outcome=action==='shortcut'?await controller.excludeCoverageSubtree(selected,async()=>true):
+                    await controller.saveAndApplyScope({mode:'rules',includes:[],excludes:[...scope.excludes,{scope:'all',pattern:'/tests/cache/'}]},async()=>true);
+                assert.equal(injected,true);
+                assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(outcome.scopeCommitted,true);
+                assert.equal(writes.length,action==='shortcut'?1:3,'owned configuration writes, without compensation or retries');
+                assert.deepEqual(config.watchExclude,[...scope.excludes,{scope:'all',pattern:'/tests/cache/'}]);
+                assert.equal(controller.getStatus().effective.scopeRevision,controller.getStatus().requested.scope.scopeRevision);
+                assert.equal(tracker.getSubtreeCoverageGaps().some(gap=>gap.targetPath===selected),false);
+                assert.equal(tracker.getOriginalContent(other),'original');
+                assert.deepEqual(tracker.getReviewToken(other),token);
+            }finally{fs.promises.opendir=opendir;fs.openSync=open;fs.promises.open=asyncOpen;}
+        });
+    },'rules',boundary==='directory'?[{scope:'all',pattern:'/.vscode/'}]:boundary==='file'?[{scope:'all',pattern:'/.vscode/settings.json'}]:[]));
+
+
+    for(const change of ['monitored-file','new-exclusion','settings-request','excluded-node-replacement','git-policy','watcher-policy'])
+    test(`EXCLUDES shared exclusions retain concurrent ${change} protection`,()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'cache');fs.mkdirSync(selected);
+        const other=path.join(dir,'kept.txt');fs.writeFileSync(other,'original');
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));fs.writeFileSync(settingsFile,'{}');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(other)]);tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        tracker.setSubtreeCoverageGap(selected,'directory-runtime-coverage-gap','Prior import');
+        await withController(tracker,scope,async({controller,hooks,config,notifyConfiguration})=>{
+            let wrote=false,injected=false;
+            hooks.afterWrite=()=>{if(fs.existsSync(path.dirname(settingsFile))){fs.writeFileSync(settingsFile,JSON.stringify(config));}wrote=true;};
+            const opendir=fs.promises.opendir;
+            fs.promises.opendir=async(directory,...args)=>{
+                const handle=await opendir(directory,...args);
+                if(wrote&&!injected&&tracker.baselineTransaction){
+                    injected=true;
+                    tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                    if(change==='watcher-policy'){
+                        h.setVsCodeExcludes({'files.watcherExclude':{'kept/**':true}});h.fireConfigurationChanged('files.watcherExclude');
+                    }else if(change==='settings-request'){
+                        config.watchExclude=[...scope.excludes,{scope:'all',pattern:'/independent-choice/'}];notifyConfiguration('watchExclude');
+                    }else{
+                        let file=change==='new-exclusion'?path.join(selected,'new.txt'):change==='git-policy'?path.join(dir,'.vscode','.gitignore'):other;
+                        if(change==='excluded-node-replacement'){
+                            fs.rmSync(path.dirname(settingsFile),{recursive:true});file=path.dirname(settingsFile);
+                        }
+                        fs.writeFileSync(file,'independent content');tracker.dispatchExternalEvent(Uri.file(file),'change',tracker.sessionEpoch);
+                    }
+                }
+                return handle;
+            };
+            try{
+                const outcome=await controller.excludeCoverageSubtree(selected,async()=>true);
+                assert.equal(injected,true);assert.notEqual(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.equal(tracker.getOriginalContent(other),'original');
+                if(change==='settings-request'){assert.deepEqual(config.watchExclude,[...scope.excludes,{scope:'all',pattern:'/independent-choice/'}]);}
+            }finally{fs.promises.opendir=opendir;}
+        });
+    },'rules',[{scope:'all',pattern:'/.vscode/'}]));
+
+    for(const activity of ['settings','new-exclusion'])
+    test(`EXCLUDES applying a saved request distinguishes already excluded settings from ${activity} events`,()=>fixture(async({tracker,scope,dir})=>{
+        const selected=path.join(dir,'cache');fs.mkdirSync(selected);
+        const child=path.join(selected,'existing.txt');fs.writeFileSync(child,'original');
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));fs.writeFileSync(settingsFile,'{}');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(child)]);tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        await withController(tracker,scope,async({controller,hooks,config,notifyConfiguration})=>{
+            config.watchExclude=[...scope.excludes,{scope:'all',pattern:'/cache/'}];notifyConfiguration('watchExclude');
+            const paths=tracker.getExplicitlyExcludedPendingReviewPaths(controller.getRequestedScope().scope);
+            assert.deepEqual(paths,[child]);
+            hooks.afterWrite=async()=>{
+                const file=activity==='settings'?settingsFile:child;
+                const text=activity==='settings'?JSON.stringify(config):'independent pending edit';
+                fs.writeFileSync(file,text);
+                tracker.dispatchExternalEvent(Uri.file(file),'change',tracker.sessionEpoch);
+                tracker.onDocumentChanged({document:{uri:Uri.file(file),isDirty:false,getText:()=>text}});
+                assert.equal(await tracker.flushPendingPersistence(),true);
+            };
+            const outcome=await controller.saveAndApplyScope(controller.getRequestedRawScope(),async()=>true);
+            if(activity==='new-exclusion'){
+                assert.notEqual(outcome.status,'applied',JSON.stringify(outcome));
+                assert.equal(controller.getStatus().effective.scopeRevision,scope.scopeRevision);
+                assert.equal(tracker.getOriginalContent(child),'original');
+                return;
+            }
+            assert.equal(outcome.status,'applied',JSON.stringify(outcome));
+            assert.equal(tracker.getTrackedChange(settingsFile),undefined,'already excluded control data must not become a new review');
+            assert.equal(tracker.getCoverageGaps().some(([file])=>file===settingsFile),false);
+        });
+    },'rules',[{scope:'all',pattern:'/.vscode/'}]));
+
+    test('EXCLUDES saved request ignores excluded settings notifications while draining earlier monitored work',()=>fixture(async({tracker,scope,dir})=>{
+        const settingsFile=path.join(dir,'.vscode','settings.json');fs.mkdirSync(path.dirname(settingsFile));fs.writeFileSync(settingsFile,'{}');
+        const selected=path.join(dir,'cache');fs.mkdirSync(selected);
+        const child=path.join(selected,'existing.txt');fs.writeFileSync(child,'original');
+        const other=path.join(dir,'kept.txt');fs.writeFileSync(other,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        h.setListedFiles([Uri.file(child),Uri.file(other)]);tracker.startRecording();await h.waitUntil(()=>tracker.getBaselineState()==='ready');
+        await withController(tracker,scope,async({controller,hooks,config,notifyConfiguration})=>{
+            config.watchExclude=[...scope.excludes,{scope:'all',pattern:'/cache/'}];notifyConfiguration('watchExclude');
+            await tracker.ignoreRefreshPromise;
+            hooks.afterWrite=async(key)=>{if(key==='watchExclude'){
+                fs.writeFileSync(other,'independent pending text');await tracker.onExternalFileChanged(Uri.file(other));
+            }};
+            const barrier=h.pause(other,'read');
+            const action=controller.saveAndApplyScope(controller.getRequestedRawScope(),async()=>true);
+            let result;
+            try{
+                await Promise.race([barrier.entered,action.then(outcome=>assert.fail(`Read drain was not reached: ${JSON.stringify(outcome)}`))]);
+                tracker.dispatchExternalEvent(Uri.file(settingsFile),'change',tracker.sessionEpoch);
+                tracker.onDocumentChanged({document:{uri:Uri.file(settingsFile),isDirty:false,getText:()=>JSON.stringify(config)}});
+            }finally{barrier.release();result=await action;}
+            assert.equal(result.status,'applied',JSON.stringify(result));
+            assert.equal(tracker.getTrackedChange(settingsFile),undefined);
+            assert.equal(tracker.getOriginalContent(other),'original');
+            assert.equal(tracker.getTrackedChange(other)?.currentContent,'independent pending text');
+        });
+    },'rules',[{scope:'all',pattern:'/.vscode/'}]));
+
+    for(const change of ['included-parent-delete','monitored-identity'])
+    test(`EXCLUDES unrelated Apply must retain ${change} events through commit`,()=>fixture(async({tracker,dir})=>{
+        const parent=path.join(dir,'ignored');fs.mkdirSync(parent);
+        const target=change==='included-parent-delete'?path.join(parent,'child.txt'):path.join(dir,'monitored.txt');
+        fs.writeFileSync(target,'original');
+        if(change==='included-parent-delete'){fs.writeFileSync(path.join(dir,'.gitignore'),'ignored\n');}
+        const initial=validateAndCanonicalizeScope({mode:change==='included-parent-delete'?'rules':'wholeWorkspace',
+            includes:change==='included-parent-delete'?[{scope:'all',path:'ignored/child.txt'}]:[],excludes:[]},tracker.currentWorkspaceRootIdentities()).scope;
+        assert.equal((await tracker.applyConfiguredMonitoringScope(initial)).status,'applied');
+        const candidate=validateAndCanonicalizeScope({...initial,excludes:[{scope:'all',pattern:'/noise/'}]},initial.roots).scope;
+        const outside=path.join(path.dirname(dir),'outside-identity.txt');
+        if(change==='monitored-identity'){
+            fs.writeFileSync(outside,'outside content');
+            const probe=path.join(dir,'symlink-probe');
+            try{fs.symlinkSync(outside,probe);fs.unlinkSync(probe);}
+            catch(error){if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP monitored-identity requires filesystem symlink permission');return;}throw error;}
+        }
+        const copy=vscode.workspace.fs.copy;let injected=false;
+        vscode.workspace.fs.copy=async(...args)=>{
+            if(!injected&&tracker.baselineTransaction&&tracker.effectiveMonitoringScope.scopeRevision===candidate.scopeRevision){
+                injected=true;
+                if(change==='included-parent-delete'){fs.rmSync(parent,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(parent));}
+                else{fs.unlinkSync(target);fs.symlinkSync(outside,target);await tracker.onExternalFileChanged(Uri.file(target));}
+            }
+            return copy(...args);
+        };
+        try{
+            const result=await tracker.applyConfiguredMonitoringScope(candidate);
+            assert.equal(injected,true);assert.notEqual(result.status,'applied',JSON.stringify(result));
+            assert.equal(tracker.getOriginalContent(target),'original');
+        }finally{vscode.workspace.fs.copy=copy;fs.rmSync(outside,{force:true});}
+    }));
+
+    test('PR60 REVIEW identity uncertainty cannot discard a transient monitored replacement during Apply',()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'src','a.ts'),outside=path.join(dir,'transient-identity.txt');
+        fs.mkdirSync(path.dirname(target));
+        fs.mkdirSync(path.join(dir,'.vscode'));fs.writeFileSync(path.join(dir,'.vscode','settings.json'),'{}');
+        fs.writeFileSync(target,'original');fs.writeFileSync(outside,'outside bytes');
+        const probe=path.join(dir,'identity-probe');
+        try{fs.symlinkSync(outside,probe);fs.unlinkSync(probe);}
+        catch(error){fs.rmSync(outside,{force:true});if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP transient identity requires symlink permission');return;}throw error;}
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+        const copy=vscode.workspace.fs.copy;let injected=false;
+        vscode.workspace.fs.copy=async(...args)=>{
+            if(!injected&&tracker.baselineTransaction&&tracker.effectiveMonitoringScope.scopeRevision===candidate.scopeRevision){
+                injected=true;fs.unlinkSync(target);fs.symlinkSync(outside,target);
+                try{await tracker.onExternalFileChanged(Uri.file(target));}
+                finally{fs.unlinkSync(target);fs.writeFileSync(target,'replacement text');}
+            }
+            return copy(...args);
+        };
+        try{
+            const result=await tracker.applyConfiguredMonitoringScope(candidate);
+            assert.equal(injected,true);assert.notEqual(result.status,'applied',JSON.stringify(result));
+            await h.waitUntil(()=>tracker.getTrackedChange(target)?.currentContent==='replacement text');
+            assert.equal(tracker.getOriginalContent(target),'original');
+        }finally{vscode.workspace.fs.copy=copy;fs.rmSync(outside,{force:true});}
+    },'wholeWorkspace',[{scope:'all',pattern:'/.vscode/'}]));
+
+    for(const phase of ['pending','preflight'])
+    test(`PR60 REVIEW ${phase} preserves uncertain identity evidence outside actual exclusions`,()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'src','a.ts'),surrogate=path.join(dir,'surrogate.txt');
+        fs.mkdirSync(path.dirname(target));fs.writeFileSync(target,'original');fs.writeFileSync(surrogate,'surrogate');
+        const probe=path.join(dir,'identity-probe');
+        try{fs.symlinkSync(surrogate,probe);fs.unlinkSync(probe);}
+        catch(error){if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP identity event requires symlink permission');return;}throw error;}
+        const other=path.join(dir,'other.txt');fs.writeFileSync(other,'original other');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const replace=async()=>{
+            fs.unlinkSync(target);fs.symlinkSync(surrogate,target);
+            try{await tracker.onExternalFileChanged(Uri.file(target));}
+            finally{fs.unlinkSync(target);fs.writeFileSync(target,'replacement text');}
+        };
+        if(phase==='pending'){
+            const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+            tracker.setPendingMonitoringScope(candidate);await replace();
+        }else{
+            const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+            tracker.setPendingMonitoringScope(candidate);await tracker.ignoreRefreshPromise;
+            fs.writeFileSync(other,'other pending');await tracker.onExternalFileChanged(Uri.file(other));
+            const barrier=h.pause(other,'read');
+            const action=tracker.applyConfiguredMonitoringScope(candidate);
+            try{
+                await Promise.race([barrier.entered,action.then(result=>assert.fail(`Preflight drain was not reached: ${JSON.stringify(result)}`))]);
+                assert.equal(tracker.scopeApplyPreflight,true,'gate must be the public Apply preflight drain');
+                await replace();
+            }finally{barrier.release();await action;}
+        }
+        assert.ok(tracker.getTrackedChange(target)||tracker.coverageGaps.get(target)?.file,'uncertain identity notification must retain review or coverage evidence');
+        assert.equal(tracker.getOriginalContent(target),'original');
+    },'wholeWorkspace',[{scope:'all',pattern:'/.vscode/'}]));
 
     registerScopeSingleActionAcceptance(h,fixture,scopeFor,withController);
     registerScopeSingleActionCrashes(h,fixture,scopeFor,withController);

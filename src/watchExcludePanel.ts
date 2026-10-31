@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { DiffTracker } from './diffTracker';
-import { MonitoringScopeApplyOutcome, MonitoringScopeConfirmation, MonitoringScopeController } from './monitoringScopeController';
+import { MonitoringScopeApplyOutcome, MonitoringScopeConfirmation, MonitoringScopeController, ScopeOperationReportToken } from './monitoringScopeController';
 import { MonitoringScopeRequest } from './monitoringScope';
 
 type ScopeMessage = {
@@ -28,7 +28,6 @@ export class WatchExcludePanel {
     private actionInProgress = false;
     private activeActionId?: number;
     private disposed = false;
-    private lastOutcome?: MonitoringScopeApplyOutcome;
     private nextLease = 0;
     private editorLease?: {id:number;resolve:(clean:boolean)=>void;timer:ReturnType<typeof setTimeout>};
 
@@ -99,16 +98,28 @@ export class WatchExcludePanel {
             await this.postStatus();
             return;
         }
+        // A redelivered UI action still belongs to its original invocation.
+        // Do not let a duplicate consume that invocation's diagnostic lease.
+        if (this.actionInProgress && message.command !== 'testPath' && message.actionId === this.activeActionId) { return; }
+        const reportToken=['saveAndApply','saveRequest','apply','completeLegacyMigration','restoreEffective','discardDraft','reviewConflict'].includes(message.command)
+            ? this.scopeController.captureOperationOutcomeToken() : undefined;
+        const rejected=(reason:string):MonitoringScopeApplyOutcome=>{
+            const outcome:MonitoringScopeApplyOutcome={status:'conflict',reason,settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'};
+            if(reportToken){this.scopeController.recordUnchangedOperationOutcome(outcome,reportToken);}
+            return outcome;
+        };
         if (['saveAndApply','saveRequest','completeLegacyMigration'].includes(message.command) &&
             typeof message.draftRevision === 'number' && message.draftRevision < this.draftRevision) {
             void this.panel.webview.postMessage({command:'scopeOperation',actionId:message.actionId,
-                outcome:{status:'conflict',reason:'A newer editor draft exists. The older save was not performed.'}});
+                outcome:rejected('A newer editor draft exists. The older save was not performed.')});
+            await this.postStatus();
             return;
         }
         if (this.actionInProgress && message.command !== 'testPath') {
             if (message.actionId !== this.activeActionId) {
                 void this.panel.webview.postMessage({command:'scopeOperation',actionId:message.actionId,
-                    outcome:{status:'conflict',reason:'Another scope action is in progress; your draft is preserved.'}});
+                    outcome:rejected('Another scope action is in progress; your draft is preserved.')});
+                await this.postStatus();
             }
             return;
         }
@@ -117,7 +128,8 @@ export class WatchExcludePanel {
             const revision = message.draftRevision;
             if (this.actionInProgress || typeof revision !== 'number' || revision < this.draftRevision || !message.baseVersion) {
                 void this.panel.webview.postMessage({command:'scopeOperation',actionId:message.actionId,
-                    outcome:{status:'conflict',reason:'The editor draft or another scope operation changed. Your draft is preserved.'}});
+                    outcome:rejected('The editor draft or another scope operation changed. Your draft is preserved.')});
+                await this.postStatus();
                 return;
             }
             this.draftRevision = revision;
@@ -135,7 +147,7 @@ export class WatchExcludePanel {
                 outcome = {status:'failed',reason:`Scope operation interrupted: ${String(error)} Check the effective scope in Status; your draft is preserved.`};
             } finally { this.actionInProgress = false; this.activeActionId = undefined; }
             const acceptDraft = outcome.scopeCommitted === true && outcome.settingsStatus === 'saved' && this.draftRevision === revision;
-            await this.finishEditorAction(message,outcome,acceptDraft);
+            await this.finishEditorAction(message,outcome,acceptDraft,reportToken);
             return;
         }
 
@@ -157,7 +169,7 @@ export class WatchExcludePanel {
                     : {status:'conflict',reason:result.errors.map(error=>error.message).join('; ')};
             } catch (error) {outcome={status:'failed',reason:`Request save did not complete: ${String(error)} Your draft is preserved.`};}
             finally {this.actionInProgress=false;this.activeActionId=undefined;}
-            await this.finishEditorAction({...message,draftRevision:revision},outcome,outcome.status==='saved' && this.draftRevision===revision);
+            await this.finishEditorAction({...message,draftRevision:revision},outcome,outcome.status==='saved' && this.draftRevision===revision,reportToken);
             return;
         }
 
@@ -165,8 +177,8 @@ export class WatchExcludePanel {
             let outcome: MonitoringScopeApplyOutcome;
             if(message.baseVersion && message.baseVersion!==this.scopeController.getRequestVersion()){
                 outcome={status:'conflict',reason:'Saved settings changed after this editor loaded. Review the current settings; your draft is preserved.'};
-                this.showOutcome(outcome);
-            }else{outcome=await this.applyInteractively();}
+                this.showOutcome(outcome,reportToken);
+            }else{outcome=await this.applyInteractively(message.actionId);}
             void this.panel.webview.postMessage({command:'scopeOperation',actionId:message.actionId,
                 draftRevision:message.draftRevision,acceptDraft:false,outcome});
             await this.postStatus();
@@ -174,35 +186,54 @@ export class WatchExcludePanel {
         }
 
         if (message.command === 'migrateLegacy') {
-            const outcome = await this.scopeController.migrateLegacyWatchRules();
-            if (outcome.status === 'migrated') {
-                void vscode.window.showInformationMessage('Code Diff Tracker: Legacy Global watch rules migrated into this workspace request.');
-            } else {
-                void vscode.window.showWarningMessage(
-                    `Code Diff Tracker: Legacy rule migration needs attention. ${outcome.reason ?? ''}${outcome.manual?.length ? ' ' + outcome.manual.join(', ') : ''}`
-                );
-            }
+            this.actionInProgress=true;this.activeActionId=message.actionId;
+            try {
+                const outcome = await this.scopeController.migrateLegacyWatchRules();
+                if (outcome.status === 'migrated') {
+                    void vscode.window.showInformationMessage('Code Diff Tracker: Legacy Global watch rules migrated into this workspace request.');
+                } else {
+                    void vscode.window.showWarningMessage(
+                        `Code Diff Tracker: Legacy rule migration needs attention. ${outcome.reason ?? ''}${outcome.manual?.length ? ' ' + outcome.manual.join(', ') : ''}`
+                    );
+                }
+            } finally {this.actionInProgress=false;this.activeActionId=undefined;}
             await this.postStatus();
             return;
         }
 
         if (message.command === 'completeLegacyMigration') {
-            const request = {mode:message.mode,includes:message.includes,excludes:message.excludes} as MonitoringScopeRequest;
-            const answer = await vscode.window.showWarningMessage(
-                'Save this editor target and mark the legacy monitoring migration as reviewed?',
-                {
-                    modal: true,
-                    detail: 'The exact editor target is validated and saved first, then migration evidence is bound to that Scope Revision. The committed legacy policy remains effective until Apply succeeds.'
-                },
-                'Save and Mark Migration Complete'
-            );
-            if (answer === 'Save and Mark Migration Complete') {
-                const outcome = await this.scopeController.completeLegacyMigrationUsingCurrentScope(request);
-                if (outcome.status !== 'completed') {
-                    void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Current scope is invalid.'}`);
-                }
+            const expectedRequestVersion=message.baseVersion ?? this.scopeController.getRequestVersion();
+            const revision=message.draftRevision ?? this.draftRevision;
+            const current=()=>!this.disposed && this.draftRevision===revision;
+            let outcome:MonitoringScopeApplyOutcome={status:'cancelled',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'};
+            if(expectedRequestVersion!==this.scopeController.getRequestVersion() || !current()){
+                await this.finishEditorAction(message,rejected('Migration settings or draft changed. Review the current settings; your draft is preserved.'),false,reportToken);
+                return;
             }
-            await this.postStatus();
+            this.actionInProgress=true;this.activeActionId=message.actionId;
+            try {
+                const request = {mode:message.mode,includes:message.includes,excludes:message.excludes} as MonitoringScopeRequest;
+                const answer = await vscode.window.showWarningMessage(
+                    'Save this editor target and mark the legacy monitoring migration as reviewed?',
+                    {
+                        modal: true,
+                        detail: 'The exact editor target is validated and saved first, then migration evidence is bound to that Scope Revision. The committed legacy policy remains effective until Apply succeeds.'
+                    },
+                    'Save and Mark Migration Complete'
+                );
+                if (answer === 'Save and Mark Migration Complete' &&
+                    (!current() || expectedRequestVersion!==this.scopeController.getRequestVersion())) {
+                    outcome=rejected('The migration draft or Workspace settings changed during confirmation; newer settings and your draft are preserved.');
+                } else if (answer === 'Save and Mark Migration Complete') {
+                    const result = await this.scopeController.completeLegacyMigrationUsingCurrentScope(request,expectedRequestVersion,current);
+                    outcome=result.status==='completed'
+                        ? {status:'saved',settingsStatus:'saved',scopeCommitted:false,coverageStatus:'notRun',reason:'Migration target saved and reviewed. The effective legacy scope remains unchanged until Apply succeeds.'}
+                        : {status:result.status==='conflict'?'conflict':'invalid',reason:result.reason};
+                }
+            } catch(error) {
+                outcome={status:'failed',reason:`Migration did not complete: ${String(error)} Check the saved request and effective scope; your draft is preserved.`};
+            } finally {this.actionInProgress=false;this.activeActionId=undefined;}
+            await this.finishEditorAction(message,outcome,outcome.status==='saved'&&current(),reportToken);
             return;
         }
 
@@ -223,7 +254,7 @@ export class WatchExcludePanel {
                 }
             } catch(error) {outcome={status:'failed',reason:`Restore did not complete: ${String(error)}`};}
             finally {this.actionInProgress=false;this.activeActionId=undefined;}
-            await this.finishEditorAction(message,outcome);
+            await this.finishEditorAction(message,outcome,false,reportToken);
             return;
         }
 
@@ -242,7 +273,7 @@ export class WatchExcludePanel {
                         reason:'Unsaved draft discarded. Current Workspace settings reloaded.'};
                 }else if(answer){outcome={status:'conflict',reason:'The draft changed during confirmation and has been preserved.'};}
             }finally{this.actionInProgress=false;this.activeActionId=undefined;}
-            await this.finishEditorAction({...message,draftRevision:revision},outcome,acceptDraft);
+            await this.finishEditorAction({...message,draftRevision:revision},outcome,acceptDraft,reportToken);
             return;
         }
 
@@ -263,7 +294,7 @@ export class WatchExcludePanel {
                     }else{outcome={status:'conflict',reason:'Draft or settings changed during conflict review; the draft is preserved.'};}
                 }
             }finally{this.actionInProgress=false;this.activeActionId=undefined;}
-            await this.finishEditorAction({...message,draftRevision:revision},outcome);
+            await this.finishEditorAction({...message,draftRevision:revision},outcome,false,reportToken);
             return;
         }
 
@@ -321,7 +352,8 @@ export class WatchExcludePanel {
         }
     }
 
-    private async finishEditorAction(message: ScopeMessage,outcome: MonitoringScopeApplyOutcome,acceptDraft=false): Promise<void> {
+    private async finishEditorAction(message: ScopeMessage,outcome: MonitoringScopeApplyOutcome,acceptDraft=false,reportToken?:ScopeOperationReportToken): Promise<void> {
+        if(reportToken){this.scopeController.recordUnchangedOperationOutcome(outcome,reportToken);}
         if (this.disposed) { return; }
         if (acceptDraft && this.draftRevision === message.draftRevision) {this.draftDirty=false;}
         this.showOutcome(outcome);
@@ -342,8 +374,8 @@ export class WatchExcludePanel {
         return answer === 'Confirm and Apply';
     }
 
-    private showOutcome(outcome: MonitoringScopeApplyOutcome): void {
-        this.lastOutcome = outcome;
+    private showOutcome(outcome: MonitoringScopeApplyOutcome,reportToken?:ScopeOperationReportToken): void {
+        if(reportToken){this.scopeController.recordUnchangedOperationOutcome(outcome,reportToken);}
         if (outcome.status === 'cancelled') { return; }
         const text = `Code Diff Tracker: ${outcome.reason ?? (outcome.status === 'applied'
             ? 'Monitoring scope applied and observation coverage verified.' : outcome.status)}`;
@@ -351,15 +383,17 @@ export class WatchExcludePanel {
         else { void vscode.window.showWarningMessage(text); }
     }
 
-    public async applyInteractively(): Promise<MonitoringScopeApplyOutcome> {
+    public async applyInteractively(actionId?:number): Promise<MonitoringScopeApplyOutcome> {
+        const reportToken=this.scopeController.captureOperationOutcomeToken();
         if (this.actionInProgress || (this.draftKnown && this.draftDirty)) {
             const outcome: MonitoringScopeApplyOutcome = {status:'conflict',
                 reason:'An unsaved draft or another scope action is open. Use Save and Apply for this draft; it has been preserved.'};
-            this.showOutcome(outcome);
+            this.showOutcome(outcome,reportToken);
             return outcome;
         }
         const revision = this.draftRevision;
         this.actionInProgress = true;
+        this.activeActionId=actionId;
         try {
             const outcome = await this.scopeController.saveAndApplyScope(
                 this.scopeController.getRequestedRawScope() as MonitoringScopeRequest,
@@ -367,7 +401,7 @@ export class WatchExcludePanel {
                 ()=>!this.disposed && this.draftRevision === revision);
             if (!this.disposed) { this.showOutcome(outcome); await this.postStatus(); }
             return outcome;
-        } finally { this.actionInProgress = false; }
+        } finally { this.actionInProgress = false; this.activeActionId=undefined; }
     }
 
     private async postStatus(): Promise<void> {
@@ -375,7 +409,7 @@ export class WatchExcludePanel {
         void this.panel.webview.postMessage({
             command: 'scopeStatus',
             requestVersion: this.scopeController.getRequestVersion(),
-            operationOutcome: this.lastOutcome,
+            operationOutcome: status.operationOutcome,
             rawRequested: status.rawRequested,
             requested: {
                 ok: status.requested.ok,
