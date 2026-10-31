@@ -224,7 +224,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 arguments: [item]
             };
         } else {
-            const sourceNote = vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false)
+            const sourceNote = fileDiff.sourceNote && vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false)
                 ? fileDiff.sourceNote : undefined;
             item.description = sourceNote ? 'Source uncertain' : undefined;
             item.iconPath = vscode.ThemeIcon.File;
