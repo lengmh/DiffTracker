@@ -113,7 +113,11 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         await until('post-certification nested reread gate', () => entered || settled, diagnostics);
         assert.equal(entered, true, JSON.stringify(await Promise.race([action, Promise.resolve('pending')])));
         assert.equal(tracker.getTrackedChange(files[0])?.currentContent, 'pending 0');
-        fs.rmSync(ancestor, { recursive: true });
+        // Keep native identity/error callbacks runnable while Windows removes
+        // watched descendants. Synchronous removal blocks the callbacks that
+        // release their handles and can leave the parent pending deletion.
+        await fs.promises.rm(ancestor, { recursive: true });
+        assert.equal(fs.existsSync(ancestor), false, 'the ancestor must actually be removed');
         await until('real deletion buffered during Recheck', () => [...tracker.restoreEvents.values()].some(event =>
             event.kind === 'delete' && inside(files[0], event.uri.fsPath)) || tracker.coverageRecheckSelectedOverflow, diagnostics);
         release();
