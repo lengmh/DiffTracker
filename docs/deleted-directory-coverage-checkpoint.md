@@ -124,3 +124,23 @@ Retirement now retains independently reported regular-file events from the same 
 | Directory ignore | No obligation or traversal outside policy | Excluded children are not adopted | Dormant uncertainty is retained |
 
 The eleven added retirement cases include runtime/restore/Retry positive and historical-Unknown controls, an after-barrier comparison, create+change, create+delete and two bounded-overflow cases. The three positive during-barrier cases fail on 7ce724f and all eleven pass after the correction. The preceding 26 provenance/ignore cases and both epoch outcomes still pass. A real Host test uses WorkspaceEdit.createFile, waits for actual onDidCreateFiles delivery during certification, writes through the real provider and verifies the child has its correct empty baseline and review token; its historical-Unknown sibling stays Unknown. Normal restore and Retry pass on official 1.80.2 and Stable. The actual 1.80.2 case fails against 7ce724f at the exact-file baseline assertion. This positive case and the parent-only block-Revert negatives run together, without callback injection or retries.
+
+
+## Creation evidence lifetime: fixed phase matrix
+
+Two subsequent reviews identified complementary ordering errors on 152dd91: ancestor deletion did not revoke retained descendant creates, while an exact delete followed by a new regular-file create inherited an obsolete directory-observation flag. These require one queue contract rather than separate per-stage exceptions.
+
+| Received evidence | Pending creation state |
+| --- | --- |
+| Independent file create | Fresh file proof; replace the previous incarnation's observation marker |
+| Change, same file target | Preserve its existing creation proof; do not revive revoked proof |
+| Exact delete | No creation proof remains for that incarnation |
+| Ancestor delete | Revoke pending descendant creates into observation-only changes |
+| New independent create after deletion | Establish fresh proof again; historical Unknown remains protected |
+| Coarse directory notification / a queued target now classified as a directory | Observe the subtree; never infer all child before-images |
+
+The same revocation and merge rules feed runtime retirement, normal restore, Retry, interrupted Keep cleanup, Recheck and final archive replay. Generic and archive consumers retain an exact queued object through asynchronous classification, then consume it only if its epoch/context and object identity remain current. Discovery and all consumers use the same directory-observation predicate. Known baselines and review data are never retired by this evidence invalidation.
+
+The bounded regression matrix is 53 cases: 17 retirement cases, 16 provenance controls, six archive causal controls, two final-archive ancestor controls, six ignored-directory cases, two epoch outcomes and four exact type-transition controls. Ancestor negative and positive cases cover runtime/restore/Retry, Keep cleanup and stopped archive replay. The old head fails the five negative ancestor cases while accepting fresh post-delete creates. In the production handler with the mocked VS Code boundary, the three old retirement cases return success from block Revert and empty the buffer; corrected cases return conflict with both buffer and disk unchanged. Normal/Retry exact delete-to-file cases fail on the old head; the corrected historical-Unknown control remains Unknown. A file-create followed only by a directory change is also classified before consumption, preserving its children's Unknown.
+
+A real 1.80.2 Host comparison waits for actual directory create, actual exact delete, then an actual native regular-file create at the same path during intent cleanup. The old head loses the text baseline; the correction retains the empty before-image and token. Stable passes the same scenario. A WorkspaceEdit control also passes on the old head because its onDidCreateFiles entry bypasses this particular queued-filesystem-notification bug; that control is retained as a distinct successful path and is not called a native red reproduction. The earlier real retirement WorkspaceEdit red/green remains a separate valid comparison. No callback injection, arbitrary sleep, retry or safety assertion removal forces these outcomes.

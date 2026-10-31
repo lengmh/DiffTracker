@@ -209,4 +209,42 @@ export function registerMonitoringLifecycleDiagnostics(h,fixture) {
         }finally{gate.release();await restore;h.setListedIgnores([]);}
     },'rules',policy==='explicit'?[{scope:'all',pattern:'/ignored/'}]:[]));
 
+    for(const {retry,historical,directoryTarget=false} of [{retry:false,historical:false},{retry:true,historical:false},{retry:true,historical:true},{retry:true,historical:false,directoryTarget:true}])
+    test(`P2-EXACT-CREATE-TYPE retry=${retry} historical=${historical} directoryTarget=${directoryTarget}`,()=>fixture(async({tracker,dir,scope})=>{
+        const file=path.join(dir,'review.txt'),target=path.join(dir,'introduced');fs.writeFileSync(file,'original');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        tracker.fileSnapshots.set(file,'original');tracker.baselineExistingFiles.add(file);
+        if(historical){tracker.recordUnresolvedBaseline(target,'Historical before-image was not recorded');}
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri.fsPath,saved=fs.readFileSync(path.join(storage,'session-state.json'));
+        const intent=path.join(storage,'session-state.keep-in-progress.json');
+        fs.writeFileSync(path.join(storage,'session-state.pre-keep.json'),saved);
+        fs.writeFileSync(intent,JSON.stringify({version:1,backupSha256:createHash('sha256').update(saved).digest('hex')}));
+        tracker.isRecording=false;tracker.disposeFileWatchers();tracker.recoveryBlocked=retry;
+        const gate=h.pause(intent,'delete'),restore=retry?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try{
+            await gate.entered;fs.mkdirSync(target);tracker.dispatchExternalEvent(Uri.file(target),'create',tracker.sessionEpoch);
+            fs.rmdirSync(target);tracker.dispatchExternalEvent(Uri.file(target),'delete',tracker.sessionEpoch);
+            fs.writeFileSync(target,'independently created replacement');tracker.dispatchExternalEvent(Uri.file(target),'create',tracker.sessionEpoch);
+            if(directoryTarget){
+                fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(path.join(target,'child.txt'),'unproven child');
+                tracker.dispatchExternalEvent(Uri.file(target),'change',tracker.sessionEpoch);
+            }
+            gate.release();const result=await restore;assert.equal(retry?result.status:result,'recovered');
+            assert.equal(tracker.getOriginalContent(file),'original');
+            if(directoryTarget){
+                const child=path.join(target,'child.txt');assert.equal(tracker.getOriginalContent(child),undefined);
+                assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);
+                assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            }else if(historical){
+                assert.equal(tracker.getReviewToken(target),undefined);assert.equal((await tracker.revertBlock(target,0)).status,'conflict');
+                assert.equal(tracker.unresolvedBaselineFiles.has(target),true);
+            }else{
+                assert.equal(tracker.getOriginalContent(target),'','an exact delete followed by a fresh file create clears old directory provenance');
+                assert.ok(tracker.getReviewToken(target));assert.equal(tracker.getTrackedChange(target)?.currentContent,'independently created replacement');
+            }
+            if(!directoryTarget){assert.equal(fs.readFileSync(target,'utf8'),'independently created replacement');}
+        }finally{gate.release();await restore;}
+    }));
+
 }

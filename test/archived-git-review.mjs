@@ -144,6 +144,22 @@ export function registerArchivedGitReview(h) {
         }finally{gate.release();await operation;}
     },{configured:true,ignoredBaseline:true,ignoredDirectory:true,stoppedArchive}));
 
+    for(const newProof of [false,true])test(`P2-ANCESTOR-CREATION-ARCHIVE newProof=${newProof}`,()=>fixture(async ctx=>{
+        const preview=await ready(ctx.tracker),gate=pause(path.join(ctx.storage,INTENT),'delete');
+        const root=path.join(ctx.workspace,'incoming'),child=path.join(root,'created.txt');
+        const operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        try{
+            await Promise.race([gate.entered,operation.then(result=>{throw new Error(`Restore finished before directory barrier: ${JSON.stringify(result)}`);})]);
+            fs.mkdirSync(root);fs.writeFileSync(child,'first incarnation');emitWatcher('create',Uri.file(child));
+            fs.rmSync(root,{recursive:true});emitWatcher('delete',Uri.file(root));
+            fs.mkdirSync(root);fs.writeFileSync(child,'unproven replacement');emitWatcher('create',Uri.file(root));
+            if(newProof){emitWatcher('create',Uri.file(child));}
+            gate.release();assert.equal((await operation).status,'restored');
+            await assertDirectoryChildProvenance(ctx.tracker,child,newProof,'unproven replacement');
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main before-image\n');
+        }finally{gate.release();await operation;}
+    },{configured:true,stoppedArchive:true}));
+
     async function assertDirectoryChildProvenance(tracker,child,knownAbsence,contents) {
         assert.equal(fs.readFileSync(child,'utf8'),contents);
         if(knownAbsence){

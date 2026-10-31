@@ -100,6 +100,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
         const child=path.join(root,`unproven-${operation}-${retry?'retry':'restore'}.txt`);
         const ignored=path.join(workspace,`ignored-${operation}-${retry?'retry':'restore'}`);
         const observeIgnored=operation==='keep'&&!retry;
+        const transition=path.join(workspace,`transition-${operation}-${retry?'retry':'restore'}`);
         const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-cleanup-provenance-host-')));
         const stage=fs.mkdtempSync(path.join(workspace,'.vscode','cleanup-stage-'));
         let tracker=new DiffTracker(storage);
@@ -142,6 +143,12 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                         await until('real directory-ignored Host create must arrive during intent cleanup',()=>tracker.restoreEvents.has(ignored));
                         assert.equal(tracker.isPathIgnored(vscode.Uri.file(ignored),true),true);
                         assert.equal(tracker.isPathIgnored(vscode.Uri.file(ignored)),false);
+                        fs.mkdirSync(transition);
+                        await until('real directory create must reach cleanup queue',()=>tracker.restoreEvents.get(transition)?.reconcileDirectory===true);
+                        fs.rmdirSync(transition);
+                        await until('real exact delete must precede replacement file creation',()=>tracker.restoreEvents.get(transition)?.kind==='delete');
+                        fs.writeFileSync(transition,'independently created after exact delete');
+                        await until('real independent file create must replace old directory evidence',()=>tracker.restoreEvents.get(transition)?.kind==='create');
                     }
                     await until('real parent notification must arrive during intent cleanup',()=>tracker.restoreEvents.has(root));
                 }
@@ -170,6 +177,9 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                 assert.equal(tracker.fileSnapshots.has(excludedChild),false);assert.equal(tracker.unresolvedBaselineFiles.has(excludedChild),false);
                 assert.equal(tracker.supplementalDirectoryWatchers.has(ignored),false);assert.equal(tracker.importedDirectoryWatchers.has(ignored),false);
                 console.log('PASS HOST-IGNORED-DIRECTORY real directory-only excluded create cannot block preserved-review recovery');
+                assert.equal(tracker.getOriginalContent(transition),'');assert.ok(tracker.getReviewToken(transition));
+                assert.equal(tracker.getTrackedChange(transition)?.currentContent,'independently created after exact delete');
+                console.log('PASS HOST-EXACT-CREATE-TYPE real directory create, exact delete and native file creation preserve fresh file evidence');
             }
             if(retry){
                 const paused=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json')));
@@ -180,6 +190,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
         }finally{
             await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
             await fs.promises.rm(stage,{recursive:true,force:true});await fs.promises.rm(ignored,{recursive:true,force:true});
+            await fs.promises.rm(transition,{recursive:true,force:true});
             await fs.promises.rm(storage.fsPath,{recursive:true,force:true});
         }
     }

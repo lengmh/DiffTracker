@@ -345,6 +345,12 @@ interface StartupEvent {
     kind: 'change' | 'create' | 'delete';
 }
 
+interface QueuedExternalEvent {
+    uri: vscode.Uri;
+    kind: StartupEvent['kind'];
+    reconcileDirectory?: boolean;
+}
+
 interface LargeFileObservation { exists: boolean; size?: number; }
 interface LargeFileReminderState {
     observed: LargeFileObservation;
@@ -533,7 +539,7 @@ export class DiffTracker {
     private initialWatchBoundaryMonotonicNs?: bigint;
     private readonly startupTimestampSafetyMarginMs = 2000;
     private initialIgnoreEvents = new Map<string, StartupEvent>();
-    private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete'; reconcileDirectory?: boolean }>();
+    private restoreEvents = new Map<string, QueuedExternalEvent>();
     private restoreDirectoryAttempts = new Map<string, number>();
     private restoreDirectoryBudget?: { remainingEntries: number };
     // Only same-session post-baseline notifications can be resolved by a later
@@ -1465,15 +1471,17 @@ export class DiffTracker {
             }
             const restoreEvents = [...this.restoreEvents.values()];
             for (const event of restoreEvents) {
-                const { uri, kind, reconcileDirectory } = event;
+                const { uri, kind } = event;
+                const reconcileDirectory = this.queuedEventNeedsObservation(event);
                 if (!this.isCurrentEpoch(epoch)) { return false; }
                 if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
                 // Keep unconsumed child notifications visible to a directory
                 // scan. A later replacement supersedes the exact queued proof.
-                this.restoreEvents.delete(uri.fsPath);
-                if (this.isPathIgnored(uri)) { continue; }
+                if (this.isPathIgnored(uri)) { this.restoreEvents.delete(uri.fsPath); continue; }
                 const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
                 if (!this.isCurrentEpoch(epoch)) { return false; }
+                if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                this.restoreEvents.delete(uri.fsPath);
                 if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
                     if (this.restoringEpoch !== epoch) {
@@ -1989,7 +1997,8 @@ export class DiffTracker {
                 const events = [...this.restoreEvents.values()];
                 const deletedTargets = new Set<ScopeCoverageTarget>();
                 for (const event of events) {
-                    const { uri, kind, reconcileDirectory } = event;
+                    const { uri, kind } = event;
+                    const reconcileDirectory = this.queuedEventNeedsObservation(event);
                     if (!this.isCurrentEpoch(epoch)) { break; }
                     if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
                     this.restoreEvents.delete(uri.fsPath);
@@ -2688,10 +2697,29 @@ export class DiffTracker {
                 this.queueRestoreEvent(uri,kind);
             }
         }
+        if (deferred && kind === 'delete') { this.revokeQueuedDescendantCreations(uri.fsPath); }
         return deferred;
     }
 
+    private revokeQueuedDescendantCreations(deletedPath: string): void {
+        for (const [target,event] of this.restoreEvents) {
+            if (target !== deletedPath && this.pathBelongsToRoot(target,deletedPath) && event.kind === 'create') {
+                this.restoreEvents.set(target,{uri:event.uri,kind:'change',reconcileDirectory:true});
+            }
+        }
+    }
+
+    private queuedEventNeedsObservation(event: QueuedExternalEvent): boolean {
+        if (event.reconcileDirectory) { return true; }
+        if (event.kind === 'create' && this.effectiveMonitoringScope.kind === 'configured') {
+            try { return fs.lstatSync(event.uri.fsPath).isDirectory(); }
+            catch { return true; }
+        }
+        return false;
+    }
+
     private queueRestoreEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', reconcileDirectory = false): void {
+        if (kind === 'delete') { this.revokeQueuedDescendantCreations(uri.fsPath); }
         if (kind === 'create' && !reconcileDirectory && this.effectiveMonitoringScope.kind === 'configured') {
             // Host watchers can also report only a populated directory's create.
             // Classify before queueing: discovery and concurrent directory scans
@@ -2702,7 +2730,9 @@ export class DiffTracker {
         const previous = this.restoreEvents.get(uri.fsPath);
         this.restoreEvents.set(uri.fsPath,{
             uri, kind:kind==='change' && previous?.kind==='create' ? 'create' : kind,
-            reconcileDirectory:reconcileDirectory || previous?.reconcileDirectory
+            // A new independent file create starts fresh proof after deletion;
+            // changes alone cannot revive the revoked incarnation's evidence.
+            reconcileDirectory:reconcileDirectory || (kind !== 'create' && previous?.reconcileDirectory)
         });
     }
 
@@ -10026,7 +10056,7 @@ export class DiffTracker {
         for (let current = filePath; ; current = path.dirname(current)) {
             const restored = this.restoreEvents.get(current);
             if (this.activeCreations.get(current)?.duringScan === false ||
-                (restored?.kind === 'create' && !restored.reconcileDirectory)) { return true; }
+                (restored?.kind === 'create' && !this.queuedEventNeedsObservation(restored))) { return true; }
             for (const job of this.directoryObservations.values()) {
                 if (!job.current()) { continue; }
                 const identity = job.creations.get(current);
@@ -10041,7 +10071,8 @@ export class DiffTracker {
 
     private hasQueuedDirectoryObservation(filePath: string): boolean {
         for (let current = filePath; ; current = path.dirname(current)) {
-            if (this.restoreEvents.get(current)?.reconcileDirectory) { return true; }
+            const event = this.restoreEvents.get(current);
+            if (event && this.queuedEventNeedsObservation(event)) { return true; }
             const parent = path.dirname(current);
             if (parent === current) { return false; }
         }
@@ -12097,16 +12128,18 @@ export class DiffTracker {
             }
             remainingEvents -= work;
             for (const event of events) {
-                const { uri, kind, reconcileDirectory } = event;
+                const { uri, kind } = event;
+                const reconcileDirectory = this.queuedEventNeedsObservation(event);
                 if (!contextCurrent() || this.recoveryBlocked) {
                     throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
                 }
                 if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
-                this.restoreEvents.delete(uri.fsPath);
                 const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
                 if (!contextCurrent() || this.recoveryBlocked) {
                     throw new Error('Restore context changed while classifying a directory notification');
                 }
+                if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                this.restoreEvents.delete(uri.fsPath);
                 if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
                     if (!contextCurrent() || !await this.reconcileRestoredDirectory(uri,this.sessionEpoch,true)) {

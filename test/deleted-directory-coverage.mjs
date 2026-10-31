@@ -460,12 +460,13 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{gate.release();await restoration;}
     }));
 
-    for(const {mode,priorUnknown,after=false,later} of [
+    for(const {mode,priorUnknown,after=false,later,ancestorDelete=false,newProof=false} of [
         ...['runtime','restore','retry'].flatMap(mode=>[false,true].map(priorUnknown=>({mode,priorUnknown}))),
+        ...['runtime','restore','retry'].flatMap(mode=>[false,true].map(newProof=>({mode,priorUnknown:false,ancestorDelete:true,newProof}))),
         {mode:'runtime',priorUnknown:false,after:true},
         {mode:'runtime',priorUnknown:false,later:'change'},
         {mode:'restore',priorUnknown:false,later:'delete'}
-    ])test(`P2-RETIREMENT-FILE-PROOF mode=${mode} priorUnknown=${priorUnknown} after=${after} later=${later??'none'}`,()=>fixture(async({tracker,dir,scope})=>{
+    ])test(`P2-RETIREMENT-FILE-PROOF mode=${mode} priorUnknown=${priorUnknown} after=${after} later=${later??'none'} ancestorDelete=${ancestorDelete} newProof=${newProof}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'created.txt');
         if(priorUnknown){tracker.recordUnresolvedBaseline(child,'Historical child before-image was not recorded');}
         fs.rmSync(root,{recursive:true});
@@ -481,6 +482,11 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             await gate.entered;assert.ok(tracker.missingDirectoryRetirement);
             fs.mkdirSync(root);fs.writeFileSync(file,'recreated known');
             if(!after){fs.writeFileSync(child,'independent new file');await tracker.onExternalFileCreatedEvent(Uri.file(child));}
+            if(ancestorDelete){
+                fs.rmSync(root,{recursive:true});await tracker.onExternalFileDeleted(Uri.file(root));
+                fs.mkdirSync(root);fs.writeFileSync(file,'recreated known');fs.writeFileSync(child,'independent new file');
+                if(newProof){await tracker.onExternalFileCreatedEvent(Uri.file(child));}
+            }
             if(later==='change'){fs.writeFileSync(child,'changed independent file');await tracker.onExternalFileChanged(Uri.file(child));}
             if(later==='delete'){
                 fs.unlinkSync(child);await tracker.onExternalFileDeleted(Uri.file(child));
@@ -492,9 +498,14 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             if(mode!=='runtime'){assert.equal(mode==='retry'?result.status:result,'restored');}
             if(after){fs.writeFileSync(child,'independent new file');await tracker.onExternalFileCreatedEvent(Uri.file(child));}
             assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getTrackedChange(file)?.currentContent,'recreated known');
-            if(priorUnknown||later==='delete'){
+            const unknown=priorUnknown||later==='delete'||(ancestorDelete&&!newProof);
+            if(unknown){
+                const doc=h.document(child),before=doc.getText();assert.equal(doc.isDirty,false);
+                const reverted=await tracker.revertBlock(child,0);
+                assert.equal(reverted.status,'conflict',JSON.stringify({reason:'unproven incarnation must refuse block Revert',status:reverted.status,buffer:doc.getText()}));
+                assert.equal(doc.getText(),before);assert.equal(doc.isDirty,false);
                 assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.fileSnapshots.has(child),false);
-                assert.equal(tracker.getReviewToken(child),undefined);assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+                assert.equal(tracker.getReviewToken(child),undefined);
             }else{
                 assert.equal(tracker.getOriginalContent(child),'','exact file-create proof must survive retirement');
                 assert.equal(tracker.unresolvedBaselineFiles.has(child),false);assert.ok(tracker.getReviewToken(child));
@@ -502,8 +513,8 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             }
             if(mode==='retry'){
                 const saved=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json')));
-                assert.equal(new Map(saved.fileSnapshots).get(child),priorUnknown?undefined:'');
-                assert.equal(new Map(saved.unresolvedBaselineFiles).has(child),priorUnknown);
+                assert.equal(new Map(saved.fileSnapshots).get(child),unknown?undefined:'');
+                assert.equal(new Map(saved.unresolvedBaselineFiles).has(child),unknown);
             }
             assert.equal(tracker.restoreEvents.size,0,'retirement must not leave an unconsumed proof queue');
         }finally{gate.release();await operation;}
@@ -608,10 +619,11 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{gate.release();await restoration;tracker.flushPendingPersistence=flush;}
     }));
 
-    for(const {operation,retry,hostOnly=false} of [
+    for(const {operation,retry,hostOnly=false,ancestorDelete=false,newProof=false} of [
         ...['keep','restore'].flatMap(operation=>[false,true].map(retry=>({operation,retry}))),
-        {operation:'keep',retry:true,hostOnly:true}
-    ])test(`P2-INTENT-RECONSTRUCTION-PROVENANCE operation=${operation} retry=${retry} hostOnly=${hostOnly}`,()=>fixture(async({tracker,dir,scope})=>{
+        {operation:'keep',retry:true,hostOnly:true},
+        ...[false,true].map(newProof=>({operation:'keep',retry:true,ancestorDelete:true,newProof}))
+    ])test(`P2-INTENT-RECONSTRUCTION-PROVENANCE operation=${operation} retry=${retry} hostOnly=${hostOnly} ancestorDelete=${ancestorDelete} newProof=${newProof}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'unproven-child.txt');
         fs.rmSync(root,{recursive:true});tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Historical missing root');
         await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
@@ -624,6 +636,12 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         try{
             await gate.entered;assert.equal(tracker.missingDirectoryRetirement,undefined,'certification has already completed');
             fs.mkdirSync(root);fs.writeFileSync(file,'recreated during intent cleanup');fs.writeFileSync(child,'unproven child');
+            if(ancestorDelete){
+                tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch);
+                fs.rmSync(root,{recursive:true});tracker.dispatchExternalEvent(Uri.file(root),'delete',tracker.sessionEpoch);
+                fs.mkdirSync(root);fs.writeFileSync(file,'recreated during intent cleanup');fs.writeFileSync(child,'unproven child');
+                if(newProof){tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch);}
+            }
             const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
             assert.ok(parent);
             if(hostOnly){tracker.dispatchExternalEvent(Uri.file(root),'create',tracker.sessionEpoch);}
@@ -632,16 +650,18 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             gate.release();const result=await restoration;
             assert.equal(retry?result.status:result,'recovered');
             assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getTrackedChange(file)?.currentContent,'recreated during intent cleanup');
-            assert.equal(tracker.unresolvedBaselineFiles.has(child),true,JSON.stringify({
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),!newProof,JSON.stringify({
                 reason:'an observation-only directory reconstruction cannot prove child absence during intent cleanup',
                 inferredAbsence,adoptedBaseline:tracker.fileSnapshots.get(child),baselineExisted:tracker.baselineExistingFiles.has(child)
             }));
-            assert.equal(inferredAbsence,false,'queued reconstruction provenance must not prove child creation before it is drained');
-            assert.equal(tracker.fileSnapshots.has(child),false);
+            assert.equal(inferredAbsence,newProof,'queued reconstruction provenance must not prove child creation before it is drained');
+            assert.equal(tracker.fileSnapshots.has(child),newProof);
+            if(newProof){assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}
+            else{assert.equal((await tracker.revertBlock(child,0)).status,'conflict');}
             if(retry){
                 const paused=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json')));
-                assert.ok(new Map(paused.unresolvedBaselineFiles).has(child));
-                assert.equal(new Map(paused.fileSnapshots).has(child),false);assert.equal(paused.isRecording,false);
+                assert.equal(new Map(paused.unresolvedBaselineFiles).has(child),!newProof);
+                assert.equal(new Map(paused.fileSnapshots).has(child),newProof);assert.equal(paused.isRecording,false);
             }else assert.equal(tracker.supplementalDirectoryWatchers.get(root)?.epoch,tracker.sessionEpoch);
         }finally{gate.release();await restoration;}
     }));
