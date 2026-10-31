@@ -495,6 +495,36 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{gate.release();classification?.release();await restoration;}
     }));
 
+    for(const priorUnknown of [false,true]) test(`P2-RESTORE-CREATION-PROVENANCE priorUnknown=${priorUnknown}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root}=await seed(tracker,dir,scope),child=path.join(root,'child.txt');
+        if(priorUnknown)tracker.recordUnresolvedBaseline(child,'Historical child before-image is unknown');
+        fs.rmSync(root,{recursive:true});tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Historical missing root');
+        await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
+        tracker=new DiffTracker(storage);setTracker(tracker);
+        let recreated=false,delivered=false;const flush=tracker.flushPendingPersistence.bind(tracker);
+        tracker.flushPendingPersistence=async(...args)=>{
+            if(recreated&&!tracker.missingDirectoryRetirement&&!delivered){
+                delivered=true;
+                // A separate Host file-create notification can arrive after
+                // the coarse retirement barrier releases. Model that boundary
+                // independently from the native directory notification.
+                tracker.dispatchExternalEvent(Uri.file(child),'create',tracker.sessionEpoch);
+            }
+            return flush(...args);
+        };
+        const gate=h.pause(path.join(storage.fsPath,'session-state.tmp.json'),'write');
+        const restoration=tracker.restorePersistedState();
+        try{
+            await gate.entered;fs.mkdirSync(root);fs.writeFileSync(child,'current child bytes');recreated=true;
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename',path.basename(root));
+            gate.release();assert.equal(await restoration,'restored');assert.equal(delivered,true);
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),priorUnknown);
+            if(!priorUnknown){assert.equal(tracker.fileSnapshots.get(child),'');assert.equal(tracker.baselineExistingFiles.has(child),false);}
+            else assert.equal(tracker.fileSnapshots.has(child),false,'a later create cannot invent a historical Unknown before-image');
+        }finally{gate.release();await restoration;tracker.flushPendingPersistence=flush;}
+    }));
+
     for(const sameIdentity of [true,false]) test(`DELETED-COVERAGE missing target validates alternate real-root spelling by physical identity (same=${sameIdentity})`,()=>fixture(async({tracker,dir})=>{
         const missing=path.join(dir,'missing','temporary');
         const other=path.join(dir,'other');fs.mkdirSync(other);

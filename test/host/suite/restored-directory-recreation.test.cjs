@@ -31,11 +31,19 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             tracker.sessionWorkspaceRoots=tracker.getWorkspaceRoots();tracker.isRecording=true;
             tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
             tracker.fileSnapshots.set(file,'original host baseline');tracker.baselineExistingFiles.add(file);
+            tracker.recordUnresolvedBaseline(unknown,'Historical child before-image was not recorded');
             tracker.supplementalCoverageRoots.add(root);
             await fs.promises.rm(root,{recursive:true});
             tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Synthetic historical missing directory');
             assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
             tracker=new DiffTracker(storage);if(retry)tracker.recoveryBlocked=true;
+            const notifications=[],dispatch=tracker.dispatchExternalEvent;
+            tracker.dispatchExternalEvent=function(uri,kind,epoch){
+                if(notifications.length<32&&path.dirname(uri.fsPath)===root){
+                    notifications.push({name:path.basename(uri.fsPath),kind,retirement:!!this.missingDirectoryRetirement});
+                }
+                return dispatch.call(this,uri,kind,epoch);
+            };
             const save=tracker.flushPersistState.bind(tracker);let reconstructed=false;
             tracker.flushPersistState=async(...args)=>{
                 if(tracker.missingDirectoryRetirement&&!reconstructed){
@@ -55,7 +63,10 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             assert.equal(tracker.getOriginalContent(file),'original host baseline');
             assert.equal(tracker.getTrackedChange(file)?.currentContent,'reconstructed during host certification');
             assert.equal(tracker.getTrackedChange(file)?.isDeleted,false);
-            assert.equal(tracker.unresolvedBaselineFiles.has(unknown),true,'native directory signal does not prove child absence');
+            assert.equal(tracker.unresolvedBaselineFiles.has(unknown),true,JSON.stringify({
+                reason:'historical Unknown must survive any later file-create notification',notifications,
+                adoptedBaseline:tracker.fileSnapshots.has(unknown),baselineExisted:tracker.baselineExistingFiles.has(unknown)
+            }));
             if(retry){
                 assert.equal(tracker.getIsRecording(),false);
                 const paused=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json')));
@@ -68,7 +79,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
                 await until('new persistent owner must observe later edits in the blind subtree',()=>
                     tracker.getTrackedChange(file)?.currentContent==='later native host edit');
             }
-            console.log(`PASS HOST-RESTORE-RECREATE retry=${retry} real blind-subtree reconstruction is reconciled before recovery returns or saves paused review`);
+            console.log(`PASS HOST-RESTORE-RECREATE retry=${retry} real reconstruction reconciles known review and preserves historical Unknown; childCreates=${notifications.filter(item=>item.name==='unproven.txt'&&item.kind==='create').length}`);
         }finally{
             await tracker.dispose();await fs.promises.rm(root,{recursive:true,force:true});
             await fs.promises.rm(storage.fsPath,{recursive:true,force:true});

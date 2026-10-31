@@ -20,7 +20,7 @@ The prior exclusions remain present. The refused action preserves the effective 
 
 ## What is established
 
-`updateOwnedScopeSetting` is byte-identical to main/v0.8.13. The preceding `3971ddc` candidate with the same production code passed its complete 1.80 Host job. A fresh local isolated scope-settings scenario passes. These comparisons narrow the issue but do not prove the intermittent publication problem fixed.
+At the failed ce8de6b checkpoint, `updateOwnedScopeSetting` was byte-identical to main/v0.8.13. The later P2 fix adds Status publication after late cleanup; its ownership checks and conflict latch remain unchanged. The preceding `3971ddc` candidate with the same production code passed its complete 1.80 Host job. A fresh local isolated scope-settings scenario passes. These comparisons narrow the issue but do not prove the intermittent publication problem fixed.
 
 A separate local probe against the unmodified official 1.80.2 runtime performed 50 serial configuration API writes in a fresh synthetic workspace/profile, capturing configuration, disk and document metadata. It observed no all-unset publication. It is one bounded reproduction attempt, not a retry of the failed acceptance case or evidence of universal success.
 
