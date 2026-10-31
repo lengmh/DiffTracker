@@ -14,6 +14,9 @@ async function until(description, predicate, tracker) {
     }
 }
 module.exports = async function deletedDirectoryCoverageHost(workspace) {
+    // Production watcher paths enter through VS Code Uri.fsPath (including
+    // Windows drive normalization). Seed direct-owner keys on that same boundary.
+    workspace = vscode.Uri.file(workspace).fsPath;
     const container = path.join(workspace,'deleted-coverage-host');
     const parent = path.join(container,'deep');
     const root = path.join(parent,'selected');
