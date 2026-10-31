@@ -935,4 +935,5 @@ module.exports = async function runExtensionHostScenario() {
         await require('./s4d-handoff-refusal.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
         await require('./nested-workspace-coverage.test.cjs')(secondRoot);
+        await require('./nested-recheck-deletion.test.cjs')(secondRoot);
 };

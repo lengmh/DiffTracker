@@ -1792,14 +1792,32 @@ export class DiffTracker {
                 // result, not an unbounded rescan/retry loop.
                 const events = [...this.restoreEvents.values()];
                 this.restoreEvents.clear();
+                const deletedTargets = new Set<ScopeCoverageTarget>();
                 for (const { uri, kind } of events) {
                     if (!this.isCurrentEpoch(epoch)) { break; }
                     if (kind === 'create') { await this.onExternalFileCreated(uri); }
-                    else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
+                    else if (kind === 'delete') {
+                        await this.onExternalFileDeleted(uri);
+                        for (const target of targets ?? []) {
+                            if (this.scopeCoverageTargetContains(target, uri.fsPath) || this.pathBelongsToRoot(target.path, uri.fsPath)) {
+                                deletedTargets.add(target);
+                            }
+                        }
+                    }
                     else if (await this.isUntrackedDirectory(uri)) {
                         if (this.isCurrentEpoch(epoch)) { await this.reconcileDirectoryObservation(uri,epoch); }
                     } else if (this.isCurrentEpoch(epoch)) {
                         await this.readFileAndUpdate(uri.fsPath,uri,()=>this.isCurrentEpoch(epoch));
+                    }
+                }
+                if (this.isCurrentEpoch(epoch) && deletedTargets.size > 0) {
+                    try {
+                        // Only uncertainty causally affected by these replayed
+                        // deletions belongs to this regional recovery retry.
+                        this.annotateScopeOperationRecovery([...deletedTargets], scope.scopeRevision);
+                    } catch (error) {
+                        completion.failureReason = `Recheck deletion uncertainty could not be retained: ${String(error)}`;
+                        await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                     }
                 }
                 if (this.isCurrentEpoch(epoch) && !await this.flushPendingPersistence() && this.isCurrentEpoch(epoch)) {
@@ -4718,6 +4736,7 @@ export class DiffTracker {
     private isPendingScopeRecoveryEvidence(evidence: CoverageGapEvidence | undefined): boolean {
         return !!evidence && (evidence.reasonCode === 'pending-explicit-exclusion' ||
             evidence.reasonCode === 'scope-recheck-incomplete' ||
+            evidence.reasonCode === 'file-observation-unverified' ||
             evidence.reasonCode === 'pending-scope-deferred-event' ||
             evidence.reasonCode === 'pending-scope-deferred-delete' ||
             evidence.reasonCode === 'pending-scope-gap');
@@ -6599,7 +6618,8 @@ export class DiffTracker {
 
     private isDormantPendingScopeGap(targetPath: string, evidence: CoverageGapEvidence): boolean {
         if (!evidence.reasonCode.startsWith('pending-scope-') &&
-            evidence.reasonCode !== 'pending-explicit-exclusion' && evidence.reasonCode !== 'scope-recheck-incomplete') { return false; }
+            evidence.reasonCode !== 'pending-explicit-exclusion' && evidence.reasonCode !== 'scope-recheck-incomplete' &&
+            evidence.reasonCode !== 'file-observation-unverified') { return false; }
         // Retained file review is still actionable evidence even outside scope.
         if (evidence.targetKind === 'file' && this.trackedChanges.has(targetPath)) { return false; }
         const scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope;
@@ -6622,6 +6642,12 @@ export class DiffTracker {
         // later document notification could turn into an unapproved new review.
         const folder=this.owningWorkspaceFolderForTraversal(uri.fsPath);
         if (!folder) { return false; }
+        // Exclusion belongs to this owner, not to independently registered
+        // workspace roots below it. An ancestor event can invalidate their
+        // known resources without granting traversal of the excluded parent.
+        if (this.getSupportedWorkspaceFolders().some(root =>
+            root.uri.toString() !== folder.uri.toString() &&
+            this.pathBelongsToRoot(root.uri.fsPath, uri.fsPath))) { return false; }
         const parent=path.dirname(uri.fsPath);
         // An outer exclusion cannot suppress the independently owned nested
         // workspace root, even when its parent belongs to that outer scope.
@@ -10624,18 +10650,39 @@ export class DiffTracker {
                 this.removeSupplementalDirectoryWatchers(uri.fsPath);
             }
 
-            const parentIgnored = this.isPathIgnored(uri);
+            // A root deletion has known descendants but no workspace-relative
+            // path to pass to ordinary ignore matchers. Its registered owner
+            // still defines where evidence may be preserved, even while absent.
+            const parentIgnored = this.getSupportedWorkspaceFolders().some(folder =>
+                path.resolve(folder.uri.fsPath) === path.resolve(uri.fsPath)) || this.isPathIgnored(uri);
             if (parentIgnored) {
                 // Ordinary policy may ignore the parent while an already-pending
                 // child review is deliberately retained outside target scope.
-                // Reconcile only those retained resources; do not enumerate or
-                // discover new descendants in the ignored subtree.
+                // Independently owned nested roots also retain their own known
+                // resources. Neither case authorizes discovery in this subtree.
                 const root = path.resolve(uri.fsPath);
-                const retainedDescendants = [...this.retainedReviewPaths]
-                    .filter(filePath => path.resolve(filePath) !== root && this.pathBelongsToRoot(filePath, root));
-                for (const filePath of retainedDescendants) {
+                const independent = new Set(this.knownFileEvidenceUnder(root).filter(filePath => {
+                    const folder = this.owningWorkspaceFolderForTraversal(filePath);
+                    return !!folder && this.pathBelongsToRoot(folder.uri.fsPath, root);
+                }));
+                const descendants = new Set([...independent, ...[...this.retainedReviewPaths]
+                    .filter(filePath => path.resolve(filePath) !== root && this.pathBelongsToRoot(filePath, root))]);
+                for (const filePath of descendants) {
                     if (!this.isCurrentEpoch(epoch)) { return; }
-                    await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath));
+                    const target = vscode.Uri.file(filePath);
+                    if (independent.has(filePath) && this.isPathIgnored(target)) {
+                        // The ancestor may have removed/replaced the nested
+                        // root itself. Refusing unsafe I/O must not leave its
+                        // previously read review looking current and verified.
+                        const evidence = this.coverageGaps.get(filePath)?.file ?? {
+                            targetKind: 'file' as const, reasonCode: 'file-observation-unverified',
+                            reason: 'An ancestor deletion affected this independently owned workspace resource; its current state could not be safely verified.'
+                        };
+                        this.setCoverageGap(filePath, evidence);
+                        this.markFileUnavailable(filePath, evidence.reason);
+                    } else {
+                        await this.readFileAndUpdate(filePath, target);
+                    }
                 }
                 return;
             }
