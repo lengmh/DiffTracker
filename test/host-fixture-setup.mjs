@@ -206,6 +206,14 @@ test('S4 settings are seeded after Native exits and restores its files, before t
                 assert.equal(fs.existsSync(offlineFile),false);
                 assert.ok(options.launchArgs.some(value=>value.includes('lifecycle-user-data')),
                     'recovery diagnostics need a fresh host profile');
+            } else if (phase === 'restore-recreate') {
+                assert.equal(path.resolve(options.launchArgs[0]),path.resolve(workspace));
+                assert.deepEqual(JSON.parse(fs.readFileSync(settings,'utf8')),{
+                    'files.watcherExclude':{'restored-recreate-host/**':true}
+                });
+                assert.equal(fs.existsSync(path.join(workspace,'native-a.txt')),false);
+                assert.equal(fs.existsSync(offlineFile),false);
+                assert.ok(options.launchArgs.some(value=>value.includes('restore-recreate-user-data')));
             } else if (phase === 'prepare') {
                 assert.equal(fs.existsSync(path.join(workspace, 'native-opaque.bin')), false,
                     'Native fixture cleanup must finish first');
@@ -243,6 +251,6 @@ test('S4 settings are seeded after Native exits and restores its files, before t
     });
     assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
     assert.deepEqual(result.stdout.match(/FIXTURE-PHASE [\w-]+/g), [
-        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE lifecycle-diagnostics', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
+        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE lifecycle-diagnostics', 'FIXTURE-PHASE restore-recreate', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
     ]);
 });

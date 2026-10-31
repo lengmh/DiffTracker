@@ -423,6 +423,78 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {gate.release();await restoration;}
     }));
 
+    for(const retry of [false,true]) test(`P2-RESTORE-RECREATE retry=${retry}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope);
+        fs.rmSync(root,{recursive:true});
+        tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Synthetic old missing-root record');
+        assert.equal(await tracker.flushPendingPersistence(),true);
+        const storage=tracker.storageUri;await tracker.dispose();
+        tracker=new DiffTracker(storage);setTracker(tracker);
+        if(retry)tracker.recoveryBlocked=true;
+        const gate=h.pause(path.join(storage.fsPath,'session-state.tmp.json'),'write');
+        const restoration=retry?tracker.retrySavedSessionRecovery():tracker.restorePersistedState();
+        try{
+            await gate.entered;assert.ok(tracker.missingDirectoryRetirement);
+            fs.mkdirSync(root);fs.writeFileSync(file,'recreated during certification');
+            const unknown=path.join(root,'unproven.txt');fs.writeFileSync(unknown,'no proven before-image');
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename',path.basename(root));
+            assert.equal(tracker.missingDirectoryRetirement.dirty.size,1);
+            gate.release();const outcome=await restoration;
+            assert.equal(retry?outcome.status:outcome,'restored');
+            assert.equal(tracker.getOriginalContent(file),'original');
+            assert.equal(tracker.getTrackedChange(file)?.currentContent,'recreated during certification',
+                'delivered reconstruction must be reconciled before recovery completes');
+            assert.equal(tracker.getTrackedChange(file)?.isDeleted,false);
+            assert.equal(tracker.unresolvedBaselineFiles.has(unknown),true,'reconstruction does not prove child absence');
+            if(retry){
+                assert.equal(tracker.getIsRecording(),false);
+                const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,'session-state.json'),'utf8'));
+                assert.equal(saved.stoppedReviews.find(item=>item.filePath===file)?.currentContent,'recreated during certification');
+                assert.equal(saved.stoppedReviews.find(item=>item.filePath===file)?.isDeleted,false);
+            }else{
+                assert.equal(tracker.supplementalDirectoryWatchers.get(root)?.epoch,tracker.sessionEpoch);
+                assert.equal(tracker.supplementalDirectoryWatchers.get(root)?.observationDirectory,undefined);
+            }
+        }finally{gate.release();await restoration;}
+    }));
+
+    for(const failure of ['quota','budget','stop','late-epoch']) test(`P2-RESTORE-RECREATE failure=${failure}`,()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope);fs.rmSync(root,{recursive:true});
+        tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Synthetic historical gap');
+        await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
+        tracker=new DiffTracker(storage);setTracker(tracker);
+        const gate=h.pause(path.join(storage.fsPath,'session-state.tmp.json'),'write');
+        let classification;
+        const restoration=tracker.restorePersistedState();
+        try{
+            await gate.entered;fs.mkdirSync(root);fs.writeFileSync(file,'recreated despite interruption');
+            const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
+            assert.ok(parent);parent.listener('rename',path.basename(root));
+            if(failure==='late-epoch')classification=h.pause(root,'stat');
+            else if(failure==='quota')tracker.maxImportedDirectoryWatchers=0;
+            else if(failure==='budget')tracker.restoreDirectoryBudget={remainingEntries:0};
+            else tracker.stopRecording();
+            gate.release();
+            if(classification){
+                await classification.entered;tracker.advanceEpoch();tracker.isRecording=false;tracker.recoveryBlocked=false;
+                tracker.coverageGaps.clear();classification.release();
+            }
+            assert.equal(await restoration,'blocked');
+            assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getIsRecording(),false);
+            if(failure==='late-epoch'){
+                assert.equal(tracker.coverageGaps.size,0,'old directory classification cannot publish into a newer epoch');
+                assert.equal(tracker.restoreDirectoryAttempts.size,0);assert.equal(tracker.isRecoveryBlocked(),false);
+            }else if(failure!=='stop'){
+                assert.equal(tracker.isRecoveryBlocked(),true);assert.ok(tracker.getSubtreeCoverageGaps().length);
+                tracker.maxImportedDirectoryWatchers=256;
+                assert.equal((await tracker.retrySavedSessionRecovery()).status,'restored');
+                assert.equal(tracker.getTrackedChange(file)?.currentContent,'recreated despite interruption');
+                assert.equal(tracker.getOriginalContent(file),'original');
+            }
+        }finally{gate.release();classification?.release();await restoration;}
+    }));
+
     for(const sameIdentity of [true,false]) test(`DELETED-COVERAGE missing target validates alternate real-root spelling by physical identity (same=${sameIdentity})`,()=>fixture(async({tracker,dir})=>{
         const missing=path.join(dir,'missing','temporary');
         const other=path.join(dir,'other');fs.mkdirSync(other);

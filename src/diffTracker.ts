@@ -533,7 +533,9 @@ export class DiffTracker {
     private initialWatchBoundaryMonotonicNs?: bigint;
     private readonly startupTimestampSafetyMarginMs = 2000;
     private initialIgnoreEvents = new Map<string, StartupEvent>();
-    private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete' }>();
+    private restoreEvents = new Map<string, { uri: vscode.Uri; kind: 'change' | 'create' | 'delete'; reconcileDirectory?: boolean }>();
+    private restoreDirectoryAttempts = new Map<string, number>();
+    private restoreDirectoryBudget?: { remainingEntries: number };
     // Only same-session post-baseline notifications can be resolved by a later
     // create event. Restored or scan-time uncertainty still requires a rebuild.
     private postBaselineUnknownFiles = new Set<string>();
@@ -678,6 +680,8 @@ export class DiffTracker {
         this.initialWatchBoundaryMonotonicNs = undefined;
         this.initialIgnoreEvents.clear();
         this.restoreEvents.clear();
+        this.restoreDirectoryAttempts.clear();
+        this.restoreDirectoryBudget = undefined;
         this.postBaselineUnknownFiles.clear();
         this.mayAdoptLegacyGitContexts = false;
         this.clearExternalChangeTimers();
@@ -1195,6 +1199,8 @@ export class DiffTracker {
             if (epoch === this.sessionEpoch) {
                 this.restoringEpoch = undefined;
                 this.restoreEvents.clear();
+                this.restoreDirectoryAttempts.clear();
+                this.restoreDirectoryBudget = undefined;
             }
             this._onDidChangeLifecycleState.fire();
         }
@@ -1450,15 +1456,72 @@ export class DiffTracker {
             }
             const restoreEvents = [...this.restoreEvents.values()];
             this.restoreEvents.clear();
-            for (const { uri, kind } of restoreEvents) {
+            for (const { uri, kind, reconcileDirectory } of restoreEvents) {
                 if (!this.isCurrentEpoch(epoch)) { return false; }
                 if (this.isPathIgnored(uri)) { continue; }
+                if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
+                    if (!await this.reconcileRestoredDirectory(uri,epoch)) {
+                        if (this.isCurrentEpoch(epoch)) {
+                            this.recoveryBlocked = true;
+                            this.isRecording = false;
+                            this.externalWatcherEnabled = false;
+                            this.disposeFileWatchers();
+                            this.persistenceIssue = 'A reconstructed directory could not be verified during recovery. Original review is preserved; resolve its coverage issue before retrying.';
+                            this._onDidChangeRecordingState.fire(false);
+                            this._onDidChangeBaselineState.fire(this.getBaselineState());
+                        }
+                        return false;
+                    }
+                    continue;
+                }
                 if (kind === 'create') { await this.onExternalFileCreated(uri); }
                 else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
                 else { await this.readFileAndUpdate(uri.fsPath, uri); }
             }
         }
         return this.isCurrentEpoch(epoch);
+    }
+
+    private async reconcileRestoredDirectory(uri: vscode.Uri, epoch: number): Promise<boolean> {
+        if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== epoch) { return false; }
+        const scope = this.effectiveMonitoringScope;
+        const folder = this.owningWorkspaceFolderForTraversal(uri.fsPath);
+        if (!folder || scope.kind !== 'configured') { return false; }
+        if (!this.coverageGaps.get(uri.fsPath)?.subtree) {
+            this.setSubtreeCoverageGap(uri.fsPath,'supplemental-watcher-directory-change-gap',
+                'Directory reconstruction is being verified during saved review recovery.');
+        }
+        if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== epoch) { return false; }
+        const attempts = this.restoreDirectoryAttempts.get(uri.fsPath) ?? 0;
+        if (attempts >= 2 || (!attempts && this.restoreDirectoryAttempts.size >= this.maxImportedDirectoryWatchers)) { return false; }
+        this.restoreDirectoryAttempts.set(uri.fsPath,attempts+1);
+        this.restoreDirectoryBudget ??= {remainingEntries:this.maxScopePreflightEntries};
+        const generation = this.coverageGeneration, policy = this.watcherCoverageRevision;
+        const current = () => this.isCurrentEpoch(epoch) && this.restoringEpoch === epoch &&
+            this.isRecording && this.externalWatcherEnabled && this.snapshotInitialized && !this.baselineBuilding &&
+            this.effectiveMonitoringScope === scope && this.coverageGeneration === generation &&
+            this.watcherCoverageRevision === policy && !this.baselineTransaction && !this.scopeApplyPreflight &&
+            this.activeScopeApplications === 0 && !this.pendingMonitoringScope && !this.recoveryBlocked &&
+            !this.persistenceFailed && !this.workspaceContextChanged &&
+            this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString() === folder.uri.toString() &&
+            !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty &&
+                this.pathBelongsToRoot(document.uri.fsPath,uri.fsPath));
+        // This token belongs only to the restore drain. The ordinary runtime
+        // directory observer keeps its restoring guard. Share the bounded
+        // watch/scan/persist handoff without treating a directory signal as
+        // proof that newly discovered children had an empty before-image.
+        const observation: DirectoryObservation = {
+            current, budget:this.restoreDirectoryBudget, beginProof:()=>{},
+            settlePreparation:async()=>{
+                if (!current()) { return false; }
+                const publications = await Promise.allSettled([...this.runtimeBaselinePublications]);
+                return publications.every(result=>result.status==='fulfilled' && result.value) && current();
+            }
+        };
+        if (!current()) { return false; }
+        await this.onExternalFileCreated(uri,false,undefined,false,observation);
+        return current() && this.canReuseSupplementalDirectoryOwner(uri.fsPath,epoch) &&
+            !this.coverageGaps.get(uri.fsPath)?.subtree;
     }
 
     private shouldTrackOnlyAutomatedChanges(): boolean {
@@ -2606,7 +2669,7 @@ export class DiffTracker {
             // a new incarnation and establishes absence again.
             const previous = this.restoreEvents.get(uri.fsPath);
             if (kind !== 'change' || previous?.kind !== 'create') {
-                this.restoreEvents.set(uri.fsPath, { uri, kind });
+                this.restoreEvents.set(uri.fsPath, { uri, kind, reconcileDirectory:previous?.reconcileDirectory });
             }
             return;
         }
@@ -3518,7 +3581,10 @@ export class DiffTracker {
             if (!this.isCurrentEpoch(epoch)) { break; }
             if (deleted || this.confirmedMissingDirectory(target)) { await this.onExternalFileDeleted(vscode.Uri.file(target)); }
             if (this.isCurrentEpoch(epoch) && !this.confirmedMissingDirectory(target)) {
-                await this.onExternalFileChanged(vscode.Uri.file(target));
+                if (this.restoringEpoch === epoch) {
+                    const uri = vscode.Uri.file(target), previous = this.restoreEvents.get(target);
+                    this.restoreEvents.set(target,{uri,kind:previous?.kind==='create'?'create':'change',reconcileDirectory:true});
+                } else { await this.onExternalFileChanged(vscode.Uri.file(target)); }
             }
         }
     }

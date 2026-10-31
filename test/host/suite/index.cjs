@@ -20,6 +20,10 @@ async function bounded(description, scenario, milliseconds) {
 exports.run = async () => {
     const restart = require('./s4d-restart.test.cjs');
     const phase = process.env.DIFF_TRACKER_HOST_PHASE;
+    if (phase === 'restore-recreate') {
+        await bounded('Restored directory reconstruction',()=>require('./restored-directory-recreation.test.cjs')(process.env.DIFF_TRACKER_HOST_WORKSPACE),60000);
+        return;
+    }
     if (phase === 'lifecycle-diagnostics') {
         await bounded('Monitoring lifecycle diagnostics',()=>require('./monitoring-lifecycle-status.test.cjs')(process.env.DIFF_TRACKER_HOST_WORKSPACE),60000);
         return;

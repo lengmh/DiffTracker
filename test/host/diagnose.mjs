@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const selected = process.argv[2];
-if (!['scope-settings', 'workspace-edit', 'deleted-coverage', 'lifecycle-diagnostics'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit, deleted-coverage or lifecycle-diagnostics'); }
+if (!['scope-settings', 'workspace-edit', 'deleted-coverage', 'lifecycle-diagnostics', 'restore-recreate'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit, deleted-coverage, lifecycle-diagnostics or restore-recreate'); }
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-host-isolation-'));
 const workspace = path.join(temporary, 'workspace');
@@ -22,7 +22,8 @@ fs.writeFileSync(path.join(workspace, '.vscode', 'settings.json'), JSON.stringif
     ...(selected === 'lifecycle-diagnostics' ? {
         'diffTracker.monitoringScope':'rules',
         'diffTracker.watchInclude':[]
-    } : {})
+    } : {}),
+    ...(selected === 'restore-recreate' ? {'files.watcherExclude':{'restored-recreate-host/**':true}} : {})
 }));
 try {
     console.log('HOST-LIFECYCLE isolated launch:', JSON.stringify({ scenario: selected, version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable' }));

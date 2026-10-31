@@ -180,6 +180,20 @@ try {
             DIFF_TRACKER_HOST_PHASE:'lifecycle-diagnostics'}
     });
 
+    const recreateWorkspace=path.join(tempRoot,'restore-recreate-workspace');
+    mkdirSync(path.join(recreateWorkspace,'.vscode'),{recursive:true});
+    writeFileSync(path.join(recreateWorkspace,'ProbeName'),'synthetic case identity');
+    writeFileSync(path.join(recreateWorkspace,'.vscode','settings.json'),JSON.stringify({
+        'files.watcherExclude':{'restored-recreate-host/**':true}
+    }));
+    await runTests({
+        ...hostOptions,
+        launchArgs:hostOptions.launchArgs.map((argument,index)=>index===0?recreateWorkspace:
+            argument.startsWith('--user-data-dir=')?`--user-data-dir=${path.join(tempRoot,'restore-recreate-user-data')}`:argument),
+        extensionTestsEnv:{...hostOptions.extensionTestsEnv,DIFF_TRACKER_HOST_WORKSPACE:recreateWorkspace,
+            DIFF_TRACKER_HOST_PHASE:'restore-recreate'}
+    });
+
     // Seed the final S4 folder configuration only after Native has exited and
     // restored its fixtures. A live settings update in prepare can deliver late
     // create/save events during Whole Workspace Apply. Keep these writes offline.
