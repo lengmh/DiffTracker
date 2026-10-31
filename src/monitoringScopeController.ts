@@ -956,6 +956,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             allowLegacyMigrationWrite?: boolean;
             expectedLegacySourceFingerprint?: string;
             expectedRequestVersion?: string;
+            stillCurrent?: () => boolean;
         }
     ): Promise<ScopeValidationResult> {
         const validated = validateAndCanonicalizeScope(request, this.getWorkspaceRoots());
@@ -963,7 +964,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         const validatedScope = validated.scope;
         const expected = options?.expectedRequestVersion ? this.scopeSettings() : undefined;
         const roots = JSON.stringify(this.getWorkspaceRoots());
-        const settingsStillCurrent = () => !this.disposed && (!expected ||
+        const settingsStillCurrent = () => !this.disposed && options?.stillCurrent?.()!==false && (!expected ||
             (JSON.stringify(this.getWorkspaceRoots()) === roots && this.settingsFingerprint() === this.settingsFingerprint(expected)));
         const draftConflict = (): ScopeValidationResult => ({ok:false,warnings:validated.warnings,
             errors:[{field:'exclude',message:'Workspace Settings changed after the draft was loaded or during its save. Your draft and newer settings are preserved.'}]});
@@ -1220,14 +1221,22 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public completeLegacyMigrationUsingCurrentScope(
-        reviewedTarget?: MonitoringScopeRequest
-    ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
-        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget)),result=>result);
+        reviewedTarget?: MonitoringScopeRequest,
+        expectedRequestVersion = this.getRequestVersion(),
+        stillCurrent: () => boolean = () => true
+    ): Promise<{ status: 'completed' | 'invalid' | 'conflict'; reason?: string }> {
+        return this.recordScopeOperation(()=>this.enqueueScopeSettingsWrite(()=>
+            this.completeLegacyMigrationUsingCurrentScopeNow(reviewedTarget,expectedRequestVersion,stillCurrent)),result=>result);
     }
 
     private async completeLegacyMigrationUsingCurrentScopeNow(
-        reviewedTarget?: MonitoringScopeRequest
-    ): Promise<{ status: 'completed' | 'invalid'; reason?: string }> {
+        reviewedTarget: MonitoringScopeRequest | undefined,
+        expectedRequestVersion: string,
+        stillCurrent: () => boolean
+    ): Promise<{ status: 'completed' | 'invalid' | 'conflict'; reason?: string }> {
+        if (!stillCurrent() || this.disposed || expectedRequestVersion!==this.getRequestVersion()) {
+            return {status:'conflict',reason:'The migration draft or Workspace settings changed during confirmation or while queued; newer settings and your draft are preserved.'};
+        }
         const roots = this.getWorkspaceRoots();
         const approvedSource = this.getLegacySourceSnapshot(roots);
         const workspaceFile = vscode.workspace.workspaceFile?.toString();
@@ -1238,6 +1247,8 @@ export class MonitoringScopeController implements vscode.Disposable {
             try {
                 requested = await this.saveRequestedScopeNow(reviewedTarget, {
                     allowLegacyMigrationWrite: true,
+                    expectedRequestVersion,
+                    stillCurrent,
                     // The approved source may be committed-only, but the
                     // mutable Workspace value still has to remain exactly as
                     // reviewed until its destructive replacement.
@@ -1269,6 +1280,7 @@ export class MonitoringScopeController implements vscode.Disposable {
             }
         }
 
+        if (!stillCurrent()) { return {status:'conflict',reason:'The migration editor changed before completion. Check the saved request; the effective scope is unchanged.'}; }
         try {
             await this.markLegacyMigrationComplete({
                 approvedSourceFingerprint,

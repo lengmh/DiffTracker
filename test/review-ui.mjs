@@ -650,7 +650,7 @@ function connectScopeEditor(h) {
     };
     ui=scopeEditorScriptHarness(message=>{
         const action=panel.handleMessage(message);
-        if(['saveAndApply','saveRequest','restoreEffective','discardDraft','reviewConflict','apply'].includes(message.command))lastAction=action;
+        if(['saveAndApply','saveRequest','restoreEffective','discardDraft','reviewConflict','apply','completeLegacyMigration'].includes(message.command))lastAction=action;
         return action;
     });
     waiting.forEach(message=>ui.receive(message));
@@ -993,6 +993,67 @@ for (const kind of ['automatic', 'manual']) {
         h.WatchExcludePanel.currentPanel.dispose();
     });
 }
+
+for(const changed of ['external-settings','closed-panel','newer-draft','unchanged']) await test(`PR60 REVIEW manual migration preserves ${changed} during confirmation`,async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope(),waits=[];
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];
+    h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[{scope:'all',pattern:'/old/'}]};
+    h.controller.reconcileRequestedScope();
+    h.vscode.window.showWarningMessage=(message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):h.state.warnings.push(message);
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/old/'}]));
+    ui.click('complete-migration');const action=ui.action();assert.equal(waits.length,1);
+    if(changed==='external-settings'){
+        h.state.workspaceConfiguration.watchExclude=[{scope:'all',pattern:'/newer/'}];h.controller.reconcileRequestedScope();
+    }else if(changed==='closed-panel'){panel.dispose();}
+    else if(changed==='newer-draft'){ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/newer-draft/'}]));}
+    waits[0]('Save and Mark Migration Complete');await action;
+    if(changed!=='closed-panel'){assert.equal(ui.elements.get('complete-migration').disabled,false,'every terminal acknowledgement releases the editor');}
+    if(changed==='unchanged'){
+        assert.equal(h.state.updates.length,3);assert.equal(h.controller.getStatus().legacyMigrationComplete,true);panel.dispose();return;
+    }
+    assert.equal(h.state.updates.length,0,'a stale or closed confirmation cannot write settings');
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:changed==='external-settings'?'/newer/':'/old/'}]);
+    assert.equal(h.controller.getStatus().legacyMigrationComplete,false);
+    assert.equal(h.tracker.getEffectiveMonitoringScope().kind,'legacyV3');panel.dispose();
+});
+
+await test('PR60 REVIEW a closed migration confirmation cannot overwrite a newer panel result',async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope(),waits=[];
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[]};
+    h.vscode.window.showWarningMessage=(_message,options)=>options?.modal?new Promise(resolve=>waits.push(resolve)):undefined;
+    await h.run('manageMonitoringScope');const oldPanel=h.WatchExcludePanel.currentPanel,oldUI=connectScopeEditor(h);
+    oldUI.input('excludes',JSON.stringify([{scope:'all',pattern:'/old/'}]));oldUI.click('complete-migration');const old=oldUI.action();oldPanel.dispose();
+    await h.run('manageMonitoringScope');const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    ui.input('excludes',JSON.stringify([{scope:'all',pattern:'/newer/'}]));ui.click('complete-migration');const newer=ui.action();
+    assert.equal(waits.length,2);waits[1]('Save and Mark Migration Complete');await newer;
+    const diagnostic=JSON.stringify(h.controller.getStatus().operationOutcome);
+    waits[0]('Save and Mark Migration Complete');await old;
+    assert.equal(JSON.stringify(h.controller.getStatus().operationOutcome),diagnostic);
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:'/newer/'}]);
+    assert.equal(h.state.updates.length,3);panel.dispose();
+});
+
+await test('PR60 REVIEW a queued manual migration cannot replace a newer completed request',async()=>{
+    const h=monitoringScopeCommandHarness(),effective=h.tracker.getEffectiveMonitoringScope();
+    h.tracker.getEffectiveMonitoringScope=()=>({kind:'legacyV3',roots:effective.roots,scopeRevision:'legacy'});
+    h.tracker.prepareLegacyCompatibilityPolicySnapshot=async()=>true;
+    h.state.configuration.watchExclude=['legacy/'];h.state.workspaceConfiguration={monitoringScope:'rules',watchInclude:[],watchExclude:[]};
+    const entered=deferred(),gate=deferred();let held=false;
+    h.state.beforeConfigurationUpdate=async()=>{if(!held){held=true;entered.resolve();await gate.promise;}};
+    const proposal=pattern=>({mode:'rules',includes:[],excludes:[{scope:'all',pattern}]});
+    const first=h.controller.completeLegacyMigrationUsingCurrentScope(proposal('/newer/'));let second;
+    try{await entered.promise;second=h.controller.completeLegacyMigrationUsingCurrentScope(proposal('/old/'));}
+    finally{gate.resolve();await first;}
+    const outcome=await second;
+    assert.equal(outcome.status,'conflict',JSON.stringify(outcome));
+    assert.deepEqual(h.state.workspaceConfiguration.watchExclude,[{scope:'all',pattern:'/newer/'}]);
+    assert.equal(h.state.updates.length,3);
+});
 
 for (const first of ['restore', 'quick']) {
     await test(`${first}-first restore and quick commands serialize complete settings writes`, async () => {

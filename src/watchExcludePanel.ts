@@ -202,6 +202,14 @@ export class WatchExcludePanel {
         }
 
         if (message.command === 'completeLegacyMigration') {
+            const expectedRequestVersion=message.baseVersion ?? this.scopeController.getRequestVersion();
+            const revision=message.draftRevision ?? this.draftRevision;
+            const current=()=>!this.disposed && this.draftRevision===revision;
+            let outcome:MonitoringScopeApplyOutcome={status:'cancelled',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'};
+            if(expectedRequestVersion!==this.scopeController.getRequestVersion() || !current()){
+                await this.finishEditorAction(message,rejected('Migration settings or draft changed. Review the current settings; your draft is preserved.'),false,reportToken);
+                return;
+            }
             this.actionInProgress=true;this.activeActionId=message.actionId;
             try {
                 const request = {mode:message.mode,includes:message.includes,excludes:message.excludes} as MonitoringScopeRequest;
@@ -213,16 +221,19 @@ export class WatchExcludePanel {
                     },
                     'Save and Mark Migration Complete'
                 );
-                if (answer === 'Save and Mark Migration Complete') {
-                    const outcome = await this.scopeController.completeLegacyMigrationUsingCurrentScope(request);
-                    if (outcome.status !== 'completed') {
-                        void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? 'Current scope is invalid.'}`);
-                    }
-                } else if(reportToken) {
-                    this.scopeController.recordUnchangedOperationOutcome({status:'cancelled',settingsStatus:'unchanged',scopeCommitted:false,coverageStatus:'notRun'},reportToken);
+                if (answer === 'Save and Mark Migration Complete' &&
+                    (!current() || expectedRequestVersion!==this.scopeController.getRequestVersion())) {
+                    outcome=rejected('The migration draft or Workspace settings changed during confirmation; newer settings and your draft are preserved.');
+                } else if (answer === 'Save and Mark Migration Complete') {
+                    const result = await this.scopeController.completeLegacyMigrationUsingCurrentScope(request,expectedRequestVersion,current);
+                    outcome=result.status==='completed'
+                        ? {status:'saved',settingsStatus:'saved',scopeCommitted:false,coverageStatus:'notRun',reason:'Migration target saved and reviewed. The effective legacy scope remains unchanged until Apply succeeds.'}
+                        : {status:result.status==='conflict'?'conflict':'invalid',reason:result.reason};
                 }
+            } catch(error) {
+                outcome={status:'failed',reason:`Migration did not complete: ${String(error)} Check the saved request and effective scope; your draft is preserved.`};
             } finally {this.actionInProgress=false;this.activeActionId=undefined;}
-            await this.postStatus();
+            await this.finishEditorAction(message,outcome,outcome.status==='saved'&&current(),reportToken);
             return;
         }
 

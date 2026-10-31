@@ -247,9 +247,110 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(savedState(tracker).coverageGaps.some(([target,record])=>target===directory&&record.importedCoverageRequired),true,JSON.stringify({saved:savedState(tracker).coverageGaps.map(([p,r])=>[path.relative(dir,p),r]),live:[...tracker.importedCoverageObligations].map(p=>path.relative(dir,p)),owners:[...tracker.supplementalDirectoryWatchers].map(([p,r])=>[path.relative(dir,p),path.relative(dir,r.coverageRoot)])}));
     }));
 
-    for(const late of ['owner-failure','overflow','excluded-noise','overflow-budget','stop','regional-unrelated-overflow','regional-selected-overflow','regional-parent-overflow'])
+    for(const nested of [false,true])
+    test(`PR60 REVIEW regional overflow retains ancestor deletion across workspace ownership (nested=${nested})`,()=>fixture(async context=>{
+        const previousFolders=vscode.workspace.workspaceFolders,previousGet=vscode.workspace.getWorkspaceFolder;
+        let tracker=context.tracker;
+        const outer=path.join(context.dir,'outer'),parent=path.join(outer,'work'),inner=path.join(parent,'pkg');
+        fs.mkdirSync(path.join(inner,'selected'),{recursive:true});
+        const target=path.join(inner,'selected','tracked.txt');fs.writeFileSync(target,'baseline');
+        const folders=[{name:'outer',uri:Uri.file(outer)},...(nested?[{name:'inner',uri:Uri.file(inner)}]:[])];
+        vscode.workspace.workspaceFolders=folders;
+        vscode.workspace.getWorkspaceFolder=uri=>[...folders].reverse().find(folder=>{
+            const relative=path.relative(folder.uri.fsPath,uri.fsPath);return relative===''||relative!=='..'&&!relative.startsWith(`..${path.sep}`)&&!path.isAbsolute(relative);
+        });
+        const open=fs.promises.open;
+        let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+        try{
+            const storage=tracker.storageUri;await tracker.dispose();tracker=new h.DiffTracker(storage);h.setTracker(tracker);
+            tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+            const scope=validateAndCanonicalizeScope({mode:'wholeWorkspace',includes:[],excludes:[]},tracker.currentWorkspaceRootIdentities()).scope;
+            tracker.effectiveMonitoringScope={kind:'configured',...scope};
+            assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+            fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
+            tracker.setFileCoverageGap(target,'pending-scope-gap','Earlier pending interval');tracker.markFileUnavailable(target,'Earlier pending interval');
+            const targets=[{path:target,kind:'file',workspaceRoot:folders.at(-1).uri.toString()}];
+            assert.equal(await tracker.retainScopeOperationRecovery(targets,scope.scopeRevision),true);
+            fs.promises.open=async(file,...args)=>{
+                const handle=await open(file,...args);
+                if(!held&&String(file)===target&&!tracker.baselineTransaction&&!tracker.coverageGaps.get(target)?.file&&tracker.restoringEpoch===tracker.sessionEpoch){held=true;enter();await gate;}
+                return handle;
+            };
+            const action=tracker.recheckScopeOperationCoverage(targets,scope.scopeRevision);let outcome;
+            try{
+                await Promise.race([entered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
+                tracker.maxScopePreflightEntries=2;
+                for(const name of ['late-a.txt','late-b.txt']){const file=path.join(outer,name);fs.writeFileSync(file,'late');tracker.dispatchExternalEvent(Uri.file(file),'create',tracker.sessionEpoch);}
+                fs.rmSync(parent,{recursive:true});tracker.dispatchExternalEvent(Uri.file(parent),'delete',tracker.sessionEpoch);
+            }finally{release();outcome=await action;}
+            assert.equal(outcome.status,'limited',JSON.stringify(outcome));
+            assert.equal(tracker.getOriginalContent(target),'baseline');
+            assert.equal(tracker.getScopeOperationCoverageGaps(targets).related.length,1);
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            const marker=savedState(tracker).coverageGaps.find(([file])=>file===target)?.[1]?.file;
+            assert.equal(marker?.scopeOperationRevision,scope.scopeRevision);
+        }finally{release();fs.promises.open=open;vscode.workspace.workspaceFolders=previousFolders;vscode.workspace.getWorkspaceFolder=previousGet;}
+    }));
+
+    test('PR60 REVIEW buffered host directory change discovers unknown children before Recheck completes',()=>fixture(async context=>{
+        const {tracker,dir}=context,target=await seed(context);
+        const directory=path.join(dir,'observed');fs.mkdirSync(directory);
+        assert.equal((await tracker.applyConfiguredMonitoringScope(context.scope)).status,'applied');
+        tracker.setFileCoverageGap(target,'pending-scope-gap','Earlier pending interval');tracker.markFileUnavailable(target,'Earlier pending interval');
+        const child=path.join(directory,'unknown.txt'),open=fs.promises.open;
+        let enter,release,held=false;const entered=new Promise(resolve=>{enter=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+        fs.promises.open=async(file,...args)=>{
+            const handle=await open(file,...args);
+            if(!held&&String(file)===target&&!tracker.baselineTransaction&&!tracker.coverageGaps.get(target)?.file&&tracker.restoringEpoch===tracker.sessionEpoch){held=true;enter();await gate;}
+            return handle;
+        };
+        const action=tracker.recheckObservationCoverage();let outcome;
+        try{
+            await Promise.race([entered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
+            const host=tracker.fileWatchers[0];assert.ok(host?.active,'use the registered VS Code watcher callback');
+            fs.writeFileSync(child,'unknown before-image');host.emit('change',Uri.file(directory));
+        }finally{release();try{outcome=await action;}finally{fs.promises.open=open;}}
+        assert.equal(outcome.status,'rechecked',JSON.stringify(outcome));
+        assert.equal(tracker.getTrackedChange(child)?.reviewKind,'unknown');
+        assert.equal(tracker.getOriginalContent(child),undefined);
+        assert.equal(tracker.getOriginalContent(target),'baseline');
+    }));
+
+    test('PR60 REVIEW Stop during final replay supersedes Recheck completion',()=>fixture(async context=>{
+        const {tracker,dir}=context,target=await seed(context),late=path.join(dir,'replayed.txt');
+        fs.writeFileSync(late,'original later file');assert.equal((await tracker.applyConfiguredMonitoringScope(context.scope)).status,'applied');
+        tracker.setFileCoverageGap(target,'pending-scope-gap','Earlier pending interval');tracker.markFileUnavailable(target,'Earlier pending interval');
+        const open=fs.promises.open;let postEnter,postRelease,replayEnter,replayRelease,postHeld=false,replayHeld=false;
+        const postEntered=new Promise(resolve=>{postEnter=resolve;}),postGate=new Promise(resolve=>{postRelease=resolve;});
+        const replayEntered=new Promise(resolve=>{replayEnter=resolve;}),replayGate=new Promise(resolve=>{replayRelease=resolve;});
+        fs.promises.open=async(file,...args)=>{
+            const handle=await open(file,...args);
+            if(!postHeld&&String(file)===target&&!tracker.baselineTransaction&&!tracker.coverageGaps.get(target)?.file&&tracker.restoringEpoch===tracker.sessionEpoch){postHeld=true;postEnter();await postGate;}
+            if(!replayHeld&&String(file)===late&&tracker.restoringEpoch===undefined&&tracker.coverageRecheckEpoch===tracker.sessionEpoch){replayHeld=true;replayEnter();await replayGate;}
+            return handle;
+        };
+        const action=tracker.recheckObservationCoverage();let outcome;
+        try{
+            await Promise.race([postEntered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
+            fs.writeFileSync(late,'late pending');tracker.fileWatchers[0].emit('change',Uri.file(late));postRelease();
+            await Promise.race([replayEntered,action.then(result=>assert.fail(`Final replay read was not reached: ${JSON.stringify(result)}`))]);
+            tracker.stopRecording();
+        }finally{postRelease();replayRelease();try{outcome=await action;}finally{fs.promises.open=open;}}
+        assert.equal(outcome.status,'conflict',JSON.stringify(outcome));
+        assert.equal(tracker.getIsRecording(),false);assert.equal(tracker.getOriginalContent(late),'original later file');
+    }));
+
+    for(const late of ['transient-identity','owner-failure','overflow','excluded-noise','overflow-budget','stop','regional-unrelated-overflow','regional-selected-overflow','regional-parent-overflow'])
     test(`RECHECK reports post-certification ${late} after replay without accepting new baselines`,()=>fixture(async context=>{
-        let {tracker}=context;const {dir}=context;let target=await seed(context);
+        let {tracker}=context;const {dir}=context;
+        const identityTarget=path.join(dir,'src','a.ts'),surrogate=path.join(dir,'surrogate.txt');
+        if(late==='transient-identity'){
+            fs.mkdirSync(path.dirname(identityTarget));fs.writeFileSync(identityTarget,'identity baseline');fs.writeFileSync(surrogate,'surrogate');
+            const probe=path.join(dir,'identity-probe');
+            try{fs.symlinkSync(surrogate,probe);fs.unlinkSync(probe);}
+            catch(error){if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP identity replay requires symlink permission');return;}throw error;}
+        }
+        let target=await seed(context);
         const regional=late.startsWith('regional-');
         if(regional){
             const folder=path.join(dir,'selected');fs.mkdirSync(folder);target=path.join(folder,'tracked.txt');
@@ -274,6 +375,11 @@ export function registerRecheckObservationCoverage(h, fixture) {
         try{
             await Promise.race([entered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
             if(late==='stop'){tracker.stopRecording();}
+            else if(late==='transient-identity'){
+                fs.unlinkSync(identityTarget);fs.symlinkSync(surrogate,identityTarget);
+                try{tracker.fileWatchers[0].emit('change',Uri.file(identityTarget));}
+                finally{fs.unlinkSync(identityTarget);fs.writeFileSync(identityTarget,'replacement text');}
+            }
             else if(late==='owner-failure'){
                 fs.mkdirSync(lateDirectory);fs.writeFileSync(path.join(lateDirectory,'unverified.txt'),'late content');
                 fs.watch=(directory,...args)=>{
@@ -295,6 +401,11 @@ export function registerRecheckObservationCoverage(h, fixture) {
             }
         }finally{release();try{outcome=await action;}finally{fs.watch=watch;fs.promises.open=open;tracker.maxScopePreflightEntries=limit;tracker.maxPersistedBytes=byteLimit;}}
         assert.equal(tracker.getOriginalContent(target),'baseline');
+        if(late==='transient-identity'){
+            assert.equal(outcome.status,'rechecked',JSON.stringify(outcome));
+            assert.equal(tracker.getTrackedChange(identityTarget)?.currentContent,'replacement text');
+            assert.equal(tracker.getOriginalContent(identityTarget),'identity baseline');return;
+        }
         if(late==='stop'||late==='overflow-budget'){
             assert.notEqual(outcome.status,'rechecked',JSON.stringify(outcome));assert.equal(tracker.getIsRecording(),false);
             if(late==='overflow-budget'){assert.equal(outcome.status,'failed');assert.match(outcome.reason,/overflow/);}
@@ -342,7 +453,7 @@ export function registerRecheckObservationCoverage(h, fixture) {
             assert.equal(await tracker.flushPendingPersistence(),true);
             assert.ok(savedState(tracker).coverageGaps.some(([,record])=>record.subtree));
         }
-    },'wholeWorkspace',[{scope:'all',pattern:'/excluded/'}]));
+    },'wholeWorkspace',[{scope:'all',pattern:'/.vscode/'},{scope:'all',pattern:'/excluded/'}]));
 
     async function seedDirectoryGap(context, code = 'directory-runtime-coverage-gap') {
         const {tracker, dir, scope} = context;

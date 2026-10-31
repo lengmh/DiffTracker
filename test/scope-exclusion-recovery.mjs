@@ -1323,6 +1323,66 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         }finally{vscode.workspace.fs.copy=copy;fs.rmSync(outside,{force:true});}
     }));
 
+    test('PR60 REVIEW identity uncertainty cannot discard a transient monitored replacement during Apply',()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'src','a.ts'),outside=path.join(dir,'transient-identity.txt');
+        fs.mkdirSync(path.dirname(target));
+        fs.mkdirSync(path.join(dir,'.vscode'));fs.writeFileSync(path.join(dir,'.vscode','settings.json'),'{}');
+        fs.writeFileSync(target,'original');fs.writeFileSync(outside,'outside bytes');
+        const probe=path.join(dir,'identity-probe');
+        try{fs.symlinkSync(outside,probe);fs.unlinkSync(probe);}
+        catch(error){fs.rmSync(outside,{force:true});if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP transient identity requires symlink permission');return;}throw error;}
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+        const copy=vscode.workspace.fs.copy;let injected=false;
+        vscode.workspace.fs.copy=async(...args)=>{
+            if(!injected&&tracker.baselineTransaction&&tracker.effectiveMonitoringScope.scopeRevision===candidate.scopeRevision){
+                injected=true;fs.unlinkSync(target);fs.symlinkSync(outside,target);
+                try{await tracker.onExternalFileChanged(Uri.file(target));}
+                finally{fs.unlinkSync(target);fs.writeFileSync(target,'replacement text');}
+            }
+            return copy(...args);
+        };
+        try{
+            const result=await tracker.applyConfiguredMonitoringScope(candidate);
+            assert.equal(injected,true);assert.notEqual(result.status,'applied',JSON.stringify(result));
+            await h.waitUntil(()=>tracker.getTrackedChange(target)?.currentContent==='replacement text');
+            assert.equal(tracker.getOriginalContent(target),'original');
+        }finally{vscode.workspace.fs.copy=copy;fs.rmSync(outside,{force:true});}
+    },'wholeWorkspace',[{scope:'all',pattern:'/.vscode/'}]));
+
+    for(const phase of ['pending','preflight'])
+    test(`PR60 REVIEW ${phase} preserves uncertain identity evidence outside actual exclusions`,()=>fixture(async({tracker,dir,scope})=>{
+        const target=path.join(dir,'src','a.ts'),surrogate=path.join(dir,'surrogate.txt');
+        fs.mkdirSync(path.dirname(target));fs.writeFileSync(target,'original');fs.writeFileSync(surrogate,'surrogate');
+        const probe=path.join(dir,'identity-probe');
+        try{fs.symlinkSync(surrogate,probe);fs.unlinkSync(probe);}
+        catch(error){if(['EPERM','EACCES'].includes(error.code)){console.log('SKIP identity event requires symlink permission');return;}throw error;}
+        const other=path.join(dir,'other.txt');fs.writeFileSync(other,'original other');
+        assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
+        const replace=async()=>{
+            fs.unlinkSync(target);fs.symlinkSync(surrogate,target);
+            try{await tracker.onExternalFileChanged(Uri.file(target));}
+            finally{fs.unlinkSync(target);fs.writeFileSync(target,'replacement text');}
+        };
+        if(phase==='pending'){
+            const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+            tracker.setPendingMonitoringScope(candidate);await replace();
+        }else{
+            const candidate=validateAndCanonicalizeScope({...scope,excludes:[...scope.excludes,{scope:'all',pattern:'/noise/'}]},scope.roots).scope;
+            tracker.setPendingMonitoringScope(candidate);await tracker.ignoreRefreshPromise;
+            fs.writeFileSync(other,'other pending');await tracker.onExternalFileChanged(Uri.file(other));
+            const barrier=h.pause(other,'read');
+            const action=tracker.applyConfiguredMonitoringScope(candidate);
+            try{
+                await Promise.race([barrier.entered,action.then(result=>assert.fail(`Preflight drain was not reached: ${JSON.stringify(result)}`))]);
+                assert.equal(tracker.scopeApplyPreflight,true,'gate must be the public Apply preflight drain');
+                await replace();
+            }finally{barrier.release();await action;}
+        }
+        assert.ok(tracker.getTrackedChange(target)||tracker.coverageGaps.get(target)?.file,'uncertain identity notification must retain review or coverage evidence');
+        assert.equal(tracker.getOriginalContent(target),'original');
+    },'wholeWorkspace',[{scope:'all',pattern:'/.vscode/'}]));
+
     registerScopeSingleActionAcceptance(h,fixture,scopeFor,withController);
     registerScopeSingleActionCrashes(h,fixture,scopeFor,withController);
 }

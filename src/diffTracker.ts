@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import ignore, { Ignore } from 'ignore';
 import { canKeepAcrossGitBranches, compareGitContexts, GitContextSnapshot } from './gitContext';
 import { asciiCaseFold, detectLocalPathCaseSensitivity, PathIdentityWorkBudget, resolveRelativePathIdentity, sameExistingDirectoryEntry } from './utils/pathIdentity';
-import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
+import { cachedExclusionDirectoryCaseSensitivity, CanonicalMonitoringScope, configuredScopeExplicitlyExcludesPath, configuredScopeExplicitlyExcludesSubtree, createLegacyEffectiveScope, detectScopeExpansion, EffectiveMonitoringScope, evaluateConfiguredScope, isHardUnmonitorableRelativePath, parseEffectiveMonitoringScope, validateAndCanonicalizeScope, WorkspaceRootIdentity } from './monitoringScope';
 
 export type ReviewKind = 'text' | 'opaque' | 'unknown';
 
@@ -1417,6 +1417,9 @@ export class DiffTracker {
                 // to this invocation rather than inspecting a newer session.
                 if (completion.failureReason) { return { status: 'failed', reason: completion.failureReason }; }
                 if (this.isCurrentEpoch(epoch) && this.persistenceFailed) { return { status:'failed',reason:this.persistenceIssue }; }
+                if (!this.isCurrentEpoch(epoch) && (result.status==='rechecked' || result.status==='limited')) {
+                    return {status:'conflict',reason:'Recheck was superseded during deferred observation replay; original baselines are preserved.'};
+                }
                 if (this.isCurrentEpoch(epoch) && result.status==='rechecked' &&
                     (completion.overflow || (targets ? this.getScopeOperationCoverageGaps(targets).related.length>0 : this.getCoverageGaps().length>0))) {
                     return {status:'limited',reason:'Recheck finished, but deferred activity left observation coverage unverified. See Monitoring Scope diagnostics.'};
@@ -1536,8 +1539,9 @@ export class DiffTracker {
             let overlaps=false;
             for(const target of targets){
                 if(this.scopeCoverageTargetContains(target,filePath) ||
-                    (this.owningWorkspaceFolderForTraversal(filePath)?.uri.toString()===target.workspaceRoot &&
-                    this.pathBelongsToRoot(target.path,filePath))){overflowTargets.add(target);overlaps=true;}
+                    // An outer workspace ancestor can invalidate a nested
+                    // target without owning traversal inside that workspace.
+                    (!!this.owningWorkspaceFolderForTraversal(filePath) && this.pathBelongsToRoot(target.path,filePath))){overflowTargets.add(target);overlaps=true;}
             }
             return overlaps;
         };
@@ -1792,7 +1796,11 @@ export class DiffTracker {
                     if (!this.isCurrentEpoch(epoch)) { break; }
                     if (kind === 'create') { await this.onExternalFileCreated(uri); }
                     else if (kind === 'delete') { await this.onExternalFileDeleted(uri); }
-                    else { await this.readFileAndUpdate(uri.fsPath, uri); }
+                    else if (await this.isUntrackedDirectory(uri)) {
+                        if (this.isCurrentEpoch(epoch)) { await this.reconcileDirectoryObservation(uri,epoch); }
+                    } else if (this.isCurrentEpoch(epoch)) {
+                        await this.readFileAndUpdate(uri.fsPath,uri,()=>this.isCurrentEpoch(epoch));
+                    }
                 }
                 if (this.isCurrentEpoch(epoch) && !await this.flushPendingPersistence() && this.isCurrentEpoch(epoch)) {
                     completion.failureReason = 'Observation coverage recheck results could not be saved; recording is paused with original review preserved.';
@@ -6613,8 +6621,8 @@ export class DiffTracker {
         // publication is pending. Do not create a synthetic pending gap that a
         // later document notification could turn into an unapproved new review.
         const parent=path.dirname(uri.fsPath);
-        const oldParent=this.scopeExplicitlyExcludesDirectory(parent,committed);
-        const nextParent=this.scopeExplicitlyExcludesDirectory(parent,{kind:'configured',...candidate});
+        const oldParent=this.scopeExplicitlyExcludesDirectory(parent,committed,true);
+        const nextParent=this.scopeExplicitlyExcludesDirectory(parent,{kind:'configured',...candidate},true);
         if (oldParent && nextParent) { return true; }
         const folder=this.owningWorkspaceFolderForTraversal(uri.fsPath);
         if (!folder) { return false; }
@@ -6628,12 +6636,12 @@ export class DiffTracker {
             (rule.scope==='all'||rule.folder===folder.name) && rule.pattern==='/'+relative && !/[\\*?\[\]{}]/.test(rule.pattern));
         if ((oldParent||literal(committed)) && (nextParent||literal(candidate))) { return true; }
         if (oldParent||nextParent) { return false; }
-        return evaluateConfiguredScope(committed,identity,relative,false,false).source==='explicitExclude' &&
-            evaluateConfiguredScope(candidate,identity,relative,false,false).source==='explicitExclude';
+        return configuredScopeExplicitlyExcludesPath(committed,identity,relative) &&
+            configuredScopeExplicitlyExcludesPath(candidate,identity,relative);
     }
 
     private scopeExplicitlyExcludesDirectory(
-        targetPath: string, scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope
+        targetPath: string, scope = this.committedScopeDuringApply ?? this.effectiveMonitoringScope, requireProof = false
     ): boolean {
         if (scope.kind !== 'configured') { return false; }
         const folder = this.owningWorkspaceFolderForTraversal(targetPath);
@@ -6643,7 +6651,7 @@ export class DiffTracker {
         // Prove the earliest excluded ancestor first. Resolving a deep gap's
         // identity must not enumerate below an already-proven privacy boundary.
         for (let length = 0; length <= segments.length; length++) {
-            if (configuredScopeExplicitlyExcludesSubtree(scope, identity, segments.slice(0, length).join('/'))) { return true; }
+            if (configuredScopeExplicitlyExcludesSubtree(scope, identity, segments.slice(0, length).join('/'), undefined, requireProof)) { return true; }
         }
         return false;
     }
