@@ -1463,7 +1463,9 @@ export class DiffTracker {
                 // scan. A later replacement supersedes the exact queued proof.
                 this.restoreEvents.delete(uri.fsPath);
                 if (this.isPathIgnored(uri)) { continue; }
-                if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
+                const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
+                if (!this.isCurrentEpoch(epoch)) { return false; }
+                if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
                     if (!await this.reconcileRestoredDirectory(uri,epoch)) {
                         if (this.isCurrentEpoch(epoch)) {
@@ -12055,7 +12057,11 @@ export class DiffTracker {
                 }
                 if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
                 this.restoreEvents.delete(uri.fsPath);
-                if (reconcileDirectory && await this.isUntrackedDirectory(uri)) {
+                const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
+                if (!contextCurrent() || this.recoveryBlocked) {
+                    throw new Error('Restore context changed while classifying a directory notification');
+                }
+                if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
                     if (!contextCurrent() || !await this.reconcileRestoredDirectory(uri,this.sessionEpoch,true)) {
                         throw new Error('Post-restore directory reconstruction could not be verified without inventing child before-images');

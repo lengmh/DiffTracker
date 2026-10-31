@@ -460,7 +460,7 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{gate.release();await restoration;}
     }));
 
-    for(const failure of ['quota','budget','stop','late-epoch']) test(`P2-RESTORE-RECREATE failure=${failure}`,()=>fixture(async({tracker,dir,scope})=>{
+    for(const failure of ['quota','budget','stop','late-epoch','late-epoch-file']) test(`P2-RESTORE-RECREATE failure=${failure}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope);fs.rmSync(root,{recursive:true});
         tracker.setSubtreeCoverageGap(root,'supplemental-watcher-target-missing-gap','Synthetic historical gap');
         await tracker.flushPendingPersistence();const storage=tracker.storageUri;await tracker.dispose();
@@ -472,20 +472,29 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             await gate.entered;fs.mkdirSync(root);fs.writeFileSync(file,'recreated despite interruption');
             const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
             assert.ok(parent);parent.listener('rename',path.basename(root));
-            if(failure==='late-epoch')classification=h.pause(root,'stat');
+            if(failure.startsWith('late-epoch'))classification=h.pause(root,'stat');
             else if(failure==='quota')tracker.maxImportedDirectoryWatchers=0;
             else if(failure==='budget')tracker.restoreDirectoryBudget={remainingEntries:0};
             else tracker.stopRecording();
             gate.release();
             if(classification){
                 await classification.entered;tracker.advanceEpoch();tracker.isRecording=false;tracker.recoveryBlocked=false;
-                tracker.coverageGaps.clear();classification.release();
+                tracker.coverageGaps.clear();
+                if(failure==='late-epoch-file'){
+                    fs.rmSync(root,{recursive:true});fs.writeFileSync(root,'stale notification bytes');
+                    tracker.fileSnapshots.set(root,'new epoch baseline');tracker.baselineExistingFiles.add(root);
+                    tracker.trackedChanges.delete(root);
+                }
+                classification.release();
             }
             assert.equal(await restoration,'blocked');
             assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getIsRecording(),false);
-            if(failure==='late-epoch'){
+            if(failure.startsWith('late-epoch')){
                 assert.equal(tracker.coverageGaps.size,0,'old directory classification cannot publish into a newer epoch');
                 assert.equal(tracker.restoreDirectoryAttempts.size,0);assert.equal(tracker.isRecoveryBlocked(),false);
+                if(failure==='late-epoch-file'){
+                    assert.equal(tracker.getTrackedChange(root),undefined,'old directory classification cannot reread and mutate a newer stopped projection');
+                }
             }else if(failure!=='stop'){
                 assert.equal(tracker.isRecoveryBlocked(),true);assert.ok(tracker.getSubtreeCoverageGaps().length);
                 tracker.maxImportedDirectoryWatchers=256;
