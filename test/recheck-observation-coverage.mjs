@@ -247,8 +247,8 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(savedState(tracker).coverageGaps.some(([target,record])=>target===directory&&record.importedCoverageRequired),true,JSON.stringify({saved:savedState(tracker).coverageGaps.map(([p,r])=>[path.relative(dir,p),r]),live:[...tracker.importedCoverageObligations].map(p=>path.relative(dir,p)),owners:[...tracker.supplementalDirectoryWatchers].map(([p,r])=>[path.relative(dir,p),path.relative(dir,r.coverageRoot)])}));
     }));
 
-    for(const nested of [false,true])
-    test(`PR60 REVIEW regional overflow retains ancestor deletion across workspace ownership (nested=${nested})`,()=>fixture(async context=>{
+    for(const [nested,excludedOuter] of [[false,false],[true,false],[true,true]])
+    test(`PR60 REVIEW regional overflow retains ancestor deletion across workspace ownership (nested=${nested}, excludedOuter=${excludedOuter})`,()=>fixture(async context=>{
         const previousFolders=vscode.workspace.workspaceFolders,previousGet=vscode.workspace.getWorkspaceFolder;
         let tracker=context.tracker;
         const outer=path.join(context.dir,'outer'),parent=path.join(outer,'work'),inner=path.join(parent,'pkg');
@@ -264,7 +264,7 @@ export function registerRecheckObservationCoverage(h, fixture) {
         try{
             const storage=tracker.storageUri;await tracker.dispose();tracker=new h.DiffTracker(storage);h.setTracker(tracker);
             tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
-            const scope=validateAndCanonicalizeScope({mode:'wholeWorkspace',includes:[],excludes:[]},tracker.currentWorkspaceRootIdentities()).scope;
+            const scope=validateAndCanonicalizeScope({mode:'wholeWorkspace',includes:[],excludes:excludedOuter?[{scope:'folder',folder:'outer',pattern:'/work/'}]:[]},tracker.currentWorkspaceRootIdentities()).scope;
             tracker.effectiveMonitoringScope={kind:'configured',...scope};
             assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
             fs.writeFileSync(target,'pending');await tracker.readFileAndUpdate(target,Uri.file(target));
@@ -281,7 +281,8 @@ export function registerRecheckObservationCoverage(h, fixture) {
                 await Promise.race([entered,action.then(result=>assert.fail(`Post-certification read was not reached: ${JSON.stringify(result)}`))]);
                 tracker.maxScopePreflightEntries=2;
                 for(const name of ['late-a.txt','late-b.txt']){const file=path.join(outer,name);fs.writeFileSync(file,'late');tracker.dispatchExternalEvent(Uri.file(file),'create',tracker.sessionEpoch);}
-                fs.rmSync(parent,{recursive:true});tracker.dispatchExternalEvent(Uri.file(parent),'delete',tracker.sessionEpoch);
+                const deleted=excludedOuter?inner:parent;
+                fs.rmSync(deleted,{recursive:true});tracker.dispatchExternalEvent(Uri.file(deleted),'delete',tracker.sessionEpoch);
             }finally{release();outcome=await action;}
             assert.equal(outcome.status,'limited',JSON.stringify(outcome));
             assert.equal(tracker.getOriginalContent(target),'baseline');

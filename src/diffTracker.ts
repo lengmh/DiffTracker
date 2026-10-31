@@ -6620,12 +6620,15 @@ export class DiffTracker {
         // Strict descendants are outside both reviews, even while settings
         // publication is pending. Do not create a synthetic pending gap that a
         // later document notification could turn into an unapproved new review.
-        const parent=path.dirname(uri.fsPath);
-        const oldParent=this.scopeExplicitlyExcludesDirectory(parent,committed,true);
-        const nextParent=this.scopeExplicitlyExcludesDirectory(parent,{kind:'configured',...candidate},true);
-        if (oldParent && nextParent) { return true; }
         const folder=this.owningWorkspaceFolderForTraversal(uri.fsPath);
         if (!folder) { return false; }
+        const parent=path.dirname(uri.fsPath);
+        // An outer exclusion cannot suppress the independently owned nested
+        // workspace root, even when its parent belongs to that outer scope.
+        const sameOwner=this.owningWorkspaceFolderForTraversal(parent)?.uri.toString()===folder.uri.toString();
+        const oldParent=sameOwner && this.scopeExplicitlyExcludesDirectory(parent,committed,true);
+        const nextParent=sameOwner && this.scopeExplicitlyExcludesDirectory(parent,{kind:'configured',...candidate},true);
+        if (oldParent && nextParent) { return true; }
         const identity=this.workspaceRootIdentityForFolder(folder);
         if (typeof identity.caseSensitive!=='boolean') { return false; }
         const relative=this.toPosixPath(path.relative(folder.uri.fsPath,uri.fsPath));

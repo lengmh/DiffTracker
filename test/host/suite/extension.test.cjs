@@ -538,8 +538,46 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal(await read('crlf.txt'), 'one\r\ntwo\r\n');
 
         // Extension recovery covers file creation/deletion without overwriting later work.
-        await write('new-empty.txt', '');
-        await untilStable('empty creation pending', () => reviewablePending('new-empty.txt'));
+        const emptyPath=uri('new-empty.txt').fsPath,emptyTrace=[],emptyMethods=new Map();
+        const emptyObservation=tracker=>({epoch:tracker.sessionEpoch,recording:tracker.isRecording,
+            ready:tracker.snapshotInitialized,building:tracker.baselineBuilding,transaction:!!tracker.baselineTransaction,
+            preflight:tracker.scopeApplyPreflight,pendingScope:!!tracker.pendingMonitoringScope,
+            restoring:tracker.restoringEpoch,recheck:tracker.coverageRecheckEpoch,
+            baseline:tracker.fileSnapshots.has(emptyPath),baselineExists:tracker.baselineExistingFiles.has(emptyPath),
+            unknown:tracker.unresolvedBaselineFiles.get(emptyPath),
+            reviewKind:tracker.trackedChanges.get(emptyPath)?.reviewKind,
+            unavailable:tracker.trackedChanges.get(emptyPath)?.unavailableReason,
+            fileGap:tracker.coverageGaps.get(emptyPath)?.file?.reasonCode,
+            rootGap:tracker.coverageGaps.get(workspacePath)?.subtree?.reasonCode,
+            directoryJobs:tracker.directoryObservations.size,
+            nativeRoot:tracker.supplementalDirectoryWatchers.has(workspacePath)});
+        for(const method of ['dispatchExternalEvent','onExternalFileCreated','onExternalFileChanged',
+            'readFileAndUpdate','recordUnresolvedBaseline','markFileUnavailable']){
+            const original=DiffTracker.prototype[method];emptyMethods.set(method,original);
+            DiffTracker.prototype[method]=function(...args){
+                const file=typeof args[0]==='string'?args[0]:args[0]?.fsPath;
+                if((file===emptyPath||file===workspacePath)&&emptyTrace.length<100){
+                    emptyTrace.push({method,path:file===emptyPath?'new-empty.txt':'<primary>',
+                        kind:method==='dispatchExternalEvent'?args[1]:undefined,...emptyObservation(this)});
+                }
+                return original.apply(this,args);
+            };
+        }
+        try{
+            await write('new-empty.txt', '');
+            await untilStable('empty creation pending', () => reviewablePending('new-empty.txt'));
+            console.log('HOST-EMPTY-CREATE observed:',JSON.stringify(emptyTrace));
+        }catch(error){
+            const current=await state(),change=current.trackedChanges.find(item=>item.filePath===emptyPath);
+            console.error('HOST-EMPTY-CREATE failure:',JSON.stringify({trace:emptyTrace,
+                recording:current.isRecording,baselineState:current.baselineState,gitPauses:current.gitPauses.length,
+                change:change&&{reviewKind:change.reviewKind,unavailableReason:change.unavailableReason,
+                    baselineExists:change.baselineExists,currentExists:change.currentExists,isDeleted:change.isDeleted},
+                token:current.reviewTokens.some(token=>token.filePath===emptyPath),
+                original:await vscode.commands.executeCommand('diffTracker._testOriginalContent',emptyPath),
+                coverage:current.coverageGaps.map(([file,reason])=>[path.relative(workspacePath,file),reason])}));
+            throw error;
+        }finally{for(const [method,original] of emptyMethods){DiffTracker.prototype[method]=original;}}
         const emptyRevert = await vscode.commands.executeCommand('diffTracker._testRevertFile', uri('new-empty.txt').fsPath);
         assert.equal(emptyRevert.status, 'conflict');
         assert.match(emptyRevert.reason, /delete it manually/);
