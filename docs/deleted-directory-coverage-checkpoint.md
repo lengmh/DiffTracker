@@ -246,3 +246,22 @@ No persisted schema or user configuration migration is introduced. The private
 independent reproduction package and raw logs are excluded from the repository
 and VSIX. Exact-head CI, automatic review and a new independent review remain
 required before acceptance; no merge or release is included.
+
+## Follow-up: a failed directory import owns only its own publication
+
+A rollback snapshot can contain a transient Unknown that a later independent
+creation has legitimately replaced. Restoring that snapshot must not overwrite
+the newer publication or its accepted baseline. The failed import still restores
+its own provisional children; historical Unknown is not eligible for promotion.
+Legacy runtime file-create notifications now use the same revocable proof as
+configured notifications, so a subsequent delete can also revoke the newer
+provisional creation before it is accepted.
+
+The fixed 16-case rollback matrix covers configured/legacy scope, storage/no
+storage, a later exact file creation, a later nested-directory batch, revoked
+creation, and historical Unknown. It fails the old parent at a real metadata
+await after other children have been prepared. Storage cases verify primary,
+last-good and reload state; all cases preserve file contents and the unrelated
+Unknown children. The independent four-case reproduction changes from 0/4 to
+4/4. These are controlled filesystem/provider-boundary regressions, not a claim
+of a naturally delivered Host reproduction of this exact interleaving.

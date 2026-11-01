@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createLegacyEffectiveScope } from '../out/monitoringScope.js';
 
 export function registerDirectoryPublicationSafety(h,fixture){
     const {test,Uri,DiffTracker,pause,document,faults,setTracker,waitUntil}=h;
@@ -249,6 +250,76 @@ export function registerDirectoryPublicationSafety(h,fixture){
             assert.equal(premature,undefined,'an earlier writer cannot accept a newer unfinished batch');
             assert.equal(tracker.getOriginalContent(a.known),'original known file');
         }finally{for(const gate of [...ag,...bg]){gate.release();}await first;if(second){await second;}if(saving){await saving;}}
+    }));
+    for(const storage of [false,true])for(const legacy of [false,true])for(const later of ['file','directory','revoked','historical'])
+    test(`DIRECTORY-ROLLBACK later state storage=${storage} legacy=${legacy} later=${later}`,()=>fixture(async({tracker,dir})=>{
+        const savedStorage=tracker.storageUri;
+        if(!storage){tracker.storageUri=undefined;}
+        if(legacy){tracker.effectiveMonitoringScope=createLegacyEffectiveScope(tracker.currentWorkspaceRootIdentities(),[]);}
+        const root=path.join(dir,'overlapping-import');fs.mkdirSync(root);
+        const children=Array.from({length:3},(_,index)=>later==='directory'
+            ? path.join(root,`nested-${index}`,'child.txt'):path.join(root,`child-${index}.txt`));
+        for(const child of children){
+            fs.mkdirSync(path.dirname(child),{recursive:true});fs.writeFileSync(child,'unverified observation');
+            if(later==='historical'){tracker.recordUnresolvedBaseline(child,'Historical unknown before-image');}
+            else{await tracker.readFileAndUpdate(child,Uri.file(child));assert.equal(tracker.postBaselineUnknownFiles.has(child),true);}
+            fs.unlinkSync(child);
+            fs.writeFileSync(child,'first directory contents');
+        }
+        const historical=path.join(root,'historical.txt');fs.writeFileSync(historical,'historical unknown contents');
+        tracker.recordUnresolvedBaseline(historical,'Historical unknown before-image');
+        h.setListedFiles([...children,historical].map(Uri.file));
+        const gates=children.map(child=>pause(child,'stat'));
+        const old=legacy?tracker.onExternalFileCreatedEvent(Uri.file(root)):tracker.onExternalFileCreated(Uri.file(root));
+        let newer;
+        try{
+            const first=await bounded(Promise.race(gates.map((gate,index)=>gate.entered.then(()=>index))));
+            gates[first].release();
+            const second=await bounded(Promise.race(gates.flatMap((gate,index)=>index===first?[]:[gate.entered.then(()=>index)])));
+            gates[second].release();const last=3-first-second;await bounded(gates[last].entered);
+            const target=children[first],carry=children[second],previous=tracker.runtimeCreationPublications.get(target);
+            assert.equal(tracker.getOriginalContent(target),later==='historical'?undefined:'');
+            assert.equal(tracker.getOriginalContent(carry),later==='historical'?undefined:'');
+            const createdPath=later==='directory'?path.dirname(target):target;
+            fs.rmSync(createdPath,{recursive:true});tracker.dispatchExternalEvent(Uri.file(createdPath),'delete',tracker.sessionEpoch);
+            await waitUntil(()=>tracker.activeExternalOperations.size===0,5000);
+            if(later==='directory'){fs.mkdirSync(createdPath);}
+            fs.writeFileSync(target,'independently created replacement');
+            newer=tracker.onExternalFileCreatedEvent(Uri.file(createdPath));let newerDone=false;void newer.then(()=>{newerDone=true;});
+            await waitUntil(()=>{const current=tracker.runtimeCreationPublications.get(target);return newerDone||
+                (tracker.getOriginalContent(target)===''&&(!current||current!==previous&&
+                    (later==='directory'?current.batch?.root===createdPath:!current.batch)));},5000);
+            if(later==='revoked'){
+                fs.unlinkSync(target);tracker.dispatchExternalEvent(Uri.file(target),'delete',tracker.sessionEpoch);
+                await waitUntil(()=>tracker.activeExternalOperations.size===0,5000);
+                fs.writeFileSync(target,'replacement without a fresh creation');
+            }
+            // Fail only the old parent's next classification. Its rollback may
+            // restore its own child, but cannot overwrite the newer creation.
+            fs.unlinkSync(children[last]);fs.mkdirSync(children[last]);
+            gates[last].release();await bounded(Promise.all([old,newer]));
+            const known=later==='file'||later==='directory';
+            await tracker.readFileAndUpdate(target,Uri.file(target));
+            if(known){
+                assert.equal(tracker.getOriginalContent(target),'','newer creation survives rollback of prior transient Unknown');
+                assert.ok(tracker.getReviewToken(target));assert.equal(tracker.unresolvedBaselineFiles.has(target),false);
+            }else{await unknown(tracker,target);}
+            assert.equal(fs.readFileSync(target,'utf8'),later==='revoked'?'replacement without a fresh creation':'independently created replacement');
+            await unknown(tracker,carry);await unknown(tracker,historical);
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            if(storage){
+                for(const name of ['session-state.json','session-state.last-good.json']){
+                    const state=JSON.parse(fs.readFileSync(path.join(savedStorage.fsPath,name),'utf8'));
+                    assert.equal(new Map(state.fileSnapshots).get(target),known?'':undefined);
+                    assert.equal(new Map(state.unresolvedBaselineFiles).has(target),!known);
+                }
+                await tracker.dispose();const restored=new DiffTracker(savedStorage);setTracker(restored);
+                assert.equal(await restored.restorePersistedState(),'restored');
+                if(known){assert.equal(restored.getOriginalContent(target),'');assert.ok(restored.getReviewToken(target));}
+                else{await unknown(restored,target);}
+                await unknown(restored,carry);await unknown(restored,historical);
+            }
+        }finally{for(const gate of gates){gate.release();}await bounded(Promise.all([old,newer]));}
     }));
     for(const {afterFirst=false,beforeDirectory=false} of [{},{afterFirst:true},{beforeDirectory:true}])for(const replace of [false,true])
     test(`DIRECTORY-PUBLICATION open pending child afterFirst=${afterFirst} replace=${replace} beforeDirectory=${beforeDirectory}`,()=>fixture(async({tracker,dir})=>{

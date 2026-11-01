@@ -2834,14 +2834,14 @@ export class DiffTracker {
 
     private queuedEventNeedsObservation(event: QueuedExternalEvent): boolean {
         if (event.reconcileDirectory || event.revoked) { return true; }
-        if (event.kind === 'create' && this.effectiveMonitoringScope.kind === 'configured') {
+        if (event.kind === 'create' && (this.effectiveMonitoringScope.kind === 'configured' || event.creationCurrent)) {
             return !event.creationCurrent?.();
         }
         return false;
     }
 
     private async replayQueuedCreation(event: QueuedExternalEvent, observeStopped = false): Promise<void> {
-        if (this.effectiveMonitoringScope.kind !== 'configured') {
+        if (this.effectiveMonitoringScope.kind !== 'configured' && !event.creationCurrent) {
             return this.onExternalFileCreated(event.uri,false,undefined,observeStopped);
         }
         const epoch = this.sessionEpoch;
@@ -11122,14 +11122,13 @@ export class DiffTracker {
         if (this.deferMissingDirectoryRetirementEvent(uri,'create')) { return; }
         const filePath = uri.fsPath;
         const epoch=this.sessionEpoch;
-        if (uri.scheme==='file' && this.isRecording && this.externalWatcherEnabled &&
-            this.effectiveMonitoringScope.kind==='configured' && !this.isPathIgnored(uri)) {
+        if (uri.scheme==='file' && this.isRecording && this.externalWatcherEnabled && !this.isPathIgnored(uri)) {
             let regularFile=false;
             try { regularFile=fs.lstatSync(filePath).isFile(); } catch { /* The ordinary reader handles missing paths. */ }
             if (regularFile) {
                 // Direct and queued file notifications share revocation, owner
                 // identity and type checks across every asynchronous boundary.
-                await this.replayQueuedCreation({uri,kind:'create',creationCurrent:this.captureFileCreationContext(uri)});
+                await this.replayQueuedCreation({uri,kind:'create',creationCurrent:this.captureFileCreationContext(uri) ?? (()=>false)});
                 if (this.isCurrentEpoch(epoch) && this.pendingMonitoringScope && this.deferPendingScopeEvent(uri)) { return; }
                 if (this.isCurrentEpoch(epoch) && this.restoringEpoch===undefined && this.coverageRecheckEpoch===undefined &&
                     this.restoreEvents.has(filePath)) { await this.drainRestoreEvents(epoch); }
@@ -11454,7 +11453,11 @@ export class DiffTracker {
                             for(const target of [...this.fileSnapshots.keys(),
                                 ...this.opaqueBaselineFiles.keys(),...this.largeFileReminders.keys()]){
                                 const pending=this.runtimeCreationPublications.get(target);
-                                if(!previous.has(target) && (!pending || !owned.has(pending))){preserved.add(target);}
+                                // A prior transient Unknown can be replaced by
+                                // a later independent creation. The old snapshot
+                                // does not own that newer publication or commit.
+                                if((!previous.has(target) || importRollback.postBaselineUnknownFiles.has(target)) &&
+                                    (!pending || !owned.has(pending))){preserved.add(target);}
                             }
                             for(const document of childPersistenceBudget.creationBatch!.documents){
                                 if(this.unresolvedBaselineFiles.has(document)){preserved.add(document);}
