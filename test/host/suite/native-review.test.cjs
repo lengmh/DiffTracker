@@ -140,7 +140,17 @@ module.exports = async function nativeReviewCheckpoint() {
 
     let scenarioFailure;
     try {
-        write(A, CURRENT_A); write(B, CURRENT_B);
+        // Native UI acceptance needs two acknowledged working-document edits.
+        // Unopened native notification delivery is exercised by its dedicated
+        // Host contracts; a raw setup write has no watcher-registration fence.
+        const edits=new vscode.WorkspaceEdit();
+        for(const [name,before,content] of [[A,BASE_A,CURRENT_A],[B,BASE_B,CURRENT_B]]){
+            const document=await vscode.workspace.openTextDocument(uri(name));
+            assert.equal(document.getText(),before,'fixture document must match its captured before-image');
+            edits.replace(document.uri,new vscode.Range(document.positionAt(0),document.positionAt(before.length)),content);
+        }
+        assert.equal(await vscode.workspace.applyEdit(edits),true);
+        await saveRealDocument(A,CURRENT_A);await saveRealDocument(B,CURRENT_B);
         const firstA = await review(A, CURRENT_A), firstB = await review(B, CURRENT_B);
         await vscode.commands.executeCommand('diffTracker.openDiffDefault', uri(A));
         await until('default Webview tab', () => vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputWebview);
@@ -373,7 +383,11 @@ module.exports = async function nativeReviewCheckpoint() {
                 baselineState: failedState.baselineState, reviewTokens: failedState.reviewTokens,
                 fixtureReviews: failedState.trackedChanges.filter(change =>
                     [uri(A).fsPath, uri(B).fsPath].includes(change.filePath)),
-                originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null
+                originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null,
+                diskA:read(A),diskB:read(B),
+                workingDocuments:vscode.workspace.textDocuments.filter(document=>document.uri.scheme==='file' &&
+                    [uri(A).fsPath,uri(B).fsPath].includes(document.uri.fsPath)).map(document=>({name:path.basename(document.uri.fsPath),
+                        dirty:document.isDirty,length:document.getText().length,version:document.version}))
             }));
         } catch (diagnosticError) {
             console.error('Native Review pre-cleanup diagnostics failed:', diagnosticError.stack || diagnosticError);
@@ -423,7 +437,11 @@ module.exports = async function nativeReviewCheckpoint() {
                         filePath: change.filePath, kind: change.reviewKind, reason: change.reviewReason,
                         unavailableReason: change.unavailableReason
                     })),
-                    originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null
+                    originalA: (await original(A)) ?? null, originalB: (await original(B)) ?? null,
+                diskA:read(A),diskB:read(B),
+                workingDocuments:vscode.workspace.textDocuments.filter(document=>document.uri.scheme==='file' &&
+                    [uri(A).fsPath,uri(B).fsPath].includes(document.uri.fsPath)).map(document=>({name:path.basename(document.uri.fsPath),
+                        dirty:document.isDirty,length:document.getText().length,version:document.version}))
                 }));
             } catch (diagnosticError) {
                 console.error('Native Review cleanup diagnostics failed:', diagnosticError.stack || diagnosticError);

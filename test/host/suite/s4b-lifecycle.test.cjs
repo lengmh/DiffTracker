@@ -36,6 +36,12 @@ async function directoryChangeHost(workspace) {
     const providerFallbacks = [];
     let traceRecurrence = false;
     const directoryTrace = [];
+    let traceRound;
+    const rememberDirectoryTrace=trace=>{
+        if(directoryTrace.length===64){directoryTrace.shift();}
+        directoryTrace.push({...trace,round:traceRound});
+        return directoryTrace.at(-1);
+    };
     const relativeTracePath = target => tracker.pathBelongsToRoot(target,root)
         ? path.relative(root,target) : tracker.pathBelongsToRoot(root,target) ? '[ancestor]' : '[outside fixture]';
     const scopedTracePath = target => !tracker.pathBelongsToRoot(target,child) &&
@@ -103,21 +109,19 @@ async function directoryChangeHost(workspace) {
         const caller = new Error().stack.split('\n').find(line=>/onExternalFileCreated|ensureSnapshotForDocument/.test(line))
             ?.match(/onExternalFileCreated|ensureSnapshotForDocument/)?.[0] ?? 'other';
         if (traceRecurrence) { runtimePublicationCallers[caller]=(runtimePublicationCallers[caller]??0)+1; }
-        const trace = traceRecurrence && directoryTrace.length<24 ? {method:'completeRuntimeBaseline',
-            caller,pending:true} : undefined;
-        if (trace) { directoryTrace.push(trace); }
+        const trace = traceRecurrence ? rememberDirectoryTrace({method:'completeRuntimeBaseline',
+            caller,pending:true}) : undefined;
         try { return await completeRuntimeBaseline.apply(this,args); }
         finally { if (trace) { trace.pending=false; } }
     };
-    for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation']) {
+    for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation','onExternalFileCreated']) {
         const original = tracker[method];
         tracker[method] = async function(uri,...args) {
             if (method==='reconcileDirectoryObservation' && args[1] && scopedTracePath(uri.fsPath) &&
                 createdDirectoryIdentities.size<16) { createdDirectoryIdentities.set(uri.fsPath,{epoch:args[0],identity:args[1]}); }
-            const trace = traceRecurrence && scopedTracePath(uri.fsPath) && directoryTrace.length<24
-                ? {method,before:traceState(uri),pending:true} : undefined;
+            const trace = traceRecurrence && scopedTracePath(uri.fsPath)
+                ? rememberDirectoryTrace({method,before:traceState(uri),pending:true}) : undefined;
             if (trace && method==='reconcileDirectoryObservation') { trace.creationIdentity=!!args[1]; }
-            if (trace) { directoryTrace.push(trace); }
             try {
                 const result = await original.call(this,uri,...args);
                 if (trace && method==='isUntrackedDirectory') {
@@ -131,6 +135,19 @@ async function directoryChangeHost(workspace) {
             } finally {
                 if (trace) { trace.pending=false;trace.after=traceState(uri); }
             }
+        };
+    }
+    // Keep the failing round's terminal gap transitions, rather than only
+    // the first round's entries. Observation only: no events or actions added.
+    for(const method of ['setSubtreeCoverageGap','clearCoverageGap']){
+        const original=tracker[method];
+        tracker[method]=function(target,...args){
+            if(traceRecurrence && scopedTracePath(target)){
+                rememberDirectoryTrace({method,before:traceState(vscode.Uri.file(target)),
+                    codeOrKind:args[0],reason:method==='setSubtreeCoverageGap'?args[1]:undefined,
+                    callers:new Error().stack.split('\n').slice(1,5).map(line=>line.trim().replace(/ \(.*$/,''))});
+            }
+            return original.call(this,target,...args);
         };
     }
     fs.lstatSync = function(target, ...args) {
@@ -252,6 +269,7 @@ async function directoryChangeHost(workspace) {
         };
         try {
             for (let round = 0; round < 3; round++) {
+                traceRound=round;directoryTrace.length=0;providerTrace.length=0;policyTrace.length=0;
                 const before = observedNotifications;
                 const inner = path.join(child, `created-${round}`); fs.mkdirSync(inner);
                 fs.writeFileSync(path.join(inner, 'ignored.txt'), `excluded modification ${round}\n`);
