@@ -352,6 +352,7 @@ interface QueuedExternalEvent {
     kind: StartupEvent['kind'];
     reconcileDirectory?: boolean;
     revoked?: boolean;
+    creationCurrent?: () => boolean;
 }
 
 interface LargeFileObservation { exists: boolean; size?: number; }
@@ -2755,11 +2756,33 @@ export class DiffTracker {
         }
     }
 
+    private captureFileCreationContext(uri: vscode.Uri, allowMissing = false): (() => boolean) | undefined {
+        const epoch=this.sessionEpoch,scope=this.effectiveMonitoringScope,generation=this.coverageGeneration;
+        const folder=this.owningWorkspaceFolderForTraversal(uri.fsPath);
+        if (!folder || this.isPathIgnored(uri) || this.validateResourceTarget(uri.fsPath)) { return undefined; }
+        const parent=path.dirname(uri.fsPath),owner=folder.uri.toString();
+        const fileTypeCurrent=():boolean => {
+            try { return fs.lstatSync(uri.fsPath).isFile(); }
+            catch(error) { return allowMissing && this.isFileNotFound(error); }
+        };
+        try {
+            const identity=fs.statSync(parent,{bigint:true});
+            if (!identity.isDirectory() || !fileTypeCurrent()) { return undefined; }
+            return () => {
+                if (!this.isCurrentEpoch(epoch) || this.effectiveMonitoringScope!==scope ||
+                    this.coverageGeneration!==generation || this.isPathIgnored(uri) ||
+                    this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString()!==owner) { return false; }
+                try { return !this.validateResourceTarget(uri.fsPath) && fileTypeCurrent() &&
+                    this.supplementalIdentityMatches(fs.statSync(parent,{bigint:true}),identity); }
+                catch { return false; }
+            };
+        } catch { return undefined; }
+    }
+
     private queuedEventNeedsObservation(event: QueuedExternalEvent): boolean {
         if (event.reconcileDirectory || event.revoked) { return true; }
         if (event.kind === 'create' && this.effectiveMonitoringScope.kind === 'configured') {
-            try { return fs.lstatSync(event.uri.fsPath).isDirectory(); }
-            catch { return true; }
+            return !event.creationCurrent?.();
         }
         return false;
     }
@@ -2787,16 +2810,18 @@ export class DiffTracker {
 
     private queueRestoreEvent(uri: vscode.Uri, kind: 'change' | 'create' | 'delete', reconcileDirectory = false): void {
         if (kind === 'delete') { this.revokeQueuedDescendantCreations(uri.fsPath); }
+        const previous = this.restoreEvents.get(uri.fsPath);
+        let creationCurrent=kind==='change' && previous?.kind==='create' ? previous.creationCurrent : undefined;
         if (kind === 'create' && !reconcileDirectory && this.effectiveMonitoringScope.kind === 'configured') {
             // Host watchers can also report only a populated directory's create.
             // Classify before queueing: discovery and concurrent directory scans
             // consult this queue before the event itself reaches the drain.
-            try { reconcileDirectory = fs.lstatSync(uri.fsPath).isDirectory(); }
-            catch { reconcileDirectory = true; /* Unverified metadata cannot prove an empty before-image. */ }
+            creationCurrent=this.captureFileCreationContext(uri);
+            reconcileDirectory=!creationCurrent;
         }
-        const previous = this.restoreEvents.get(uri.fsPath);
         this.restoreEvents.set(uri.fsPath,{
             uri, kind:kind==='change' && previous?.kind==='create' ? 'create' : kind,
+            creationCurrent,
             // A new independent file create starts fresh proof after deletion;
             // changes alone cannot revive the revoked incarnation's evidence.
             reconcileDirectory:reconcileDirectory || (kind !== 'create' && previous?.reconcileDirectory)
@@ -10144,8 +10169,10 @@ export class DiffTracker {
         for (let current = filePath; ; current = path.dirname(current)) {
             const restored = this.restoreEvents.get(current);
             const active = this.activeCreations.get(current);
-            if ((active?.duringScan === false && !active.cancelled && (!active.evidenceCurrent || active.evidenceCurrent())) ||
-                (restored?.kind === 'create' && !this.queuedEventNeedsObservation(restored))) { return true; }
+            if ((active?.duringScan === false && !active.cancelled &&
+                (current===filePath || !active.evidenceCurrent) && (!active.evidenceCurrent || active.evidenceCurrent())) ||
+                (restored?.kind === 'create' && (current===filePath || this.effectiveMonitoringScope.kind!=='configured') &&
+                    !this.queuedEventNeedsObservation(restored))) { return true; }
             for (const job of this.directoryObservations.values()) {
                 if (!job.current()) { continue; }
                 const identity = job.creations.get(current);
@@ -10170,9 +10197,24 @@ export class DiffTracker {
         }
     }
 
+    private planRestoredAddition(filePath: string, scanContextCurrent: boolean): CandidateBaselinePlan {
+        if (this.mayHaveSuppressedResource(filePath)) {
+            return {kind:'unresolved',reason:'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review'};
+        }
+        // A file notification is its own proof. The old scan can establish
+        // absence only while this candidate's incarnation remains unchanged.
+        return this.hasObservedCreation(filePath) || (scanContextCurrent && this.scanCoverage &&
+            this.scanCoverage===this.ignoreFingerprint && !this.hasUnprovenDirectoryObservation(filePath))
+            ? {kind:'text',content:'',baselineExists:false}
+            : {kind:'unresolved',reason:'Prior scan coverage is unknown or ignore rules changed; before-image is unknown'};
+    }
+
     private async discoverRestoredFiles(
         epoch: number, recheckCurrent?: () => boolean, archiveDiscovery = false
     ): Promise<void> {
+        const scope=this.effectiveMonitoringScope,generation=this.coverageGeneration;
+        const discoveryCurrent=() => this.isCurrentEpoch(epoch) && this.effectiveMonitoringScope===scope &&
+            this.coverageGeneration===generation && !this.workspaceContextChanged && (!recheckCurrent || recheckCurrent());
         const candidates = new Map<string, vscode.Uri>();
         const wholeWorkspace = this.effectiveMonitoringScope.kind === 'configured' &&
             this.effectiveMonitoringScope.mode === 'wholeWorkspace';
@@ -10234,12 +10276,13 @@ export class DiffTracker {
             candidates.set(canonical, canonicalUri);
         }
 
-        const plannedAdditions: Array<{ filePath: string; plan: CandidateBaselinePlan }> = [];
+        const plannedAdditions: Array<{ filePath: string; plan: CandidateBaselinePlan; contextCurrent?: () => boolean }> = [];
         for (const uri of candidates.values()) {
             if (!this.isCurrentEpoch(epoch)) { return; }
             const filePath = uri.fsPath;
             if (uri.scheme !== 'file' || this.isPathIgnored(uri) ||
                 this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath) || this.largeFileReminders.has(filePath)) { continue; }
+            const contextCurrent=this.captureFileCreationContext(uri,true);
             if (await this.isUntrackedDirectory(uri)) { continue; }
             if (!this.isCurrentEpoch(epoch)) { return; }
             if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) || this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath) || this.largeFileReminders.has(filePath)) { continue; }
@@ -10248,35 +10291,33 @@ export class DiffTracker {
                 if (!this.isCurrentEpoch(epoch) || (recheckCurrent && !recheckCurrent())) { return; }
                 if (this.suppressUnsupportedResource(filePath, state)) { continue; }
             }
-            const observedCreation = this.hasObservedCreation(filePath);
-            const plan: CandidateBaselinePlan = this.mayHaveSuppressedResource(filePath)
-                ? { kind: 'unresolved', reason: 'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review' }
-                // A queued reconstruction interrupts the older scan's absence
-                // inference for its children. Only independent creation proof
-                // can establish an empty before-image during this discovery.
-                : observedCreation || (this.scanCoverage && this.scanCoverage === this.ignoreFingerprint &&
-                    !this.hasUnprovenDirectoryObservation(filePath))
-                    ? { kind: 'text', content: '', baselineExists: false }
-                    : {
-                        kind: 'unresolved',
-                        reason: 'Prior scan coverage is unknown or ignore rules changed; before-image is unknown'
-                    };
+            const plan=this.planRestoredAddition(filePath,contextCurrent?.() ?? false);
             if (persistenceBudget) {
                 this.consumeCandidatePersistenceBudget(filePath, plan, persistenceBudget);
             }
-            plannedAdditions.push({ filePath, plan });
+            plannedAdditions.push({ filePath, plan, contextCurrent });
         }
 
-        const publishableAdditions = plannedAdditions.filter(({ filePath }) => {
+        if (!this.isCurrentEpoch(epoch)) { return; }
+        if (!discoveryCurrent()) { throw new Error('Observation ownership changed during restored discovery; original before-images are preserved'); }
+        // Planning yielded between candidates. Reclassify at the synchronous
+        // publication boundary: old proof may be revoked or valid proof may
+        // have arrived. Existing historical Unknown is never upgraded here.
+        const publicationBudget=persistenceBudget ? this.createCandidatePersistenceBudget() : undefined;
+        const publishableAdditions = plannedAdditions.flatMap(({ filePath, contextCurrent }) => {
             const uri = vscode.Uri.file(filePath);
-            return !this.isPathIgnored(uri) &&
-                !this.fileSnapshots.has(filePath) &&
-                !this.unresolvedBaselineFiles.has(filePath) &&
-                !this.opaqueBaselineFiles.has(filePath) && !this.largeFileReminders.has(filePath);
+            if (this.isPathIgnored(uri) || this.fileSnapshots.has(filePath) ||
+                this.unresolvedBaselineFiles.has(filePath) || this.opaqueBaselineFiles.has(filePath) ||
+                this.largeFileReminders.has(filePath)) { return []; }
+            try { if (!fs.lstatSync(filePath).isFile()) { this.queueRestoreEvent(uri,'change',true);return []; } }
+            catch(error) { if (!this.isFileNotFound(error)) { this.queueRestoreEvent(uri,'change',true);return []; } }
+            const plan=this.planRestoredAddition(filePath,contextCurrent?.() ?? false);
+            if (publicationBudget) { this.consumeCandidatePersistenceBudget(filePath,plan,publicationBudget); }
+            return [{filePath,plan}];
         });
-        if (!this.isCurrentEpoch(epoch) || (recheckCurrent && !recheckCurrent())) { return; }
-        if (persistenceBudget) {
-            this.validateCandidatePersistenceProjection(persistenceBudget);
+        if (!discoveryCurrent()) { return; }
+        if (publicationBudget) {
+            this.validateCandidatePersistenceProjection(publicationBudget);
         }
         this.validateRestoreAdditionsProjection(publishableAdditions);
 
@@ -10297,22 +10338,22 @@ export class DiffTracker {
             } else {
                 throw new Error('Unexpected opaque restore candidate');
             }
-            if (persistenceBudget) {
+            if (publicationBudget) {
                 this.noteCandidateBudgetPublication(
                     filePath,
-                    persistenceBudget,
+                    publicationBudget,
                     beforeReason,
                     beforeRevision
                 );
             }
         }
-        if (persistenceBudget) {
-            this.validateCandidatePersistenceProjection(persistenceBudget);
+        if (publicationBudget) {
+            this.validateCandidatePersistenceProjection(publicationBudget);
         }
         if (publishableAdditions.length > 0 && !await this.flushPendingPersistence()) {
             throw new Error('Restored additions could not be persisted');
         }
-        if (recheckCurrent && (!this.isCurrentEpoch(epoch) || !recheckCurrent())) { return; }
+        if (!discoveryCurrent()) { return; }
         for (const { filePath, reason } of unresolvedReviews) {
             this.markFileUnavailable(filePath, reason);
         }
@@ -10900,6 +10941,21 @@ export class DiffTracker {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         if (this.deferMissingDirectoryRetirementEvent(uri,'create')) { return; }
         const filePath = uri.fsPath;
+        const epoch=this.sessionEpoch;
+        if (uri.scheme==='file' && this.isRecording && this.externalWatcherEnabled &&
+            this.effectiveMonitoringScope.kind==='configured' && !this.isPathIgnored(uri)) {
+            let regularFile=false;
+            try { regularFile=fs.lstatSync(filePath).isFile(); } catch { /* The ordinary reader handles missing paths. */ }
+            if (regularFile) {
+                // Direct and queued file notifications share revocation, owner
+                // identity and type checks across every asynchronous boundary.
+                await this.replayQueuedCreation({uri,kind:'create',creationCurrent:this.captureFileCreationContext(uri)});
+                if (this.isCurrentEpoch(epoch) && this.pendingMonitoringScope && this.deferPendingScopeEvent(uri)) { return; }
+                if (this.isCurrentEpoch(epoch) && this.restoringEpoch===undefined && this.coverageRecheckEpoch===undefined &&
+                    this.restoreEvents.has(filePath)) { await this.drainRestoreEvents(epoch); }
+                return;
+            }
+        }
         if (uri.scheme === 'file' && this.isRecording && this.externalWatcherEnabled &&
             this.effectiveMonitoringScope.kind === 'configured' && this.snapshotInitialized &&
             (!this.baselineBuilding || this.runtimeBaselinePublications.size > 0) && !this.baselineTransaction && !this.scopeApplyPreflight &&

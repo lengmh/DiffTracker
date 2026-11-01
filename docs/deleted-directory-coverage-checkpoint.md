@@ -189,3 +189,60 @@ Restored discovery now checks same-owner, non-workspace-root deferred directory 
 The original [971c72d Ubuntu Stable failure](https://github.com/lengmh/DiffTracker/actions/runs/41237227580/job/124643433700) lacked event provenance diagnostics and remains retained. The tested restore path performs zero Recheck calls, so the previous Recheck-only retirement change is not on that path. A controlled real Stable reproduction found a separate production producer: onDidSaveTextDocument processed a newly created file before its queued creation was replayed, publishing historical Unknown despite the retained, unrevoked create proof. WorkspaceEdit.createFile followed by an actual document edit/save reproduces the same empty-baseline assertion failure; the trace records queued create proof and no later delete. This proves the save-notification defect, without claiming the unrecorded original CI had exactly that event sequence.
 
 Save notifications now defer through the existing retirement/recovery queue, preserving create+change semantics instead of constructing a before-image early. Four boundary controls cover normal runtime, restore, Retry and historical Unknown; restore/Retry fail before correction, all four pass after it. Both official Stable and 1.80.2 Host pass direct creation and forced actual save × normal restore/Retry, together with the parent-only Unknown/block-Revert negatives. The original positive assertion is unchanged; bounded event/Unknown-producer diagnostics now make any recurrence reviewable. No sleeps, retries, gap filtering, baseline adoption or extra watcher allowance force these outcomes. The prospective full tracker count is 1940; new exact-head CI and original independent ultra review remain required.
+
+## Follow-up on 8cf9e805: revocable creation proof at publication
+
+Four independently supplied controlled probes were reproduced separately before
+editing production code. The restored-discovery late-create P2 and Workspace
+Source hints toggle P2 are specific to this branch. The stale restored absence
+plan P1 and direct runtime metadata-await P1 also reproduce on main a4a309a.
+The P1 probes demonstrate block Revert emptying the editor buffer; they do not
+demonstrate a disk write or a successful whole-file Revert.
+
+Direct configured file notifications and queued consumers now share the same
+revocable proof. It binds the current epoch, effective scope, coverage generation,
+workspace owner, parent physical identity and regular-file type. A proof applies
+only to its exact file, and cannot authorize a replacement directory's children.
+An ordinary atomic file update under the same parent remains supported. A new
+independent create after deletion establishes a fresh proof; historical Unknown
+is never upgraded by this discovery path.
+
+Restored discovery rederives each candidate at the synchronous publication
+boundary, after all metadata awaits. This both rejects revoked empty-baseline
+plans and admits valid file-create proof received after an earlier Unknown plan.
+The final categories are reserved against a fresh persistence budget before any
+baseline maps change. An invalidated direct create also retains the existing
+pending-scope event obligation when a newly requested exclusion caused the
+invalidation.
+
+| Boundary | Negative control | Positive control |
+| --- | --- | --- |
+| Direct runtime metadata await | Ancestor replacement, including no delivered delete; file to populated directory | Ordinary file creation, fresh post-delete proof, atomic file update |
+| Restore planning to publication | Ancestor delete revokes an already planned empty baseline; block and whole-file Revert refuse | Same-incarnation late file-create replaces only the provisional Unknown plan |
+| Persistence and allowance | Publication budget refusal, save failure, historical Unknown | Valid proof and revoked proof retain their correct categories across reload |
+| Lifecycle and scope | Stop, newer epoch, pending exclusion preserve original state and observation duty | Known baseline and unrelated review remain intact |
+
+The portable independent probes first report runtime 1/3, restored discovery 2/6
+and Source hints 1/3 on 8cf9e805. Unchanged probes pass 3/3, 6/6 and 3/3 after the
+correction. Twenty-one integrated tracker regressions cover these cases and the
+failure/lifecycle controls. Three UI regressions toggle both directions with a
+true/false Workspace override and with no override, checking effective value,
+write target and unchanged Global preference. Source hints uses an existing
+Workspace override when present; other settings keep their current write scope.
+
+The first full local run exposed an unpublished compatibility regression: final
+file-type validation skipped a disappeared scan candidate, dropping its proven
+absent baseline during an offline delete replay. The correction captures the
+parent/scan witness before the metadata await and preserves confirmed missing
+files under that still-valid witness. It does not accept directories or unknown
+metadata. The final full suite passes 1961/1961 tracker cases and all UI, Git
+and Host fixture suites, including the final pending-scope control. Full real Linux Extension Host runs pass on official Stable and 1.80.2,
+including existing native parent-only Unknown/block-Revert protections and
+independent file-create controls. The newly reported interleavings use real
+files and controlled production notification/provider boundaries; natural Host
+delivery has not independently reproduced those exact new sequences.
+
+No persisted schema or user configuration migration is introduced. The private
+independent reproduction package and raw logs are excluded from the repository
+and VSIX. Exact-head CI, automatic review and a new independent review remain
+required before acceptance; no merge or release is included.

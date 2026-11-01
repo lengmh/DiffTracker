@@ -1,3 +1,4 @@
+import { registerCreationProofLifecycle } from './creation-proof-lifecycle.mjs';
 import { registerMonitoringLifecycleDiagnostics } from './monitoring-lifecycle-diagnostics.mjs';
 import { registerDeletedDirectoryCoverage } from './deleted-directory-coverage.mjs';
 import { registerScopeExclusionRecovery } from './scope-exclusion-recovery.mjs';
@@ -59,6 +60,7 @@ export function registerPR12BoundedInvariants(h) {
     registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
     registerMonitoringLifecycleDiagnostics(h, fixture);
     registerDeletedDirectoryCoverage(h, fixture);
+    registerCreationProofLifecycle(h, fixture);
     registerS4BSupplementalCoverage(h, fixture, scopeFor);
     registerS4CImportHandoff(h, fixture);
     registerRecheckObservationCoverage(h, fixture);
