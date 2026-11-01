@@ -346,3 +346,13 @@ proof passes are unchanged. Zero allowance, Stop and storage failure still
 prevent certification. The minimum Host's workspace-context refusal
 is a separate retained failure, with its folder-event diagnostics expanded
 without changing the production workspace membership guard.
+
+Policy contraction during rollback also preserves the original stopped review
+in legacy Rules. A temporary, epoch-bound set of original known resources now
+survives rollback discovery and intent cleanup. Ordinary policy pruning retains
+those exact resources so current-content reconciliation can still read them;
+pending explicit exclusions and hard boundaries remain in force. The set ends
+with the archive task and does not authorize discovery of new files. File and
+parent exclusions have red/green legacy controls and configured positive
+controls, including latest review content, primary/last-good persistence,
+unchanged safety backup and the existing recovery pause on reload.

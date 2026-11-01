@@ -1071,6 +1071,7 @@ export class DiffTracker {
     // those requests belong to the enclosing transaction's final publication.
     private archiveRestoreStaging = false;
     private archiveRestoreTask?: Promise<ArchivedGitReviewRestoreResult>;
+    private archiveRestoreFrozenReview?: { epoch: number; paths: Set<string> };
     private archiveRestoreStopRequested = false;
     private archiveRestoreFinalizingEpoch?: number;
     // Only live policy events invalidate restore; replay-owned directory scans
@@ -9463,7 +9464,9 @@ export class DiffTracker {
     private pruneIgnoredTrackedChanges(): void {
         const removedFiles: string[] = [];
         const retainedFiles: string[] = [];
-        for (const filePath of this.trackedChanges.keys()) {
+        const frozen=this.archiveRestoreTask && this.archiveRestoreFrozenReview?.epoch===this.sessionEpoch
+            ? this.archiveRestoreFrozenReview.paths : undefined;
+        for (const filePath of new Set([...this.trackedChanges.keys(),...(frozen??[])])) {
             const uri = vscode.Uri.file(filePath);
             const folder = vscode.workspace.getWorkspaceFolder(uri);
             if (this.workspaceContextChanged && (!folder || folder.uri.scheme !== 'file')) { continue; }
@@ -9476,7 +9479,7 @@ export class DiffTracker {
                 retainedFiles.push(filePath);
             }
             if (!this.isPathIgnored(uri, false, true, false)) { continue; }
-            if (this.effectiveMonitoringScope.kind === 'configured' && folder?.uri.scheme === 'file') {
+            if ((this.effectiveMonitoringScope.kind === 'configured' || frozen?.has(filePath)) && folder?.uri.scheme === 'file') {
                 const identity = this.workspaceRootIdentityForFolder(folder);
                 const relative = this.toPosixPath(path.relative(folder.uri.fsPath, filePath));
                 if (typeof identity.caseSensitive === 'boolean' &&
@@ -12436,6 +12439,7 @@ export class DiffTracker {
         this.archiveRestoreTask = task;
         return task.finally(() => {
             this.archiveRestoreTask = undefined;
+            this.archiveRestoreFrozenReview = undefined;
             this.archiveRestoreStaging = false;
             this.archiveRestoreFinalizingEpoch = undefined;
             this.archiveRestorePolicyChanged = false;
@@ -12570,6 +12574,15 @@ export class DiffTracker {
             this._onDidChangeBaselineState.fire(this.getBaselineState());
             return { status: 'restored' };
         } catch (error) {
+            if(!previousState.isRecording){
+                // A policy notification can arrive during rollback discovery
+                // or later intent cleanup. Preserve only the original known
+                // resources until both phases finish, including legacy Rules.
+                this.archiveRestoreFrozenReview={epoch,paths:new Set([
+                    ...previous.fileSnapshots.keys(),...previous.unresolvedBaselineFiles.keys(),
+                    ...previous.opaqueBaselineFiles.keys(),...previous.largeFileReminders.keys(),...previous.trackedChanges.keys()
+                ])};
+            }
             this.endBaselineTransaction(transaction, false);
             if (!this.isCurrentEpoch(epoch)) {
                 this.recoveryBlocked = true;

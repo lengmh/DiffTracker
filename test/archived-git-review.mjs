@@ -16,7 +16,7 @@ const PRIMARY = 'session-state.json';
 export function registerArchivedGitReview(h) {
     const { test, Uri, DiffTracker, vscode, file, document, faults, counters,
         pause, emitWatcher, emitWorkspaceFilesCreated, fireConfigurationChanged,
-        waitUntil, watcherInstances, nativeDirectoryWatchers, setVsCodeExcludes, getTracker, setTracker, setListedFiles } = h;
+        waitUntil, watcherInstances, nativeDirectoryWatchers, setVsCodeExcludes, getTracker, setTracker, setListedFiles, setListedIgnores } = h;
 
     async function fixture(run, { compatible = true, unknown = false, configured = false, stoppedArchive = false,
         ignoredBaseline = false, ignorePolicyFile = '.gitignore', blindDirectory = false, ignoredDirectory = false } = {}) {
@@ -53,6 +53,7 @@ export function registerArchivedGitReview(h) {
             fs.mkdirSync(path.dirname(ignoreFile), { recursive: true });
             fs.writeFileSync(ignoreFile, 'policy-hidden.txt\n'+(ignoredDirectory?'ignored/\n':''));
             fs.writeFileSync(ignored, 'preexisting content excluded from the archived baseline\n');
+            if(ignorePolicyFile==='.gitignore'){setListedIgnores([Uri.file(ignoreFile)]);}
         }
         setListedFiles([Uri.file(target), Uri.file(opaque), ...(blindDirectory ? [Uri.file(blindFile)] : []), ...(stoppedArchive ? [Uri.file(deleted)] : []),
             ...(ignoredBaseline ? [Uri.file(ignoreFile), Uri.file(ignored)] : [])]);
@@ -806,7 +807,8 @@ export function registerArchivedGitReview(h) {
     },{stoppedArchive:true,configured}));
 
     for (const configured of [false,true]) for (const stoppedArchive of [false,true])
-    test(`ARCHIVE-RESTORE policy save during rollback preserves review scope (configured=${configured}, stopped=${stoppedArchive})`,()=>fixture(async ctx=>{
+    for(const exclusion of stoppedArchive?['none','file','parent']:['none'])
+    test(`ARCHIVE-RESTORE policy save during rollback preserves review scope (configured=${configured}, stopped=${stoppedArchive}, exclusion=${exclusion})`,()=>fixture(async ctx=>{
         const before=readState(ctx.storage),preview=await ready(ctx.tracker);
         const read=pause(ctx.target,'read'),operation=ctx.tracker.restoreArchivedGitReview(preview.token);
         let policy;
@@ -821,17 +823,23 @@ export function registerArchivedGitReview(h) {
             emitWorkspaceFilesCreated({files:[Uri.file(late)]});
             const doc=document(ctx.target);doc.text='known change during policy refresh\n';doc.isDirty=true;doc.version++;
             assert.equal(await doc.save(),true);ctx.tracker.onDidSaveDocument(doc);
-            const policyDoc=document(ctx.ignoreFile);assert.equal(await policyDoc.save(),true);ctx.tracker.onDidSaveDocument(policyDoc);
+            const policyDoc=document(ctx.ignoreFile);
+            if(exclusion!=='none'){policyDoc.text=exclusion==='file'?'review.txt\n':'*\n';policyDoc.isDirty=true;policyDoc.version++;}
+            assert.equal(await policyDoc.save(),true);ctx.tracker.onDidSaveDocument(policyDoc);
             policy.release();const result=await operation;
             assert.equal(result.status,'failed','a policy change must still invalidate the restore context');
             assert.equal(ctx.tracker.getIsRecording(),false);
+            assert.equal(ctx.tracker.archiveRestoreFrozenReview,undefined,'the temporary path boundary ends with this task');
             assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main pending review\n');
             assert.equal(changeFor(ctx.tracker,ctx.target)?.currentContent,'known change during policy refresh\n');
             for(const name of [PRIMARY,'session-state.last-good.json']){
                 const saved=readState(ctx.storage,name);
                 const hasLate=new Map(saved.fileSnapshots).has(late)||new Map(saved.unresolvedBaselineFiles).has(late);
                 assert.equal(hasLate,!stoppedArchive,'only active rollback may discover a new file');
-                if(stoppedArchive){assert.deepEqual(saved.fileSnapshots,before.fileSnapshots);}
+                if(stoppedArchive){
+                    assert.deepEqual(saved.fileSnapshots,before.fileSnapshots);
+                    assert.equal(saved.stoppedReviews.find(review=>review.filePath===ctx.target)?.currentContent,'known change during policy refresh\n');
+                }
             }
             assert.equal(changeFor(ctx.tracker,late)!==undefined,!stoppedArchive);
             assert.deepEqual(readState(ctx.storage,BACKUP),before);

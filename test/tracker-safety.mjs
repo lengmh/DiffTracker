@@ -5851,7 +5851,8 @@ registerArchivedGitReview({
     fireConfigurationChanged: key => configurationChanged({ affectsConfiguration: name => name === key }),
     getTracker: () => tracker,
     setTracker: value => { tracker = value; },
-    setListedFiles: value => { listedFiles = value; }
+    setListedFiles: value => { listedFiles = value; },
+    setListedIgnores: value => { listedIgnores = value; }
 });
 
 registerStoppedReviewActions({
