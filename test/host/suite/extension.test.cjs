@@ -560,17 +560,27 @@ module.exports = async function runExtensionHostScenario() {
             fileGap:tracker.coverageGaps.get(emptyPath)?.file?.reasonCode,
             rootGap:tracker.coverageGaps.get(workspacePath)?.subtree?.reasonCode,
             directoryJobs:tracker.directoryObservations.size,
+            pendingRead:tracker.pendingSnapshotReads.has(emptyPath),
             nativeRoot:tracker.supplementalDirectoryWatchers.has(workspacePath)});
         for(const method of ['dispatchExternalEvent','onExternalFileCreated','onExternalFileChanged',
-            'readFileAndUpdate','recordUnresolvedBaseline','markFileUnavailable']){
+            'readFileAndUpdate','readFileSnapshot','recordUnresolvedBaseline','markFileUnavailable']){
             const original=DiffTracker.prototype[method];emptyMethods.set(method,original);
             DiffTracker.prototype[method]=function(...args){
                 const file=typeof args[0]==='string'?args[0]:args[0]?.fsPath;
                 if((file===emptyPath||file===workspacePath)&&emptyTrace.length<100){
                     emptyTrace.push({method,path:file===emptyPath?'new-empty.txt':'<primary>',
-                        kind:method==='dispatchExternalEvent'?args[1]:undefined,...emptyObservation(this)});
+                        kind:method==='dispatchExternalEvent'?args[1]:undefined,
+                        operationCurrent:method==='readFileAndUpdate'&&args[2]?args[2]():undefined,...emptyObservation(this)});
                 }
-                return original.apply(this,args);
+                const result=original.apply(this,args);
+                if(method==='readFileSnapshot' && file===emptyPath){
+                    void result.then(state=>{
+                        if(emptyTrace.length<100){emptyTrace.push({method:'snapshot-result',kind:state.kind,
+                            bytes:state.kind==='text'?Buffer.byteLength(state.content,'utf8'):undefined,
+                            nodeExists:fs.existsSync(emptyPath),...emptyObservation(this)});}
+                    },()=>{});
+                }
+                return result;
             };
         }
         try{

@@ -356,3 +356,15 @@ with the archive task and does not authorize discovery of new files. File and
 parent exclusions have red/green legacy controls and configured positive
 controls, including latest review content, primary/last-good persistence,
 unchanged safety backup and the existing recovery pause on reload.
+
+A duplicate file-create can also finish its older Ready save after a newer
+creation has started reading. The obsolete operation previously reserved the
+latest-read slot before checking its validity, so it could suppress the valid
+read while its own result was rejected. Empty and nonempty creation reviews
+could both disappear without changing the baseline or disk. Reads now check
+their operation before claiming that slot and still validate after I/O. Four
+legacy/configured controls reproduce the omission on main/v0.8.13 and c12 and
+verify review tokens and Keep after correction. The Windows empty-creation
+failure has the matching two-create/two-read shape; its trace did not capture
+the old operation's predicate, so exact native causality is not asserted from
+that trace alone.

@@ -11835,6 +11835,9 @@ export class DiffTracker {
             if (!doc?.isDirty) { this.pendingWriteFiles.delete(filePath); }
         }
         if (this.isPathIgnored(uri)) { return; }
+        // An obsolete creation must not supersede a valid in-flight read just
+        // by starting later. Keep the post-I/O guard for changes during reading.
+        if(operationCurrent && !operationCurrent()){return;}
         // A stable snapshot can still arrive out of order: its final stat may
         // have completed before a later mutation while its promise is delayed.
         // Only the newest read for this path may publish into the review.
