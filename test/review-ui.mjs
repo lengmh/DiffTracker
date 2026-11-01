@@ -2059,6 +2059,26 @@ await test('WebView sidebar changes update existing workspace overrides instead 
     await picker.run('diffTracker.selectWebviewDiffStyle');
     assert.deepEqual(picker.state.updates, [['webviewDiffStyle', 'unified', 2]]);
 });
+for(const workspaceValue of [true,false,undefined]) await test(`SOURCE-PREFERENCE effective toggle with workspace=${workspaceValue}`,async()=>{
+    const h=harness();const global={enableSourceTracking:false,showCodeLens:true};
+    const workspace=workspaceValue===undefined?{}:{enableSourceTracking:workspaceValue};
+    const writes=[];
+    h.vscode.workspace.getConfiguration=()=>({
+        get:(key,fallback)=>workspace[key]??global[key]??fallback,
+        inspect:key=>({workspaceValue:workspace[key],globalValue:global[key]}),
+        update:async(key,value,target)=>{writes.push([key,value,target]);(target===2?workspace:global)[key]=value;}
+    });
+    const provider=new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();
+    const recording=provider.getChildren().find(item=>item.label==='Recording');
+    const row=()=>provider.getChildren(recording).find(item=>item.settingKey==='enableSourceTracking');
+    const before=row().isEnabled;
+    for(const expected of [!before,before]){
+        await provider.toggleSetting('enableSourceTracking');assert.equal(row().isEnabled,expected);
+        assert.deepEqual(writes.at(-1),['enableSourceTracking',expected,workspaceValue===undefined?1:2]);
+    }
+    if(workspaceValue!==undefined){assert.equal(global.enableSourceTracking,false,'a workspace override does not change the global preference');}
+    provider.dispose();
+});
 await test('settings tree shows the selected Native Review label',()=>{
     const h=harness();h.state.configuration={defaultOpenMode:'nativeReview'};
     const provider=new (h.load('settingsTreeView.ts').SettingsTreeDataProvider)();

@@ -202,8 +202,8 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
         const config = vscode.workspace.getConfiguration('diffTracker');
         const setting = this.settings.flatMap(group => group.items).find(item => item.key === settingKey);
         const currentValue = config.get<boolean>(settingKey, setting?.defaultValue ?? true);
-        const isWebviewDefault = settingKey === 'webviewWordWrap' || settingKey === 'webviewExpandUnchanged';
-        const target = isWebviewDefault && config.inspect(settingKey)?.workspaceValue !== undefined
+        const isWindowPreference = settingKey === 'webviewWordWrap' || settingKey === 'webviewExpandUnchanged' || settingKey === 'enableSourceTracking';
+        const target = isWindowPreference && config.inspect(settingKey)?.workspaceValue !== undefined
             ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
         await config.update(settingKey, !currentValue, target);
         this.refresh();
