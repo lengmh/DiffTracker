@@ -9,7 +9,7 @@ const {validateAndCanonicalizeScope} = require('../../../out/monitoringScope.js'
 async function until(description, predicate, tracker) {
     const deadline = Date.now() + 15000;
     while (!predicate()) {
-        if (Date.now() > deadline) { throw new Error(`${description}: ${JSON.stringify({gaps:tracker.getSubtreeCoverageGaps(),reviews:tracker.getTrackedChanges().map(change=>({name:path.basename(change.filePath),kind:change.reviewKind,deleted:change.isDeleted}))})}`); }
+        if (Date.now() > deadline) { throw new Error(`${description}: ${JSON.stringify({gaps:tracker.getSubtreeCoverageGaps(),reviews:tracker.getTrackedChanges().map(change=>({name:path.basename(change.filePath),kind:change.reviewKind,deleted:change.isDeleted})),trace:tracker.deletedCoverageTrace})}`); }
         await new Promise(resolve=>setTimeout(resolve,25));
     }
 }
@@ -25,6 +25,22 @@ module.exports = async function deletedDirectoryCoverageHost(workspace) {
     const storage = fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-deleted-host-'));
     let tracker = new DiffTracker(vscode.Uri.file(storage));
     try {
+        // Bounded diagnostics preserve the event ordering of a failed native
+        // lifecycle. These wrappers neither await nor replay a notification.
+        const trace=[];tracker.deletedCoverageTrace=trace;
+        for(const method of ['onExternalFileCreated','onExternalFileChanged','onExternalFileDeleted','setSubtreeCoverageGap','clearCoverageGap']){
+            const original=tracker[method];
+            tracker[method]=function(target,...args){
+                const owner=this.supplementalDirectoryWatchers.get(root);
+                trace.push({method,target:path.relative(workspace,typeof target==='string'?target:target.fsPath),
+                    gap:method==='setSubtreeCoverageGap'?args[0]:undefined,
+                    caller:method==='setSubtreeCoverageGap'?new Error().stack.split('\n').slice(2,5).map(line=>line.replace(/\([^)]*[/\\]([^/\\()]+:\d+:\d+)\)/,'($1)')):undefined,
+                    rootExists:fs.existsSync(root),owner:owner?{epoch:owner.epoch,observationDirectory:owner.observationDirectory&&path.relative(workspace,owner.observationDirectory)}:undefined,
+                    retirement:!!this.missingDirectoryRetirement,observations:this.directoryObservations.size});
+                if(trace.length>96){trace.shift();}
+                return original.call(this,target,...args);
+            };
+        }
         fs.mkdirSync(root,{recursive:true}); fs.writeFileSync(file,'original host baseline');
         fs.writeFileSync(sibling,'original sibling baseline');
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(root));

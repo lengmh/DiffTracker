@@ -1523,7 +1523,9 @@ export class DiffTracker {
             if ([...this.restoreEvents.values()].some(event => path.basename(event.uri.fsPath) === '.gitignore')) {
                 await this.refreshIgnoreMatchers();
                 if (!this.isCurrentEpoch(epoch)) { return false; }
-                await this.discoverRestoredFiles(epoch, undefined, failOnActivity);
+                // A policy refresh must not expand a cancelled stopped review.
+                // Its queued events below still reconcile the original paths.
+                if (!existingReviewOnly) { await this.discoverRestoredFiles(epoch, undefined, failOnActivity); }
                 if (!this.isCurrentEpoch(epoch)) { return false; }
             }
             const restoreEvents = [...this.restoreEvents.values()];
@@ -10882,9 +10884,27 @@ export class DiffTracker {
                 }
                 job.dirty = false;
                 const directory = job.directory;
+                // A normal delete can finish while this observation awaits
+                // ignore discovery. Its new reconstruction owner supersedes
+                // the old incarnation, including any delayed scan failure.
+                let identity: fs.BigIntStats;
+                try {
+                    identity=fs.lstatSync(directory,{bigint:true});
+                    if(!identity.isDirectory() || identity.isSymbolicLink()){break;}
+                } catch {
+                    if(this.confirmedMissingDirectory(directory)){
+                        await this.onExternalFileDeleted(vscode.Uri.file(directory));
+                    }
+                    break;
+                }
+                const observationCurrent=():boolean=>{
+                    if(!current() || job.directory!==directory){return false;}
+                    try{return this.supplementalIdentityMatches(fs.lstatSync(directory,{bigint:true}),identity);}
+                    catch{return false;}
+                };
                 let publicationVersion = this.baselineCompletionVersion;
                 let proofBegan=false;
-                const observation: DirectoryObservation = { current: () => current() && job.directory === directory,
+                const observation: DirectoryObservation = { current: observationCurrent,
                     settlePreparation: () => settlePreparation(directory), budget,
                     beginProof: target => {
                         if (target === directory) {
@@ -11308,6 +11328,7 @@ export class DiffTracker {
                         !scanEvent && this.effectiveMonitoringScope.kind === 'configured'
                     );
                 } catch (error) {
+                    if(!creationIsCurrent()){return;}
                     await this.pauseRecordingForUnpersistableCoverage(
                         'Created directory could not reserve durable coverage evidence; recording is paused until the baseline is rebuilt.',
                         error
@@ -11398,7 +11419,7 @@ export class DiffTracker {
                             await this.onExternalFileCreated(child, scanEvent, childPersistenceBudget, observeStopped, directoryObservation);
                         }
                     }
-                    if (handoff) {
+                    if (handoff || (!scanEvent && this.effectiveMonitoringScope.kind === 'legacyV3')) {
                         const discovered = new Set(children.map(child => child.fsPath));
                         const folder = this.owningWorkspaceFolderForTraversal(filePath)!;
                         for (const known of durablePaths) {
@@ -11411,7 +11432,7 @@ export class DiffTracker {
                             }
                             await this.readFileAndUpdate(known, vscode.Uri.file(known), creationIsCurrent);
                         }
-                        if (!handoff.stillCurrent()) { watchFailed = true; failureReason = watcherFailureReason; }
+                        if (handoff && !handoff.stillCurrent()) { watchFailed = true; failureReason = watcherFailureReason; }
                     }
                     let watcherFailureProjected = false;
                     if (watchFailed && !scanEvent && creationIsCurrent()) {

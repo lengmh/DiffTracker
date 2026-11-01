@@ -61,6 +61,41 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
         return {root,file};
     }
+    test('DELETED-COVERAGE deletion cancels an older in-flight directory observation',()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope);
+        const ignore=h.pause(path.dirname(dir),'ignoreScan');
+        const observation=tracker.onExternalFileChanged(Uri.file(root));
+        let deletion;
+        try {
+            await ignore.entered;
+            fs.rmSync(root,{recursive:true});deletion=tracker.onExternalFileDeleted(Uri.file(root));
+            await deletion;
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'normal deletion has already certified reconstruction');
+            ignore.release();await Promise.all([observation,deletion]);
+            assert.equal(tracker.getOriginalContent(file),'original');
+            assert.equal(tracker.getTrackedChange(file)?.isDeleted,true);
+            assert.equal(currentOwner(tracker,root)?.observationDirectory,dir);
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'a deleted incarnation cannot publish a later scan failure');
+        } finally {ignore.release();await Promise.all([observation,deletion]);}
+    }));
+    test('DELETED-COVERAGE a replacement receives its own bounded observation after an obsolete pass',()=>fixture(async({tracker,dir,scope})=>{
+        const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'unproven.txt');
+        const ignore=h.pause(path.dirname(dir),'ignoreScan'),observation=tracker.onExternalFileChanged(Uri.file(root));
+        let replacement;
+        try {
+            await ignore.entered;
+            fs.rmSync(root,{recursive:true});fs.mkdirSync(root);fs.writeFileSync(file,'replacement known');fs.writeFileSync(child,'unproven replacement');
+            replacement=tracker.onExternalFileChanged(Uri.file(root));
+            ignore.release();await Promise.all([observation,replacement]);
+            assert.equal(tracker.getOriginalContent(file),'original');
+            assert.equal(tracker.getTrackedChange(file)?.currentContent,'replacement known');
+            assert.equal(tracker.getOriginalContent(child),undefined);
+            assert.equal(tracker.unresolvedBaselineFiles.has(child),true);
+            assert.equal(tracker.getReviewToken(child),undefined);
+            assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);
+        } finally {ignore.release();await Promise.all([observation,replacement]);}
+    }));
     test('DELETED-COVERAGE last-file deletion keeps the existing directory owner', () => fixture(async ({tracker,dir,scope}) => {
         const {root,file} = await seed(tracker,dir,scope);
         const owner = currentOwner(tracker,root);

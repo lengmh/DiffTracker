@@ -126,6 +126,36 @@ export function registerLegacyCreationProof(h,fixture){
             }
         }finally{gate.release();await operation;}
     }));
+    for(const channel of ['direct','queued'])
+    test(`LEGACY-PROOF reconstruction retains missing baseline descendants ${channel}`,()=>fixture(async({tracker,dir})=>{
+        legacy(tracker);tracker.sessionWorkspaceRoots=tracker.getWorkspaceRoots();
+        const root=path.join(dir,'reconstructed-directory');fs.mkdirSync(root);
+        const missing=path.join(root,'deleted.txt'),kept=path.join(root,'kept.txt');
+        for(const file of [missing,kept]){
+            fs.writeFileSync(file,'original baseline');tracker.fileSnapshots.set(file,'original baseline');tracker.baselineExistingFiles.add(file);
+        }
+        setListedFiles([missing,kept].map(Uri.file));await tracker.onExternalFileCreatedEvent(Uri.file(root));
+        tracker.activateExternalWatchers(tracker.createExternalWatchers(tracker.sessionEpoch));
+        fs.rmSync(root,{recursive:true});fs.mkdirSync(root);fs.writeFileSync(kept,'changed retained child');setListedFiles([Uri.file(kept)]);
+        if(channel==='queued'){
+            tracker.restoringEpoch=tracker.sessionEpoch;
+            tracker.dispatchExternalEvent(Uri.file(root),'create',tracker.sessionEpoch);
+            assert.equal(await bounded(tracker.drainRestoreEvents(tracker.sessionEpoch)),true);tracker.restoringEpoch=undefined;
+        }else{await tracker.onExternalFileCreatedEvent(Uri.file(root));}
+        assert.equal(tracker.getOriginalContent(missing),'original baseline');
+        assert.equal(tracker.getTrackedChange(missing)?.isDeleted,true,'Full coverage must include the missing descendant deletion review');
+        assert.equal(tracker.getOriginalContent(kept),'original baseline');
+        assert.equal(tracker.getTrackedChange(kept)?.currentContent,'changed retained child');
+        assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);assert.equal(tracker.getIsRecording(),true);
+        const storage=tracker.storageUri;assert.equal(await tracker.flushPendingPersistence(),true);
+        for(const name of ['session-state.json','session-state.last-good.json']){
+            const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,name),'utf8'));
+            assert.equal(new Map(saved.fileSnapshots).get(missing),'original baseline');
+        }
+        await tracker.dispose();const reader=new DiffTracker(storage);setTracker(reader);
+        assert.equal(await reader.restorePersistedState(),'restored');
+        assert.equal(reader.getOriginalContent(missing),'original baseline');assert.equal(reader.getTrackedChange(missing)?.isDeleted,true);
+    }));
     for(const replace of [false,true])
     test(`LEGACY-PROOF queued directory verifies its existing owner replace=${replace}`,()=>fixture(async({tracker,dir})=>{
         legacy(tracker);const root=path.join(dir,'observed-directory');fs.mkdirSync(root);

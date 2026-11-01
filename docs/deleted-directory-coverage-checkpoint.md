@@ -312,3 +312,27 @@ durable write barrier. Queue consumption alone does not revoke valid proof.
 Eight controls cover both scopes, read/write awaits, valid/revoked evidence and
 reload. Listener registration precedes physical creation; notifications run the
 installed production callbacks at the modeled VS Code boundary.
+
+The automatic review of 7778b3b also identified missing deletion projection for
+legacy directory reconstruction. Both direct and queued legacy imports must
+reconcile retained baseline descendants absent from the completed scan before
+certifying coverage. They now share the same owner-filtered, bounded missing-path
+pass as configured handoffs. Two controls fail on the preceding candidates and
+pass after correction, preserving original baselines, sibling edits and deletion
+review through primary/last-good persistence and reload.
+
+Stopped archive rollback also keeps that frozen review boundary when a saved
+`.gitignore` notification refreshes policy. The refresh retains its ordinary
+context-invalidated diagnostic, but its event drain does not discover unseen
+files. Four controls cover legacy/configured and active/stopped rollback;
+known edits remain reconciled, and only active rollback can discover additions.
+
+A filesystem-backed deletion control exposed an older directory observation
+finishing after normal deletion had already certified its reconstruction owner.
+That obsolete pass wrote a fresh runtime coverage failure. Each bounded proof
+pass now binds the directory incarnation across its awaits; obsolete scans
+cannot publish later failures. A coalesced replacement still receives its own
+bounded pass, with unknown child before-images protected. This control matches
+the residual gap seen in a minimum Host failure; its exact native event ordering
+has not been established. The original failure is retained separately from the
+subsequent isolated Host diagnostic, which passed once.

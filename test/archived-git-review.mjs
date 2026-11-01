@@ -805,6 +805,42 @@ export function registerArchivedGitReview(h) {
         }finally{read.release();cleanup?.release();await operation;}
     },{stoppedArchive:true,configured}));
 
+    for (const configured of [false,true]) for (const stoppedArchive of [false,true])
+    test(`ARCHIVE-RESTORE policy save during rollback preserves review scope (configured=${configured}, stopped=${stoppedArchive})`,()=>fixture(async ctx=>{
+        const before=readState(ctx.storage),preview=await ready(ctx.tracker);
+        const read=pause(ctx.target,'read'),operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        let policy;
+        try {
+            await read.entered;
+            const abort=path.join(ctx.workspace,'cancel-restore.txt');fs.writeFileSync(abort,'independent creation cancels the one-shot restore');
+            emitWorkspaceFilesCreated({files:[Uri.file(abort)]});
+            policy=pause(path.dirname(ctx.workspace),'ignoreScan');read.release();
+            await Promise.race([policy.entered,operation.then(result=>{throw new Error(`Rollback completed before policy refresh: ${JSON.stringify(result)}`);})]);
+            const late=path.join(ctx.workspace,'outside-stopped-review.txt');fs.writeFileSync(late,'created during rollback');
+            setListedFiles([ctx.target,ctx.opaque,ctx.deleted,ctx.ignoreFile,abort,late].map(Uri.file));
+            emitWorkspaceFilesCreated({files:[Uri.file(late)]});
+            const doc=document(ctx.target);doc.text='known change during policy refresh\n';doc.isDirty=true;doc.version++;
+            assert.equal(await doc.save(),true);ctx.tracker.onDidSaveDocument(doc);
+            const policyDoc=document(ctx.ignoreFile);assert.equal(await policyDoc.save(),true);ctx.tracker.onDidSaveDocument(policyDoc);
+            policy.release();const result=await operation;
+            assert.equal(result.status,'failed','a policy change must still invalidate the restore context');
+            assert.equal(ctx.tracker.getIsRecording(),false);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main pending review\n');
+            assert.equal(changeFor(ctx.tracker,ctx.target)?.currentContent,'known change during policy refresh\n');
+            for(const name of [PRIMARY,'session-state.last-good.json']){
+                const saved=readState(ctx.storage,name);
+                const hasLate=new Map(saved.fileSnapshots).has(late)||new Map(saved.unresolvedBaselineFiles).has(late);
+                assert.equal(hasLate,!stoppedArchive,'only active rollback may discover a new file');
+                if(stoppedArchive){assert.deepEqual(saved.fileSnapshots,before.fileSnapshots);}
+            }
+            assert.equal(changeFor(ctx.tracker,late)!==undefined,!stoppedArchive);
+            assert.deepEqual(readState(ctx.storage,BACKUP),before);
+            assert.equal(fs.readFileSync(late,'utf8'),'created during rollback');
+            assert.equal(await ctx.restart(),'blocked','the policy recovery guard remains enforced on reload');
+            assert.equal(ctx.currentTracker().getReviewToken(late),undefined);
+        } finally {read.release();policy?.release();await operation;}
+    },{configured,stoppedArchive,ignoredBaseline:true}));
+
     for (const configured of [false, true]) {
         test(`ARCHIVE-RESTORE recording-state ${configured ? 'preparation' : 'discovery'} limit fails closed for a stopped archive (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
             const added = path.join(ctx.workspace, 'beyond-stopped-archive-discovery-limit.txt');
