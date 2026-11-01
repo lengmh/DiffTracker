@@ -56,6 +56,7 @@ const missing = async name => {
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
         const publication=require('../scope-publication-probe.cjs').observeScopePublication(vscode);
+        const workspaceObservation=require('../workspace-trace.cjs').observeWorkspace(vscode);
         try {
         const folderNames=folders=>folders.map(folder=>({name:folder.name,scheme:folder.uri.scheme}));
         const initialWorkspaceFolders=folderNames(vscode.workspace.workspaceFolders??[]),workspaceContextEvents=[];
@@ -971,5 +972,5 @@ module.exports = async function runExtensionHostScenario() {
         await require('./audit.test.cjs')(workspacePath);
         await require('./nested-workspace-coverage.test.cjs')(secondRoot);
         await require('./nested-recheck-deletion.test.cjs')(secondRoot);
-        } finally {publication.finish();}
+        } finally {workspaceObservation.finish();publication.finish();}
 };

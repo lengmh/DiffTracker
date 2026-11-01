@@ -70,6 +70,7 @@ jobs:
         id: minimum_host
         env:
           DIFF_TRACKER_VSCODE_VERSION: 1.80.2
+          DIFF_TRACKER_HOST_TRACE_WORKSPACE: '1'
         run: xvfb-run -a npm run test:host
       - name: Observed configuration publication comparison
         if: ${{ always() && (steps.minimum_host.outcome == 'success' || steps.minimum_host.outcome == 'failure') }}

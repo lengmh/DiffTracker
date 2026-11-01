@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { runTests } from '@vscode/test-electron';
+import { runTests as launchTests } from '@vscode/test-electron';
+import workspaceTrace from './workspace-trace.cjs';
 
 const extensionDevelopmentPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const extensionTestsPath = path.join(extensionDevelopmentPath, 'test', 'host', 'suite', 'index.cjs');
@@ -16,6 +17,16 @@ const workspaceFile = path.join(tempRoot, 'host.code-workspace');
 const restartStorage = path.join(tempRoot, 's4d-restart-storage');
 const userDataPath = path.join(tempRoot, 'user-data');
 const nativeUserDataPath = path.join(tempRoot, 'native-user-data');
+async function runTests(options) {
+    if (process.env.DIFF_TRACKER_HOST_TRACE_WORKSPACE !== '1' || options.extensionTestsEnv?.DIFF_TRACKER_HOST_PHASE !== 'prepare') {
+        return launchTests(options);
+    }
+    const collector = workspaceTrace.createLogCollector({ workspaceFile, roots: [workspacePath, secondRoot] });
+    try {
+        return await launchTests({ ...options, launchArgs: [...options.launchArgs, '--log', 'trace'],
+            stdout: collector.stdout, stderr: collector.stderr });
+    } finally { collector.finish(userDataPath); }
+}
 const git = (...args) => execFileSync('git', args, {
     cwd: workspacePath,
     encoding: 'utf8',

@@ -46,4 +46,22 @@ The fixture creates the workspace file synchronously before launching any Host. 
 
 Native file notifications did observe zero-byte workspace files during actual API writes, including without DiffTracker. The official 1.80.2 [workspace loader](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/configuration/browser/configuration.ts#L721) schedules a file-event reload and parses file content, while [configuration writes](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/configuration/browser/configurationService.ts#L979) also request a reload; [workspace publication](https://github.com/microsoft/vscode/blob/1.80.2/src/vs/workbench/services/configuration/browser/configurationService.ts#L780) can turn an empty folder list into membership events. An empty-file read is consistent with the observed sequence, but the failed workbench's actual read result has not been captured, so it is an inference rather than the established physical cause.
 
+The original minimum Host process now has an opt-in, test-only diagnostic,
+`DIFF_TRACKER_HOST_TRACE_WORKSPACE=1`. It enables supported `--log trace` logging
+and observes public folder events plus bounded reads of the synthetic workspace
+file. Disk samples distinguish empty bytes, invalid JSON, valid JSON with the
+expected roots, and read errors. Physical root checks are Extension Host samples;
+they are not the workbench's validation results. No workbench method is replaced,
+no notification is injected, and the original assertions and exit status remain.
+
+Only fixed metadata and counters are published. Raw workbench lines, paths,
+settings and arguments are discarded; profile logs are scanned within finite
+file/byte limits and are not uploaded. Standard logs can expose workspace read
+errors, root-validation warnings and unscoped parser exceptions. They do not
+expose successful workspace reads, normal parser output or successful root
+validation. An absent error counter therefore does not prove that the workbench
+read valid content. If failure recurs without a corresponding standard error,
+the remaining evidence gap is the workbench's actual read/parse result; this
+diagnostic does not justify clearing the context guard or claiming a Host fix.
+
 `DIFF_TRACKER_HOST_TRACE_PUBLICATION=1` now enables bounded, test-only API/file/folder diagnostics in a separate minimum-Host comparison. The original uninstrumented acceptance run is retained, followed by one fresh observed run; a successful comparison cannot replace an earlier failure. The probe records timestamps, byte lengths, hashes and synthetic fixture values, never workspace-file contents. It does not change API results, delay notifications, retry writes or skip the native acceptance assertions. The next failed trace is needed to compare the failing write intervals; determining the exact workbench read may require separate upstream instrumentation. Neither eventual restored folders nor passing local controls authorize silently clearing the workspace-change guard.
