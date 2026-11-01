@@ -336,3 +336,13 @@ bounded pass, with unknown child before-images protected. This control matches
 the residual gap seen in a minimum Host failure; its exact native event ordering
 has not been established. The original failure is retained separately from the
 subsequent isolated Host diagnostic, which passed once.
+
+The next Windows Host failure retained directory-change gaps after a finite
+series of Ready publications interrupted preparation before its first proof.
+A deterministic filesystem/write-barrier control reproduces that omission.
+Completed publications now count as progress, with a separate finite allowance
+bounded by the existing preparation-entry limit; scan entries and the two actual
+proof passes are unchanged. Zero allowance, Stop and storage failure still
+prevent certification. The minimum Host's workspace-context refusal
+is a separate retained failure, with its folder-event diagnostics expanded
+without changing the production workspace membership guard.

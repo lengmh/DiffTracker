@@ -55,6 +55,13 @@ const missing = async name => {
 
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
+        const folderNames=folders=>folders.map(folder=>({name:folder.name,scheme:folder.uri.scheme}));
+        const initialWorkspaceFolders=folderNames(vscode.workspace.workspaceFolders??[]),workspaceContextEvents=[];
+        const workspaceTrace=vscode.workspace.onDidChangeWorkspaceFolders(event=>{
+            if(workspaceContextEvents.length<16){workspaceContextEvents.push({
+                added:folderNames(event.added),removed:folderNames(event.removed),current:folderNames(vscode.workspace.workspaceFolders??[])
+            });}
+        });
         const extension = vscode.extensions.getExtension('lengmh.code-diff-tracker');
         assert.ok(extension, 'development extension is installed');
         await extension.activate();
@@ -160,7 +167,8 @@ module.exports = async function runExtensionHostScenario() {
                 effectiveRevision:this.effectiveMonitoringScope.scopeRevision,pendingRevision:this.pendingMonitoringScope?.scopeRevision});
             const before = readiness();
             const result = await performScopeApply.apply(this,args);
-            if (result.status === 'conflict') { scopePreparationDiagnostic = {before,after:readiness()}; }
+            if (result.status === 'conflict') { scopePreparationDiagnostic = {before,after:readiness(),
+                initialWorkspaceFolders,workspaceContextEvents,currentWorkspaceFolders:folderNames(vscode.workspace.workspaceFolders??[])}; }
             return result;
         };
         let descendantWatcherApply;
@@ -168,7 +176,7 @@ module.exports = async function runExtensionHostScenario() {
             descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
                 grantConsent: true
             });
-        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply; }
+        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply;workspaceTrace.dispose(); }
         assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify({outcome:descendantWatcherApply,scopePreparationDiagnostic}));
 
         await scopeConfig.update('watchInclude', [privateInclude],

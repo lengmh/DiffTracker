@@ -100,6 +100,7 @@ async function directoryChangeHost(workspace) {
         fileGap:!!tracker.coverageGaps.get(uri.fsPath)?.file,baselineFile:tracker.baselineExistingFiles.has(uri.fsPath),
         opaqueFile:tracker.opaqueBaselineFiles.has(uri.fsPath),hostWatchers:tracker.fileWatchers.length,
         generation:tracker.coverageGeneration,watcherRevision:tracker.watcherCoverageRevision,ignoreRevision:tracker.ignorePolicyRevision,
+        readyPublications:tracker.runtimeBaselinePublications.size,baselineVersion:tracker.baselineCompletionVersion,
         jobs:[...tracker.directoryObservations].slice(0,8).map(([key,job])=>
             ({root:relativeTracePath(key),path:relativeTracePath(job.directory),dirty:job.dirty,current:job.current()})),
         dirtyUnderPath:vscode.workspace.textDocuments.filter(doc=>doc.uri.scheme==='file'&&doc.isDirty&&
@@ -111,7 +112,7 @@ async function directoryChangeHost(workspace) {
         if (traceRecurrence) { runtimePublicationCallers[caller]=(runtimePublicationCallers[caller]??0)+1; }
         const trace = traceRecurrence ? rememberDirectoryTrace({method:'completeRuntimeBaseline',
             caller,pending:true}) : undefined;
-        try { return await completeRuntimeBaseline.apply(this,args); }
+        try { const result=await completeRuntimeBaseline.apply(this,args);if(trace){trace.result=result;}return result; }
         finally { if (trace) { trace.pending=false; } }
     };
     for (const method of ['onExternalFileChanged','isUntrackedDirectory','reconcileDirectoryObservation','onExternalFileCreated']) {

@@ -10872,14 +10872,27 @@ export class DiffTracker {
             // consuming proof passes. All passes share the traversal budget.
             // A save failure must stop further passes without invalidating the
             // current pass's rollback/coverage-failure publication.
-            for (let proofs=0,preparations=0; proofs<2 && preparations<2 && active() && !this.persistenceFailed;) {
+            let preparationProgress=this.maxScopePreflightEntries;
+            let preparations=0;
+            const interruptedPreparation=(directory:string,version:number):void=>{
+                // Upward coalescing is bounded by path depth. Completed Ready
+                // publications are progress too, but consume their own finite
+                // allowance without spending entries from the actual scan.
+                if(job.directory!==directory){return;}
+                const progress=this.baselineCompletionVersion-version;
+                if(progress>0 && progress<=preparationProgress){
+                    preparationProgress-=progress;preparations=0;
+                }else{preparations++;}
+            };
+            for (let proofs=0; proofs<2 && preparations<2 && active() && !this.persistenceFailed;) {
                 // An independent file creation briefly holds the same Ready
                 // publication guard. Wait for that exact finite set of writes;
                 // no proof may run while it is held. Other lifecycle guards
                 // still cancel the job, and new activity cannot add passes.
                 const beforePreparation=job.directory;
+                const beforeVersion=this.baselineCompletionVersion;
                 if (!await settlePreparation()) {
-                    if(job.directory===beforePreparation){preparations++;}
+                    interruptedPreparation(beforePreparation,beforeVersion);
                     continue;
                 }
                 job.dirty = false;
@@ -10903,6 +10916,7 @@ export class DiffTracker {
                     catch{return false;}
                 };
                 let publicationVersion = this.baselineCompletionVersion;
+                const preparationVersion=publicationVersion;
                 let proofBegan=false;
                 const observation: DirectoryObservation = { current: observationCurrent,
                     settlePreparation: () => settlePreparation(directory), budget,
@@ -10917,7 +10931,7 @@ export class DiffTracker {
                         }
                     } };
                 await this.onExternalFileCreated(vscode.Uri.file(directory), false, undefined, false, observation);
-                if(proofBegan){proofs++;}else if(job.directory===directory){preparations++;}
+                if(proofBegan){proofs++;}else{interruptedPreparation(directory,preparationVersion);}
                 if (!job.dirty && publicationVersion === this.baselineCompletionVersion) { break; }
             }
         })().finally(() => {
