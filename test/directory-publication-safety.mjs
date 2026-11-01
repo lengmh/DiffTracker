@@ -70,7 +70,7 @@ export function registerDirectoryPublicationSafety(h,fixture){
             }finally{gate.release();await operation;}
         }));
     }
-    for(const activity of ['ancestor-delete','fresh-child','stop','epoch','save-failure']){
+    for(const activity of ['ancestor-delete','fresh-child','stale-parent-delete','ancestor-retains-parent','silent-ancestor-retains-parent','stop','epoch','save-failure']){
         test(`DIRECTORY-PUBLICATION control ${activity}`,()=>fixture(async({tracker,dir})=>{
             const {container,root,known,children}=await seed(tracker,dir);
             let history;
@@ -83,14 +83,20 @@ export function registerDirectoryPublicationSafety(h,fixture){
             const operation=tracker.onExternalFileCreatedEvent(Uri.file(root));let fresh;
             try{
                 await bounded(gate.entered);
-                if(activity==='ancestor-delete'||activity==='fresh-child'){
+                if(activity==='ancestor-retains-parent'||activity==='silent-ancestor-retains-parent'){
+                    const aside=path.join(dir,'retained-directory');fs.renameSync(root,aside);fs.rmSync(container,{recursive:true});
+                    fs.mkdirSync(container);fs.renameSync(aside,root);fs.writeFileSync(known,'replacement known file');
+                    for(const child of children){fs.writeFileSync(child,'replacement beneath a retained immediate parent');}
+                    if(activity==='ancestor-retains-parent'){tracker.dispatchExternalEvent(Uri.file(container),'delete',tracker.sessionEpoch);}
+                }else if(activity==='ancestor-delete'||activity==='fresh-child'){
                     const deleted=activity==='ancestor-delete'?container:root;
                     fs.rmSync(deleted,{recursive:true});tracker.dispatchExternalEvent(Uri.file(deleted),'delete',tracker.sessionEpoch);
                     fs.mkdirSync(path.join(root,'nested'),{recursive:true});
                     for(const child of children){fs.writeFileSync(child,'unproven replacement');}
                     if(activity==='ancestor-delete'){fs.writeFileSync(known,'replacement known file');}
                     else{fresh=tracker.onExternalFileCreatedEvent(Uri.file(children[0]));}
-                }else if(activity==='stop'){tracker.stopRecording();}
+                }else if(activity==='stale-parent-delete'){tracker.dispatchExternalEvent(Uri.file(root),'delete',tracker.sessionEpoch);}
+                else if(activity==='stop'){tracker.stopRecording();}
                 else if(activity==='epoch'){
                     tracker.advanceEpoch();tracker.unresolvedBaselineFiles.delete(children[0]);tracker.postBaselineUnknownFiles.delete(children[0]);
                     tracker.fileSnapshots.set(children[0],'new epoch baseline');tracker.baselineExistingFiles.add(children[0]);
@@ -100,7 +106,7 @@ export function registerDirectoryPublicationSafety(h,fixture){
                 if(history){assert.equal(JSON.stringify(tracker.revertHistory),history,'ancestor reconciliation preserves the independent Undo record');}
                 for(const [index,child] of children.entries()){
                     if(index===0&&activity==='epoch'){assert.equal(tracker.getOriginalContent(child),'new epoch baseline');}
-                    else if(index===0&&activity==='fresh-child'){assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}
+                    else if(activity==='stale-parent-delete' || (index===0&&activity==='fresh-child')){assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}
                     else{await unknown(tracker,child);}
                 }
                 if(activity==='save-failure'){
@@ -243,6 +249,99 @@ export function registerDirectoryPublicationSafety(h,fixture){
             assert.equal(premature,undefined,'an earlier writer cannot accept a newer unfinished batch');
             assert.equal(tracker.getOriginalContent(a.known),'original known file');
         }finally{for(const gate of [...ag,...bg]){gate.release();}await first;if(second){await second;}if(saving){await saving;}}
+    }));
+    for(const {afterFirst=false,beforeDirectory=false} of [{},{afterFirst:true},{beforeDirectory:true}])for(const replace of [false,true])
+    test(`DIRECTORY-PUBLICATION open pending child afterFirst=${afterFirst} replace=${replace} beforeDirectory=${beforeDirectory}`,()=>fixture(async({tracker,dir})=>{
+        const {root,children,known}=await seed(tracker,dir,2),storage=tracker.storageUri;
+        const gates=beforeDirectory?[pause(root,'stat')]:children.map(file=>pause(file,'stat'));
+        const operation=tracker.onExternalFileCreatedEvent(Uri.file(root));let saving;
+        try{
+            const first=await bounded(Promise.race(gates.map((gate,index)=>gate.entered.then(()=>index))));
+            let opened=first;
+            if(afterFirst){gates[first].release();opened=1-first;await bounded(gates[opened].entered);}
+            const target=children[opened],doc=document(target);tracker.onDocumentOpened(doc);
+            const interim=tracker.buildPersistedState();
+            saving=tracker.flushPendingPersistence();
+            if(replace){
+                fs.rmSync(root,{recursive:true});tracker.dispatchExternalEvent(Uri.file(root),'delete',tracker.sessionEpoch);
+                fs.mkdirSync(path.join(root,'nested'),{recursive:true});
+                for(const child of children){fs.writeFileSync(child,'replacement with no independent child creation');}
+            }
+            for(const gate of gates){gate.release();}
+            await bounded(operation);await bounded(saving);
+            if(replace){await tracker.readFileAndUpdate(target,Uri.file(target));await unknown(tracker,target);}
+            else{assert.equal(tracker.getOriginalContent(target),'');assert.ok(tracker.getReviewToken(target));}
+            assert.equal(new Map(interim.fileSnapshots).has(target),false,'open cannot export an unaccepted child absence baseline');
+            assert.equal(new Map(interim.unresolvedBaselineFiles).has(target),true,'the unfinished child remains unproven during preparation');
+            assert.equal(tracker.getOriginalContent(known),'original known file');
+            assert.equal(await tracker.flushPendingPersistence(),true);
+            for(const name of ['session-state.json','session-state.last-good.json']){
+                const saved=JSON.parse(fs.readFileSync(path.join(storage.fsPath,name),'utf8'));
+                assert.equal(new Map(saved.fileSnapshots).has(target),!replace);
+            }
+            await tracker.dispose();const reader=new DiffTracker(storage);setTracker(reader);
+            assert.equal(await reader.restorePersistedState(),'restored');
+            if(replace){await unknown(reader,target);}else{assert.equal(reader.getOriginalContent(target),'');assert.ok(reader.getReviewToken(target));}
+        }finally{for(const gate of gates){gate.release();}await operation;if(saving){await saving;}}
+    }));
+    for(const activity of ['stop','epoch','save-failure','unknown-quota'])
+    test(`DIRECTORY-PUBLICATION pending editor control ${activity}`,()=>fixture(async({tracker,dir})=>{
+        const {root,children,known}=await seed(tracker,dir,2),storage=tracker.storageUri;
+        const gates=children.map(file=>pause(file,'stat'));
+        const operation=tracker.onExternalFileCreatedEvent(Uri.file(root));let saving;
+        try{
+            const i=await bounded(Promise.race(gates.map((gate,index)=>gate.entered.then(()=>index))));
+            const target=children[i];tracker.onDocumentOpened(document(target));
+            assert.equal(tracker.getOriginalContent(target),undefined);assert.equal(tracker.getReviewToken(target),undefined);
+            if(activity==='stop'){tracker.stopRecording();saving=tracker.flushPendingPersistence();assert.equal(await bounded(saving),true);}
+            else if(activity==='epoch'){
+                tracker.advanceEpoch();tracker.unresolvedBaselineFiles.delete(target);tracker.postBaselineUnknownFiles.delete(target);
+                tracker.fileSnapshots.set(target,'new epoch before-image');tracker.baselineExistingFiles.add(target);
+            }else if(activity==='save-failure'){
+                faults.set(path.join(storage.fsPath,'session-state.json'),{copy:Object.assign(new Error('Synthetic pending document save failure'),{code:'NoPermissions'})});
+            }else{
+                const allowance=tracker.fileSnapshots.size+children.length;tracker.maxPersistedSnapshots=allowance;
+                for(let n=tracker.unresolvedBaselineFiles.size;n<=allowance;n++){
+                    tracker.recordUnresolvedBaseline(path.join(dir,`pending-quota-${n}.txt`),'Concurrent unknown evidence');
+                }
+            }
+            for(const gate of gates){gate.release();}await bounded(operation);
+            if(activity==='epoch'){assert.equal(tracker.getOriginalContent(target),'new epoch before-image');}
+            else{await unknown(tracker,target);}
+            assert.equal(tracker.getOriginalContent(known),'original known file');
+            if(activity==='save-failure'||activity==='unknown-quota'){
+                assert.equal(await tracker.flushPendingPersistence(),false);
+                assert.equal(fs.existsSync(path.join(storage.fsPath,'session-state.unsaved')),true);
+                const reader=new DiffTracker(storage);try{assert.equal(await reader.restorePersistedState(),'blocked');}finally{await reader.dispose();}
+            }
+        }finally{for(const gate of gates){gate.release();}await operation;if(saving){await saving;}faults.clear();tracker.maxPersistedSnapshots=10000;}
+    }));
+    test('DIRECTORY-PUBLICATION a late editor observation invalidates an older write projection',()=>fixture(async({tracker,dir})=>{
+        const {root}=await seed(tracker,dir,2),storage=tracker.storageUri;
+        const gate=pause(path.join(storage.fsPath,'session-state.tmp.json'),'write');
+        let entered,release;const held=new Promise(resolve=>{entered=resolve;}),hold=new Promise(resolve=>{release=resolve;});
+        const flush=tracker.flushPendingPersistence.bind(tracker);let firstResult;
+        tracker.flushPendingPersistence=async(...args)=>{
+            const result=await flush(...args);
+            if(firstResult===undefined){firstResult=result;entered();await hold;}
+            return result;
+        };
+        const operation=tracker.onExternalFileCreatedEvent(Uri.file(root));
+        try{
+            await bounded(gate.entered);
+            const target=path.join(root,'late-open.txt');fs.writeFileSync(target,'unaccepted late document');
+            tracker.onDocumentOpened(document(target));
+            assert.equal(tracker.getOriginalContent(target),undefined);assert.equal(tracker.getReviewToken(target),undefined);
+            gate.release();await bounded(held);
+            assert.equal(firstResult,false,'a payload captured before the new observation cannot commit');
+            const reader=new DiffTracker(storage);
+            try{
+                const result=await reader.restorePersistedState();
+                assert.ok(result==='blocked'||result==='restored');
+                if(result==='restored'){assert.equal(reader.getOriginalContent(target),undefined);assert.equal(reader.getReviewToken(target),undefined);}
+            }finally{await reader.dispose();}
+            release();await bounded(operation);
+        }finally{gate.release();release();tracker.flushPendingPersistence=flush;await operation;}
     }));
     test('DIRECTORY-PUBLICATION opening an unseen file respects deferred directory provenance',()=>fixture(async({tracker,dir})=>{
         const {root}=await seed(tracker,dir,0);

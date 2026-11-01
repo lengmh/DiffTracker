@@ -288,7 +288,7 @@ interface IgnoreDiscoveryBudget {
 
 interface CandidatePersistenceBudget {
     creationPublications?: Set<RuntimeCreationPublication>;
-    creationCurrent?: () => boolean;
+    creationCurrent?: (ancestor?: string) => boolean;
     creationBatch?: DirectoryCreationBatch;
     remainingBytes: number;
     fileSnapshots: number;
@@ -356,19 +356,21 @@ interface QueuedExternalEvent {
     kind: StartupEvent['kind'];
     reconcileDirectory?: boolean;
     revoked?: boolean;
-    creationCurrent?: () => boolean;
+    creationCurrent?: (ancestor?: string) => boolean;
 }
 
 interface RuntimeCreationPublication {
     filePath: string;
     snapshots: Map<string,string>;
-    current: () => boolean;
+    current: (ancestor?: string) => boolean;
     revoked: boolean;
     committed: boolean;
     batch?: DirectoryCreationBatch;
 }
 
 interface DirectoryCreationBatch {
+    epoch: number;
+    documents: Set<string>;
     root: string;
     prepared: boolean;
     ready: Promise<void>;
@@ -996,10 +998,12 @@ export class DiffTracker {
     private excludedDirectoryKinds = new Map<string, {epoch:number; workspaceRoot:string; parent:fs.BigIntStats}>();
     private directoryObservations = new Map<string, {
         directory: string; workspaceRoot: string; dirty: boolean; done: Promise<void>;
-        creations: Map<string, fs.BigIntStats>; active: () => boolean; current: () => boolean;
+        creations: Map<string, {identity:fs.BigIntStats;current?:()=>boolean}>; active: () => boolean; current: () => boolean;
     }>();
     private runtimeBaselinePublications = new Set<Promise<boolean>>();
     private runtimeCreationPublications = new Map<string, RuntimeCreationPublication>();
+    private directoryCreationBatches = new Set<DirectoryCreationBatch>();
+    private directoryDocumentRevision = 0;
     private settledScopeSettings = new WeakMap<ScopeOperationObservation,SettledSettingsWrite>();
     // Persisted as restart uncertainty, never as proof that an OS handle lives.
     private importedCoverageObligations = new Set<string>();
@@ -2768,14 +2772,25 @@ export class DiffTracker {
     }
 
     private revokeQueuedDescendantCreations(deletedPath: string): void {
-        this.invalidateRuntimeCreationPublications(deletedPath, true);
+        let existingDirectory=false;
+        try { const stat=fs.lstatSync(deletedPath);existingDirectory=stat.isDirectory() && !stat.isSymbolicLink(); }
+        catch { /* Missing or inaccessible ancestry cannot preserve proof. */ }
+        // A Host delete can arrive after reconstruction and a newer exact file
+        // create. Only that proof's captured physical ancestor chain can show
+        // the notification belongs to an older directory generation. Always
+        // reconcile the delete; preserve no exact-file or unknown-identity proof.
+        const unchangedAncestor=(current?: (ancestor?: string)=>boolean) =>
+            existingDirectory && !!current?.(deletedPath);
+        for(const [target,item] of this.runtimeCreationPublications){
+            if(this.pathBelongsToRoot(target,deletedPath) && !unchangedAncestor(item.current)){this.rejectRuntimeCreationPublication(item);}
+        }
         for (const [target,event] of this.restoreEvents) {
-            if (target !== deletedPath && this.pathBelongsToRoot(target,deletedPath) && event.kind === 'create') {
+            if (target !== deletedPath && this.pathBelongsToRoot(target,deletedPath) && event.kind === 'create' && !unchangedAncestor(event.creationCurrent)) {
                 this.restoreEvents.set(target,{uri:event.uri,kind:'change',reconcileDirectory:true});
             }
         }
         for (const event of this.activeQueuedCreations) {
-            if (!event.revoked && this.pathBelongsToRoot(event.uri.fsPath,deletedPath)) {
+            if (!event.revoked && this.pathBelongsToRoot(event.uri.fsPath,deletedPath) && !unchangedAncestor(event.creationCurrent)) {
                 event.revoked = true;
                 const queued = this.restoreEvents.get(event.uri.fsPath);
                 if (!queued || queued.kind === 'change') {
@@ -2785,24 +2800,33 @@ export class DiffTracker {
         }
     }
 
-    private captureFileCreationContext(uri: vscode.Uri, allowMissing = false): (() => boolean) | undefined {
+    private captureFileCreationContext(uri: vscode.Uri, allowMissing = false, directory = false): ((ancestor?: string) => boolean) | undefined {
         const epoch=this.sessionEpoch,scope=this.effectiveMonitoringScope,generation=this.coverageGeneration;
         const folder=this.owningWorkspaceFolderForTraversal(uri.fsPath);
         if (!folder || this.isPathIgnored(uri) || this.validateResourceTarget(uri.fsPath)) { return undefined; }
         const parent=path.dirname(uri.fsPath),owner=folder.uri.toString();
         const fileTypeCurrent=():boolean => {
-            try { return fs.lstatSync(uri.fsPath).isFile(); }
+            try { const stat=fs.lstatSync(uri.fsPath);return directory ? stat.isDirectory() && !stat.isSymbolicLink() : stat.isFile(); }
             catch(error) { return allowMissing && this.isFileNotFound(error); }
         };
         try {
             const identity=fs.statSync(parent,{bigint:true});
             if (!identity.isDirectory() || !fileTypeCurrent()) { return undefined; }
-            return () => {
+            const ancestors=new Map<string,fs.BigIntStats>();
+            for(let directory=parent;this.pathBelongsToRoot(directory,folder.uri.fsPath);directory=path.dirname(directory)){
+                if(ancestors.size>=this.maxPathIdentityPreparationEntries){return undefined;}
+                const ancestor=directory===parent?identity:fs.statSync(directory,{bigint:true});
+                if(!ancestor.isDirectory()){return undefined;}
+                ancestors.set(path.resolve(directory),ancestor);
+                if(path.resolve(directory)===path.resolve(folder.uri.fsPath)){break;}
+            }
+            return (deletedAncestor?: string) => {
                 if (!this.isCurrentEpoch(epoch) || this.effectiveMonitoringScope!==scope ||
-                    this.coverageGeneration!==generation || this.isPathIgnored(uri) ||
+                    this.coverageGeneration!==generation || (deletedAncestor && !ancestors.has(path.resolve(deletedAncestor))) || this.isPathIgnored(uri) ||
                     this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString()!==owner) { return false; }
                 try { return !this.validateResourceTarget(uri.fsPath) && fileTypeCurrent() &&
-                    this.supplementalIdentityMatches(fs.statSync(parent,{bigint:true}),identity); }
+                    [...ancestors].every(([directory,ancestor])=>
+                        this.supplementalIdentityMatches(fs.statSync(directory,{bigint:true}),ancestor)); }
                 catch { return false; }
             };
         } catch { return undefined; }
@@ -2825,7 +2849,8 @@ export class DiffTracker {
             await this.pauseRecordingForUnpersistableCoverage('In-flight file creation proof exceeded the bounded reconstruction allowance; original baselines are preserved.');
             return;
         }
-        const current = () => this.isCurrentEpoch(epoch) && !event.revoked && !this.queuedEventNeedsObservation(event);
+        const current = (ancestor?: string) => this.isCurrentEpoch(epoch) && !event.revoked && !this.queuedEventNeedsObservation(event) &&
+            (!ancestor || !!event.creationCurrent?.(ancestor));
         this.activeQueuedCreations.add(event);
         try { await this.onExternalFileCreated(event.uri,false,undefined,observeStopped,undefined,current); }
         finally {
@@ -4578,12 +4603,12 @@ export class DiffTracker {
         retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch || !!transaction?.baselineRecovery;
         if (this.archiveRestoreStaging && !transaction) { return true; }
         if (waitForDirectoryBatches) {
-            const batches = new Set([...this.runtimeCreationPublications.values()]
-                .map(item=>item.batch).filter((batch): batch is DirectoryCreationBatch=>!!batch && !batch.prepared));
-            if (batches.size > 0) {
+            const batches = [...new Set([...this.runtimeCreationPublications.values()]
+                .map(item=>item.batch).filter((batch): batch is DirectoryCreationBatch=>!!batch && !batch.prepared))];
+            if (batches.length > 0) {
                 // Capture one finite preparation set. The parent releases it
                 // after its budget is sealed or after rejecting its own paths.
-                await Promise.all([...batches].map(batch=>batch.ready));
+                await Promise.all(batches.map(batch=>batch.ready));
                 if (epoch !== this.sessionEpoch) { return false; }
                 return this.flushPersistState(completedBaseline,transaction,retainFailureMarker,false);
             }
@@ -4613,6 +4638,7 @@ export class DiffTracker {
             this.invalidateRuntimeCreationPublications();
             return creations.every(item => item.committed || (!item.revoked && item.current()));
         };
+        const documentRevision=this.directoryDocumentRevision;
         const state = this.buildPersistedState(new Set(creations));
         // Persist the ready candidate while actions remain blocked in memory.
         if (state && completedBaseline) { state.baselineState = 'ready'; }
@@ -4632,7 +4658,7 @@ export class DiffTracker {
         }
 
         const persistTask = async (): Promise<boolean> => {
-            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && creationsCurrent() && (!transaction ||
+            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && documentRevision===this.directoryDocumentRevision && creationsCurrent() && (!transaction ||
                 (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch) && (transaction.valid?.() ?? true)));
             if (!transactionCurrent()) { return false; }
             const targetUri = this.getPersistedStateUri();
@@ -10322,10 +10348,10 @@ export class DiffTracker {
                     !this.queuedEventNeedsObservation(restored))) { return true; }
             for (const job of this.directoryObservations.values()) {
                 if (!job.current()) { continue; }
-                const identity = job.creations.get(current);
-                if (!identity) { continue; }
+                const creation = job.creations.get(current);
+                if (!creation?.current?.()) { continue; }
                 try {
-                    if (this.supplementalIdentityMatches(fs.lstatSync(current, {bigint:true}), identity)) { return true; }
+                    if (this.supplementalIdentityMatches(fs.lstatSync(current, {bigint:true}), creation.identity)) { return true; }
                 } catch { /* A missing/replaced creation cannot prove absence. */ }
             }
             if (path.dirname(current) === current) { return false; }
@@ -10745,7 +10771,7 @@ export class DiffTracker {
         const previous = this.directoryObservations.get(root);
         if (previous?.active()) {
             if (creationIdentity && (previous.creations.has(uri.fsPath) || previous.creations.size < this.maxImportedDirectoryWatchers)) {
-                previous.creations.set(uri.fsPath, creationIdentity);
+                previous.creations.set(uri.fsPath, {identity:creationIdentity,current:this.captureFileCreationContext(uri,false,true)});
             }
             // Coalesce affected siblings at their common owned ancestor. Never
             // extend this bounded job across a nested workspace boundary.
@@ -10759,7 +10785,8 @@ export class DiffTracker {
         const generation = this.coverageGeneration;
         const policy = this.watcherCoverageRevision;
         const job = { directory: uri.fsPath, workspaceRoot: folder.uri.toString(), dirty: false, done: Promise.resolve(),
-            creations: new Map<string, fs.BigIntStats>(creationIdentity ? [[uri.fsPath, creationIdentity]] : []),
+            creations: new Map<string, {identity:fs.BigIntStats;current?:()=>boolean}>(creationIdentity
+                ? [[uri.fsPath, {identity:creationIdentity,current:this.captureFileCreationContext(uri,false,true)}]] : []),
             active: () => false, current: () => false };
         const active = (): boolean => this.isCurrentEpoch(epoch) && this.isRecording && this.externalWatcherEnabled &&
             this.directoryObservations.get(root) === job && this.effectiveMonitoringScope === scope &&
@@ -11134,7 +11161,7 @@ export class DiffTracker {
         persistenceBudget?: CandidatePersistenceBudget,
         observeStopped = false,
         directoryObservation?: DirectoryObservation,
-        creationEvidenceCurrent?: () => boolean
+        creationEvidenceCurrent?: (ancestor?: string) => boolean
     ): Promise<void> {
         if (uri.scheme === 'file') { uri = vscode.Uri.file(this.canonicalTrackingPath(uri.fsPath)); }
         const epoch = this.sessionEpoch;
@@ -11169,13 +11196,24 @@ export class DiffTracker {
         const creation = { duringScan: scanEvent || !!directoryObservation, cancelled: false, evidenceCurrent:creationEvidenceCurrent };
         // A newer import of the same directory owns its preparation. Release
         // an older unfinished batch before it can block that replacement's save.
-        for (const item of [...this.runtimeCreationPublications.values()]) {
-            if (item.batch?.root === filePath && !item.batch.prepared) {
-                this.rejectRuntimeCreationPublication(item);
-                item.batch.release();
+        for (const batch of [...this.directoryCreationBatches]) {
+            if (batch.root === filePath && !batch.prepared) {
+                for(const item of [...this.runtimeCreationPublications.values()]){
+                    if(item.batch===batch){this.rejectRuntimeCreationPublication(item);}
+                }
+                this.directoryCreationBatches.delete(batch);
+                batch.release();
             }
         }
         this.activeCreations.set(filePath, creation);
+        // Observation ownership starts before type classification can yield.
+        // Budgeted children share their parent's owner; an exact file operation
+        // releases its own short-lived owner without blocking its normal writer.
+        let releaseObservation!:()=>void;
+        const ownsObservation=!persistenceBudget?.creationBatch;
+        const observationBatch=persistenceBudget?.creationBatch ?? {root:filePath,epoch,documents:new Set<string>(),prepared:false,
+            ready:new Promise<void>(resolve=>{releaseObservation=resolve;}),release:()=>releaseObservation()};
+        if(ownsObservation && !scanEvent){this.directoryCreationBatches.add(observationBatch);}
         const budgetFileContext = persistenceBudget ? this.captureFileCreationContext(uri) : undefined;
         const creationIsCurrent = () => this.isCurrentEpoch(epoch) && !creation.cancelled &&
             this.activeCreations.get(filePath) === creation && (!directoryObservation || directoryObservation.current()) &&
@@ -11195,9 +11233,7 @@ export class DiffTracker {
                 let childPersistenceBudget!: CandidatePersistenceBudget;
                 try {
                     childPersistenceBudget = this.createCandidatePersistenceBudget();
-                    let release!: () => void;
-                    const ready = new Promise<void>(resolve=>{release=resolve;});
-                    childPersistenceBudget.creationBatch={root:filePath,prepared:false,ready,release};
+                    childPersistenceBudget.creationBatch=observationBatch;
                     const identity=fs.lstatSync(filePath,{bigint:true});
                     childPersistenceBudget.creationCurrent=()=>{
                         try { return this.isCurrentEpoch(epoch) && identity.isDirectory() &&
@@ -11420,6 +11456,9 @@ export class DiffTracker {
                                 const pending=this.runtimeCreationPublications.get(target);
                                 if(!previous.has(target) && (!pending || !owned.has(pending))){preserved.add(target);}
                             }
+                            for(const document of childPersistenceBudget.creationBatch!.documents){
+                                if(this.unresolvedBaselineFiles.has(document)){preserved.add(document);}
+                            }
                             this.restoreImportedDirectoryRollbackState(filePath, importRollback,preserved);
                             for(const item of owned){this.rejectRuntimeCreationPublication(item,this.persistenceFailed);}
                         }
@@ -11438,7 +11477,7 @@ export class DiffTracker {
                 } finally {
                     if (this.isCurrentEpoch(epoch) && !stagedPublication) {
                         const publications=childPersistenceBudget.creationPublications ?? new Set<RuntimeCreationPublication>();
-                        const incomplete=!scanEvent && publications.size>0 && (publicationFailed || !childPersistenceBudget.creationBatch!.prepared ||
+                        const incomplete=!scanEvent && (publications.size>0 || childPersistenceBudget.creationBatch!.documents.size>0) && (publicationFailed || !childPersistenceBudget.creationBatch!.prepared ||
                             [...publications].some(item=>!item.committed));
                         for (const item of childPersistenceBudget.creationPublications ?? []) {
                             if (this.runtimeCreationPublications.get(item.filePath)===item) { this.rejectRuntimeCreationPublication(item); }
@@ -11493,8 +11532,8 @@ export class DiffTracker {
                 if (persistenceBudget && !budgetFileContext?.()) { throw new Error('A directory child creation proof changed before publication'); }
                 const publication: RuntimeCreationPublication | undefined = creationEvidenceCurrent || persistenceBudget
                     ? {filePath,snapshots:this.fileSnapshots,
-                        current:() => this.isCurrentEpoch(epoch) && !creation.cancelled && (creationEvidenceCurrent?.() ?? true) &&
-                            (!persistenceBudget || (!!budgetFileContext?.() && !!persistenceBudget.creationCurrent?.())),
+                        current:(ancestor?: string) => this.isCurrentEpoch(epoch) && !creation.cancelled && (creationEvidenceCurrent?.(ancestor) ?? true) &&
+                            (!persistenceBudget || (!!budgetFileContext?.(ancestor) && !!persistenceBudget.creationCurrent?.())),
                         revoked:false,committed:false,batch:persistenceBudget?.creationBatch} : undefined;
                 if (publication) {
                     this.runtimeCreationPublications.set(filePath,publication);
@@ -11553,6 +11592,7 @@ export class DiffTracker {
             await this.readFileAndUpdate(filePath, uri, creationIsCurrent);
         } finally {
             if (this.activeCreations.get(filePath) === creation) { this.activeCreations.delete(filePath); }
+            if(ownsObservation){this.directoryCreationBatches.delete(observationBatch);observationBatch.release();}
         }
     }
 
@@ -14901,6 +14941,28 @@ export class DiffTracker {
             return;
         }
 
+        // Opening a not-yet-classified batch child is observation, not an
+        // independent creation. Its owner must classify/accept the before-image.
+        // Temporary Unknown may be upgraded only by the batch's still-valid
+        // creation evidence; historical Unknown is never relabelled here.
+        const batches=this.snapshotInitialized && !this.hasCapturedBaseline(filePath) && !this.largeFileReminders.has(filePath)
+            ? [...this.directoryCreationBatches].filter(candidate=>candidate.epoch===this.sessionEpoch &&
+                this.pathBelongsToRoot(filePath,candidate.root) &&
+                this.owningWorkspaceFolderForTraversal(filePath)?.uri.toString()===
+                    this.owningWorkspaceFolderForTraversal(candidate.root)?.uri.toString()) : [];
+        if(batches.length){
+            if(this.unresolvedBaselineFiles.has(filePath)){return;}
+            if(batches.some(batch=>batch.documents.size>=this.maxScopePreflightEntries)){
+                void this.pauseRecordingForUnpersistableCoverage('Directory document observation exceeded its bounded allowance; before-images are preserved.');
+                return;
+            }
+            const creationKnown=this.hasObservedCreation(filePath);
+            for(const batch of batches){batch.documents.add(filePath);}
+            ++this.directoryDocumentRevision;++this.baselineCompletionVersion;
+            this.recordUnresolvedBaseline(filePath,'Document opened before directory classification completed; before-image is not yet accepted');
+            if(creationKnown){this.postBaselineUnknownFiles.add(filePath);}
+            return;
+        }
         if (this.observeLargeDocument(filePath, useDocumentContent, persistenceBudget)) { return; }
         if (this.hasCapturedBaseline(filePath)) { return; }
 

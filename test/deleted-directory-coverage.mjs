@@ -847,8 +847,9 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         }finally{metadata.release();await recheck;tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;}
     },'wholeWorkspace',replacement==='ignored'?[{scope:'all',pattern:'/temporary/introduced/'}]:[]));
 
-    for(const {mode,historical=false} of [{mode:'runtime'},{mode:'restore'},{mode:'retry'},{mode:'restore',historical:true}])
-    test(`P2-RETIREMENT-SAVE-PROOF mode=${mode} historical=${historical}`,()=>fixture(async({tracker,dir,scope})=>{
+    for(const {mode,historical=false,staleDelete=false} of [{mode:'runtime'},{mode:'restore'},{mode:'retry'},{mode:'restore',historical:true},
+        {mode:'runtime',staleDelete:true},{mode:'restore',staleDelete:true},{mode:'retry',staleDelete:true}])
+    test(`P2-RETIREMENT-SAVE-PROOF mode=${mode} historical=${historical} staleDelete=${staleDelete}`,()=>fixture(async({tracker,dir,scope})=>{
         const {root,file}=await seed(tracker,dir,scope),child=path.join(root,'saved-create.txt');
         if(historical){tracker.recordUnresolvedBaseline(child,'Historical before-image is unknown');}
         fs.rmSync(root,{recursive:true});
@@ -864,7 +865,9 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             await tracker.onExternalFileCreatedEvent(Uri.file(child));
             tracker.onDidSaveDocument(h.document(child));
             const parent=[...nativeDirectoryWatchers].reverse().find(owner=>owner.active&&path.resolve(String(owner.directory))===path.resolve(dir));
-            assert.ok(parent);parent.listener('rename',path.basename(root));gate.release();await operation;
+            assert.ok(parent);parent.listener('rename',path.basename(root));
+            if(staleDelete){tracker.dispatchExternalEvent(Uri.file(root),'delete',tracker.sessionEpoch);}
+            gate.release();await operation;
             assert.equal(tracker.getOriginalContent(file),'original');
             assert.equal(tracker.unresolvedBaselineFiles.has(child),historical,'save delivery must not convert valid current creation proof into historical Unknown');
             if(historical){assert.equal(tracker.getReviewToken(child),undefined);assert.equal((await tracker.revertBlock(child,0)).status,'conflict');}
