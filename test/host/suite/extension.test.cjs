@@ -55,6 +55,8 @@ const missing = async name => {
 
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
+        const publication=require('../scope-publication-probe.cjs').observeScopePublication(vscode);
+        try {
         const folderNames=folders=>folders.map(folder=>({name:folder.name,scheme:folder.uri.scheme}));
         const initialWorkspaceFolders=folderNames(vscode.workspace.workspaceFolders??[]),workspaceContextEvents=[];
         const workspaceTrace=vscode.workspace.onDidChangeWorkspaceFolders(event=>{
@@ -97,7 +99,7 @@ module.exports = async function runExtensionHostScenario() {
             undefined,
             'ordinary excluded path must not already have a baseline'
         );
-        const scopeConfig = vscode.workspace.getConfiguration('diffTracker');
+        const scopeConfig = publication.configuration('diffTracker');
         await scopeConfig.update('watchInclude', [privateInclude],
             vscode.ConfigurationTarget.Workspace);
         const includeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
@@ -113,7 +115,7 @@ module.exports = async function runExtensionHostScenario() {
 
         // Unsupported watcher coverage still fails closed. S4-B may establish
         // direct coverage when an explicit directory include supplies a bound.
-        const filesConfig = vscode.workspace.getConfiguration('files');
+        const filesConfig = publication.configuration('files');
         const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
 
         // The Start command must project the backend's actual post-start state.
@@ -176,7 +178,7 @@ module.exports = async function runExtensionHostScenario() {
             descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
                 grantConsent: true
             });
-        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply;workspaceTrace.dispose(); }
+        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply;workspaceTrace.dispose();publication.finish(); }
         assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify({outcome:descendantWatcherApply,scopePreparationDiagnostic}));
 
         await scopeConfig.update('watchInclude', [privateInclude],
@@ -959,4 +961,5 @@ module.exports = async function runExtensionHostScenario() {
         await require('./audit.test.cjs')(workspacePath);
         await require('./nested-workspace-coverage.test.cjs')(secondRoot);
         await require('./nested-recheck-deletion.test.cjs')(secondRoot);
+        } finally {publication.finish();}
 };
