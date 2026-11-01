@@ -211,6 +211,7 @@ interface DirectoryObservation {
 }
 
 const DEFERRED_RECHECK_REASON = 'The bounded Recheck replay left a deferred observation; original before-images are preserved and this target remains unverified.';
+const DIRECTORY_PUBLICATION_REASON = 'Directory publication was interrupted; before-images for unobserved descendants remain unknown. Recheck observation coverage.';
 
 const dormantExcludedDirectoryGapCodes = new Set([
     'directory-scan-coverage-gap', 'directory-runtime-coverage-gap',
@@ -286,6 +287,9 @@ interface IgnoreDiscoveryBudget {
 }
 
 interface CandidatePersistenceBudget {
+    creationPublications?: Set<RuntimeCreationPublication>;
+    creationCurrent?: () => boolean;
+    creationBatch?: DirectoryCreationBatch;
     remainingBytes: number;
     fileSnapshots: number;
     fileModes: number;
@@ -361,6 +365,14 @@ interface RuntimeCreationPublication {
     current: () => boolean;
     revoked: boolean;
     committed: boolean;
+    batch?: DirectoryCreationBatch;
+}
+
+interface DirectoryCreationBatch {
+    root: string;
+    prepared: boolean;
+    ready: Promise<void>;
+    release: () => void;
 }
 
 interface LargeFileObservation { exists: boolean; size?: number; }
@@ -685,6 +697,9 @@ export class DiffTracker {
     }
 
     private advanceEpoch(): number {
+        for (const batch of new Set([...this.runtimeCreationPublications.values()].map(item=>item.batch))) {
+            if (batch) { this.retainDirectoryPublicationUncertainty(batch.root); }
+        }
         this.invalidateRuntimeCreationPublications(undefined, true);
         if (this.baselineTransaction?.baselineRecovery?.prepared && !this.baselineTransaction.durablyCommitted) {
             // An in-flight intent write may still finish after cancellation. Do
@@ -764,6 +779,7 @@ export class DiffTracker {
 
     public getOpaqueReviewToken(filePath: string): OpaqueReviewToken | undefined {
         filePath = this.canonicalTrackingPath(filePath);
+        if (this.runtimeCreationPublications.has(filePath)) { return undefined; }
         const change = this.trackedChanges.get(filePath);
         if (!change || change.largeFileReminder || change.reviewKind !== 'opaque' || change.unavailableReason ||
             !!this.coverageGaps.get(filePath)?.file || this.disposed) { return undefined; }
@@ -807,6 +823,7 @@ export class DiffTracker {
 
     public getUnknownReviewToken(filePath: string): UnknownReviewToken | undefined {
         filePath = this.canonicalTrackingPath(filePath);
+        if (this.runtimeCreationPublications.has(filePath)) { return undefined; }
         const change = this.trackedChanges.get(filePath);
         if (!change || change.largeFileReminder || change.reviewKind !== 'unknown' || this.disposed) { return undefined; }
         return { filePath, epoch: this.sessionEpoch, reviewRevision: this.unknownReviewRevision(change) };
@@ -3089,7 +3106,9 @@ export class DiffTracker {
         // distinguishable from unrelated imported/restart uncertainty.
         return !!evidence && !this.sessionWorkspaceRoots.some(root=>path.resolve(root)===path.resolve(target)) &&
             (evidence.reasonCode==='coverage-recheck-incomplete' ||
-                (evidence.reasonCode===this.importedCoverageRestartCode && evidence.reason===DEFERRED_RECHECK_REASON));
+                (evidence.reasonCode===this.importedCoverageRestartCode && evidence.reason===DEFERRED_RECHECK_REASON) ||
+                ((evidence.reasonCode==='directory-runtime-coverage-gap' || evidence.reasonCode===this.importedCoverageRestartCode) &&
+                    evidence.reason.startsWith(DIRECTORY_PUBLICATION_REASON)));
     }
 
     private persistedCoverageGap(
@@ -4381,7 +4400,7 @@ export class DiffTracker {
         }
     }
 
-    private buildPersistedState(): PersistedTrackerState | undefined {
+    private buildPersistedState(includeProvisional: boolean | ReadonlySet<RuntimeCreationPublication> = false): PersistedTrackerState | undefined {
         if (!this.storageUri) {
             return undefined;
         }
@@ -4399,7 +4418,7 @@ export class DiffTracker {
             return undefined;
         }
 
-        return {
+        const state: PersistedTrackerState = {
             version: 5,
             suppressedResourceBloom: this.suppressedResourceBloom.some(byte => byte !== 0)
                 ? this.suppressedResourceBloom.toString('hex') : undefined,
@@ -4431,6 +4450,23 @@ export class DiffTracker {
             gitContexts: [...this.baselineGitContexts.values()]
                 .sort((left, right) => left.repoRoot.localeCompare(right.repoRoot))
         };
+        if (includeProvisional !== true && this.runtimeCreationPublications.size > 0) {
+            // Recovery intents and exported snapshots cannot borrow a writer's
+            // ephemeral acceptance guard. Preserve these paths as Unknown there.
+            const paths = new Set([...this.runtimeCreationPublications.values()]
+                .filter(item => (includeProvisional === false || !includeProvisional.has(item)) && !item.committed && item.snapshots === this.fileSnapshots &&
+                    this.fileSnapshots.get(item.filePath) === '' && !this.baselineExistingFiles.has(item.filePath)).map(item => item.filePath));
+            const reason = 'File creation baseline has not been durably accepted; before-image is unknown';
+            state.fileSnapshots = state.fileSnapshots.filter(([file]) => !paths.has(file));
+            state.fileModes = state.fileModes.filter(([file]) => !paths.has(file));
+            state.baselineExistingFiles = state.baselineExistingFiles.filter(file => !paths.has(file));
+            const unresolved = new Map(state.unresolvedBaselineFiles);
+            for (const file of paths) { unresolved.set(file,reason); }
+            state.unresolvedBaselineFiles = [...unresolved].sort(([a],[b]) => a.localeCompare(b));
+            state.stoppedReviews = state.stoppedReviews?.map(review => paths.has(review.filePath)
+                ? {...review,reviewKind:'unknown',baselineExists:undefined,unavailableReason:reason,reviewReason:reason} : review);
+        }
+        return state;
     }
 
     private schedulePersistState(): void {
@@ -4535,16 +4571,28 @@ export class DiffTracker {
     private async flushPersistState(
         completedBaseline = false,
         transaction?: BaselineTransaction,
-        retainFailureMarker = false
+        retainFailureMarker = false,
+        waitForDirectoryBatches = true
     ): Promise<boolean> {
         const epoch = this.sessionEpoch;
         retainFailureMarker = retainFailureMarker || this.archiveRestoreFinalizingEpoch === epoch || !!transaction?.baselineRecovery;
         if (this.archiveRestoreStaging && !transaction) { return true; }
+        if (waitForDirectoryBatches) {
+            const batches = new Set([...this.runtimeCreationPublications.values()]
+                .map(item=>item.batch).filter((batch): batch is DirectoryCreationBatch=>!!batch && !batch.prepared));
+            if (batches.size > 0) {
+                // Capture one finite preparation set. The parent releases it
+                // after its budget is sealed or after rejecting its own paths.
+                await Promise.all([...batches].map(batch=>batch.ready));
+                if (epoch !== this.sessionEpoch) { return false; }
+                return this.flushPersistState(completedBaseline,transaction,retainFailureMarker,false);
+            }
+        }
         if (transaction && (this.baselineTransaction !== transaction || !this.isCurrentEpoch(transaction.epoch))) { return false; }
         if (this.baselineTransaction && !transaction) {
             await this.baselineTransaction.done;
             if (epoch !== this.sessionEpoch) { return false; }
-            return this.flushPersistState(completedBaseline, undefined, retainFailureMarker);
+            return this.flushPersistState(completedBaseline, undefined, retainFailureMarker,waitForDirectoryBatches);
         }
         // A blocked restore must never erase the evidence during shutdown.
         if (this.recoveryBlocked) { return false; }
@@ -4557,12 +4605,12 @@ export class DiffTracker {
         }
 
         this.invalidateRuntimeCreationPublications();
-        const creations = [...this.runtimeCreationPublications.values()];
+        const creations = [...this.runtimeCreationPublications.values()].filter(item=>!item.batch || item.batch.prepared);
         const creationsCurrent = (): boolean => {
             this.invalidateRuntimeCreationPublications();
             return creations.every(item => item.committed || (!item.revoked && item.current()));
         };
-        const state = this.buildPersistedState();
+        const state = this.buildPersistedState(new Set(creations));
         // Persist the ready candidate while actions remain blocked in memory.
         if (state && completedBaseline) { state.baselineState = 'ready'; }
         let payload: Uint8Array | undefined;
@@ -6246,7 +6294,7 @@ export class DiffTracker {
     }
 
     private createCandidatePersistenceBudget(projectedScanCoverage = this.scanCoverage): CandidatePersistenceBudget {
-        const state = this.buildPersistedState();
+        const state = this.buildPersistedState(true);
         let remainingBytes = Number.POSITIVE_INFINITY;
         let fileModes = [...this.fileModes.keys()].filter(filePath => this.fileSnapshots.has(filePath)).length;
         let baselineExistingFiles = this.baselineExistingFiles.size;
@@ -6352,7 +6400,7 @@ export class DiffTracker {
         // concurrently mutable durable evidence outside the baseline maps too,
         // including coverage gaps and retained-review metadata.
         this.synchronizeCandidateUnresolvedBudget(budget);
-        const state = this.buildPersistedState();
+        const state = this.buildPersistedState(true);
         if (!state) { return ''; }
         state.baselineState = 'ready';
         if (!this.parsePersistedState(state)) {
@@ -9600,9 +9648,22 @@ export class DiffTracker {
     private invalidateRuntimeCreationPublications(root?: string, force = false): void {
         for (const [filePath, item] of this.runtimeCreationPublications) {
             if ((root && !this.pathBelongsToRoot(filePath,root)) || (!force && item.current())) { continue; }
-            item.revoked = true;
-            this.runtimeCreationPublications.delete(filePath);
-            if (this.fileSnapshots === item.snapshots && this.fileSnapshots.get(filePath) === '' && !this.baselineExistingFiles.has(filePath)) {
+            this.rejectRuntimeCreationPublication(item);
+        }
+    }
+
+    private rejectRuntimeCreationPublication(item: RuntimeCreationPublication, restoreMissing = false): void {
+        if (item.committed) { return; }
+        const filePath=item.filePath,owner=this.runtimeCreationPublications.get(filePath);
+        item.revoked = true;
+        if (owner && owner !== item) { return; }
+        if (item.batch) { this.retainDirectoryPublicationUncertainty(item.batch.root); }
+        if (owner === item) { this.runtimeCreationPublications.delete(filePath); }
+        if (this.fileSnapshots === item.snapshots) {
+            const provisional = owner === item && this.fileSnapshots.get(filePath) === '' && !this.baselineExistingFiles.has(filePath);
+            const missing = restoreMissing && !this.fileSnapshots.has(filePath) && !this.unresolvedBaselineFiles.has(filePath) &&
+                !this.opaqueBaselineFiles.has(filePath) && !this.largeFileReminders.has(filePath);
+            if (provisional || missing) {
                 this.fileSnapshots.delete(filePath);
                 this.fileModes.delete(filePath);
                 this.recordUnresolvedBaseline(filePath,'File creation changed before its baseline was durably accepted; before-image is unknown');
@@ -9612,6 +9673,14 @@ export class DiffTracker {
                 ++this.baselineCompletionVersion;
             }
         }
+    }
+
+    private retainDirectoryPublicationUncertainty(root: string): void {
+        if (this.isPathIgnored(vscode.Uri.file(root),true)) { return; }
+        const previous=this.coverageGaps.get(root)?.subtree;
+        if (previous?.reasonCode==='coverage-recheck-incomplete' || previous?.reason.startsWith(DIRECTORY_PUBLICATION_REASON)) { return; }
+        this.setSubtreeCoverageGap(root,'directory-runtime-coverage-gap',
+            (DIRECTORY_PUBLICATION_REASON+(previous?.reason ? ` ${previous.reason}` : '')).slice(0,1000),false);
     }
 
     private async completeRuntimeCreationPublication(
@@ -9810,6 +9879,7 @@ export class DiffTracker {
 
     public getLargeFileReminderToken(filePath: string): LargeFileReminderToken | undefined {
         filePath = this.canonicalTrackingPath(filePath);
+        if (this.runtimeCreationPublications.has(filePath)) { return undefined; }
         const entry = this.largeFileReminders.get(filePath);
         if (!entry || this.disposed || this.sameLargeObservation(entry.observed, entry.acknowledged)) { return undefined; }
         let instance = this.largeReminderInstances.get(entry);
@@ -10868,10 +10938,13 @@ export class DiffTracker {
             );
         }
         if (!isCurrent()) { return; }
+        const deferred=this.coverageGaps.get(filePath)?.subtree;
+        const preserveDeferred=deferred?.reasonCode==='coverage-recheck-incomplete' ||
+            (deferred?.reasonCode==='directory-runtime-coverage-gap' && deferred.reason.startsWith(DIRECTORY_PUBLICATION_REASON));
         this.setSubtreeCoverageGap(
             filePath,
-            duringScan ? 'directory-scan-coverage-gap' : 'directory-runtime-coverage-gap',
-            reason,
+            preserveDeferred ? deferred!.reasonCode : duringScan ? 'directory-scan-coverage-gap' : 'directory-runtime-coverage-gap',
+            preserveDeferred ? (deferred.reason.includes(reason) ? deferred.reason : `${deferred.reason} ${reason}`).slice(0,1000) : reason,
             schedule
         );
     }
@@ -10928,22 +11001,23 @@ export class DiffTracker {
 
     private restoreImportedDirectoryRollbackState(
         root: string,
-        previous: ImportedDirectoryRollbackState
+        previous: ImportedDirectoryRollbackState,
+        preservedPaths?: ReadonlySet<string>
     ): void {
         const resolvedRoot = path.resolve(root);
         const ownsPath = (targetPath: string): boolean =>
-            path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot);
+            (path.resolve(targetPath) === resolvedRoot || this.pathBelongsToRoot(targetPath, resolvedRoot)) && !preservedPaths?.has(targetPath);
         const restoreMap = <T>(target: Map<string, T>, snapshot: Map<string, T>): void => {
             for (const targetPath of [...target.keys()]) {
                 if (ownsPath(targetPath)) { target.delete(targetPath); }
             }
-            for (const [targetPath, value] of snapshot) { target.set(targetPath, value); }
+            for (const [targetPath, value] of snapshot) { if (ownsPath(targetPath)) { target.set(targetPath, value); } }
         };
         const restoreSet = (target: Set<string>, snapshot: Set<string>): void => {
             for (const targetPath of [...target]) {
                 if (ownsPath(targetPath)) { target.delete(targetPath); }
             }
-            for (const targetPath of snapshot) { target.add(targetPath); }
+            for (const targetPath of snapshot) { if (ownsPath(targetPath)) { target.add(targetPath); } }
         };
 
         restoreMap(this.fileSnapshots, previous.fileSnapshots);
@@ -10965,9 +11039,11 @@ export class DiffTracker {
             .filter(record => record.items.length > 0);
         const byId = new Map(retainedHistory.map(record => [record.id, record]));
         for (const record of previous.revertHistory) {
+            const items=record.items.filter(item => ownsPath(item.filePath));
+            if (items.length === 0) { continue; }
             const current = byId.get(record.id);
             if (current) {
-                current.items.push(...record.items.map(item => ({
+                current.items.push(...items.map(item => ({
                     ...item,
                     before: { ...item.before },
                     after: { ...item.after }
@@ -10975,7 +11051,7 @@ export class DiffTracker {
             } else {
                 const restored = {
                     ...record,
-                    items: record.items.map(item => ({
+                    items: items.map(item => ({
                         ...item,
                         before: { ...item.before },
                         after: { ...item.after }
@@ -11088,12 +11164,24 @@ export class DiffTracker {
         // A directory notification proves neither creation nor child absence.
         // Share the watch/scan/persist handoff, but keep its provenance distinct.
         const creation = { duringScan: scanEvent || !!directoryObservation, cancelled: false, evidenceCurrent:creationEvidenceCurrent };
+        // A newer import of the same directory owns its preparation. Release
+        // an older unfinished batch before it can block that replacement's save.
+        for (const item of [...this.runtimeCreationPublications.values()]) {
+            if (item.batch?.root === filePath && !item.batch.prepared) {
+                this.rejectRuntimeCreationPublication(item);
+                item.batch.release();
+            }
+        }
         this.activeCreations.set(filePath, creation);
+        const budgetFileContext = persistenceBudget ? this.captureFileCreationContext(uri) : undefined;
         const creationIsCurrent = () => this.isCurrentEpoch(epoch) && !creation.cancelled &&
             this.activeCreations.get(filePath) === creation && (!directoryObservation || directoryObservation.current()) &&
             (!creationEvidenceCurrent || creationEvidenceCurrent());
         try {
             const directory = await this.isUntrackedDirectory(uri);
+            if (persistenceBudget && (directory || (budgetFileContext && !budgetFileContext()))) {
+                throw new Error('A directory child changed during creation classification');
+            }
             if (directory && directoryObservation && !await directoryObservation.settlePreparation()) { return; }
             if (!creationIsCurrent()) { return; }
             if (directory) {
@@ -11104,6 +11192,15 @@ export class DiffTracker {
                 let childPersistenceBudget!: CandidatePersistenceBudget;
                 try {
                     childPersistenceBudget = this.createCandidatePersistenceBudget();
+                    let release!: () => void;
+                    const ready = new Promise<void>(resolve=>{release=resolve;});
+                    childPersistenceBudget.creationBatch={root:filePath,prepared:false,ready,release};
+                    const identity=fs.lstatSync(filePath,{bigint:true});
+                    childPersistenceBudget.creationCurrent=()=>{
+                        try { return this.isCurrentEpoch(epoch) && identity.isDirectory() &&
+                            this.supplementalIdentityMatches(fs.lstatSync(filePath,{bigint:true}),identity); }
+                        catch { return false; }
+                    };
                     // A failed populated-directory import must always leave a
                     // durable subtree obligation. Reserve the worst-case watcher
                     // failure evidence before mutating any child baseline so a
@@ -11151,6 +11248,8 @@ export class DiffTracker {
                 // Native watchers may report only the parent when a populated
                 // directory appears; its nested .gitignore events are not guaranteed.
                 let failureReason = scanFailureReason;
+                let stagedPublication = false;
+                let publicationFailed = false;
                 try {
                     await this.refreshIgnoreMatchers();
                     if (directoryObservation && !await directoryObservation.settlePreparation()) { return; }
@@ -11248,9 +11347,12 @@ export class DiffTracker {
                         // and any required watcher-failure gap cross the same
                         // projection and durable write barrier.
                         this.validateCandidatePersistenceProjection(childPersistenceBudget);
+                        childPersistenceBudget.creationBatch!.prepared=true;
+                        childPersistenceBudget.creationBatch!.release();
                         if (!await this.flushPendingPersistence()) {
                             throw new Error('Created directory baseline changes could not be persisted');
                         }
+                        stagedPublication=this.archiveRestoreStaging;
                     }
                     if (watchFailed && creationIsCurrent()) {
                         if (!watcherFailureProjected) {
@@ -11289,6 +11391,7 @@ export class DiffTracker {
                                     evidence?.reasonCode === 'supplemental-watcher-identity-gap' ||
                                     evidence?.reasonCode === 'supplemental-watcher-target-missing-gap' ||
                                     evidence?.reasonCode === this.importedCoverageRestartCode ||
+                                    (evidence?.reasonCode === 'coverage-recheck-incomplete' && evidence.reason.startsWith(DIRECTORY_PUBLICATION_REASON)) ||
                                     evidence?.reasonCode === 'directory-runtime-coverage-gap' ||
                                     evidence?.reasonCode === 'directory-scan-coverage-gap') &&
                                     this.coverageGaps.get(directory)?.subtree === evidence) {
@@ -11300,10 +11403,24 @@ export class DiffTracker {
                         if (removedAbsentSentinel) { this.schedulePersistState(); }
                     }
                 } catch {
+                    stagedPublication=false;
+                    publicationFailed=true;
                     if (creationIsCurrent()) {
                         if (importRollback) {
-                            this.restoreImportedDirectoryRollbackState(filePath, importRollback);
+                            const owned=childPersistenceBudget.creationPublications ?? new Set<RuntimeCreationPublication>();
+                            const previous=new Set([...importRollback.fileSnapshots.keys(),...importRollback.unresolvedBaselineFiles.keys(),
+                                ...importRollback.opaqueBaselineFiles.keys(),...importRollback.largeFileReminders.keys(),...importRollback.trackedChanges.keys()]);
+                            const preserved=new Set([...owned].filter(item=>item.committed ||
+                                (item.revoked && this.unresolvedBaselineFiles.has(item.filePath))).map(item=>item.filePath));
+                            for(const target of [...this.fileSnapshots.keys(),
+                                ...this.opaqueBaselineFiles.keys(),...this.largeFileReminders.keys()]){
+                                const pending=this.runtimeCreationPublications.get(target);
+                                if(!previous.has(target) && (!pending || !owned.has(pending))){preserved.add(target);}
+                            }
+                            this.restoreImportedDirectoryRollbackState(filePath, importRollback,preserved);
+                            for(const item of owned){this.rejectRuntimeCreationPublication(item,this.persistenceFailed);}
                         }
+                        childPersistenceBudget.creationBatch!.release();
                         await this.markCreatedDirectoryUnavailable(filePath, failureReason, scanEvent, epoch);
                         if (importRollback) {
                             // A failed flush can occur after the target file was
@@ -11315,6 +11432,17 @@ export class DiffTracker {
                             await this.flushPendingPersistence();
                         }
                     }
+                } finally {
+                    if (this.isCurrentEpoch(epoch) && !stagedPublication) {
+                        const publications=childPersistenceBudget.creationPublications ?? new Set<RuntimeCreationPublication>();
+                        const incomplete=!scanEvent && publications.size>0 && (publicationFailed || !childPersistenceBudget.creationBatch!.prepared ||
+                            [...publications].some(item=>!item.committed));
+                        for (const item of childPersistenceBudget.creationPublications ?? []) {
+                            if (this.runtimeCreationPublications.get(item.filePath)===item) { this.rejectRuntimeCreationPublication(item); }
+                        }
+                        if(incomplete && this.activeCreations.get(filePath)===creation){this.retainDirectoryPublicationUncertainty(filePath);}
+                    }
+                    childPersistenceBudget.creationBatch!.release();
                 }
                 return;
             }
@@ -11359,11 +11487,16 @@ export class DiffTracker {
                         persistenceBudget
                     );
                 }
-                const publication: RuntimeCreationPublication | undefined = !persistenceBudget && creationEvidenceCurrent
+                if (persistenceBudget && !budgetFileContext?.()) { throw new Error('A directory child creation proof changed before publication'); }
+                const publication: RuntimeCreationPublication | undefined = creationEvidenceCurrent || persistenceBudget
                     ? {filePath,snapshots:this.fileSnapshots,
-                        current:() => this.isCurrentEpoch(epoch) && !creation.cancelled && creationEvidenceCurrent(),
-                        revoked:false,committed:false} : undefined;
-                if (publication) { this.runtimeCreationPublications.set(filePath,publication); }
+                        current:() => this.isCurrentEpoch(epoch) && !creation.cancelled && (creationEvidenceCurrent?.() ?? true) &&
+                            (!persistenceBudget || (!!budgetFileContext?.() && !!persistenceBudget.creationCurrent?.())),
+                        revoked:false,committed:false,batch:persistenceBudget?.creationBatch} : undefined;
+                if (publication) {
+                    this.runtimeCreationPublications.set(filePath,publication);
+                    if(persistenceBudget){(persistenceBudget.creationPublications ??= new Set()).add(publication);}
+                }
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
@@ -14774,6 +14907,7 @@ export class DiffTracker {
         }
         const unresolvedReason = this.unresolvedBaselineFiles.get(filePath);
         if (unresolvedReason ||
+            (this.snapshotInitialized && this.hasUnprovenDirectoryObservation(filePath) && !this.hasObservedCreation(filePath)) ||
             (this.snapshotInitialized && (!this.scanCoverage || this.scanCoverage !== this.ignoreFingerprint))) {
             this.recordUnresolvedBaseline(filePath, 'Path was not covered by the baseline scan; before-image is unknown');
             return;

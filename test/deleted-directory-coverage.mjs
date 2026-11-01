@@ -730,7 +730,7 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         } finally {fs.realpathSync=realpath;fs.statSync=stat;}
     }));
 
-    for(const replacement of ['directory','file','budget','budget0','budget-file','budget-reload','budget-reload-wrapped','budget-reload-proof','new-epoch','ignored'])
+    for(const replacement of ['directory','file','budget','budget0','budget-file','budget-editor','budget-reload','budget-reload-wrapped','budget-reload-proof','new-epoch','ignored'])
     test(`P2-RECHECK-TYPE-FALLBACK ${replacement}`,()=>fixture(async({tracker:initialTracker,dir,scope})=>{
         let tracker=initialTracker;
         const {root,file}=await seed(tracker,dir,scope),target=path.join(root,'introduced'),child=path.join(target,'unproven.txt');
@@ -742,7 +742,7 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                 delivered=true;fs.writeFileSync(target,'independent file');
                 tracker.dispatchExternalEvent(Uri.file(target),'create',restoring);
                 if(replacement.startsWith('budget')){
-                    tracker.maxScopePreflightEntries=replacement==='budget'||replacement.startsWith('budget-reload')?1:0;
+                    tracker.maxScopePreflightEntries=replacement==='budget'||replacement==='budget-editor'||replacement.startsWith('budget-reload')?1:0;
                     if(replacement==='budget0'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
                 }
             }
@@ -769,6 +769,17 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
                 assert.equal(tracker.coverageGaps.get(target)?.[kind]?.reasonCode,'coverage-recheck-incomplete');
                 assert.ok(JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json'))).coverageGaps.some(([name,gap])=>name===target&&gap[kind]?.reasonCode==='coverage-recheck-incomplete'));
                 tracker.maxScopePreflightEntries=allowance;
+                if(replacement==='budget-editor'){
+                    assert.equal(tracker.fileSnapshots.has(child),false);
+                    const doc=h.document(child),before=doc.getText(),dirty=doc.isDirty;
+                    tracker.onDocumentOpened(doc);
+                    const admitted=tracker.fileSnapshots.has(child),token=tracker.getReviewToken(child);
+                    const action=await tracker.revertBlock(child,0);
+                    assert.equal(action.status,'conflict','a deferred descendant must not acquire block-edit permission when opened');
+                    assert.equal(admitted,false,'opening a deferred descendant cannot prove an absent before-image');
+                    assert.equal(token,undefined);
+                    assert.equal(doc.getText(),before);assert.equal(doc.isDirty,dirty);
+                }
                 if(replacement.startsWith('budget-reload')){
                     const storage=tracker.storageUri;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;
                     await tracker.dispose();
