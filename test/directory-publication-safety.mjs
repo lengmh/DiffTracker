@@ -209,6 +209,41 @@ export function registerDirectoryPublicationSafety(h,fixture){
             if(!cancel){for(const child of children){assert.equal(tracker.getOriginalContent(child),'');assert.ok(tracker.getReviewToken(child));}}
         }finally{tracker.flushPendingPersistence=flush;for(const gate of gates){gate.release();}holdRelease();await operation;if(saving){await saving;}}
     }));
+    for(const storage of [false,true])for(const replace of [false,true])
+    test(`DIRECTORY-PUBLICATION overlapping batch storage=${storage} replace=${replace}`,()=>fixture(async({tracker,dir})=>{
+        const a=await seed(tracker,dir,2);
+        const root=path.join(a.container,'second-directory');fs.mkdirSync(root);
+        const files=[0,1].map(index=>path.join(root,`second-${index}.txt`));
+        for(const file of files){fs.writeFileSync(file,'independent second directory contents');}
+        if(!storage){tracker.storageUri=undefined;}
+        const ag=a.children.map(file=>pause(file,'stat')),bg=files.map(file=>pause(file,'stat'));
+        const first=tracker.onExternalFileCreatedEvent(Uri.file(a.root));let second,saving;
+        try{
+            const i=await bounded(Promise.race(ag.map((gate,index)=>gate.entered.then(()=>index))));
+            ag[i].release();await bounded(ag[1-i].entered);
+            assert.ok(tracker.runtimeCreationPublications.has(a.children[i]));
+            saving=tracker.flushPendingPersistence();
+            second=tracker.onExternalFileCreatedEvent(Uri.file(root));
+            const j=await bounded(Promise.race(bg.map((gate,index)=>gate.entered.then(()=>index))));
+            bg[j].release();await bounded(bg[1-j].entered);
+            for(const gate of ag){gate.release();}
+            assert.equal(await bounded(saving),true);
+            const premature=tracker.getReviewToken(files[j]);
+            if(replace){
+                fs.rmSync(root,{recursive:true});tracker.dispatchExternalEvent(Uri.file(root),'delete',tracker.sessionEpoch);
+                fs.mkdirSync(root);for(const file of files){fs.writeFileSync(file,'unproven replacement contents');}
+            }
+            for(const gate of bg){gate.release();}
+            await bounded(first);await bounded(second);
+            for(const file of files){await tracker.readFileAndUpdate(file,Uri.file(file));}
+            // Check the modifying boundary before token assertions, so the red
+            // replacement control also demonstrates the buffer-safety effect.
+            if(replace){await unknown(tracker,files[j]);}
+            else{for(const file of files){assert.equal(tracker.getOriginalContent(file),'');assert.ok(tracker.getReviewToken(file));}}
+            assert.equal(premature,undefined,'an earlier writer cannot accept a newer unfinished batch');
+            assert.equal(tracker.getOriginalContent(a.known),'original known file');
+        }finally{for(const gate of [...ag,...bg]){gate.release();}await first;if(second){await second;}if(saving){await saving;}}
+    }));
     test('DIRECTORY-PUBLICATION opening an unseen file respects deferred directory provenance',()=>fixture(async({tracker,dir})=>{
         const {root}=await seed(tracker,dir,0);
         tracker.retainDirectoryPublicationUncertainty(root);

@@ -4599,8 +4599,11 @@ export class DiffTracker {
         const storageUri = this.storageUri;
         if (!storageUri) {
             this.invalidateRuntimeCreationPublications();
-            for (const item of this.runtimeCreationPublications.values()) { item.committed = true; }
-            this.runtimeCreationPublications.clear();
+            for (const [filePath,item] of this.runtimeCreationPublications) {
+                if (item.batch && !item.batch.prepared) { continue; }
+                item.committed = true;
+                this.runtimeCreationPublications.delete(filePath);
+            }
             return true;
         }
 
