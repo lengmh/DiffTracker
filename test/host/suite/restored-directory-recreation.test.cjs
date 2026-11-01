@@ -24,10 +24,16 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
         const storage=vscode.Uri.file(fs.mkdtempSync(path.join(os.tmpdir(),'difftracker-restored-directory-host-')));
         let tracker=new DiffTracker(storage);
         const exactCreates=[],evidenceTrace=[];let recheckCalls=0;
+        const physicalRoot=()=>{
+            try{
+                const stat=fs.statSync(root,{bigint:true});
+                return {dev:String(stat.dev),ino:String(stat.ino),birthtimeNs:String(stat.birthtimeNs),directory:stat.isDirectory()};
+            }catch(error){return {missing:error.code==='ENOENT',code:error.code};}
+        };
         const trace=(action,extra={})=>{
             if(evidenceTrace.length>=96){return;}
             const queued=tracker.restoreEvents.get(proven);
-            evidenceTrace.push({action,...extra,retirement:!!tracker.missingDirectoryRetirement,
+            evidenceTrace.push({action,...extra,physicalRoot:physicalRoot(),retirement:!!tracker.missingDirectoryRetirement,
                 restoring:tracker.restoringEpoch===tracker.sessionEpoch,
                 queued:queued?{kind:queued.kind,observation:!!queued.reconcileDirectory,revoked:!!queued.revoked}:undefined,
                 retained:tracker.missingDirectoryRetirement?.createdFiles.has(proven),
@@ -53,7 +59,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             const notifications=[],dispatch=tracker.dispatchExternalEvent;
             tracker.dispatchExternalEvent=function(uri,kind,epoch,...metadata){
                 if(notifications.length<64&&(this.pathBelongsToRoot(uri.fsPath,root)||this.pathBelongsToRoot(root,uri.fsPath))){
-                    notifications.push({name:uri.fsPath===root?'[root]':path.dirname(uri.fsPath)===root?path.basename(uri.fsPath):'[ancestor]',kind,retirement:!!this.missingDirectoryRetirement,observation:!!metadata[0]});
+                    notifications.push({name:uri.fsPath===root?'[root]':path.dirname(uri.fsPath)===root?path.basename(uri.fsPath):'[ancestor]',kind,physicalRoot:physicalRoot(),retirement:!!this.missingDirectoryRetirement,observation:!!metadata[0]});
                     trace('dispatch',{name:notifications.at(-1).name,kind});
                 }
                 return dispatch.call(this,uri,kind,epoch,...metadata);
@@ -71,7 +77,7 @@ module.exports=async function restoredDirectoryRecreationHost(workspace){
             const save=tracker.flushPersistState.bind(tracker);let reconstructed=false;
             tracker.flushPersistState=async(...args)=>{
                 if(tracker.missingDirectoryRetirement&&!reconstructed){
-                    reconstructed=true;fs.mkdirSync(root);
+                    reconstructed=true;fs.mkdirSync(root);trace('physical-directory-reconstruction');
                     fs.writeFileSync(file,'reconstructed during host certification');
                     fs.writeFileSync(unknown,'unproven child before-image');
                     const edit=new vscode.WorkspaceEdit();edit.createFile(vscode.Uri.file(proven));

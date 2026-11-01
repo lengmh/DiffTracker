@@ -103,6 +103,7 @@ export function registerCreationProofLifecycle(h,fixture) {
                 if(mode==='stop'){tracker.stopRecording();}
                 if(mode==='new-epoch'){
                     tracker.advanceEpoch();tracker.isRecording=false;
+                    tracker.unresolvedBaselineFiles.delete(first);tracker.postBaselineUnknownFiles.delete(first);
                     tracker.fileSnapshots.set(first,'new epoch baseline');tracker.baselineExistingFiles.add(first);
                 }
                 if(mode==='save-failure'){faults.set(path.join(storage.fsPath,'session-state.json'),{copy:Object.assign(new Error('Synthetic copy failure'),{code:'NoPermissions'})});}
@@ -244,7 +245,7 @@ test(`CREATION-PROOF runtime control ${activity}`,()=>fixture(async({tracker,dir
             const pending=validateAndCanonicalizeScope({mode:'wholeWorkspace',includes:[],excludes:[{scope:'all',pattern:'/live-parent/'}]},tracker.currentWorkspaceRootIdentities());
             assert.equal(pending.ok,true);tracker.setPendingMonitoringScope(pending.scope);
         }else if(activity==='stop'){tracker.stopRecording();}
-        else{tracker.advanceEpoch();tracker.isRecording=false;tracker.fileSnapshots.set(target,'new epoch baseline');tracker.baselineExistingFiles.add(target);}
+        else{tracker.advanceEpoch();tracker.isRecording=false;tracker.unresolvedBaselineFiles.delete(target);tracker.postBaselineUnknownFiles.delete(target);tracker.fileSnapshots.set(target,'new epoch baseline');tracker.baselineExistingFiles.add(target);}
         gate.release();await creating;
         if(activity==='fresh-proof'||activity==='atomic-file'){assert.equal(tracker.getOriginalContent(target),'');assert.ok(tracker.getReviewToken(target));}
         else if(activity==='unnotified-ancestor'){await inspectAndAttemptBlock(tracker,target);}

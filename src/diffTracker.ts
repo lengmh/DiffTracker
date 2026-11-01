@@ -355,6 +355,14 @@ interface QueuedExternalEvent {
     creationCurrent?: () => boolean;
 }
 
+interface RuntimeCreationPublication {
+    filePath: string;
+    snapshots: Map<string,string>;
+    current: () => boolean;
+    revoked: boolean;
+    committed: boolean;
+}
+
 interface LargeFileObservation { exists: boolean; size?: number; }
 interface LargeFileReminderState {
     observed: LargeFileObservation;
@@ -677,6 +685,7 @@ export class DiffTracker {
     }
 
     private advanceEpoch(): number {
+        this.invalidateRuntimeCreationPublications(undefined, true);
         if (this.baselineTransaction?.baselineRecovery?.prepared && !this.baselineTransaction.durablyCommitted) {
             // An in-flight intent write may still finish after cancellation. Do
             // not let a new baseline overwrite its recovery source before reload.
@@ -720,6 +729,7 @@ export class DiffTracker {
 
     public getReviewToken(filePath: string): ReviewToken | undefined {
         filePath = this.canonicalTrackingPath(filePath);
+        if (this.runtimeCreationPublications.has(filePath)) { return undefined; }
         const change = this.trackedChanges.get(filePath);
         const baseline = this.fileSnapshots.get(filePath);
         if (!change || change.largeFileReminder || change.reviewKind !== 'text' || change.unavailableReason || baseline === undefined ||
@@ -972,6 +982,7 @@ export class DiffTracker {
         creations: Map<string, fs.BigIntStats>; active: () => boolean; current: () => boolean;
     }>();
     private runtimeBaselinePublications = new Set<Promise<boolean>>();
+    private runtimeCreationPublications = new Map<string, RuntimeCreationPublication>();
     private settledScopeSettings = new WeakMap<ScopeOperationObservation,SettledSettingsWrite>();
     // Persisted as restart uncertainty, never as proof that an OS handle lives.
     private importedCoverageObligations = new Set<string>();
@@ -2740,6 +2751,7 @@ export class DiffTracker {
     }
 
     private revokeQueuedDescendantCreations(deletedPath: string): void {
+        this.invalidateRuntimeCreationPublications(deletedPath, true);
         for (const [target,event] of this.restoreEvents) {
             if (target !== deletedPath && this.pathBelongsToRoot(target,deletedPath) && event.kind === 'create') {
                 this.restoreEvents.set(target,{uri:event.uri,kind:'change',reconcileDirectory:true});
@@ -4538,9 +4550,18 @@ export class DiffTracker {
         if (this.recoveryBlocked) { return false; }
         const storageUri = this.storageUri;
         if (!storageUri) {
+            this.invalidateRuntimeCreationPublications();
+            for (const item of this.runtimeCreationPublications.values()) { item.committed = true; }
+            this.runtimeCreationPublications.clear();
             return true;
         }
 
+        this.invalidateRuntimeCreationPublications();
+        const creations = [...this.runtimeCreationPublications.values()];
+        const creationsCurrent = (): boolean => {
+            this.invalidateRuntimeCreationPublications();
+            return creations.every(item => item.committed || (!item.revoked && item.current()));
+        };
         const state = this.buildPersistedState();
         // Persist the ready candidate while actions remain blocked in memory.
         if (state && completedBaseline) { state.baselineState = 'ready'; }
@@ -4560,7 +4581,7 @@ export class DiffTracker {
         }
 
         const persistTask = async (): Promise<boolean> => {
-            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && (!transaction ||
+            const transactionCurrent = (): boolean => epoch === this.sessionEpoch && creationsCurrent() && (!transaction ||
                 (this.baselineTransaction === transaction && this.isCurrentEpoch(transaction.epoch) && (transaction.valid?.() ?? true)));
             if (!transactionCurrent()) { return false; }
             const targetUri = this.getPersistedStateUri();
@@ -4604,16 +4625,30 @@ export class DiffTracker {
                 // its final context validation. Keep the incomplete-write marker
                 // until the caller explicitly commits that prepared publication.
                 if (!retainFailureMarker && failureUri) {
-                    await this.deletePersistedFile(failureUri);
+                    if (creations.length > 0) {
+                        // Runtime creation is still provisional. No promise
+                        // boundary may separate proof validation, durable
+                        // marker removal and acceptance of its absent baseline.
+                        if (failureUri.scheme !== 'file') { throw new Error('Creation baseline requires local durable commit'); }
+                        try { fs.unlinkSync(failureUri.fsPath); }
+                        catch (error) { if (!this.isFileNotFound(error)) { throw error; } }
+                    } else { await this.deletePersistedFile(failureUri); }
                 }
                 if (!transactionCurrent()) {
                     if (!retainFailureMarker && failureUri) {
-                        await vscode.workspace.fs.writeFile(
-                            failureUri,
-                            new TextEncoder().encode('Session write interrupted')
-                        );
+                        if (creations.length > 0 && failureUri.scheme === 'file') {
+                            fs.writeFileSync(failureUri.fsPath, 'Session write interrupted');
+                        } else {
+                            await vscode.workspace.fs.writeFile(failureUri,new TextEncoder().encode('Session write interrupted'));
+                        }
                     }
                     return false;
+                }
+                for (const item of creations) {
+                    item.committed = true;
+                    if (this.runtimeCreationPublications.get(item.filePath) === item) {
+                        this.runtimeCreationPublications.delete(item.filePath);
+                    }
                 }
                 this.persistenceIssue = undefined;
                 this.persistenceFailed = false;
@@ -9562,6 +9597,45 @@ export class DiffTracker {
         return task;
     }
 
+    private invalidateRuntimeCreationPublications(root?: string, force = false): void {
+        for (const [filePath, item] of this.runtimeCreationPublications) {
+            if ((root && !this.pathBelongsToRoot(filePath,root)) || (!force && item.current())) { continue; }
+            item.revoked = true;
+            this.runtimeCreationPublications.delete(filePath);
+            if (this.fileSnapshots === item.snapshots && this.fileSnapshots.get(filePath) === '' && !this.baselineExistingFiles.has(filePath)) {
+                this.fileSnapshots.delete(filePath);
+                this.fileModes.delete(filePath);
+                this.recordUnresolvedBaseline(filePath,'File creation changed before its baseline was durably accepted; before-image is unknown');
+                // This is a rejected provisional baseline, not historical
+                // Unknown. A genuinely new exact creation can establish proof.
+                this.postBaselineUnknownFiles.add(filePath);
+                ++this.baselineCompletionVersion;
+            }
+        }
+    }
+
+    private async completeRuntimeCreationPublication(
+        item: RuntimeCreationPublication, epoch: number, observeStopped: boolean
+    ): Promise<boolean> {
+        let saved = false;
+        // One correction pass persists revoked proof as Unknown. Continuous
+        // invalidation or a storage/budget failure keeps the failure marker.
+        for (let attempt=0; attempt<2 && this.isCurrentEpoch(epoch); attempt++) {
+            saved = await this.completeRuntimeBaseline(epoch,observeStopped);
+            if (saved) { return item.committed || this.archiveRestoreStaging; }
+            if (this.persistenceFailed) { break; }
+        }
+        if (this.runtimeCreationPublications.get(item.filePath) === item) {
+            this.invalidateRuntimeCreationPublications(item.filePath,true);
+        }
+        if (!saved && this.isCurrentEpoch(epoch)) {
+            await this.pauseRecordingForUnpersistableCoverage(
+                this.persistenceIssue ?? 'File creation baseline could not be durably accepted; original before-images are preserved.'
+            );
+        }
+        return false;
+    }
+
     private async completeBaseline(
         epoch: number,
         transaction?: BaselineTransaction,
@@ -11285,12 +11359,19 @@ export class DiffTracker {
                         persistenceBudget
                     );
                 }
+                const publication: RuntimeCreationPublication | undefined = !persistenceBudget && creationEvidenceCurrent
+                    ? {filePath,snapshots:this.fileSnapshots,
+                        current:() => this.isCurrentEpoch(epoch) && !creation.cancelled && creationEvidenceCurrent(),
+                        revoked:false,committed:false} : undefined;
+                if (publication) { this.runtimeCreationPublications.set(filePath,publication); }
                 this.unresolvedBaselineFiles.delete(filePath);
                 this.postBaselineUnknownFiles.delete(filePath);
                 this.fileSnapshots.set(filePath, '');
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
-                } else if (!await this.completeRuntimeBaseline(epoch, observeStopped)) {
+                } else if (!(publication
+                    ? await this.completeRuntimeCreationPublication(publication,epoch,observeStopped)
+                    : await this.completeRuntimeBaseline(epoch, observeStopped))) {
                     return;
                 } else if (state.kind === 'unavailable' &&
                     state.reason === 'File changed while being read; refresh before review') {
