@@ -265,3 +265,50 @@ last-good and reload state; all cases preserve file contents and the unrelated
 Unknown children. The independent four-case reproduction changes from 0/4 to
 4/4. These are controlled filesystem/provider-boundary regressions, not a claim
 of a naturally delivered Host reproduction of this exact interleaving.
+
+## Follow-up: legacy recovery queues retain revocable creation proof
+
+Legacy and configured restore queues now capture the same exact-file witness,
+revalidate it across asynchronous classification, and revoke it on ancestor
+deletion. A coarse directory notification does not establish child absence.
+Legacy queued directory observations use the existing bounded scan/publication
+path while retaining independent child proof, historical Unknown and the
+original review baseline. Healthy legacy recording remains available.
+
+Imported direct handles retain their physical directory identity. Reusing an
+owner requires that identity still to match; replacement consumes the existing
+watcher slot. A failed runtime observation keeps precise Limited evidence and
+can recover after the allowance is restored, without promoting Unknown files.
+No persisted schema, version or settings migration is introduced.
+
+The 25-case legacy matrix covers actual saved-session recovery after listeners
+are registered, direct/queued notifications, storage/no storage, ancestor and
+file-type replacement, coarse directories with/without exact child proof,
+historical Unknown, Stop/epoch, storage refusal, quotas and watcher rebinding.
+Before-image protection is checked in memory, primary/last-good state and
+reload; negative block-Revert actions preserve buffer and disk. The independent
+actual-restore probe changes from 2/3 to 3/3 and its type matrix from 8/12 to
+12/12. These interleavings control production provider/notification boundaries;
+they do not constitute a natural Host reproduction.
+
+The full-suite follow-up also preserves the original stopped-review boundary
+when an archive restoration is cancelled. Rollback to a stopped session limits
+temporary observation to existing baseline/review paths, refreshing their real
+changes without expanding the frozen review to unseen files. Active-session
+rollback still reconciles all its events. Both legacy and configured creation
+controls fail on the preceding candidate and pass after correction, including
+an independent creation during rollback intent cleanup. Exact document-save
+notifications at cleanup and earlier ancestor notifications keep changes to
+existing review files visible. Primary, last-good, archived bytes and review before-images
+retain their original assertions. Legacy archive directory controls require Unknown for
+coarse notifications and add exact-child-create positive controls.
+
+A second existing proof gap occurred when a directory child was classified with
+valid exact-file evidence, but a delete revoked it while file bytes were being
+read. Both legacy and configured negative controls allowed block Revert on the
+preceding candidate. The consumer now rechecks proof after reading and binds
+the surviving exact witness to its provisional publication, including the
+durable write barrier. Queue consumption alone does not revoke valid proof.
+Eight controls cover both scopes, read/write awaits, valid/revoked evidence and
+reload. Listener registration precedes physical creation; notifications run the
+installed production callbacks at the modeled VS Code boundary.

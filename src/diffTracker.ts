@@ -174,6 +174,7 @@ interface PreparedBatchRevert {
 interface ImportedDirectoryWatch {
     watcher: vscode.Disposable;
     epoch: number;
+    identity?: fs.BigIntStats;
     provenAbsent: boolean;
     eventRevision?: number;
 }
@@ -1289,7 +1290,7 @@ export class DiffTracker {
     }
 
     private async reconcilePersistedState(
-        epoch: number, state: PersistedTrackerState, recovered = false, failOnActivity = false
+        epoch: number, state: PersistedTrackerState, recovered = false, failOnActivity = false, existingReviewOnly = false
     ): Promise<RestoreOutcome> {
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         this.mayAdoptLegacyGitContexts = state.migratedFromV1 === true;
@@ -1473,7 +1474,7 @@ export class DiffTracker {
             await this.certifyMissingDirectoryCoverage(restoredSupplemental,epoch);
             if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         }
-        if (!await this.drainRestoreEvents(epoch,failOnActivity)) { return 'blocked'; }
+        if (!await this.drainRestoreEvents(epoch,failOnActivity,existingReviewOnly)) { return 'blocked'; }
         if (!this.isCurrentEpoch(epoch)) { return 'blocked'; }
         if (incomplete) {
             this.persistenceIssue = missingStoppedReview
@@ -1492,8 +1493,23 @@ export class DiffTracker {
         return recovered ? 'recovered' : 'restored';
     }
 
-    private async drainRestoreEvents(epoch: number, failOnActivity = false): Promise<boolean> {
+    private async reconcileExistingReviewEvent(uri: vscode.Uri, epoch: number, budget: { remainingEntries: number }): Promise<boolean> {
+        // A cancelled stopped-session restore still reconciles changes to its
+        // original review, but cannot expand that review into unseen files.
+        const known = new Set([...this.fileSnapshots.keys(),...this.unresolvedBaselineFiles.keys(),
+            ...this.opaqueBaselineFiles.keys(),...this.largeFileReminders.keys(),...this.trackedChanges.keys()]);
+        for (const target of known) {
+            if (target !== uri.fsPath && !this.pathBelongsToRoot(target,uri.fsPath)) { continue; }
+            if (!this.isCurrentEpoch(epoch)) { return false; }
+            if (budget.remainingEntries-- <= 0) { throw new Error('Stopped review rollback exceeded its bounded reconciliation allowance'); }
+            await this.readFileAndUpdate(target,vscode.Uri.file(target));
+        }
+        return this.isCurrentEpoch(epoch);
+    }
+
+    private async drainRestoreEvents(epoch: number, failOnActivity = false, existingReviewOnly = false): Promise<boolean> {
         let runtimeAllowance = this.restoringEpoch === epoch ? undefined : this.maxScopePreflightEntries;
+        const existingBudget={remainingEntries:this.maxScopePreflightEntries};
         while (this.restoreEvents.size > 0) {
             if (!this.isCurrentEpoch(epoch)) { return false; }
             if (runtimeAllowance !== undefined) {
@@ -1518,6 +1534,11 @@ export class DiffTracker {
                 if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
                 // Keep unconsumed child notifications visible to a directory
                 // scan. A later replacement supersedes the exact queued proof.
+                if (existingReviewOnly) {
+                    this.restoreEvents.delete(uri.fsPath);
+                    if (!await this.reconcileExistingReviewEvent(uri,epoch,existingBudget)) { return false; }
+                    continue;
+                }
                 if (this.isPathIgnored(uri)) { this.restoreEvents.delete(uri.fsPath); continue; }
                 const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
                 if (!this.isCurrentEpoch(epoch)) { return false; }
@@ -1525,11 +1546,15 @@ export class DiffTracker {
                 this.restoreEvents.delete(uri.fsPath);
                 if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
-                    if (this.restoringEpoch !== epoch) {
+                    if (this.restoringEpoch !== epoch && this.effectiveMonitoringScope.kind === 'configured') {
                         await this.reconcileDirectoryObservation(uri,epoch);
                         continue;
                     }
-                    if (!await this.reconcileRestoredDirectory(uri,epoch)) {
+                    if (!await this.reconcileQueuedDirectory(uri,epoch)) {
+                        if (this.restoringEpoch !== epoch) {
+                            this.schedulePersistState();
+                            return false;
+                        }
                         if (this.isCurrentEpoch(epoch)) {
                             this.recoveryBlocked = true;
                             this.isRecording = false;
@@ -1551,22 +1576,36 @@ export class DiffTracker {
         return this.isCurrentEpoch(epoch);
     }
 
-    private async reconcileRestoredDirectory(uri: vscode.Uri, epoch: number, observeStopped = false): Promise<boolean> {
-        if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== epoch) { return false; }
+    private async reconcileQueuedDirectory(uri: vscode.Uri, epoch: number, observeStopped = false): Promise<boolean> {
+        if (!this.isCurrentEpoch(epoch)) { return false; }
         const scope = this.effectiveMonitoringScope;
+        const restoring = this.restoringEpoch;
+        if (restoring !== epoch && (restoring !== undefined || scope.kind === 'configured')) { return false; }
         const folder = this.owningWorkspaceFolderForTraversal(uri.fsPath);
-        if (!folder || scope.kind !== 'configured') { return false; }
-        if (!this.coverageGaps.get(uri.fsPath)?.subtree) {
+        if (!folder) { return false; }
+        let legacyCurrent = () => true;
+        if (scope.kind === 'legacyV3') {
+            this.retainDirectoryPublicationUncertainty(uri.fsPath);
+            const context = this.captureFileCreationContext(uri,false,true);
+            try {
+                const identity=fs.lstatSync(uri.fsPath,{bigint:true});
+                legacyCurrent=()=>{
+                    try { return !!context?.() && this.supplementalIdentityMatches(fs.lstatSync(uri.fsPath,{bigint:true}),identity); }
+                    catch { return false; }
+                };
+            } catch { return false; }
+        } else if (!this.coverageGaps.get(uri.fsPath)?.subtree) {
             this.setSubtreeCoverageGap(uri.fsPath,'supplemental-watcher-directory-change-gap',
                 'Directory reconstruction is being verified during saved review recovery.');
         }
-        if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== epoch) { return false; }
-        const attempts = this.restoreDirectoryAttempts.get(uri.fsPath) ?? 0;
-        if (attempts >= 2 || (!attempts && this.restoreDirectoryAttempts.size >= this.maxImportedDirectoryWatchers)) { return false; }
-        this.restoreDirectoryAttempts.set(uri.fsPath,attempts+1);
-        this.restoreDirectoryBudget ??= {remainingEntries:this.maxScopePreflightEntries};
+        if (!this.isCurrentEpoch(epoch) || this.restoringEpoch !== restoring) { return false; }
+        const attempts = restoring === epoch ? this.restoreDirectoryAttempts.get(uri.fsPath) ?? 0 : 0;
+        if (restoring === epoch && (attempts >= 2 || (!attempts && this.restoreDirectoryAttempts.size >= this.maxImportedDirectoryWatchers))) { return false; }
+        if (restoring === epoch) { this.restoreDirectoryAttempts.set(uri.fsPath,attempts+1); }
+        const budget = restoring === epoch ? this.restoreDirectoryBudget ??= {remainingEntries:this.maxScopePreflightEntries}
+            : {remainingEntries:this.maxScopePreflightEntries};
         const generation = this.coverageGeneration, policy = this.watcherCoverageRevision;
-        const current = () => this.isCurrentEpoch(epoch) && this.restoringEpoch === epoch &&
+        const current = () => this.isCurrentEpoch(epoch) && this.restoringEpoch === restoring && legacyCurrent() &&
             (this.isRecording || (observeStopped && !!this.archiveRestoreTask)) &&
             this.externalWatcherEnabled && this.snapshotInitialized && !this.baselineBuilding &&
             this.effectiveMonitoringScope === scope && this.coverageGeneration === generation &&
@@ -1576,12 +1615,12 @@ export class DiffTracker {
             this.owningWorkspaceFolderForTraversal(uri.fsPath)?.uri.toString() === folder.uri.toString() &&
             !vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty &&
                 this.pathBelongsToRoot(document.uri.fsPath,uri.fsPath));
-        // This token belongs only to the restore drain. The ordinary runtime
+        // This token belongs only to the queued drain. The ordinary runtime
         // directory observer keeps its restoring guard. Share the bounded
         // watch/scan/persist handoff without treating a directory signal as
         // proof that newly discovered children had an empty before-image.
         const observation: DirectoryObservation = {
-            current, budget:this.restoreDirectoryBudget, beginProof:()=>{},
+            current, budget, beginProof:()=>{},
             settlePreparation:async()=>{
                 if (!current()) { return false; }
                 const publications = await Promise.allSettled([...this.runtimeBaselinePublications]);
@@ -1590,8 +1629,14 @@ export class DiffTracker {
         };
         if (!current()) { return false; }
         await this.onExternalFileCreated(uri,false,undefined,observeStopped,observation);
-        return current() && this.canReuseSupplementalDirectoryOwner(uri.fsPath,epoch) &&
+        const covered = current() && (scope.kind === 'configured' ? this.canReuseSupplementalDirectoryOwner(uri.fsPath,epoch)
+            : this.canReuseImportedDirectoryOwner(uri.fsPath,epoch)) &&
             !this.coverageGaps.get(uri.fsPath)?.subtree;
+        if (!covered && scope.kind === 'legacyV3') {
+            this.retainDirectoryPublicationUncertainty(uri.fsPath);
+            this.schedulePersistState();
+        }
+        return covered;
     }
 
     private shouldTrackOnlyAutomatedChanges(): boolean {
@@ -2834,16 +2879,13 @@ export class DiffTracker {
 
     private queuedEventNeedsObservation(event: QueuedExternalEvent): boolean {
         if (event.reconcileDirectory || event.revoked) { return true; }
-        if (event.kind === 'create' && (this.effectiveMonitoringScope.kind === 'configured' || event.creationCurrent)) {
+        if (event.kind === 'create') {
             return !event.creationCurrent?.();
         }
         return false;
     }
 
     private async replayQueuedCreation(event: QueuedExternalEvent, observeStopped = false): Promise<void> {
-        if (this.effectiveMonitoringScope.kind !== 'configured' && !event.creationCurrent) {
-            return this.onExternalFileCreated(event.uri,false,undefined,observeStopped);
-        }
         const epoch = this.sessionEpoch;
         if (this.activeQueuedCreations.size >= this.maxScopePreflightEntries) {
             await this.pauseRecordingForUnpersistableCoverage('In-flight file creation proof exceeded the bounded reconstruction allowance; original baselines are preserved.');
@@ -2866,7 +2908,7 @@ export class DiffTracker {
         if (kind === 'delete') { this.revokeQueuedDescendantCreations(uri.fsPath); }
         const previous = this.restoreEvents.get(uri.fsPath);
         let creationCurrent=kind==='change' && previous?.kind==='create' ? previous.creationCurrent : undefined;
-        if (kind === 'create' && !reconcileDirectory && this.effectiveMonitoringScope.kind === 'configured') {
+        if (kind === 'create' && !reconcileDirectory) {
             // Host watchers can also report only a populated directory's create.
             // Classify before queueing: discovery and concurrent directory scans
             // consult this queue before the event itself reaches the drain.
@@ -3934,19 +3976,28 @@ export class DiffTracker {
         return [...replay.values()];
     }
 
+    private canReuseImportedDirectoryOwner(directory: string, epoch: number): boolean {
+        const owner=this.importedDirectoryWatchers.get(directory);
+        if (owner?.epoch !== epoch || !owner.identity) { return false; }
+        try { return this.supplementalIdentityMatches(fs.lstatSync(directory,{bigint:true}),owner.identity); }
+        catch { return false; }
+    }
+
     private watchImportedDirectory(directory: string, epoch: number, inheritedAbsence = false): boolean {
         this.pruneIgnoredImportedDirectoryWatchers();
         if (this.isPathIgnored(vscode.Uri.file(directory), true)) { return false; }
         const previous = this.importedDirectoryWatchers.get(directory);
-        if (previous?.epoch === epoch) { return false; }
+        if (this.canReuseImportedDirectoryOwner(directory,epoch)) { return false; }
         const activeCount = this.activeDirectDirectoryWatcherCount(epoch);
-        if (activeCount >= this.maxImportedDirectoryWatchers) {
+        if (activeCount - (previous?.epoch === epoch ? 1 : 0) >= this.maxImportedDirectoryWatchers) {
             throw Object.assign(new Error('Imported directory watcher limit reached'), { code: 'DT_DIRECT_WATCH_CAPACITY' });
         }
         // The host may reuse a recursive watcher that never adopted moved-in
         // descendants. Watch local directories directly, without that backend.
         const targetError = this.validateResourceTarget(directory);
         if (targetError) { throw new Error(targetError); }
+        const identity=fs.lstatSync(directory,{bigint:true});
+        if (!identity.isDirectory() || identity.isSymbolicLink()) { throw new Error('Imported watcher target is not a direct directory'); }
         const provenAbsent = previous?.provenAbsent ?? (inheritedAbsence || this.hasObservedCreation(directory));
         const reportFailure = (reason: string): void => {
             void this.markCreatedDirectoryUnavailable(directory, reason, !provenAbsent, epoch);
@@ -3965,7 +4016,7 @@ export class DiffTracker {
             });
         });
         const watcher = { dispose: () => native.close() };
-        this.importedDirectoryWatchers.set(directory, { watcher, epoch, provenAbsent });
+        this.importedDirectoryWatchers.set(directory, { watcher, epoch, provenAbsent, identity });
         native.on('error', () => {
             native.close();
             if (this.isCurrentEpoch(epoch) && this.importedDirectoryWatchers.get(directory)?.watcher === watcher &&
@@ -10344,7 +10395,7 @@ export class DiffTracker {
             const active = this.activeCreations.get(current);
             if ((active?.duringScan === false && !active.cancelled &&
                 (current===filePath || !active.evidenceCurrent) && (!active.evidenceCurrent || active.evidenceCurrent())) ||
-                (restored?.kind === 'create' && (current===filePath || this.effectiveMonitoringScope.kind!=='configured') &&
+                (restored?.kind === 'create' && current===filePath &&
                     !this.queuedEventNeedsObservation(restored))) { return true; }
             for (const job of this.directoryObservations.values()) {
                 if (!job.current()) { continue; }
@@ -11491,8 +11542,9 @@ export class DiffTracker {
                 }
                 return;
             }
-            if (scanEvent || (directoryObservation && !this.hasObservedCreation(filePath) &&
-                !this.hasCapturedBaseline(filePath) && !this.largeFileReminders.has(filePath))) {
+            const creationIsUnproven = () => scanEvent || (directoryObservation && !this.hasObservedCreation(filePath) &&
+                !this.hasCapturedBaseline(filePath) && !this.largeFileReminders.has(filePath));
+            const retainUnprovenCreation = () => {
                 if (directoryObservation && this.unresolvedBaselineFiles.has(filePath)) { return; }
                 const reason = directoryObservation
                     ? 'Directory observation discovered a file without proven creation; before-image is unknown'
@@ -11511,10 +11563,11 @@ export class DiffTracker {
                 if (persistenceBudget) {
                     this.noteCandidateBudgetPublication(filePath, persistenceBudget, beforeReason, beforeRevision);
                 }
-                return;
-            }
+            };
+            if (creationIsUnproven()) { retainUnprovenCreation(); return; }
             const state = await this.readFileSnapshot(uri);
             if (!creationIsCurrent()) { return; }
+            if (creationIsUnproven()) { retainUnprovenCreation(); return; }
             if (this.suppressUnsupportedResource(filePath, state)) { return; }
             if (!this.hasCapturedBaseline(filePath) && this.mayHaveSuppressedResource(filePath)) {
                 this.recordUnresolvedBaseline(filePath, 'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review');
@@ -11533,9 +11586,19 @@ export class DiffTracker {
                     );
                 }
                 if (persistenceBudget && !budgetFileContext?.()) { throw new Error('A directory child creation proof changed before publication'); }
+                // Retain the actual exact-file witness across queue consumption.
+                // Later deletes revoke the provisional publication itself; a
+                // coarse observation cannot replace this evidence after a read.
+                const fileProof = directoryObservation
+                    ? [this.restoreEvents.get(filePath),...this.activeQueuedCreations].find(event=>event?.uri.fsPath===filePath &&
+                        event.kind==='create' && !this.queuedEventNeedsObservation(event)) : undefined;
+                const observedCreationCurrent = !directoryObservation ? undefined : fileProof?.creationCurrent
+                    ? (ancestor?:string)=>!fileProof.revoked && !!fileProof.creationCurrent?.(ancestor)
+                    : ()=>this.hasObservedCreation(filePath);
                 const publication: RuntimeCreationPublication | undefined = creationEvidenceCurrent || persistenceBudget
                     ? {filePath,snapshots:this.fileSnapshots,
                         current:(ancestor?: string) => this.isCurrentEpoch(epoch) && !creation.cancelled && (creationEvidenceCurrent?.(ancestor) ?? true) &&
+                            (!observedCreationCurrent || observedCreationCurrent(ancestor)) &&
                             (!persistenceBudget || (!!budgetFileContext?.(ancestor) && !!persistenceBudget.creationCurrent?.())),
                         revoked:false,committed:false,batch:persistenceBudget?.creationBatch} : undefined;
                 if (publication) {
@@ -12479,7 +12542,7 @@ export class DiffTracker {
             }
             try {
                 this.recoveryBlocked = false;
-                const outcome = await this.reconcilePersistedState(epoch, previousState);
+                const outcome = await this.reconcilePersistedState(epoch, previousState, false, false, !previousState.isRecording);
                 this.reconcileRestoredGitContexts([...this.latestGitContexts.values()].filter((value): value is GitContextSnapshot => !!value));
                 this.archiveRestoreStaging = false;
                 if (outcome !== 'restored' || !await this.flushPendingPersistence()) { throw new Error('Rollback could not be saved'); }
@@ -12500,7 +12563,8 @@ export class DiffTracker {
                 this.archiveRestoreStaging = false;
                 try {
                     if (!this.recoveryBlocked) {
-                        await this.replayArchiveRestoreEvents(() => contextCurrent() && this.effectiveMonitoringScope === finalScope);
+                        await this.replayArchiveRestoreEvents(() => contextCurrent() && this.effectiveMonitoringScope === finalScope,
+                            !committed && !previousState.isRecording);
                     }
                 } catch (error) {
                     const message = `Archive restoration finished its storage transaction, but newer workspace activity could not be safely reconciled. Review is paused; preserve extension storage before rebuilding. ${String(error)}`;
@@ -12523,8 +12587,9 @@ export class DiffTracker {
         }
     }
 
-    private async replayArchiveRestoreEvents(contextCurrent: () => boolean): Promise<void> {
+    private async replayArchiveRestoreEvents(contextCurrent: () => boolean, existingReviewOnly = false): Promise<void> {
         let remainingEvents = this.maxScopePreflightEntries;
+        const existingBudget={remainingEntries:this.maxScopePreflightEntries};
         // Keep restoringEpoch active until every observed event and its durable
         // evidence is drained. Temporary observation never enables recording.
         while (true) {
@@ -12544,6 +12609,13 @@ export class DiffTracker {
                     throw new Error('Restore context or monitoring policy changed; the preserved review requires recovery');
                 }
                 if (this.restoreEvents.get(uri.fsPath) !== event) { continue; }
+                if (existingReviewOnly) {
+                    this.restoreEvents.delete(uri.fsPath);
+                    if (!await this.reconcileExistingReviewEvent(uri,this.sessionEpoch,existingBudget)) {
+                        throw new Error('Stopped review rollback observation was superseded');
+                    }
+                    continue;
+                }
                 const directory = reconcileDirectory && await this.isUntrackedDirectory(uri);
                 if (!contextCurrent() || this.recoveryBlocked) {
                     throw new Error('Restore context changed while classifying a directory notification');
@@ -12552,7 +12624,7 @@ export class DiffTracker {
                 this.restoreEvents.delete(uri.fsPath);
                 if (directory) {
                     if (this.isPathIgnored(uri,true)) { continue; }
-                    if (!contextCurrent() || !await this.reconcileRestoredDirectory(uri,this.sessionEpoch,true)) {
+                    if (!contextCurrent() || !await this.reconcileQueuedDirectory(uri,this.sessionEpoch,true)) {
                         throw new Error('Post-restore directory reconstruction could not be verified without inventing child before-images');
                     }
                 }

@@ -372,7 +372,8 @@ export function registerArchivedGitReview(h) {
         assert.deepEqual(tree(ctx.workspace), disk);
     }, { stoppedArchive: true }));
 
-    test('ARCHIVE-RESTORE recording-state activity during stopped archive reconciliation rolls back', () => fixture(async ctx => {
+    for(const configured of [false,true])for(const ancestor of [false,true])
+    test(`ARCHIVE-RESTORE recording-state activity during stopped archive reconciliation rolls back (configured=${configured}, ancestor=${ancestor})`, () => fixture(async ctx => {
         const preview = await ready(ctx.tracker);
         const before = readState(ctx.storage);
         const recordingEvents = [];
@@ -388,7 +389,7 @@ export function registerArchivedGitReview(h) {
             assert.equal(watcherInstances.some(watcher => watcher.active), true,
                 'temporary coverage must observe activity during stopped archive reconciliation');
             fs.writeFileSync(ctx.target, 'new work during stopped archive reconciliation\n');
-            emitWatcher('change', Uri.file(ctx.target));
+            emitWatcher('change', Uri.file(ancestor?ctx.workspace:ctx.target));
             disk = tree(ctx.workspace);
         } finally { gate.release(); }
         const result = await operation;
@@ -402,7 +403,7 @@ export function registerArchivedGitReview(h) {
         assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
         assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
         assert.deepEqual(tree(ctx.workspace), disk);
-    }, { stoppedArchive: true }));
+    }, { stoppedArchive: true, configured }));
 
     for (const kind of ['create', 'change', 'delete']) {
         test(`ARCHIVE-RESTORE recording-state stopped archive retains ${kind} at final intent deletion`, () => fixture(async ctx => {
@@ -459,9 +460,9 @@ export function registerArchivedGitReview(h) {
         }, { stoppedArchive: true }));
     }
 
-    for (const configured of [false, true])for(const childCreate of configured?[false,true]:[false]) {
+    for (const configured of [false, true])for(const childCreate of [false,true]) {
         test(`ARCHIVE-RESTORE recording-state stopped directory create at final intent deletion preserves children (${configured ? 'configured' : 'legacy'} Rules, childCreate=${childCreate})`, () => fixture(async ctx => {
-            const knownAbsence=!configured||childCreate;
+            const knownAbsence=childCreate;
             const preview = await ready(ctx.tracker);
             const imported = path.join(ctx.workspace, 'directory-created-at-stopped-commit');
             const child = path.join(imported, 'child.txt');
@@ -738,13 +739,14 @@ export function registerArchivedGitReview(h) {
         assert.equal(watcherInstances.some(watcher => watcher.active), false);
     }, { stoppedArchive: true, configured: true }));
 
-    test('ARCHIVE-RESTORE recording-state workspace create without filesystem callback invalidates stopped reconciliation', () => fixture(async ctx => {
+    for(const configured of [false,true])
+    test(`ARCHIVE-RESTORE recording-state workspace create without filesystem callback invalidates stopped reconciliation (configured=${configured})`, () => fixture(async ctx => {
         const preview = await ready(ctx.tracker);
         const before = readState(ctx.storage);
         const added = path.join(ctx.workspace, 'workspace-created-during-stopped-restore.txt');
         const gate = pause(ctx.target, 'read');
         const operation = ctx.tracker.restoreArchivedGitReview(preview.token);
-        let disk;
+        let disk,cleanup;
         try {
             await Promise.race([gate.entered, operation.then(result => {
                 throw new Error(`Stopped archive restore finished before workspace-create barrier: ${JSON.stringify(result)}`);
@@ -752,8 +754,15 @@ export function registerArchivedGitReview(h) {
             assert.equal(ctx.tracker.getIsRecording(), false);
             fs.writeFileSync(added, 'workspace create without a filesystem event\n');
             emitWorkspaceFilesCreated({ files: [Uri.file(added)] });
-            disk = tree(ctx.workspace);
+            cleanup=pause(path.join(ctx.storage,INTENT),'delete');
         } finally { gate.release(); }
+        await cleanup.entered;
+        try{
+            const late=path.join(ctx.workspace,'workspace-created-during-stopped-rollback.txt');
+            fs.writeFileSync(late,'later creation outside the cancelled restore\n');
+            emitWorkspaceFilesCreated({files:[Uri.file(late)]});
+            disk=tree(ctx.workspace);
+        }finally{cleanup.release();}
         const result = await operation;
         assert.equal(result.status, 'rolled-back', result.reason);
         assert.equal(ctx.tracker.getIsRecording(), false);
@@ -764,7 +773,37 @@ export function registerArchivedGitReview(h) {
         assert.deepEqual(fs.readFileSync(path.join(ctx.storage, ARCHIVE)), ctx.archive);
         assert.equal(fs.existsSync(path.join(ctx.storage, INTENT)), false);
         assert.deepEqual(tree(ctx.workspace), disk);
-    }, { stoppedArchive: true }));
+    }, { stoppedArchive: true, configured }));
+
+    for(const configured of [false,true])
+    test(`ARCHIVE-RESTORE stopped rollback retains saved known changes at cleanup (configured=${configured})`,()=>fixture(async ctx=>{
+        const preview=await ready(ctx.tracker),before=readState(ctx.storage);
+        const read=pause(ctx.target,'read'),operation=ctx.tracker.restoreArchivedGitReview(preview.token);
+        let cleanup;
+        try{
+            await read.entered;
+            const added=path.join(ctx.workspace,'outside-frozen-review.txt');fs.writeFileSync(added,'unseen creation aborts this attempt\n');
+            emitWorkspaceFilesCreated({files:[Uri.file(added)]});cleanup=pause(path.join(ctx.storage,INTENT),'delete');
+            read.release();await Promise.race([cleanup.entered,operation.then(result=>{throw new Error(`Rollback completed before cleanup: ${JSON.stringify(result)}`);})]);
+            // Rollback has disposed temporary filesystem watchers. Document
+            // events remain registered and are the actual late producer here.
+            const doc=document(ctx.target);doc.text='known change during rollback cleanup\n';doc.isDirty=true;doc.version++;
+            ctx.tracker.onDocumentChanged({document:doc,contentChanges:[{text:doc.text}]});
+            ctx.tracker.onWillSaveDocument({document:doc});assert.equal(await doc.save(),true);
+            ctx.tracker.onDidSaveDocument(doc);cleanup.release();
+            const result=await operation;assert.equal(result.status,'rolled-back',result.reason);
+            assert.equal(ctx.tracker.getIsRecording(),false);
+            assert.equal(ctx.tracker.getOriginalContent(ctx.target),'main pending review\n');
+            assert.equal(changeFor(ctx.tracker,ctx.target)?.currentContent,'known change during rollback cleanup\n');
+            assert.equal(changeFor(ctx.tracker,added),undefined,'rollback does not expand the frozen review');
+            const saved=readState(ctx.storage);
+            assert.deepEqual(saved.fileSnapshots,before.fileSnapshots);
+            assert.equal(new Map(saved.unresolvedBaselineFiles).has(added),false);
+            assert.deepEqual(readState(ctx.storage,BACKUP),before);
+            assert.deepEqual(fs.readFileSync(path.join(ctx.storage,ARCHIVE)),ctx.archive);
+            assert.equal(fs.readFileSync(ctx.target,'utf8'),'known change during rollback cleanup\n');
+        }finally{read.release();cleanup?.release();await operation;}
+    },{stoppedArchive:true,configured}));
 
     for (const configured of [false, true]) {
         test(`ARCHIVE-RESTORE recording-state ${configured ? 'preparation' : 'discovery'} limit fails closed for a stopped archive (${configured ? 'configured' : 'legacy'} Rules)`, () => fixture(async ctx => {
@@ -1337,9 +1376,9 @@ export function registerArchivedGitReview(h) {
         }));
     }
 
-    for (const configured of [false, true])for(const childCreate of configured?[false,true]:[false]) {
+    for (const configured of [false, true])for(const childCreate of [false,true]) {
         test(`ARCHIVE-RESTORE directory creation during final commit keeps child provenance (${configured ? 'configured' : 'legacy'} Rules, childCreate=${childCreate})`, () => fixture(async ctx => {
-            const knownAbsence=!configured||childCreate;
+            const knownAbsence=childCreate;
             const preview = await ready(ctx.tracker);
             const gate = pause(path.join(ctx.storage, INTENT), 'delete');
             const imported = path.join(ctx.workspace, 'imported-after-preview');
