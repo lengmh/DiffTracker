@@ -16,6 +16,13 @@
   let activeAction;
   let busy = false;
   let leaseId;
+  let lifecycle;
+  const updateLifecycleControls = () => {
+    const blocked=!!(lifecycle?.blocker || lifecycle?.settingsWritePending || lifecycle?.scopeActionPending || lifecycle?.controllerDisposed);
+    for(const id of ['save-apply','apply'])document.getElementById(id).disabled=busy || blocked;
+    document.getElementById('retry-recovery').disabled=!!(busy || !lifecycle?.recoveryBlocked || lifecycle?.disposed || lifecycle?.recoveryRequiresReload || lifecycle?.recoveryRetryActive || lifecycle?.baselineTransactionActive || lifecycle?.settingsWritePending);
+    document.getElementById('discard-recovery').disabled=!!(busy || !lifecycle?.recoveryBlocked || lifecycle?.disposed || lifecycle?.recording || lifecycle?.recoveryRetryActive || lifecycle?.baselineTransactionActive || lifecycle?.settingsWritePending);
+  };
   const controls = ['mode','includes','excludes','save-apply','save','apply','reload',
     'migrate','complete-migration','restore','dismiss','discard-draft','review-conflict'].map(id=>document.getElementById(id));
   const updateDraftNotice = () => {
@@ -25,7 +32,7 @@
       : conflict?'Workspace settings changed. Your draft is preserved. Review Settings Conflict to keep it, or explicitly discard it and reload.'
         : dirty?'Unsaved draft. Save and Apply completes the scope change; Save Request Only leaves it pending.':'Editor matches the saved monitoring request.';
   };
-  const setBusy = value => {busy=value;for(const control of controls)control.disabled=value;updateDraftNotice();};
+  const setBusy = value => {busy=value;for(const control of controls)control.disabled=value;updateDraftNotice();updateLifecycleControls();};
   if (dirty) {
     mode.value = saved.mode;
     includes.value = saved.includes;
@@ -76,6 +83,8 @@
     }
   });
   document.getElementById('apply').addEventListener('click', () => submitAction('apply'));
+  document.getElementById('retry-recovery').addEventListener('click',()=>{if(!busy)vscode.postMessage({command:'retryRecovery'});});
+  document.getElementById('discard-recovery').addEventListener('click',()=>{if(!busy)vscode.postMessage({command:'discardRecovery'});});
   document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ command: 'reload' }));
   document.getElementById('migrate').addEventListener('click', () => vscode.postMessage({ command: 'migrateLegacy' }));
   document.getElementById('complete-migration').addEventListener('click',()=>submitDraft('completeLegacyMigration'));
@@ -100,6 +109,11 @@
     }
     if (message.command === 'scopeStatus') {
       currentVersion=message.requestVersion;
+      lifecycle=message.lifecycle;
+      document.getElementById('lifecycle-status').textContent=lifecycle?.blocker?.reason ||
+        (lifecycle?.settingsWritePending?'A scope settings write is still pending. Wait for it to finish.':lifecycle?.scopeActionPending?'A monitoring scope action is in progress. Wait for it to finish.':lifecycle?.controllerDisposed?'This Monitoring Scope controller is closed. Reopen it after reloading the window.':'No lifecycle blocker.');
+      document.getElementById('migration-status').textContent=message.migration?.reason || '';
+      updateLifecycleControls();
       if (!initialized || (!dirty && !busy)) {
         mode.value = message.rawRequested?.mode || 'rules';
         includes.value = JSON.stringify(message.rawRequested?.includes || [], null, 2);
@@ -109,6 +123,8 @@
       }
       publishDraft();
       status.textContent = JSON.stringify({
+        lifecycle: message.lifecycle,
+        migration: message.migration,
         requested: message.requested,
         effective: message.effective,
         consented: message.consented,

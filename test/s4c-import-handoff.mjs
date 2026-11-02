@@ -293,7 +293,7 @@ export function registerS4CImportHandoff(h, fixture) {
         }));
     }
 
-    test('S4-C pending directory deletion stays subtree-typed through restore installation failure', () => fixture(async ({tracker,dir}) => {
+    test('S4-C pending directory deletion stays subtree-typed through reconstruction owner restore', () => fixture(async ({tracker,dir}) => {
         const imported = path.join(dir, 'deleted-pending');
         fs.mkdirSync(imported);
         const target = path.join(imported, 'new.txt');
@@ -311,8 +311,10 @@ export function registerS4CImportHandoff(h, fixture) {
         assert.equal(await tracker.restorePersistedState(), 'restored');
         const gap = tracker.getSubtreeCoverageGaps().find(item => item.targetPath === imported);
         assert.equal(gap?.reasonCode, 'pending-scope-deferred-delete');
-        assert.match(gap.reason, /Pending scope reconciliation remains required/);
+        assert.match(gap.reason, /explicit exclusion awaited confirmation/);
         assert.equal(nativeDirectoryWatchers.some(owner => owner.active && owner.directory === imported), false);
+        assert.equal(tracker.supplementalDirectoryWatchers.get(imported)?.observationDirectory,dir,
+            'a reconstruction owner does not certify the independent pending-scope control evidence');
         assert.equal(await tracker.flushPendingPersistence(), true);
         const saved = JSON.parse(fs.readFileSync(path.join(storage.fsPath, 'session-state.json'), 'utf8'));
         const record = new Map(saved.coverageGaps).get(imported);

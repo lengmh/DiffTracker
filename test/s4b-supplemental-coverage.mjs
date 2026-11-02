@@ -33,7 +33,7 @@ export function registerS4BSupplementalCoverage(h, fixture) {
     const {test, Uri, DiffTracker, file, getTracker, setTracker, setVsCodeExcludes, nativeDirectoryWatchers,
         fireConfigurationChanged} = h;
 
-    test('Issue #39 deleted supplemental target retires only after committed exclusion and keeps review evidence', () => fixture(async ({tracker,dir,scope}) => {
+    test('Issue #39 deleted target without reconstruction coverage retires after committed exclusion and keeps review evidence', () => fixture(async ({tracker,dir,scope}) => {
         const blind = path.join(dir, '.aws');
         const pending = path.join(dir, 'pending.txt');
         const gitHead = path.join(dir, '.git', 'HEAD');
@@ -49,10 +49,16 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         await tracker.onExternalFileChanged(Uri.file(pending));
         await h.waitUntil(() => tracker.getReviewToken(pending));
         fs.rmdirSync(blind);
-        await tracker.onExternalFileDeleted(Uri.file(blind));
+        const watch = fs.watch;
+        fs.watch = (directory,...args) => {
+            if (path.resolve(String(directory)) === path.resolve(dir)) { throw Object.assign(new Error('guard quota'),{code:'ENOSPC'}); }
+            return watch(directory,...args);
+        };
+        try { await tracker.onExternalFileDeleted(Uri.file(blind)); }
+        finally { fs.watch = watch; }
         assert.equal(oldOwner.active, false, 'confirmed deletion closes the dead native owner');
         assert.equal(tracker.getSubtreeCoverageGaps().find(gap => gap.targetPath === blind)?.reasonCode,
-            'supplemental-watcher-target-missing-gap');
+            'supplemental-watcher-system-limit-gap');
         const before = {
             snapshots: [...tracker.fileSnapshots], reviews: structuredClone(tracker.getTrackedChanges()),
             token: tracker.getReviewToken(pending), head: fs.readFileSync(gitHead, 'utf8')
@@ -1675,6 +1681,52 @@ export function registerS4BSupplementalCoverage(h, fixture) {
         }
     },'rules'));
 
+    for(const scenario of ['finite','allowance','stop','save-failure'])
+    test(`Issue #55 finite Ready publications preserve bounded preparation (${scenario})`,()=>fixture(async({tracker,dir})=>{
+        const {blind,target:known}=await lifecycleFixture(tracker,dir);
+        const child=path.join(blind,'unproven.txt');fs.writeFileSync(child,'unproven contents');
+        if(scenario==='allowance'){tracker.maxScopePreflightEntries=0;}
+        const original=tracker.onExternalFileCreated,wrapped=new WeakSet(),created=[],gates=[];
+        let introduced=0,pending;
+        tracker.onExternalFileCreated=async function(uri,...args){
+            const observation=args[3];
+            if(uri.fsPath===blind && observation && !wrapped.has(observation)){
+                wrapped.add(observation);const settle=observation.settlePreparation;
+                observation.settlePreparation=async()=>{
+                    const result=await settle();
+                    if(result && introduced<3){
+                        // Deliver a real creation at the production await's
+                        // return boundary; hold its actual durable Ready write.
+                        const added=path.join(dir,`independent-${introduced++}.txt`);fs.writeFileSync(added,'independent creation');
+                        pending=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');gates.push(pending);
+                        created.push(this.onExternalFileCreated(Uri.file(added)));await pending.entered;
+                        if(scenario==='stop'){this.stopRecording();}
+                        if(scenario==='save-failure'){
+                            h.faults.set(path.join(this.storageUri.fsPath,'session-state.json'),{copy:Object.assign(new Error('synthetic Ready write failure'),{code:'NoPermissions'})});
+                        }
+                    }
+                    return result;
+                };
+            }
+            try{return await original.call(this,uri,...args);}
+            finally{if(uri.fsPath===blind && observation){pending?.release();}}
+        };
+        try {
+            await tracker.onExternalFileChanged(Uri.file(blind));await Promise.all(created);
+            assert.equal(tracker.getOriginalContent(known),'before');
+            assert.equal(tracker.getOriginalContent(child),undefined);assert.equal(tracker.getReviewToken(child),undefined);
+            if(scenario==='finite'){
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],'finite completed publications must leave room for the first proof');
+                assert.equal(introduced,3);assert.ok(tracker.getUnknownReviewToken(child));
+            }else{
+                assert.ok(introduced<=2,'interruption cannot grow an unbounded preparation loop');
+                assert.ok(tracker.getSubtreeCoverageGaps().length>0,'no proof means no Full certification');
+                if(scenario==='stop'){assert.equal(tracker.getIsRecording(),false);}
+                if(scenario==='save-failure'){assert.equal(tracker.persistenceFailed,true);}
+            }
+        } finally {for(const gate of gates){gate.release();}await Promise.all(created);h.faults.clear();tracker.onExternalFileCreated=original;}
+    },'rules'));
+
     test('Issue #55 finite upward parent preparation completes without spending proof passes', () => fixture(async ({tracker,dir}) => {
         const {blind,scope}=await lifecycleFixture(tracker,dir);
         const deepest=path.join(blind,'a','b','c');fs.mkdirSync(deepest,{recursive:true});
@@ -2134,8 +2186,14 @@ export function registerS4BSupplementalCoverage(h, fixture) {
             }
             owner.listener('rename', 'child');
             await settle(tracker);
-            assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
-                'a named directory self-event cannot certify a handle bound to the old inode');
+            if (replacement === 'missing') {
+                assert.deepEqual(tracker.getSubtreeCoverageGaps(),[],
+                    'verified absence retires the old inode while the live direct parent observes reconstruction');
+                assert.equal(tracker.getTrackedChange(target)?.isDeleted,true);
+            } else {
+                assert.ok(tracker.getSubtreeCoverageGaps().some(gap => gap.targetPath === blind),
+                    'a named directory self-event cannot certify a handle bound to the old inode');
+            }
             assert.equal(owner.active, false);
             assert.equal(tracker.getOriginalContent(target), 'before');
             const before = tracker.getSubtreeCoverageGaps();

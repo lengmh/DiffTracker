@@ -95,6 +95,8 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
                 { key: 'onlyRecordReviewableText', label: 'Only record reviewable text', defaultValue: false },
                 { key: 'autoOpenNextPendingFile', label: 'Auto-open next pending file', defaultValue: false },
                 { key: 'onlyTrackAutomatedChanges', label: 'Vibe Coding Only' },
+                { key: 'enableSourceTracking', label: 'Source hints (experimental)', defaultValue: false,
+                    tooltip: 'Optional source hints for Vibe Coding Only. Baseline and observation warnings remain visible when this is off.' },
                 { key: 'promptOnGitBranchChange', label: 'Prompt on Git branch change', defaultValue: false },
                 { key: 'autoStartRecording', label: 'Auto-start new workspaces', defaultValue: false }
             ]
@@ -200,8 +202,8 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
         const config = vscode.workspace.getConfiguration('diffTracker');
         const setting = this.settings.flatMap(group => group.items).find(item => item.key === settingKey);
         const currentValue = config.get<boolean>(settingKey, setting?.defaultValue ?? true);
-        const isWebviewDefault = settingKey === 'webviewWordWrap' || settingKey === 'webviewExpandUnchanged';
-        const target = isWebviewDefault && config.inspect(settingKey)?.workspaceValue !== undefined
+        const isWindowPreference = settingKey === 'webviewWordWrap' || settingKey === 'webviewExpandUnchanged' || settingKey === 'enableSourceTracking';
+        const target = isWindowPreference && config.inspect(settingKey)?.workspaceValue !== undefined
             ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
         await config.update(settingKey, !currentValue, target);
         this.refresh();

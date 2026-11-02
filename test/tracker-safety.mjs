@@ -314,7 +314,9 @@ test(`PR60 lifecycle creation reconciles unstable first snapshot once (${activit
         const storage=file('creation-superseded-storage');tracker.storageUri=Uri.file(storage);await tracker.flushPendingPersistence();
         publication=pause(path.join(storage,'session-state.tmp.json'),'write');
     }
-    fs.writeFileSync(p,'');let opens=0;
+    // VS Code metadata may expose a coarse mtime. Size changes make ongoing
+    // writes observable without relying on the platform clock's resolution.
+    fs.writeFileSync(p,'');faults.set(p,{mtime:1});let opens=0;
     fs.promises.open=async(target,...args)=>{
         const handle=await open(target,...args);
         if(String(target)===p){
@@ -322,7 +324,7 @@ test(`PR60 lifecycle creation reconciles unstable first snapshot once (${activit
             handle.read=async(...input)=>{
                 const result=await read(...input);
                 if(!changed&&(pass===1||activity==='continues-through-read')){
-                    changed=true;fs.writeFileSync(p,`settled creation text ${pass}`);
+                    changed=true;fs.writeFileSync(p,`settled creation text ${pass}${'!'.repeat(pass-1)}`);
                 }
                 return result;
             };
@@ -671,6 +673,41 @@ test('DT-02 Keep empty creation establishes an existing empty baseline',async()=
     assert.ok(succeeded(await tracker.keepAllChangesInFile(p))); assert.ok(tracker.baselineExistingFiles.has(p));
     fs.unlinkSync(p); await tracker.onExternalFileDeleted(Uri.file(p)); assert.equal(pending(p)?.isDeleted,true);
     assert.ok(succeeded(await tracker.revertFile(p))); assert.equal(disk(p),'');
+});
+for(const configured of [false,true]) for(const contents of ['', 'new contents'])
+test(`DT-02 duplicate create preserves the current creation read (configured=${configured}, empty=${contents===''})`,async()=>{
+    await tracker.dispose();tracker=new DiffTracker(Uri.file(file('duplicate-storage')));
+    tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    if(configured){
+        const {validateAndCanonicalizeScope}=require('../out/monitoringScope.js');
+        const scope=validateAndCanonicalizeScope({mode:'rules',includes:[],excludes:[]},tracker.currentWorkspaceRootIdentities());
+        assert.equal(scope.ok,true);tracker.effectiveMonitoringScope={kind:'configured',...scope.scope};
+    }
+    const p=file(),events=[],createdEvent=tracker.onExternalFileCreatedEvent;
+    tracker.onExternalFileCreatedEvent=function(...args){
+        const operation=createdEvent.apply(this,args);if(args[0].fsPath===p){events.push(operation);}return operation;
+    };
+    tracker.activateExternalWatchers(tracker.createExternalWatchers(tracker.sessionEpoch));
+    const watcher=watcherInstances.find(w=>w.active&&(typeof w.pattern==='string'?w.pattern:w.pattern.pattern)==='**/*');
+    assert.ok(watcher,'register the production callback before physically creating the candidate');
+    fs.writeFileSync(p,contents);
+    const save=pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+    const original=tracker.readFileAndUpdate,readCurrent=[];let read,second,reads=0;
+    tracker.readFileAndUpdate=function(...args){
+        if(args[0]===p){readCurrent.push(args[2]?.());if(++reads===1){read=pause(p,'read');}}
+        return original.apply(this,args);
+    };
+    watcher.emit('create',Uri.file(p));const first=events[0];assert.ok(first);
+    try{
+        await save.entered;watcher.emit('create',Uri.file(p));second=events[1];assert.ok(second);
+        await waitUntil(()=>!!read);await read.entered;
+        save.release();await first;read.release();await second;
+        assert.deepEqual(readCurrent,[true,false],'the old creation was already invalid when its read began');
+        assert.equal(tracker.getOriginalContent(p),'');assert.equal(tracker.baselineExistingFiles.has(p),false);
+        assert.equal(pending(p)?.currentContent,contents,'a duplicate notification cannot hide a genuine creation');
+        assert.equal(pending(p)?.currentExists,true);assert.ok(tracker.getReviewToken(p));
+        assert.equal((await tracker.keepAllChangesInFile(p)).status,'success');assert.equal(tracker.baselineExistingFiles.has(p),true);
+    }finally{save.release();read?.release();await Promise.all([first,second]);tracker.readFileAndUpdate=original;tracker.onExternalFileCreatedEvent=createdEvent;}
 });
 test('DT-03 stat permission failure is unavailable, not missing',async()=>{
     const p=file(); seed(p,'old','pending'); await scan(p); faults.set(p,{stat:error('NoPermissions')});
@@ -1205,6 +1242,64 @@ test('existing automation session interface balances overlapping resource sessio
     assert.equal(tracker.isAutomationChangeAllowed(p),true); tracker.endAutomationSession(second);
     assert.equal(tracker.isAutomationChangeAllowed(p),false);
 });
+test('SOURCE-PREFERENCE defaults off independently of Vibe Coding and keeps session protection',async()=>{
+    assert.equal(JSON.parse(fs.readFileSync('package.json','utf8')).contributes.configuration.properties['diffTracker.enableSourceTracking'].default,false);
+    automationOnly=true;const p=file();seed(p,'baseline','changed');
+    let attributionReads=0;const allowed=tracker.isAutomationChangeAllowed;
+    tracker.isAutomationChangeAllowed=function(...args){attributionReads++;return allowed.apply(this,args);};
+    const session=tracker.beginAutomationSession({filePaths:[p]});
+    assert.equal(tracker.automationSessions.size,1);tracker.endAutomationSession(session);
+    await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    assert.equal(attributionReads,0);
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.ok(tracker.getReviewToken(p));
+});
+
+test('SOURCE-PREFERENCE on off on refreshes presentation without changing review or history',async()=>{
+    automationOnly=true;vscodeExcludes.enableSourceTracking=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    assert.match(pending(p)?.sourceNote??'',/source is uncertain/);
+    const before={token:tracker.getReviewToken(p),snapshots:[...tracker.fileSnapshots],history:structuredClone(tracker.revertHistory),epoch:tracker.sessionEpoch};
+    const events=[];const disposable=tracker.onDidTrackChanges(event=>events.push(event));
+    vscodeExcludes.enableSourceTracking=false;configurationChanged({affectsConfiguration:key=>key==='diffTracker.enableSourceTracking'});
+    assert.equal(events.at(-1)?.fullRefresh,true);
+    assert.equal(events.at(-1)?.baselineChanged,false);
+    assert.deepEqual(tracker.getReviewToken(p),before.token);
+    assert.deepEqual([...tracker.fileSnapshots],before.snapshots);
+    assert.deepEqual(tracker.revertHistory,before.history);assert.equal(tracker.sessionEpoch,before.epoch);
+    fs.writeFileSync(p,'edited while off');await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    vscodeExcludes.enableSourceTracking=true;configurationChanged({affectsConfiguration:key=>key==='diffTracker.enableSourceTracking'});
+    assert.equal(pending(p)?.sourceNote,undefined,'enabling never retroactively classifies off-period edits');
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.ok(succeeded(await tracker.revertFile(p)));
+    assert.equal((await tracker.undoLastRevert()).succeeded,1);
+    assert.equal(disk(p),'edited while off');disposable.dispose();
+});
+
+test('SOURCE-PREFERENCE legacy automation alias still requires explicit source opt in',async()=>{
+    vscodeExcludes.onlyTrackVSCodeChanges=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    assert.equal(pending(p)?.sourceNote,undefined);
+    vscodeExcludes.enableSourceTracking=true;fs.writeFileSync(p,'later');await scan(p);
+    assert.match(pending(p)?.sourceNote??'',/source is uncertain/);
+});
+
+test('SOURCE-PREFERENCE stopped historical source metadata remains recoverable while default off',async()=>{
+    automationOnly=true;vscodeExcludes.enableSourceTracking=true;
+    const p=file();seed(p,'baseline','changed');await scan(p);
+    const note=pending(p)?.sourceNote;assert.ok(note);
+    const storage=Uri.file(file('source-preference-storage'));tracker.storageUri=storage;
+    tracker.stopRecording();assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    vscodeExcludes.enableSourceTracking=false;tracker=new DiffTracker(storage);
+    assert.equal(await tracker.restorePersistedState(),'restored');
+    assert.equal(tracker.getIsRecording(),false);
+    assert.equal(pending(p)?.sourceNote,note,'legacy persisted metadata remains intact for opt-in display');
+    assert.equal(tracker.getOriginalContent(p),'baseline');
+    assert.equal(pending(p)?.currentContent,'changed');
+});
+
 test('DT-02 Keep hunk after new file vanishes cannot accept existence',async()=>{
     const p=file(); fs.writeFileSync(p,'new\n'); await tracker.onExternalFileCreated(Uri.file(p));
     const block=tracker.getChangeBlocks(p)[0]; fs.unlinkSync(p);
@@ -5744,7 +5839,7 @@ test('ISSUE-26 failed Unknown baseline publication rolls back previous persisted
 });
 
 registerPR12BoundedInvariants({
-    test, vscode, Uri, DiffTracker, file, document, pause,
+    test, vscode, Uri, DiffTracker, file, document, pause, faults,
     createStatusBarManager: current => {
         const boundary = {StatusBarAlignment:{Right:2},ThemeColor:class {constructor(id){this.id=id;}},
             window:{createStatusBarItem:()=>({show(){},dispose(){}})}};
@@ -5786,11 +5881,13 @@ registerCrossBranchKeep({
 
 registerArchivedGitReview({
     test, Uri, DiffTracker, vscode, file, document, faults, counters, pause, emitWatcher, waitUntil, watcherInstances,
+    nativeDirectoryWatchers, setVsCodeExcludes: value => { vscodeExcludes = value; },
     emitWorkspaceFilesCreated: event => workspaceFilesCreated(event),
     fireConfigurationChanged: key => configurationChanged({ affectsConfiguration: name => name === key }),
     getTracker: () => tracker,
     setTracker: value => { tracker = value; },
-    setListedFiles: value => { listedFiles = value; }
+    setListedFiles: value => { listedFiles = value; },
+    setListedIgnores: value => { listedIgnores = value; }
 });
 
 registerStoppedReviewActions({

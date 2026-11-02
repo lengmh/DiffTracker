@@ -167,6 +167,37 @@ export function registerStateSchemaCompatibility(harness) {
         assert.equal(getTracker().parsePersistedState(state), undefined);
     });
 
+    for(const version of [4,5]) test(`SCHEMA-ORIGIN V${version} retains provenance independently of diagnostic`,()=>{
+        const {state}=fixture();state.version=version;
+        const directory=file('directory-origin');
+        state.coverageGaps=[[directory,{unprovenDirectoryObservation:true}]];
+        const origin=getTracker().parsePersistedState(state);assert.ok(origin);
+        assert.equal(origin.coverageGaps[0][1].unprovenDirectoryObservation,true);
+        assert.equal(origin.coverageGaps[0][1].subtree,undefined);
+        const subtree={targetKind:'subtree',reasonCode:'supplemental-watcher-capacity-gap',reason:'Synthetic native quota failure'};
+        state.coverageGaps=[[directory,{subtree,unprovenDirectoryObservation:true}]];
+        const mixed=getTracker().parsePersistedState(state);assert.ok(mixed);
+        assert.deepEqual(mixed.coverageGaps[0][1].subtree,subtree);
+        assert.equal(mixed.coverageGaps[0][1].unprovenDirectoryObservation,true);
+        state.coverageGaps=[[directory,{subtree}]];
+        const migrated=getTracker().parsePersistedState(state);assert.ok(migrated);
+        assert.deepEqual(migrated.coverageGaps[0][1].subtree,subtree);
+        assert.equal(migrated.coverageGaps[0][1].unprovenDirectoryObservation,true,'legacy uncertainty migration keeps the original health diagnostic');
+    });
+
+    for(const marker of [false,null,0,'true',{},[]]) test(`SCHEMA-ORIGIN rejects malformed marker ${JSON.stringify(marker)}`,()=>{
+        const {state}=fixture();
+        state.coverageGaps=[[file('invalid-origin'),{unprovenDirectoryObservation:marker,
+            subtree:{targetKind:'subtree',reasonCode:'synthetic-gap',reason:'Synthetic native uncertainty'}}]];
+        assert.equal(getTracker().parsePersistedState(state),undefined);
+    });
+
+    test('SCHEMA-ORIGIN cannot extend the saved workspace boundary',()=>{
+        const {state}=fixture();
+        state.coverageGaps=[[path.join(path.dirname(state.workspaceRoots[0]),'unrelated-origin'),{unprovenDirectoryObservation:true}]];
+        assert.equal(getTracker().parsePersistedState(state),undefined);
+    });
+
     if (process.env.DT_EXPECT_LEGACY_REJECTION === '1') {
         for (const layout of ['primary', 'both', 'backup', 'interrupted-upgrade']) {
             test(`SCHEMA-DOWNGRADE released 0.7.2 preserves ${layout} V3 state`, async () => {

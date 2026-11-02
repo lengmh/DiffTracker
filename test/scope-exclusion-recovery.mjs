@@ -1110,7 +1110,14 @@ export function registerScopeExclusionRecovery(h, fixture, scopeFor) {
         assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status, 'applied');
         fs.writeFileSync(target, 'pending'); await tracker.readFileAndUpdate(target, Uri.file(target));
         if (situation === 'missing') {
-            fs.rmSync(chosen, {recursive:true}); await tracker.onExternalFileDeleted(Uri.file(chosen));
+            fs.rmSync(chosen, {recursive:true});
+            const watch = fs.watch;
+            fs.watch = (directory,...args) => {
+                if (path.resolve(String(directory)) === path.resolve(dir)) { throw Object.assign(new Error('guard quota'),{code:'ENOSPC'}); }
+                return watch(directory,...args);
+            };
+            try { await tracker.onExternalFileDeleted(Uri.file(chosen)); }
+            finally { fs.watch = watch; }
         } else { tracker.setSubtreeCoverageGap(chosen, 'supplemental-watcher-directory-change-gap', 'Prior interval'); }
         const token = tracker.getReviewToken(target);
         await withController(tracker, scope, async ({controller, writes, config}) => {

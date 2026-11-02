@@ -51,11 +51,11 @@ module.exports = async function nestedRecheckDeletionHost(workspacePath) {
         assert.equal(nested.uri.fsPath, inner);
         tracker = new DiffTracker(vscode.Uri.file(storage));
         const dispatch = tracker.dispatchExternalEvent;
-        tracker.dispatchExternalEvent = function(event, kind, epoch) {
+        tracker.dispatchExternalEvent = function(event, kind, epoch, ...metadata) {
             if (events.length < 32 && (inside(event.fsPath, ancestor) || inside(files[0], event.fsPath) || event.fsPath === outside)) {
                 events.push({ path: path.relative(outerPath, event.fsPath), kind, epoch, restoring: this.restoringEpoch });
             }
-            return dispatch.call(this, event, kind, epoch);
+            return dispatch.call(this, event, kind, epoch, ...metadata);
         };
         const checked = validateAndCanonicalizeScope({ mode: 'rules', includes: [{ scope: 'folder', folder: nested.name, path: 'selected' }],
             excludes: [{ scope: 'folder', folder: outer.name, pattern: '/excluded-recheck/' }] },

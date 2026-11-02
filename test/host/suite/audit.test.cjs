@@ -81,7 +81,28 @@ module.exports = async function auditHost(workspace) {
             const parent = vscode.Uri.file(path.join(workspace, batch ? 'audit-parent-batch' : 'audit-parent-file')).fsPath;
             const child = path.join(parent, 'nested', 'child.txt');
             assert.equal(tracker.getOriginalContent(child), 'parent baseline\n', 'Parent recovery fixture must have a known baseline');
-            fs.rmSync(parent, { recursive: true });
+            const removalState = () => ({
+                parentExists: fs.existsSync(parent), childExists: fs.existsSync(child),
+                pendingReads: [...tracker.pendingSnapshotReads.keys()].filter(file => file.startsWith(`${parent}${path.sep}`)).length,
+                activeWrites: [...tracker.activeWriteFiles].filter(file => file.startsWith(`${parent}${path.sep}`)).length
+            });
+            const beforeRemoval = removalState();
+            try {
+                // A synchronous removal blocks callbacks which close concurrent
+                // reader handles. Yield through the filesystem API on Windows,
+                // without retrying or manufacturing a deletion notification.
+                await fs.promises.rm(parent, { recursive: true });
+            } catch (error) {
+                let entries;
+                try { entries = fs.readdirSync(parent, { withFileTypes: true }).slice(0, 8)
+                    .map(entry => ({ expectedNested: entry.name === 'nested', directory: entry.isDirectory(), symlink: entry.isSymbolicLink() })); }
+                catch { entries = undefined; }
+                console.error('HOST-PARENT removal diagnostics', JSON.stringify({ batch, beforeRemoval,
+                    afterRemoval: removalState(), entries,
+                    code: ['ENOTEMPTY','EPERM','EBUSY','ENOENT'].includes(error.code) ? error.code : 'other' }));
+                throw error;
+            }
+            assert.equal(fs.existsSync(parent), false, 'Parent fixture must be physically removed before deletion review');
             try {
                 await until(() => tracker.getTrackedChanges().some(change => change.filePath === child && change.isDeleted));
             } catch (error) {

@@ -55,6 +55,16 @@ const missing = async name => {
 
 module.exports = async function runExtensionHostScenario() {
         assert.ok(workspacePath, 'host workspace environment is required');
+        const publication=require('../scope-publication-probe.cjs').observeScopePublication(vscode);
+        const workspaceObservation=require('../workspace-trace.cjs').observeWorkspace(vscode);
+        try {
+        const folderNames=folders=>folders.map(folder=>({name:folder.name,scheme:folder.uri.scheme}));
+        const initialWorkspaceFolders=folderNames(vscode.workspace.workspaceFolders??[]),workspaceContextEvents=[];
+        const workspaceTrace=vscode.workspace.onDidChangeWorkspaceFolders(event=>{
+            if(workspaceContextEvents.length<16){workspaceContextEvents.push({
+                added:folderNames(event.added),removed:folderNames(event.removed),current:folderNames(vscode.workspace.workspaceFolders??[])
+            });}
+        });
         const extension = vscode.extensions.getExtension('lengmh.code-diff-tracker');
         assert.ok(extension, 'development extension is installed');
         await extension.activate();
@@ -90,7 +100,7 @@ module.exports = async function runExtensionHostScenario() {
             undefined,
             'ordinary excluded path must not already have a baseline'
         );
-        const scopeConfig = vscode.workspace.getConfiguration('diffTracker');
+        const scopeConfig = publication.configuration('diffTracker');
         await scopeConfig.update('watchInclude', [privateInclude],
             vscode.ConfigurationTarget.Workspace);
         const includeApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
@@ -106,7 +116,7 @@ module.exports = async function runExtensionHostScenario() {
 
         // Unsupported watcher coverage still fails closed. S4-B may establish
         // direct coverage when an explicit directory include supplies a bound.
-        const filesConfig = vscode.workspace.getConfiguration('files');
+        const filesConfig = publication.configuration('files');
         const previousWatcherExclude = filesConfig.inspect('watcherExclude')?.workspaceValue;
 
         // The Start command must project the backend's actual post-start state.
@@ -160,7 +170,8 @@ module.exports = async function runExtensionHostScenario() {
                 effectiveRevision:this.effectiveMonitoringScope.scopeRevision,pendingRevision:this.pendingMonitoringScope?.scopeRevision});
             const before = readiness();
             const result = await performScopeApply.apply(this,args);
-            if (result.status === 'conflict') { scopePreparationDiagnostic = {before,after:readiness()}; }
+            if (result.status === 'conflict') { scopePreparationDiagnostic = {before,after:readiness(),
+                initialWorkspaceFolders,workspaceContextEvents,currentWorkspaceFolders:folderNames(vscode.workspace.workspaceFolders??[])}; }
             return result;
         };
         let descendantWatcherApply;
@@ -168,7 +179,7 @@ module.exports = async function runExtensionHostScenario() {
             descendantWatcherApply = await vscode.commands.executeCommand('diffTracker._testApplyMonitoringScope', {
                 grantConsent: true
             });
-        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply; }
+        } finally { DiffTracker.prototype.performConfiguredMonitoringScopeApply = performScopeApply;workspaceTrace.dispose();publication.finish(); }
         assert.equal(descendantWatcherApply.status, 'applied', JSON.stringify({outcome:descendantWatcherApply,scopePreparationDiagnostic}));
 
         await scopeConfig.update('watchInclude', [privateInclude],
@@ -550,17 +561,27 @@ module.exports = async function runExtensionHostScenario() {
             fileGap:tracker.coverageGaps.get(emptyPath)?.file?.reasonCode,
             rootGap:tracker.coverageGaps.get(workspacePath)?.subtree?.reasonCode,
             directoryJobs:tracker.directoryObservations.size,
+            pendingRead:tracker.pendingSnapshotReads.has(emptyPath),
             nativeRoot:tracker.supplementalDirectoryWatchers.has(workspacePath)});
         for(const method of ['dispatchExternalEvent','onExternalFileCreated','onExternalFileChanged',
-            'readFileAndUpdate','recordUnresolvedBaseline','markFileUnavailable']){
+            'readFileAndUpdate','readFileSnapshot','recordUnresolvedBaseline','markFileUnavailable']){
             const original=DiffTracker.prototype[method];emptyMethods.set(method,original);
             DiffTracker.prototype[method]=function(...args){
                 const file=typeof args[0]==='string'?args[0]:args[0]?.fsPath;
                 if((file===emptyPath||file===workspacePath)&&emptyTrace.length<100){
                     emptyTrace.push({method,path:file===emptyPath?'new-empty.txt':'<primary>',
-                        kind:method==='dispatchExternalEvent'?args[1]:undefined,...emptyObservation(this)});
+                        kind:method==='dispatchExternalEvent'?args[1]:undefined,
+                        operationCurrent:method==='readFileAndUpdate'&&args[2]?args[2]():undefined,...emptyObservation(this)});
                 }
-                return original.apply(this,args);
+                const result=original.apply(this,args);
+                if(method==='readFileSnapshot' && file===emptyPath){
+                    void result.then(state=>{
+                        if(emptyTrace.length<100){emptyTrace.push({method:'snapshot-result',kind:state.kind,
+                            bytes:state.kind==='text'?Buffer.byteLength(state.content,'utf8'):undefined,
+                            nodeExists:fs.existsSync(emptyPath),...emptyObservation(this)});}
+                    },()=>{});
+                }
+                return result;
             };
         }
         try{
@@ -911,14 +932,23 @@ module.exports = async function runExtensionHostScenario() {
         }
 
 
-        await filesConfig.update('watcherExclude', previousWatcherExclude,
-            vscode.ConfigurationTarget.Workspace);
-        await scopeConfig.update('watchInclude', [privateInclude],
-            vscode.ConfigurationTarget.Workspace);
-        await delay(250);
-
+        const clearCheckpoint = async () => {
+            const current = await state();
+            const scope = await vscode.commands.executeCommand('diffTracker._testMonitoringScopeStatus');
+            return {isRecording:current.isRecording,baselineState:current.baselineState,
+                lifecycle:scope.lifecycle,pendingScope:scope.hasPendingChanges,
+                review:current.trackedChanges.find(item=>item.filePath===uri('batch-a.txt').fsPath),
+                gaps:current.subtreeCoverageGaps.map(gap=>({target:path.relative(workspacePath,gap.targetPath),reasonCode:gap.reasonCode}))};
+        };
+        // Keep this Clear test on the observation configuration just verified
+        // above. Updating watcherExclude can reinstall the Host watcher; a
+        // fixed delay does not certify delivery of the next filesystem event.
+        const beforeClear=await clearCheckpoint();
+        assert.equal(beforeClear.isRecording,true,JSON.stringify(beforeClear));
+        assert.equal(beforeClear.baselineState,'ready',JSON.stringify(beforeClear));
         await write('batch-a.txt', 'stopped clear preserves disk\n');
-        await untilStable('stopped clear pending', () => pending('batch-a.txt'));
+        try {await untilStable('stopped clear pending', () => pending('batch-a.txt'));}
+        catch(error){throw new Error(`${error.message}; checkpoint=${JSON.stringify(await clearCheckpoint())}`);}
         await vscode.commands.executeCommand('diffTracker.stopRecording');
         assert.equal(await vscode.commands.executeCommand('diffTracker._testClearDiffs'), true);
         assert.equal((await state()).isRecording, false);
@@ -926,10 +956,21 @@ module.exports = async function runExtensionHostScenario() {
         assert.equal((await state()).reviewTokens.length, 0);
         assert.equal(await read('batch-a.txt'), 'stopped clear preserves disk\n');
         console.log('PASS HOST-REVIEW stopped clear command preserves disk and recording state');
+        // Restore the fixture configuration after observation has stopped,
+        // before the independent coverage fixtures acquire their own owners.
+        await filesConfig.update('watcherExclude', previousWatcherExclude,
+            vscode.ConfigurationTarget.Workspace);
+        await scopeConfig.update('watchInclude', [privateInclude],
+            vscode.ConfigurationTarget.Workspace);
+        assert.equal((await state()).isRecording,false);
+        assert.deepEqual(filesConfig.inspect('watcherExclude')?.workspaceValue,previousWatcherExclude);
+        assert.deepEqual(scopeConfig.inspect('watchInclude')?.workspaceValue,[privateInclude]);
+        await require('./deleted-directory-coverage.test.cjs')(workspacePath);
         await require('./s4b-lifecycle.test.cjs')(workspacePath);
         await require('./s4c-handoff.test.cjs')(workspacePath);
         await require('./s4d-handoff-refusal.test.cjs')(workspacePath);
         await require('./audit.test.cjs')(workspacePath);
         await require('./nested-workspace-coverage.test.cjs')(secondRoot);
         await require('./nested-recheck-deletion.test.cjs')(secondRoot);
+        } finally {workspaceObservation.finish();publication.finish();}
 };

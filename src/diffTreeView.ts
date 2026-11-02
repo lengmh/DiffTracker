@@ -224,11 +224,13 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
                 arguments: [item]
             };
         } else {
-            item.description = fileDiff.sourceNote ? 'Source uncertain' : undefined;
+            const sourceNote = fileDiff.sourceNote && vscode.workspace.getConfiguration('diffTracker').get<boolean>('enableSourceTracking',false)
+                ? fileDiff.sourceNote : undefined;
+            item.description = sourceNote ? 'Source uncertain' : undefined;
             item.iconPath = vscode.ThemeIcon.File;
             item.contextValue = 'changedFile';
             item.tooltip += fileDiff.isDeleted ? '\nDeleted from disk' : '';
-            if (fileDiff.sourceNote) { item.tooltip += `\n${fileDiff.sourceNote}`; }
+            if (sourceNote) { item.tooltip += `\n${sourceNote}`; }
             item.command = {
                 command: 'diffTracker.openDiffDefault',
                 title: 'Open Diff',

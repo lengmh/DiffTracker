@@ -213,20 +213,29 @@ async function until(predicate) { while (!predicate()) { await delay(10); } }
 const elapsed = start => Math.round((performance.now() - start) * 10) / 10;
 const mib = bytes => Math.round(bytes / MiB * 10) / 10;
 const readSession = () => JSON.parse(fs.readFileSync(path.join(storage, 'session-state.json'), 'utf8'));
-function assertPersistedCoverage(records,activeGaps) {
+function assertPersistedCoverage(records,activeGaps,origins=new Set([...tracker.coverageGaps]
+    .filter(([,record])=>record.unprovenDirectoryObservation).map(([target])=>target))) {
     const persisted=new Map(records);
     assert.equal(persisted.size,records.length,'durable diagnostics cannot contain duplicate paths');
     const obligations=new Set(tracker.importedCoverageObligations);
     const active=new Map(activeGaps.map(gap=>[gap.targetPath,gap]));
     // Restart obligations are durable even while their native coverage is
-    // healthy. They are a separate claim from the currently active gaps.
-    assert.deepEqual(new Set(persisted.keys()),new Set([...active.keys(),...obligations]),JSON.stringify({
+    // healthy. Origin metadata is a third claim: it must round-trip even after
+    // health repair, without concealing a diagnostic or adding a native owner.
+    assert.deepEqual(new Set(persisted.keys()),new Set([...active.keys(),...obligations,...origins]),JSON.stringify({
         active:activeGaps.map(gap=>({path:path.relative(root,gap.targetPath),code:gap.reasonCode})),
         persisted:records.map(([target,record])=>({path:path.relative(root,target),record})),nativeEventTrace
     }));
     for(const [target,record] of persisted){
+        assert.equal(record.unprovenDirectoryObservation,origins.has(target)?true:undefined,
+            'persisted origin must match the live before-image evidence');
         assert.equal(record.file,undefined,'the workload must not acquire a file-level gap');
         const gap=active.get(target);
+        if(!gap&&!obligations.has(target)){
+            assert.ok(origins.has(target),'unrelated persisted uncertainty must fail the workload');
+            assert.deepEqual(record,{unprovenDirectoryObservation:true},'source-only metadata cannot conceal health or owner fields');
+            continue;
+        }
         if(obligations.has(target)){
             assert.equal(target,path.join(root,'node_modules'),'only the coalesced native dependency owner can require restart');
             assert.equal(tracker.supplementalTargetActive(target,tracker.sessionEpoch),true,
@@ -242,6 +251,17 @@ function assertPersistedCoverage(records,activeGaps) {
         }
     }
 }
+// Guard the serialized representation independently of native event ordering.
+// These records are fixture-only; no production tracker state is changed.
+const originGuard=path.join(root,'node_modules','pkg-0');
+const originRecord={unprovenDirectoryObservation:true};
+assertPersistedCoverage([[originGuard,originRecord]],[],new Set([originGuard]));
+assert.throws(()=>assertPersistedCoverage([],[],new Set([originGuard])));
+assert.throws(()=>assertPersistedCoverage([[originGuard,originRecord]],[],new Set()));
+assert.throws(()=>assertPersistedCoverage([[originGuard,{...originRecord,subtree:{
+    targetKind:'subtree',reasonCode:'synthetic-gap',reason:'Synthetic unrelated uncertainty'
+}}]],[],new Set([originGuard])));
+assert.throws(()=>assertPersistedCoverage([[originGuard,{...originRecord,importedCoverageRequired:true}]],[],new Set([originGuard])));
 let disposed = false;
 try {
     assert.equal((await controller.saveRequestedScope({ mode: 'rules', includes: [], excludes: [] })).ok, true);
