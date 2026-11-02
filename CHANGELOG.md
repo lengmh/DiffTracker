@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.14
+
+- Retire deleted directory coverage obligations after verified absence and reliable reconstruction observation. Preserve deletion reviews, original baselines and Undo without requiring permanent exclusions, a baseline rebuild or empty replacement directories.
+- Preserve observation and exact file-creation evidence across directory replacement, Recheck, bounded-budget recovery, persistence and interrupted-session recovery. Unproven before-images remain Unknown; genuine identity, permission, watcher and storage failures remain Limited.
+- Keep legacy and configured review state consistent during directory reconstruction and stopped-session policy changes. Reconcile missing tracked descendants without discovering unrelated stopped-session files or dropping frozen reviews.
+- Reject stale asynchronous snapshots after newer editor observations and successful Keep/Revert actions, while allowing newer valid observations to complete when an older action is refused.
+- Make experimental source hints opt-in with `diffTracker.enableSourceTracking`, disabled by default. Toggling respects existing Workspace preferences and updates open views without hiding baseline or coverage warnings.
+- Show distinct lifecycle, recovery, transaction and settings-write blockers in Monitoring Scope. Provide reachable saved-session recovery, clarify legacy compatibility and migration status, and preserve drafts when delayed settings writes settle.
+- Known limitations: historical VS Code 1.80 workspace-folder notifications and Windows synchronous fixture-removal failures were not fully attributed. Successful final verification does not establish their underlying causes.
+
 ## 0.8.13
 
 - Apply exclusions when the settings file or its directory is already excluded. Require verified exclusion evidence before ignoring notifications, and preserve competing edits, drafts, pending reviews and Undo when identity or scope changes.
