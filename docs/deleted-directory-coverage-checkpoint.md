@@ -377,12 +377,27 @@ then persisted the phantom projection into primary/last-good and reload. The
 reported sequence is an existing main/0.8.13 defect; subsequent stale Revert still
 refused, and no incorrect workspace write was demonstrated.
 
-Document change/save notifications and verified text actions now revoke an older
-pending read's publication marker. A returning read also checks that its same-file
+Document change/save notifications now revoke an older pending read's
+publication marker. A returning read also checks that its same-file
 baseline and semantic review state remain the values observed before I/O. Cache
 rebuilding with identical values and activity in another file do not invalidate
 it. The existing epoch, latest-read and creation-proof guards remain in place;
 there is no new persistent generation table or implicit baseline adoption.
+
+Completing action verification alone does not revoke a read: that verification
+may have sampled older bytes and returned after a newer watcher result. If the
+action then refuses, the newer pending observation remains eligible to publish.
+Actual accepted/reverted baseline and review changes participate in the returning
+read's semantic-state check. Both the original stale-result matrix and the
+rejected-action/newer-read matrix remain required.
+
+The initial action-verification revocation introduced a P2: a delayed old
+verification could cancel a newer watcher result even though the action then
+correctly refused. Removing that revocation is 8/16 to 16/16 on its focused
+matrix, with both scopes, four actions, fresh-notification controls and Stop
+primary/last-good/reload checks. The original saved-action and positive controls
+remain required alongside these cases; no refused action adopts a baseline or
+requires another notification to recover the already sampled edit.
 
 The bounded production regression matrix is 14/28 on the preceding candidate
 and 28/28 after correction. It covers both scope modes, file/block Keep/Revert,

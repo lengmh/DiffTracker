@@ -934,9 +934,6 @@ export class DiffTracker {
                 if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
                 return this.actionResult(filePath, 'conflict', reason);
             }
-            // Verification establishes a newer action boundary than any
-            // ordinary watcher read still waiting to publish for this resource.
-            this.pendingSnapshotReads.delete(filePath);
             return action(token);
         });
         this.fileActionQueues.set(filePath, task);

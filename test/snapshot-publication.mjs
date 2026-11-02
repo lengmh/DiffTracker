@@ -63,8 +63,63 @@ export function registerSnapshotPublication(h, fixture) {
         assert.equal(await reader.restorePersistedState(), 'restored');
         assert.equal(reader.getTrackedChange(target), undefined); assert.equal(reader.getReviewToken(target), undefined);
     }
+    function boundary() {
+        let enter, release;
+        return { entered: new Promise(resolve => { enter = resolve; }),
+            released: new Promise(resolve => { release = resolve; }),
+            enter: () => enter(), release: () => release() };
+    }
 
     for (const configured of [false, true]) {
+        for (const action of ['keep-file', 'keep-block', 'revert-file', 'revert-block']) for (const followup of [false, true]) {
+            test(`SNAPSHOT-PUBLICATION rejected action configured=${configured} action=${action} followup=${followup}`, () => fixture(async ({ tracker, dir }) => {
+                const { target, notify } = await seed(tracker, dir, configured);
+                const verification = boundary(), watcher = boundary(), stat = vscode.workspace.fs.stat;
+                let calls = 0;
+                vscode.workspace.fs.stat = async function(uri) {
+                    const result = await stat.call(this, uri);
+                    if (uri.fsPath === target) {
+                        if (++calls === 2) { verification.enter(); await verification.released; }
+                        else if (calls === 4) { watcher.enter(); await watcher.released; }
+                    }
+                    return result;
+                };
+                const actionTask = perform(tracker, target, action);
+                try {
+                    await within(verification.entered);
+                    fs.writeFileSync(target, latest); notify(); await within(watcher.entered);
+                    // A verification result sampled before the physical edit
+                    // returns after the watcher has sampled that newer edit.
+                    verification.release(); assert.equal((await within(actionTask)).status, 'conflict');
+                    if (followup) {
+                        notify();
+                        await within(waitUntil(() => !tracker.pendingSnapshotReads.has(target) && tracker.externalChangeTimers.size === 0, 5000));
+                    }
+                    watcher.release(); await within(idle(tracker));
+                    assert.equal(tracker.getTrackedChange(target)?.currentContent, latest);
+                    assert.equal(tracker.getOriginalContent(target), baseline);
+                    assert.equal(fs.readFileSync(target, 'utf8'), latest);
+                    const doc = vscode.workspace.textDocuments.find(value => value.uri.fsPath === target);
+                    if (doc) { assert.equal(doc.getText(), latest); assert.equal(doc.isDirty, false); }
+                    const token = tracker.getReviewToken(target); assert.ok(token);
+                    assert.equal(await tracker.verifyReview(token), true, 'the newer view must remain usable');
+                    const storage = tracker.storageUri;
+                    tracker.stopRecording(); assert.equal(await tracker.flushPendingPersistence(), true);
+                    for (const name of ['session-state.json', 'session-state.last-good.json']) {
+                        const saved = JSON.parse(fs.readFileSync(path.join(storage.fsPath, name), 'utf8'));
+                        assert.equal(new Map(saved.fileSnapshots).get(target), baseline);
+                        assert.equal(saved.stoppedReviews?.find(review => review.filePath === target)?.currentContent, latest);
+                    }
+                    await tracker.dispose(); const reader = new DiffTracker(storage); setTracker(reader);
+                    assert.equal(await reader.restorePersistedState(), 'restored');
+                    assert.equal(reader.getTrackedChange(target)?.currentContent, latest);
+                } finally {
+                    verification.release(); watcher.release(); await actionTask;
+                    await within(idle(tracker)); vscode.workspace.fs.stat = stat;
+                }
+            }));
+        }
+
         for (const action of ['keep-file', 'keep-block', 'revert-file', 'revert-block']) for (const fresh of [false, true]) {
             test(`SNAPSHOT-PUBLICATION saved action configured=${configured} action=${action} fresh=${fresh}`, () => fixture(async ({ tracker, dir }) => {
                 const { target, notify } = await seed(tracker, dir, configured), gate = capturedRead(target);
