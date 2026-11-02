@@ -54,10 +54,10 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
         fs.mkdirSync(root); fs.writeFileSync(file, 'recreated after reload'); notify(dir, 'imported');
         await waitUntil(() => tracker.getTrackedChange(file)?.currentContent === 'recreated after reload');
     }));
-    async function seed(tracker,dir,scope,relative='temporary') {
+    async function seed(tracker,dir,scope,relative='temporary',blind=true) {
         const root = path.join(dir,relative); fs.mkdirSync(root,{recursive:true});
         const file = path.join(root,'review.txt'); fs.writeFileSync(file,'original');
-        h.setVsCodeExcludes({'files.watcherExclude':{[`${relative}/**`]:true}});
+        h.setVsCodeExcludes(blind?{'files.watcherExclude':{[`${relative}/**`]:true}}:{});
         assert.equal((await tracker.applyConfiguredMonitoringScope(scope)).status,'applied');
         return {root,file};
     }
@@ -881,6 +881,164 @@ export function registerDeletedDirectoryCoverage(h, fixture) {
             if(!replacement.startsWith('budget')){assert.equal(tracker.restoreEvents.size,0,'Recheck must consume its fallback observation');}
         }finally{metadata.release();await recheck;tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;}
     },'wholeWorkspace',replacement==='ignored'?[{scope:'all',pattern:'/temporary/introduced/'}]:[]));
+
+    for(const variant of ['directory-to-file','directory','file','file-to-directory','later-file','reload-file','reload-promoted-file',
+        'file-gap-reload-directory','quota-file','quota-directory','save-failure','type-during-save','epoch-during-save',
+        'stop-during-save','scoped-file','scoped-directory','unrelated-gap','host-file','kind-unavailable'])
+    test(`DEFERRED-RECHECK-KIND ${variant}`,()=>fixture(async({tracker:initialTracker,dir,scope})=>{
+        let tracker=initialTracker;
+        const {root,file}=await seed(tracker,dir,scope,'temporary',variant!=='host-file'),target=path.join(root,'deferred-kind'),child=path.join(target,'unproven.txt');
+        fs.writeFileSync(file,'retained pending edit');await tracker.onExternalFileChanged(Uri.file(file));
+        const initiallyFile=['file','file-to-directory','file-gap-reload-directory'].includes(variant);
+        const allowance=tracker.maxScopePreflightEntries;
+        const nativeLstat=fs.lstatSync;let kindUnavailable=false;
+        if(variant==='kind-unavailable'){
+            fs.lstatSync=(value,...args)=>{
+                if(kindUnavailable&&String(value)===target){throw Object.assign(new Error('Synthetic access refused'),{code:'EACCES'});}
+                return nativeLstat(value,...args);
+            };
+        }
+        let restoring=tracker.restoringEpoch,delivered=false;
+        Object.defineProperty(tracker,'restoringEpoch',{configurable:true,get:()=>restoring,set:value=>{
+            if(!delivered&&restoring!==undefined&&value===undefined){
+                delivered=true;
+                if(initiallyFile){fs.writeFileSync(target,'independent file');}
+                else{fs.mkdirSync(target);fs.writeFileSync(child,'unproven child');}
+                tracker.dispatchExternalEvent(Uri.file(target),'create',restoring);
+                if(['directory-to-file','host-file','kind-unavailable'].includes(variant)){
+                    fs.rmSync(target,{recursive:true});fs.writeFileSync(target,'replacement file');
+                    kindUnavailable=variant==='kind-unavailable';
+                }
+                tracker.maxScopePreflightEntries=0;
+            }
+            restoring=value;
+        }});
+        try{
+            if(variant.startsWith('scoped-')){
+                tracker.setCoverageGap(root,{targetKind:'subtree',reasonCode:'scope-recheck-incomplete',
+                    reason:'Synthetic operation recovery',scopeOperationRevision:scope.scopeRevision});
+            }
+            const first=variant.startsWith('scoped-')
+                ? tracker.recheckScopeOperationCoverage([{path:root,kind:'subtree',workspaceRoot:Uri.file(dir).toString()}],scope.scopeRevision)
+                : tracker.recheckObservationCoverage();
+            assert.equal((await first).status,'limited');
+            assert.equal(delivered,true);
+            const evidence=tracker.coverageGaps.get(target);
+            assert.equal(evidence?.[variant==='directory-to-file'||variant==='host-file'||initiallyFile?'file':'subtree']?.reasonCode,
+                'coverage-recheck-incomplete','the retained evidence must describe the current resource kind');
+            tracker.maxScopePreflightEntries=allowance;
+            delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;
+            if(variant==='reload-promoted-file'){
+                await tracker.recheckObservationCoverage();
+                assert.equal(tracker.importedCoverageObligations.has(target),true);
+            }
+            if(variant==='file-to-directory'||variant==='file-gap-reload-directory'){
+                fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'unproven replacement child');
+            }else if(!['directory-to-file','file','directory','quota-directory','scoped-directory','host-file','kind-unavailable'].includes(variant)){
+                fs.rmSync(target,{recursive:true});fs.writeFileSync(target,'replacement file');
+            }
+            if(variant==='reload-file'||variant==='reload-promoted-file'||variant==='file-gap-reload-directory'){
+                const storage=tracker.storageUri;await tracker.dispose();tracker=new DiffTracker(storage);setTracker(tracker);
+                assert.equal(await tracker.restorePersistedState(),'restored');
+            }
+            if(variant==='quota-file'||variant==='quota-directory'){
+                const quota=tracker.maxImportedDirectoryWatchers;tracker.maxImportedDirectoryWatchers=0;
+                try{
+                    assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked');
+                    if(variant==='quota-directory'){
+                        assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked');
+                        assert.ok(tracker.getSubtreeCoverageGaps().some(gap=>gap.reasonCode==='supplemental-watcher-capacity-gap'));
+                    }
+                }
+                finally{tracker.maxImportedDirectoryWatchers=quota;}
+            }
+            if(variant==='kind-unavailable'){
+                assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked','unreadable kind cannot authorize retirement');
+                assert.ok(tracker.coverageGaps.get(target)?.subtree);kindUnavailable=false;
+            }
+            if(['save-failure','type-during-save','epoch-during-save','stop-during-save'].includes(variant)){
+                await tracker.recheckObservationCoverage();
+                assert.equal(tracker.restoreEvents.size,0,'consume the retained notification before testing certification');
+                assert.ok(tracker.coverageGaps.get(target)?.subtree);
+            }
+            if(variant==='save-failure'){
+                const flush=tracker.flushPersistState.bind(tracker);let failed=false;
+                tracker.flushPersistState=async(...args)=>{
+                    if(!failed&&args[1]&&!tracker.coverageGaps.get(target)?.subtree){failed=true;return false;}
+                    return flush(...args);
+                };
+                try{
+                    assert.equal((await tracker.recheckObservationCoverage()).status,'failed');assert.equal(failed,true);
+                    assert.ok(tracker.coverageGaps.get(target)?.subtree,'failed certification must restore the original uncertainty');
+                    const saved=JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath,'session-state.json')));
+                    assert.ok(saved.coverageGaps.find(([name])=>name===target)?.[1].subtree);
+                    assert.equal(new Map(saved.fileSnapshots).get(file),'original');
+                }finally{tracker.flushPersistState=flush;}
+            }
+            if(['type-during-save','epoch-during-save','stop-during-save'].includes(variant)){
+                const flush=tracker.flushPersistState.bind(tracker);let changed=false;
+                tracker.flushPersistState=async(...args)=>{
+                    if(!changed&&args[1]&&!tracker.coverageGaps.get(target)?.subtree){
+                        changed=true;
+                        const gate=h.pause(path.join(tracker.storageUri.fsPath,'session-state.tmp.json'),'write');
+                        const saving=flush(...args);
+                        await gate.entered;
+                        if(variant==='type-during-save'){fs.unlinkSync(target);fs.mkdirSync(target);fs.writeFileSync(child,'new unproven child');}
+                        else if(variant==='stop-during-save'){tracker.stopRecording();}
+                        else{tracker.advanceEpoch();}
+                        gate.release();return saving;
+                    }
+                    return flush(...args);
+                };
+                try{
+                    assert.notEqual((await tracker.recheckObservationCoverage()).status,'rechecked');assert.equal(changed,true);
+                    if(variant==='type-during-save'){assert.ok(tracker.coverageGaps.get(target)?.subtree);}
+                    else{
+                        assert.equal(tracker.getOriginalContent(file),'original');
+                        if(variant==='stop-during-save'){assert.equal(tracker.getIsRecording(),false);}
+                        return;
+                    }
+                }finally{tracker.flushPersistState=flush;}
+            }
+            const unrelated=path.join(dir,'unrelated-unverified');
+            if(variant==='unrelated-gap'){tracker.setSubtreeCoverageGap(unrelated,'synthetic-unrelated-gap','Unrelated evidence');}
+            let quiet;
+            if(variant.startsWith('scoped-')){
+                const operation=[{path:target,kind:'subtree',workspaceRoot:Uri.file(dir).toString()}];
+                assert.ok(tracker.coverageGaps.get(target)?.subtree);
+                await tracker.recheckScopeOperationCoverage(operation,scope.scopeRevision);
+                quiet=await tracker.recheckScopeOperationCoverage([{path:target,kind:'subtree',workspaceRoot:Uri.file(dir).toString()}],scope.scopeRevision);
+            }else{
+                await tracker.recheckObservationCoverage();await tracker.recheckObservationCoverage();
+                quiet=await tracker.recheckObservationCoverage();
+            }
+            assert.equal(quiet.status,variant==='unrelated-gap'?'limited':'rechecked',
+                `a settled target must have a bounded, verified recovery path: ${JSON.stringify({quiet,gaps:tracker.getCoverageGaps()})}`);
+            if(variant==='unrelated-gap'){
+                assert.equal(tracker.coverageGaps.get(unrelated)?.subtree?.reasonCode,'synthetic-unrelated-gap');
+                assert.equal(tracker.coverageGaps.get(target)?.subtree,undefined);assert.equal(tracker.coverageGaps.get(target)?.file,undefined);
+            }else{assert.deepEqual(tracker.getSubtreeCoverageGaps(),[]);}
+            assert.equal(tracker.restoreEvents.size,0);
+            assert.equal(tracker.getOriginalContent(file),'original');
+            assert.equal(tracker.getTrackedChange(file)?.currentContent,'retained pending edit');
+            if(fs.lstatSync(target).isDirectory()){
+                assert.equal(tracker.unresolvedBaselineFiles.has(child),true);assert.equal(tracker.getReviewToken(child),undefined);
+                assert.equal((await tracker.revertBlock(child,0)).status,'conflict');
+            }else{
+                assert.equal(fs.readFileSync(target,'utf8'),variant==='file'?'independent file':'replacement file');
+                if(variant!=='file'){assert.equal(tracker.getOriginalContent(target),undefined);assert.equal(tracker.getReviewToken(target),undefined);}
+            }
+            if(variant==='reload-promoted-file'||variant==='file-gap-reload-directory'){
+                const storage=tracker.storageUri;assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+                tracker=new DiffTracker(storage);setTracker(tracker);assert.equal(await tracker.restorePersistedState(),'restored');
+                assert.equal(tracker.getOriginalContent(file),'original');assert.equal(tracker.getTrackedChange(file)?.currentContent,'retained pending edit');
+                assert.equal(tracker.getReviewToken(variant==='reload-promoted-file'?target:child),undefined);
+            }
+        }finally{
+            if(variant==='kind-unavailable'){fs.lstatSync=nativeLstat;}
+            tracker.maxScopePreflightEntries=allowance;delete tracker.restoringEpoch;tracker.restoringEpoch=restoring;
+        }
+    }));
 
     for(const {mode,historical=false,staleDelete=false} of [{mode:'runtime'},{mode:'restore'},{mode:'retry'},{mode:'restore',historical:true},
         {mode:'runtime',staleDelete:true},{mode:'restore',staleDelete:true},{mode:'retry',staleDelete:true}])

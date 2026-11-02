@@ -407,3 +407,47 @@ epoch replacement. These use real synthetic files, registered production watcher
 callbacks and controlled provider-await boundaries; they are not a claimed
 natural Extension Host reproduction. The separate 1.80 workspace-root notification
 cause remains unresolved, irrespective of passing CI comparisons.
+
+## Follow-up: deferred observation kind during Recheck
+
+The release-preparation review found another bounded-replay recovery omission:
+a queued directory create can become a regular file before the replay allowance
+is exhausted. Missing creation proof was treated as current directory type,
+persisting a subtree obligation which later tried to install a directory watcher
+on that file. Three quiet Rechecks still returned Limited. The same-file control
+recovered. This path was already present in the reviewed behavior candidate;
+the version-only preparation did not introduce it.
+
+Deferred notifications now retain uncertainty for the current metadata kind.
+Recheck also classifies older deferred evidence without replacing it before
+certification: regular files require same-owner parent observation, directories
+require their bounded tree observation. Captured type and physical identity join
+the existing epoch, policy, owner/event and persistence barrier. Only successful
+certification retires the matching evidence and an obsolete file-path directory
+descriptor; rollback restores both. Missing, inaccessible, symlink and unrelated
+watcher evidence retain their existing conservative paths. Budgets are unchanged.
+
+Planning can bypass an impossible directory installation for a verified regular
+file while retaining its deferred evidence/descriptor for the transaction. This
+also preserves the origin through reload instead of overwriting it with an
+installation error. File-kind deferred evidence still prevents unproven child
+before-images if that path later becomes a directory. Genuine independent
+creation and historical Unknown continue through their existing proof rules.
+
+The 19-case filesystem-backed matrix changes from 4/19 on the preceding source
+to 19/19 after correction. It covers ordinary files/directories, both replacement
+directions, older descriptors and reload, quota refusal/recovery, inaccessible
+kind, full/regional Recheck, unrelated evidence, pending-review retention,
+rejected certification and primary-state preservation, and type/Stop/epoch
+changes at the actual temporary-state write barrier. A Host-only observation
+control caught an unpublished patch omission: after a full Recheck rebinds Host
+watchers, its parent proof must bind the new watcher array, not the disposed one.
+That control passes after correcting the capture point. No test converts Unknown
+to an invented empty baseline or removes the earlier directory-to-file guard.
+
+These are controlled production/provider-boundary regressions, not a claimed
+natural Host reproduction. The original release-preparation CI 41381273950
+passed its primary minimum Host run but failed the configuration-publication
+diagnostic comparison; its log download was denied by storage. That failure is
+retained and unattributed, independently of this correction or later results.
+Fresh final-code CI and independent review are required before publication.
