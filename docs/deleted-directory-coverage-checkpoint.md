@@ -368,3 +368,27 @@ verify review tokens and Keep after correction. The Windows empty-creation
 failure has the matching two-create/two-read shape; its trace did not capture
 the old operation's predicate, so exact native causality is not asserted from
 that trace alone.
+## Follow-up: snapshot publication after saved review actions
+
+A watcher snapshot can finish sampling before a newer editor save and Keep or
+Revert, while its final provider result returns afterward. Ordering read starts
+alone allowed that old result to recreate a phantom text review and token. Stop
+then persisted the phantom projection into primary/last-good and reload. The
+reported sequence is an existing main/0.8.13 defect; subsequent stale Revert still
+refused, and no incorrect workspace write was demonstrated.
+
+Document change/save notifications and verified text actions now revoke an older
+pending read's publication marker. A returning read also checks that its same-file
+baseline and semantic review state remain the values observed before I/O. Cache
+rebuilding with identical values and activity in another file do not invalidate
+it. The existing epoch, latest-read and creation-proof guards remain in place;
+there is no new persistent generation table or implicit baseline adoption.
+
+The bounded production regression matrix is 14/28 on the preceding candidate
+and 28/28 after correction. It covers both scope modes, file/block Keep/Revert,
+save-only observation, reads begun during an action, fresh-read controls,
+same-value view rebuilding, sibling activity, Stop primary/last-good/reload and
+epoch replacement. These use real synthetic files, registered production watcher
+callbacks and controlled provider-await boundaries; they are not a claimed
+natural Extension Host reproduction. The separate 1.80 workspace-root notification
+cause remains unresolved, irrespective of passing CI comparisons.

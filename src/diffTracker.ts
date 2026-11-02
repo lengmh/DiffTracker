@@ -934,6 +934,9 @@ export class DiffTracker {
                 if (token && this.isCurrentEpoch(token.epoch)) { await this.refreshRejectedReview(filePath); }
                 return this.actionResult(filePath, 'conflict', reason);
             }
+            // Verification establishes a newer action boundary than any
+            // ordinary watcher read still waiting to publish for this resource.
+            this.pendingSnapshotReads.delete(filePath);
             return action(token);
         });
         this.fileActionQueues.set(filePath, task);
@@ -7790,6 +7793,7 @@ export class DiffTracker {
 
     private onDidSaveDocument(doc: vscode.TextDocument): void {
         const uri=doc.uri.scheme==='file' ? vscode.Uri.file(this.canonicalTrackingPath(doc.uri.fsPath)) : doc.uri;
+        if (uri.scheme === 'file') { this.pendingSnapshotReads.delete(uri.fsPath); }
         if (this.deferArchiveRestoreEvent(uri, 'change')) { return; }
         if (this.deferMissingDirectoryRetirementEvent(uri, 'change')) { return; }
         if (this.deferCoverageRecheckEvent(uri, 'change')) { return; }
@@ -11838,6 +11842,18 @@ export class DiffTracker {
         // An obsolete creation must not supersede a valid in-flight read just
         // by starting later. Keep the post-I/O guard for changes during reading.
         if(operationCurrent && !operationCurrent()){return;}
+        // Read-start order alone does not order newer editor observations or
+        // accepted/reverted review state. Capture primitive semantic values:
+        // rebuilding a cache/view with the same values must not discard a
+        // genuinely newer read, and no per-resource generation is retained.
+        const observation = () => {
+            const change = this.trackedChanges.get(filePath);
+            return [this.fileSnapshots.get(filePath), this.baselineExistingFiles.has(filePath),
+                this.opaqueBaselineFiles.get(filePath), this.unresolvedBaselineFiles.get(filePath),
+                !!change, change?.currentContent, change?.isDeleted, change?.currentExists,
+                change?.reviewKind, change?.unavailableReason];
+        };
+        const beforeRead = observation();
         // A stable snapshot can still arrive out of order: its final stat may
         // have completed before a later mutation while its promise is delayed.
         // Only the newest read for this path may publish into the review.
@@ -11854,6 +11870,8 @@ export class DiffTracker {
             }
         }
         if (!latestRead || !this.isCurrentEpoch(epoch) || (operationCurrent && !operationCurrent()) || this.isPathIgnored(uri)) { return; }
+        const afterRead = observation();
+        if (!beforeRead.every((value, index) => value === afterRead[index])) { return; }
         if (this.suppressUnsupportedResource(filePath, state)) { return; }
         if (this.reconcileLargeFileReminder(filePath, state)) { return; }
         // A watcher read can finish after native Undo or another buffer edit.
@@ -14887,6 +14905,9 @@ export class DiffTracker {
     }
 
     private onDocumentChanged(event: vscode.TextDocumentChangeEvent) {
+        if (event.document.uri.scheme === 'file') {
+            this.pendingSnapshotReads.delete(this.canonicalTrackingPath(event.document.uri.fsPath));
+        }
         if (this.deferArchiveRestoreEvent(event.document.uri, 'change')) { return; }
         const epoch = this.sessionEpoch;
         if (!this.isRecording) {
