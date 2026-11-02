@@ -681,7 +681,8 @@ export function registerRecheckObservationCoverage(h, fixture) {
         assert.equal(await tracker.flushPendingPersistence(), true);
         const saved = JSON.parse(fs.readFileSync(path.join(tracker.storageUri.fsPath, 'session-state.json'), 'utf8'));
         assert.equal(new Map(saved.fileSnapshots).get(text), 'original baseline');
-        assert.deepEqual(saved.coverageGaps, []);
+        assert.deepEqual(saved.coverageGaps, [[blind,{unprovenDirectoryObservation:true}]],
+            'healthy configured coverage keeps only its independent before-image origin, not a new imported owner');
     }));
 
     for (const mode of ['rules', 'wholeWorkspace']) test(`RECHECK ${mode} preserves token and unknown before-images without unbounded host search`, () => fixture(async context => {

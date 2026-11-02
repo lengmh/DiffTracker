@@ -451,3 +451,64 @@ passed its primary minimum Host run but failed the configuration-publication
 diagnostic comparison; its log download was denied by storage. That failure is
 retained and unattributed, independently of this correction or later results.
 Fresh final-code CI and independent review are required before publication.
+
+## Independent directory origin and mutable watcher health
+
+Independent review of `62d1ff4` found a residual P1 and P2. A native watcher
+failure could replace deferred-directory diagnostics, then the queue was consumed.
+An unobserved late child subsequently gained an empty baseline and a block action
+which cleared its buffer; primary/last-good and reload retained that projection.
+The associated current-kind recovery also lost its eligibility after the same
+diagnostic replacement. Both sequences reproduce on the earlier `dcd8c834`
+candidate; an unmatched main queue precondition does not establish main behavior.
+
+The existing bounded coverage-record array now stores three independent facts:
+`importedCoverageRequired` describes durable observation ownership, `file` and
+`subtree` carry current health diagnostics, and `unprovenDirectoryObservation`
+preserves before-image origin for the current baseline. Replacing or retiring a
+diagnostic cannot erase that origin. Source-only records do not count as Limited
+and do not themselves create imported watcher obligations. Real watcher failures
+remain precise, while current-kind certification still needs the appropriate
+owner, identity, event, epoch and durable transaction.
+
+Discovery consults the typed origin and live creation evidence. Valid exact file
+creation remains reviewable; historical Unknown is not upgraded. Health repair
+cannot establish an empty before-image for an unobserved child. Origin survives
+primary/last-good, reload, interrupted operations and local/scope rollback;
+rollback merges live observation facts without replacing newer file evidence.
+An explicit fresh baseline retires the earlier origin. Ordinary Keep/Revert,
+Stop and coverage repair preserve it. Existing trusted baselines are not silently
+rewritten, and missing historical before-images are not reconstructed.
+
+Current V4/V5 readers strictly validate the optional boolean, standalone records,
+workspace boundaries and existing count/byte limits. Known older loss diagnostics
+are conservatively migrated without changing their error or owner evidence.
+New native/reconstruction producers record origin explicitly; new before-image
+decisions do not depend on diagnostic text. No budget or storage-version increase
+is introduced. The serialized reservation includes the origin before accepting
+directory children. Metadata-only origin also remains distinct from optional
+human/automation source hints.
+
+Ordinary control gaps retain their existing Host-backed recovery path when origin
+is present; origin alone cannot demand a native directory owner. A paired control
+caught and corrected that unpublished implementation regression. Healthy configured
+native coverage likewise retains source-only metadata without a new imported owner.
+
+The supplied 19-case provider matrix changes from 15/19 to 19/19, including the
+actual buffer-action refusals and exact-create controls. New public regressions
+use registered Host watcher callbacks plus real temporary-state-write and provider
+stat boundaries, with actual synthetic files. They cover quota/type/absence
+transitions, late children, genuine and historical creation, primary/last-good,
+reload, and import/scope rollback. Schema controls cover both supported formats,
+invalid markers and workspace boundaries. These are controlled production-boundary
+tests, not a claimed natural Extension Host reproduction. Earlier clear reviews
+and CI are not acceptance of this follow-up; fresh exact-head checks remain required.
+
+Final local checks for this follow-up pass: tracker 2194, review UI 221 plus 19
+branch-Keep cases, Git 45/28, Host fixtures 15, the supplied 215-case comparison,
+lint, performance and 35 artifact guards. Official cached Linux Stable 1.144.0
+and minimum 1.80.2 each complete all six real Host phases. Twelve public origin
+controls and nine schema cases are included in the tracker total. The inspected
+75-file internal VSIX changes only the compiled tracker from the prior candidate;
+it is not a Release artifact. Independent review and remote Verification remain
+separate gates; the earlier denied log and historical Host limitations remain.

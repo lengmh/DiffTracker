@@ -5,6 +5,7 @@ import { registerDirectoryPublicationSafety } from './directory-publication-safe
 import { registerSnapshotPublication } from './snapshot-publication.mjs';
 import { registerMonitoringLifecycleDiagnostics } from './monitoring-lifecycle-diagnostics.mjs';
 import { registerDeletedDirectoryCoverage } from './deleted-directory-coverage.mjs';
+import { registerDirectoryObservationOrigin } from './directory-observation-origin.mjs';
 import { registerScopeExclusionRecovery } from './scope-exclusion-recovery.mjs';
 import { registerPR12RuntimeBudgetRegressions } from './pr12-runtime-identity-budget.mjs';
 import { registerPR12LiteralEntryRegressions } from './pr12-literal-entry-regressions.mjs';
@@ -64,6 +65,7 @@ export function registerPR12BoundedInvariants(h) {
     registerPR12RuntimeBudgetRegressions(h, fixture, scopeFor);
     registerMonitoringLifecycleDiagnostics(h, fixture);
     registerDeletedDirectoryCoverage(h, fixture);
+    registerDirectoryObservationOrigin(h, fixture);
     registerCreationProofLifecycle(h, fixture);
     registerLegacyCreationProof(h, fixture);
     registerCreationProofPersistence(h, fixture);
