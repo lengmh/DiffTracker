@@ -512,3 +512,13 @@ controls and nine schema cases are included in the tracker total. The inspected
 75-file internal VSIX changes only the compiled tracker from the prior candidate;
 it is not a Release artifact. Independent review and remote Verification remain
 separate gates; the earlier denied log and historical Host limitations remain.
+
+Verification 41399411325 passed all three real Host jobs and both platforms'
+full unit suites, but Windows performance failed its serialized-record assertion:
+native parent notifications retained source-only entries which that older checker
+counted as extra faults. The test-only follow-up compares persisted origin to
+live origin, accepts only the exact source-only shape, and keeps every diagnostic,
+owner, before-image, workload and performance assertion. Five deterministic
+positive/negative representation controls reproduce the old checker failure and
+pass with that correction. Production source and packaged bytes are unchanged;
+the original failed run remains evidence, and the new commit needs fresh CI.
