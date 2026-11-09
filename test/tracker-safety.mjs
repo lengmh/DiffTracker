@@ -1909,6 +1909,116 @@ test('S2 successful recording Clear Diffs rebuilds current text and opaque basel
     assert.equal(tracker.getOriginalContent(textFile),'current');assert.ok(tracker.opaqueBaselineFiles.has(opaqueFile));
     assert.equal(tracker.getTrackedChanges().length,0);assert.equal(tracker.revertHistory.length,0);
 });
+test('S2 successful Clear Diffs retires an ignored unresolved race after the replacement baseline commits',async()=>{
+    const dir=file('ignored-race-dir'),ignored=path.join(dir,'changed.txt'),policy=file('.gitignore'),storage=file('storage');
+    fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async(transaction)=>{
+        transaction.readyPrepared=true;
+        // Simulate a watcher event that was classified before the new policy
+        // matcher became authoritative during Clear Diffs.
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'File changed during ignore discovery; before-image is unknown');
+        // A restored ignored path may retain durable unknown evidence without a
+        // rebuilt in-memory review row. The reset must persist its removal too.
+        tracker.trackedChanges.delete(ignored);
+    };
+    try {
+        assert.equal(await tracker.resetBaselineToCurrentState(),true);
+        assert.equal(tracker.unresolvedBaselineFiles.has(ignored),false);
+        assert.equal(pending(ignored),undefined);
+        await tracker.flushPendingPersistence();
+        const saved=JSON.parse(fs.readFileSync(path.join(storage,'session-state.json'),'utf8'));
+        assert.equal(saved.unresolvedBaselineFiles.some(([name])=>name===ignored),false);
+    } finally { tracker.initializeWorkspaceSnapshots=originalInitialize; }
+});
+test('S2 Clear Diffs preserves ignored unresolved evidence when policy changes during cleanup persistence',async()=>{
+    const dir=file('ignored-race-policy-during-persist'),ignored=path.join(dir,'changed.txt'),policy=path.join(root,'.gitignore'),storage=file('storage');
+    fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+    tracker.recordUnresolvedBaseline(ignored,'prior unknown before-image');
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async(transaction)=>{
+        transaction.readyPrepared=true;
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'during-reset unknown before-image');
+    };
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    try {
+        await persistGate.entered;
+        // The policy event arrives while cleanup persistence is awaiting its write.
+        fs.writeFileSync(policy,'');
+        emitWatcher('change',Uri.file(policy));
+        persistGate.release();
+        assert.equal(await reset,false);
+        await new Promise(resolve=>setTimeout(resolve,40));
+        assert.equal(tracker.unresolvedBaselineFiles.get(ignored),'prior unknown before-image');
+    } finally {
+        persistGate.release();tracker.initializeWorkspaceSnapshots=originalInitialize;
+    }
+});
+test('S2 Clear Diffs preserves ignored unresolved evidence when policy changes during supplemental persistence',async()=>{
+    const includeDir=file('ignored-race-supplemental'),ignored=file('ignored-race-second-flush.txt'),policy=path.join(root,'.gitignore'),storage=file('storage');
+    fs.mkdirSync(includeDir,{recursive:true});fs.writeFileSync(path.join(includeDir,'candidate.txt'),'candidate');
+    fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(ignored)+'\n');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const relativeInclude=path.relative(root,includeDir).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeInclude]:true};
+    const scope={kind:'configured',mode:'rules',roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeInclude}],excludes:[],scopeRevision:''};
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    tracker.recordUnresolvedBaseline(ignored,'prior unknown before-image');
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async(transaction)=>{
+        transaction.readyPrepared=true;
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'during-reset unknown before-image');
+    };
+    const temp=path.join(storage,'session-state.tmp.json');
+    const firstPersist=pause(temp,'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    let secondPersist;
+    try {
+        await firstPersist.entered;
+        firstPersist.release();
+        secondPersist=pause(temp,'write');
+        await secondPersist.entered;
+        // The policy event arrives while supplemental reconciliation persistence awaits its write.
+        fs.writeFileSync(policy,'');
+        emitWatcher('change',Uri.file(policy));
+        secondPersist.release();
+        assert.equal(await reset,false);
+        await new Promise(resolve=>setTimeout(resolve,40));
+        assert.equal(tracker.unresolvedBaselineFiles.get(ignored),'prior unknown before-image');
+    } finally {
+        firstPersist.release();secondPersist?.release();tracker.initializeWorkspaceSnapshots=originalInitialize;
+    }
+});
+test('S2 failed Clear Diffs preserves an ignored unresolved race for retry',async()=>{
+    const dir=file('ignored-race-failed-dir'),ignored=path.join(dir,'changed.txt'),policy=file('.gitignore'),storage=file('storage');
+    fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    tracker.recordUnresolvedBaseline(ignored,'prior unknown before-image');
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async(transaction)=>{
+        transaction.readyPrepared=true;
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'File changed during ignore discovery; before-image is unknown');
+    };
+    const temp=path.join(storage,'session-state.tmp.json');faults.set(temp,{write:error('NoPermissions')});
+    try {
+        assert.equal(await tracker.resetBaselineToCurrentState(),false);
+        assert.equal(tracker.unresolvedBaselineFiles.get(ignored),'prior unknown before-image');
+        assert.equal(tracker.getOriginalContent(ignored),undefined);
+    } finally { tracker.initializeWorkspaceSnapshots=originalInitialize;faults.clear(); }
+});
 test('AUDIT-21 stopped clear persists empty baseline and history without resuming recording',async()=>{
     const p=file(),q=file();seed(p,'before','current');seed(q,'q before','q current');await scan(p);await scan(q);assert.ok(succeeded(await tracker.revertFile(q)));
     const storage=file('storage');tracker.storageUri=Uri.file(storage);tracker.stopRecording();await tracker.flushPendingPersistence();

@@ -2720,15 +2720,28 @@ export class DiffTracker {
             const contextCurrent = transaction.valid!;
             transaction.valid = () => contextCurrent() && coverageCurrent();
             await this.initializeWorkspaceSnapshots(transaction);
-            const committed = transaction.readyPrepared && this.isCurrentEpoch(epoch) && this.baselineTransaction === transaction &&
+            let committed: boolean = transaction.readyPrepared === true && this.isCurrentEpoch(epoch) && this.baselineTransaction === transaction &&
                 this.snapshotInitialized && (!transaction.valid || transaction.valid());
+            if (committed && this.scanCoverage === this.ignoreFingerprint &&
+                this.clearIgnoredUnresolvedAfterBaselineReset()) {
+                // initializeWorkspaceSnapshots already crossed the Ready write
+                // barrier. Persist this final policy-race cleanup through the
+                // same transaction before exposing the reset as committed.
+                committed = await this.flushPersistState(true, transaction) &&
+                    this.isCurrentEpoch(epoch) &&
+                    this.scanCoverage === this.ignoreFingerprint &&
+                    (!transaction.valid || transaction.valid());
+            }
             if (!committed) {
                 await rollback();
                 return false;
             }
             if (supplemental) {
                 this.reconcileSupplementalCoverageAfterSuccessfulScan(supplemental);
-                if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) {
+                if (!await this.flushPersistState(true, transaction) ||
+                    !this.isCurrentEpoch(epoch) ||
+                    this.scanCoverage !== this.ignoreFingerprint ||
+                    (transaction.valid && !transaction.valid())) {
                     await rollback();
                     return false;
                 }
@@ -9622,6 +9635,41 @@ export class DiffTracker {
             this.emitTrackChangesEvent({ changedFiles: retainedFiles, fullRefresh: true });
         }
         if (removedFiles.length > 0) { this.emitTrackChangesEvent({ removedFiles }); }
+    }
+
+    /**
+     * A replacement baseline can make a path ignored after its prior scan
+     * recorded an unresolved before-image. Once the replacement scan and its
+     * policy fingerprint are durable, that stale unknown evidence is no longer
+     * actionable and must be retired. Policy contraction outside a reset keeps
+     * the existing conservative unknown behavior.
+     */
+    private clearIgnoredUnresolvedAfterBaselineReset(): boolean {
+        const removedFiles: string[] = [];
+        let changed = false;
+        for (const [filePath] of [...this.unresolvedBaselineFiles]) {
+            const uri = vscode.Uri.file(filePath);
+            if (!this.isPathIgnored(uri, false, false, false)) { continue; }
+
+            this.unresolvedBaselineFiles.delete(filePath);
+            changed = true;
+            this.postBaselineUnknownFiles.delete(filePath);
+            this.retainedReviewPaths.delete(filePath);
+            this.clearCoverageGap(filePath, 'file', false);
+
+            const change = this.trackedChanges.get(filePath);
+            if (change?.reviewKind === 'unknown') {
+                this.deleteTrackedChange(filePath);
+                this.lineChanges.delete(filePath);
+                this.markLineChangesUpdated(filePath);
+                this.inlineViews.delete(filePath);
+                removedFiles.push(filePath);
+            }
+        }
+        if (removedFiles.length > 0) {
+            this.emitTrackChangesEvent({ removedFiles, baselineChanged: true });
+        }
+        return changed;
     }
 
     private startupCreatePredatesWatchBoundary(
