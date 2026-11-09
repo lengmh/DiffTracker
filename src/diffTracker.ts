@@ -1435,7 +1435,10 @@ export class DiffTracker {
                 // initializeWorkspaceSnapshots already crossed the Ready write
                 // barrier. Persist this final policy-race cleanup through the
                 // same transaction before exposing the reset as committed.
-                committed = await this.flushPersistState(true, transaction) && this.isCurrentEpoch(epoch);
+                committed = await this.flushPersistState(true, transaction) &&
+                    this.isCurrentEpoch(epoch) &&
+                    this.scanCoverage === this.ignoreFingerprint &&
+                    (!transaction.valid || transaction.valid());
             }
             if (!committed) {
                 await rollback();

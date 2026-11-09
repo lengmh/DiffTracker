@@ -1689,6 +1689,32 @@ test('S2 successful Clear Diffs retires an ignored unresolved race after the rep
         assert.equal(saved.unresolvedBaselineFiles.some(([name])=>name===ignored),false);
     } finally { tracker.initializeWorkspaceSnapshots=originalInitialize; }
 });
+test('S2 Clear Diffs preserves ignored unresolved evidence when policy changes during cleanup persistence',async()=>{
+    const dir=file('ignored-race-policy-during-persist'),ignored=path.join(dir,'changed.txt'),policy=path.join(root,'.gitignore'),storage=file('storage');
+    fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    tracker.snapshotInitialized=true;tracker.baselineBuilding=false;
+    tracker.recordUnresolvedBaseline(ignored,'prior unknown before-image');
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async()=>{
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'during-reset unknown before-image');
+    };
+    const persistGate=pause(path.join(storage,'session-state.tmp.json'),'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    try {
+        await persistGate.entered;
+        // The policy event arrives while cleanup persistence is awaiting its write.
+        fs.writeFileSync(policy,'');
+        emitWatcher('change',Uri.file(policy));
+        persistGate.release();
+        assert.equal(await reset,false);
+        await new Promise(resolve=>setTimeout(resolve,40));
+        assert.equal(tracker.unresolvedBaselineFiles.get(ignored),'prior unknown before-image');
+    } finally {
+        persistGate.release();tracker.initializeWorkspaceSnapshots=originalInitialize;
+    }
+});
 test('S2 failed Clear Diffs preserves an ignored unresolved race for retry',async()=>{
     const dir=file('ignored-race-failed-dir'),ignored=path.join(dir,'changed.txt'),policy=file('.gitignore'),storage=file('storage');
     fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
