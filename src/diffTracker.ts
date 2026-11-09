@@ -1446,7 +1446,10 @@ export class DiffTracker {
             }
             if (supplemental) {
                 this.reconcileSupplementalCoverageAfterSuccessfulScan(supplemental);
-                if (!await this.flushPersistState(true, transaction) || !this.isCurrentEpoch(epoch)) {
+                if (!await this.flushPersistState(true, transaction) ||
+                    !this.isCurrentEpoch(epoch) ||
+                    this.scanCoverage !== this.ignoreFingerprint ||
+                    (transaction.valid && !transaction.valid())) {
                     await rollback();
                     return false;
                 }

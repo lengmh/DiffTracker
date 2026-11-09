@@ -1715,6 +1715,46 @@ test('S2 Clear Diffs preserves ignored unresolved evidence when policy changes d
         persistGate.release();tracker.initializeWorkspaceSnapshots=originalInitialize;
     }
 });
+test('S2 Clear Diffs preserves ignored unresolved evidence when policy changes during supplemental persistence',async()=>{
+    const includeDir=file('ignored-race-supplemental'),ignored=file('ignored-race-second-flush.txt'),policy=path.join(root,'.gitignore'),storage=file('storage');
+    fs.mkdirSync(includeDir,{recursive:true});fs.writeFileSync(path.join(includeDir,'candidate.txt'),'candidate');
+    fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(ignored)+'\n');
+    const roots=tracker.currentWorkspaceRootIdentities();
+    const relativeInclude=path.relative(root,includeDir).split(path.sep).join('/');
+    vscodeExcludes['files.watcherExclude']={[relativeInclude]:true};
+    const scope={kind:'configured',mode:'rules',roots:roots.map(identity=>({...identity})),
+        includes:[{scope:'all',path:relativeInclude}],excludes:[],scopeRevision:''};
+    scope.scopeRevision=createHash('sha256').update(JSON.stringify({
+        model:1,mode:scope.mode,roots:scope.roots,includes:scope.includes,excludes:scope.excludes
+    })).digest('hex');
+    assert.equal((await tracker.applyConfiguredMonitoringScope(scope,false,()=>true)).status,'applied');
+    listedFiles=[Uri.file(ignored)];listedIgnores=[Uri.file(policy)];tracker.storageUri=Uri.file(storage);
+    tracker.recordUnresolvedBaseline(ignored,'prior unknown before-image');
+    const originalInitialize=tracker.initializeWorkspaceSnapshots;
+    tracker.initializeWorkspaceSnapshots=async()=>{
+        tracker.snapshotInitialized=true;tracker.baselineBuilding=false;tracker.scanCoverage=tracker.ignoreFingerprint;
+        tracker.recordUnresolvedBaseline(ignored,'during-reset unknown before-image');
+    };
+    const temp=path.join(storage,'session-state.tmp.json');
+    const firstPersist=pause(temp,'write');
+    const reset=tracker.resetBaselineToCurrentState();
+    let secondPersist;
+    try {
+        await firstPersist.entered;
+        firstPersist.release();
+        secondPersist=pause(temp,'write');
+        await secondPersist.entered;
+        // The policy event arrives while supplemental reconciliation persistence awaits its write.
+        fs.writeFileSync(policy,'');
+        emitWatcher('change',Uri.file(policy));
+        secondPersist.release();
+        assert.equal(await reset,false);
+        await new Promise(resolve=>setTimeout(resolve,40));
+        assert.equal(tracker.unresolvedBaselineFiles.get(ignored),'prior unknown before-image');
+    } finally {
+        firstPersist.release();secondPersist?.release();tracker.initializeWorkspaceSnapshots=originalInitialize;
+    }
+});
 test('S2 failed Clear Diffs preserves an ignored unresolved race for retry',async()=>{
     const dir=file('ignored-race-failed-dir'),ignored=path.join(dir,'changed.txt'),policy=file('.gitignore'),storage=file('storage');
     fs.mkdirSync(dir);fs.writeFileSync(ignored,'current');fs.writeFileSync(policy,path.basename(dir)+'/'+'\n');
