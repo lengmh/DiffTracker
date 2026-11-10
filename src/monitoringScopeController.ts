@@ -199,6 +199,10 @@ export class MonitoringScopeController implements vscode.Disposable {
         return this.recordScopeOperation(()=>this.recheckObservationCoverageNow(),result=>result);
     }
 
+    public rebuildObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        return this.recordScopeOperation(()=>this.rebuildObservationCoverageNow(),result=>result);
+    }
+
     private recheckObservationCoverageNow(): Promise<ObservationCoverageRecheckResult> {
         const blocker=this.getScopeSettingsWriteBlocker();
         if (blocker) { return Promise.resolve({status:'conflict',reason:blocker}); }
@@ -208,6 +212,17 @@ export class MonitoringScopeController implements vscode.Disposable {
             return Promise.resolve({ status: 'conflict', reason: 'Correct the invalid monitoring-scope request before rechecking observation coverage.' });
         }
         return this.tracker.recheckObservationCoverage();
+    }
+
+    private rebuildObservationCoverageNow(): Promise<ObservationCoverageRecheckResult> {
+        const blocker=this.getScopeSettingsWriteBlocker();
+        if (blocker) { return Promise.resolve({status:'conflict',reason:blocker}); }
+        this.reconcileRequestedScope();
+        const requested = this.getRequestedScope();
+        if (!requested.ok) {
+            return Promise.resolve({ status: 'conflict', reason: 'Correct the invalid monitoring-scope request before rebuilding observation coverage.' });
+        }
+        return this.tracker.rebuildObservationCoverage();
     }
 
     public getWorkspaceRoots(): WorkspaceRootIdentity[] {

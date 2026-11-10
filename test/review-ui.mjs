@@ -307,7 +307,7 @@ await test('unknown state is visible in generated DOM, tree and incremental payl
     assert.equal(ui.elements.get('btn-keep-all').disabled, false);
 });
 
-await test('coverage diagnostics expose the existing guarded Recheck action without prescribing a rebuild', async () => {
+await test('coverage diagnostics expose distinct guarded Check and Rebuild actions', async () => {
     const h = harness(null);
     h.state.recheckBlocker=undefined;
     h.state.subtreeCoverageGaps=[{targetPath:'/workspace/generated-cache',reasonCode:'supplemental-watcher-runtime-gap',
@@ -315,12 +315,20 @@ await test('coverage diagnostics expose the existing guarded Recheck action with
     const tree=new (h.load('diffTreeView.ts').DiffTreeDataProvider)(h.tracker);
     let row=(await tree.getChildren()).find(item=>item.label==='Monitoring Coverage Limited').children[0];
     assert.equal(row.contextValue,'coverageDiagnosticSubtreeRecheck');
-    assert.match(row.tooltip,/Recheck Observation Coverage/);
-    assert.doesNotMatch(row.tooltip,/baseline rebuild/);
+    assert.match(row.tooltip,/Check Observation Coverage/);
+    assert.match(row.tooltip,/Rebuild Observation Coverage/);
+    assert.match(row.tooltip,/Neither operation replaces original review baselines/);
     const manifest=JSON.parse(fs.readFileSync('package.json','utf8'));
+    const commands=new Map(manifest.contributes.commands.map(command=>[command.command,command]));
+    assert.equal(commands.get('diffTracker.recheckObservationCoverage').title,'Check Observation Coverage');
+    assert.equal(commands.get('diffTracker.rebuildObservationCoverage').title,'Rebuild Observation Coverage');
+    assert.equal(commands.get('diffTracker.clearDiffs').title,'Clear Pending Diffs');
+    assert.equal(commands.get('diffTracker.clearDiffs').icon,'$(clear-all)');
     const menus=manifest.contributes.menus['view/item/context'];
     assert.ok(menus.some(menu=>menu.command==='diffTracker.recheckObservationCoverage' &&
         menu.when.includes('viewItem == coverageDiagnosticSubtreeRecheck') && menu.group.startsWith('inline')));
+    assert.ok(menus.some(menu=>menu.command==='diffTracker.rebuildObservationCoverage' &&
+        menu.when.includes('viewItem == coverageDiagnosticSubtreeRecheck')));
     assert.ok(menus.some(menu=>menu.command==='diffTracker.excludeCoverageSubtree' &&
         menu.when.includes('viewItem == coverageDiagnosticSubtreeRecheck')));
     h.state.recheckBlocker='Recheck requires an active, ready configured scope.';

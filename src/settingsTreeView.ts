@@ -148,9 +148,14 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
                     'filter'
                 ),
                 new SettingActionItem(
-                    'Recheck Observation Coverage',
-                    { command: 'diffTracker.recheckObservationCoverage', title: 'Recheck Observation Coverage' },
+                    'Check Observation Coverage',
+                    { command: 'diffTracker.recheckObservationCoverage', title: 'Check Observation Coverage' },
                     'refresh'
+                ),
+                new SettingActionItem(
+                    'Rebuild Observation Coverage',
+                    { command: 'diffTracker.rebuildObservationCoverage', title: 'Rebuild Observation Coverage' },
+                    'sync'
                 )
             ];
         }
