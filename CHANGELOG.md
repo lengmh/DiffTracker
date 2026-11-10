@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.15
+
+- Fix baseline reset cleanup so ignored paths with stale unknown evidence are retired only after a successful, policy-consistent reset; failed or racing resets preserve unresolved state for retry.
+- Stabilize the VS Code Host harness around transient multi-root workspace churn so scope-transaction coverage waits for settled roots without weakening production guards.
+
 ## 0.8.14
 
 - Retire deleted directory coverage obligations after verified absence and reliable reconstruction observation. Preserve deletion reviews, original baselines and Undo without requiring permanent exclusions, a baseline rebuild or empty replacement directories.
