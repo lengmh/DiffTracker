@@ -1654,25 +1654,52 @@ export class DiffTracker {
     }
 
     public recheckObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
-        return this.queueObservationCoverageRecheck();
+        return this.queueObservationCoverageRecheck(undefined, 'Recheck');
+    }
+
+    /**
+     * Reinstall the observation owners and replay the bounded coverage proof
+     * without replacing any baseline, pending review or Undo history. This is
+     * intentionally separate from Recheck so the UI can make the stronger
+     * watcher-rebuild intent explicit; both operations retain the same safety
+     * contract and ordinary ignore policy.
+     */
+    public rebuildObservationCoverage(): Promise<ObservationCoverageRecheckResult> {
+        return this.queueObservationCoverageRecheck(undefined, 'Rebuild');
     }
 
     public getObservationCoverageRecheckBlocker(): string | undefined {
-        if (this.coverageRecheckEpoch !== undefined) { return 'Observation coverage is already being rechecked.'; }
-        return this.observationCoverageRecheckBlocker(this.sessionEpoch,
-            () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty),
-            () => this.pausedGitRepositories.size > 0);
+        return this.getObservationCoverageOperationBlocker('Recheck');
     }
 
-    private observationCoverageRecheckBlocker(epoch: number, dirty: () => boolean, gitPaused: () => boolean): string | undefined {
+    public getObservationCoverageRebuildBlocker(): string | undefined {
+        return this.getObservationCoverageOperationBlocker('Rebuild');
+    }
+
+    private getObservationCoverageOperationBlocker(operation: 'Recheck' | 'Rebuild'): string | undefined {
+        if (this.coverageRecheckEpoch !== undefined) {
+            const participle = operation === 'Rebuild' ? 'rebuilt' : 'rechecked';
+            return `Observation coverage is already being ${participle}.`;
+        }
+        return this.observationCoverageRecheckBlocker(this.sessionEpoch,
+            () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty),
+            () => this.pausedGitRepositories.size > 0, operation);
+    }
+
+    private observationCoverageRecheckBlocker(
+        epoch: number,
+        dirty: () => boolean,
+        gitPaused: () => boolean,
+        operation: 'Recheck' | 'Rebuild' = 'Recheck'
+    ): string | undefined {
         if (!this.isCurrentEpoch(epoch) || !this.isRecording || !this.snapshotInitialized || this.baselineBuilding ||
             this.recoveryBlocked || this.persistenceFailed || this.restoringEpoch !== undefined ||
             this.baselineTransaction || this.activeScopeApplications > 0 || this.gitContextPending ||
             gitPaused() || this.workspaceContextChanged || this.pendingMonitoringScope ||
             this.effectiveMonitoringScope.kind !== 'configured') {
-            return 'Recheck requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.';
+            return `${operation} requires an active, ready configured scope with no pending scope, recovery or Git operation. Existing review and recording intent are unchanged.`;
         }
-        if (dirty()) { return 'Save or discard unsaved editor changes before rechecking observation coverage.'; }
+        if (dirty()) { return `Save or discard unsaved editor changes before ${operation.toLowerCase()}ing observation coverage.`; }
         return undefined;
     }
 
@@ -1681,34 +1708,38 @@ export class DiffTracker {
             targets.some(target => this.coverageGaps.get(target.path)?.[target.kind]?.scopeOperationRevision !== revision)) {
             return Promise.resolve({status:'conflict',reason:'The operation recovery scope changed before verification.'});
         }
-        return this.queueObservationCoverageRecheck(targets.map(target => ({...target})));
+        return this.queueObservationCoverageRecheck(targets.map(target => ({...target})), 'Recheck');
     }
 
-    private queueObservationCoverageRecheck(targets?: readonly ScopeCoverageTarget[]): Promise<ObservationCoverageRecheckResult> {
+    private queueObservationCoverageRecheck(
+        targets?: readonly ScopeCoverageTarget[],
+        operation: 'Recheck' | 'Rebuild' = 'Recheck'
+    ): Promise<ObservationCoverageRecheckResult> {
         const epoch = this.sessionEpoch;
         if (this.coverageRecheckEpoch !== undefined) {
-            return Promise.resolve({ status: 'conflict', reason: 'Observation coverage is already being rechecked.' });
+            const participle = operation === 'Rebuild' ? 'rebuilt' : 'rechecked';
+            return Promise.resolve({ status: 'conflict', reason: `Observation coverage is already being ${participle}.` });
         }
         // Claim before queueing: a concurrent Apply must not stage another scope.
         this.coverageRecheckEpoch = epoch;
         return this.queueRecoveryAction(async () => {
             const completion: { failureReason?: string; overflow?:boolean } = {};
             try {
-                const result = await this.performObservationCoverageRecheck(epoch, completion, targets);
+                const result = await this.performObservationCoverageRecheck(epoch, completion, targets, operation);
                 // Our own safe pause advances epoch too. Keep its failure local
                 // to this invocation rather than inspecting a newer session.
                 if (completion.failureReason) { return { status: 'failed', reason: completion.failureReason }; }
                 if (this.isCurrentEpoch(epoch) && this.persistenceFailed) { return { status:'failed',reason:this.persistenceIssue }; }
                 if (!this.isCurrentEpoch(epoch) && (result.status==='rechecked' || result.status==='limited')) {
-                    return {status:'conflict',reason:'Recheck was superseded during deferred observation replay; original baselines are preserved.'};
+                    return {status:'conflict',reason:`${operation} was superseded during deferred observation replay; original baselines are preserved.`};
                 }
                 if (this.isCurrentEpoch(epoch) && result.status==='rechecked' &&
                     (completion.overflow || (targets ? this.getScopeOperationCoverageGaps(targets).related.length>0 : this.getCoverageGaps().length>0))) {
-                    return {status:'limited',reason:'Recheck finished, but deferred activity left observation coverage unverified. See Monitoring Scope diagnostics.'};
+                    return {status:'limited',reason:`${operation} finished, but deferred activity left observation coverage unverified. See Monitoring Scope diagnostics.`};
                 }
                 return result;
             } catch (error) {
-                return { status: 'failed', reason: `Observation coverage recheck did not complete: ${String(error)}` };
+                return { status: 'failed', reason: `Observation coverage ${operation.toLowerCase()} did not complete: ${String(error)}` };
             }
             finally {
                 if (this.coverageRecheckEpoch === epoch) { this.coverageRecheckEpoch = undefined; }
@@ -1719,18 +1750,19 @@ export class DiffTracker {
     private async performObservationCoverageRecheck(
         epoch: number,
         completion: { failureReason?: string; overflow?:boolean },
-        targets?: readonly ScopeCoverageTarget[]
+        targets?: readonly ScopeCoverageTarget[],
+        operation: 'Recheck' | 'Rebuild' = 'Recheck'
     ): Promise<ObservationCoverageRecheckResult> {
         const selected = (filePath: string) => !targets || targets.some(target => this.scopeCoverageTargetContains(target,filePath));
         const dirty = () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty && selected(document.uri.fsPath));
         const gitPaused = () => [...this.pausedGitRepositories.keys()].some(root => !targets || targets.some(target =>
             this.pathBelongsToRoot(target.path,root) || (target.kind==='subtree' && this.pathBelongsToRoot(root,target.path))));
         const conflict = (reason: string): ObservationCoverageRecheckResult => ({ status: 'conflict', reason });
-        const blocker = this.observationCoverageRecheckBlocker(epoch,dirty,gitPaused);
+        const blocker = this.observationCoverageRecheckBlocker(epoch,dirty,gitPaused,operation);
         if (blocker) { return conflict(blocker); }
         const scope = this.effectiveMonitoringScope;
         // Keep the configured-scope type explicit after the shared UI guard.
-        if (scope.kind !== 'configured') { return conflict('Recheck requires a configured monitoring scope.'); }
+        if (scope.kind !== 'configured') { return conflict(`${operation} requires a configured monitoring scope.`); }
         const watcherRevision = this.watcherCoverageRevision;
         const ignoreVersion = this.ignoreRefreshVersion;
         const policyRevision = this.ignorePolicyRevision;
@@ -1743,7 +1775,7 @@ export class DiffTracker {
             this.ignorePolicyRevision === policyRevision;
         if ((!targets && !await this.drainDeferredScopeApplyEvents(epoch)) ||
             (targets && (this.activeExternalOperations.size > 0 || this.activeCreations.size > 0)) || !current()) {
-            return conflict('Workspace activity or scope changed before Recheck could begin; retry after it settles.');
+            return conflict(`Workspace activity or scope changed before ${operation} could begin; retry after it settles.`);
         }
         const identityIssue = this.getPathIdentityIssue();
         if (identityIssue) { return conflict(identityIssue); }
@@ -1838,7 +1870,7 @@ export class DiffTracker {
                 markers.set(root, evidence);
             }
         } catch (error) {
-            return { status: 'failed', reason: `Recheck cannot reserve durable coverage evidence: ${String(error)}` };
+            return { status: 'failed', reason: `${operation} cannot reserve durable coverage evidence: ${String(error)}` };
         }
         if (!targets) {
             for (const [target] of importedOwnerRepairs) { this.importedCoverageObligations.add(target); }
@@ -1880,12 +1912,12 @@ export class DiffTracker {
             const initialSaved = await this.flushPendingPersistence();
             // False also means the writer was superseded by Stop/Start or
             // disposal. Old work must never pause the newer recording session.
-            if (!this.isCurrentEpoch(epoch)) { return conflict('Observation coverage recheck was cancelled by a recording lifecycle change.'); }
+            if (!this.isCurrentEpoch(epoch)) { return conflict(`Observation coverage ${operation.toLowerCase()} was cancelled by a recording lifecycle change.`); }
             if (!initialSaved) {
-                await this.pauseRecordingForUnpersistableCoverage('Observation coverage recheck could not save its uncertainty; recording is paused with original review preserved.');
+                await this.pauseRecordingForUnpersistableCoverage(`Observation coverage ${operation.toLowerCase()} could not save its uncertainty; recording is paused with original review preserved.`);
                 return { status: 'failed', reason: this.persistenceIssue };
             }
-            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            if (!current()) { return conflict(`Observation coverage ${operation.toLowerCase()} was superseded; coverage remains unverified.`); }
             const preparationBudget = {remainingEntries:this.maxScopePreflightEntries};
             const fileTargets=targets
                 ? targets.filter(target=>currentKind(target.path,target.kind)==='file')
@@ -1894,6 +1926,15 @@ export class DiffTracker {
             const requiredFileCoverage = fileTargets.length>0 ? targets ? this.configuredSupplementalCoveragePlan(scope) : plan : undefined;
             if(requiredFileCoverage){requiredFileCoverage.targets=requiredFileCoverage.targets.filter(target=>!deferredTargets.get(target)?.identity.isFile());}
             if (!targets) {
+                // Rebuild is intentionally stronger than Check/Recheck: force
+                // a clean observer handoff before installing the new host and
+                // supplemental owners. The uncertainty markers above and the
+                // restoring epoch retain events that arrive during this short
+                // handoff; no baseline or review state is replaced.
+                if (operation === 'Rebuild') {
+                    this.disposeFileWatchers();
+                    this.externalWatcherEnabled = false;
+                }
                 this.activateExternalWatchers(this.createExternalWatchers(epoch),plan.targets);
                 hostWatchers=this.fileWatchers;
             }
@@ -1942,7 +1983,7 @@ export class DiffTracker {
                     }
                 }
             }
-            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            if (!current()) { return conflict(`Observation coverage ${operation.toLowerCase()} was superseded; coverage remains unverified.`); }
             if (!targets) { this.commitSupplementalCoverageTargets(plan.targets); }
             for (const [target] of importedOwnerRepairs) {
                 if (this.canReuseSupplementalDirectoryOwner(target,epoch) &&
@@ -1988,13 +2029,13 @@ export class DiffTracker {
                     await this.readFileAndUpdate(file,vscode.Uri.file(file),current);
                 }
             } else { await this.discoverRestoredFiles(epoch, current); }
-            if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+            if (!current()) { return conflict(`Observation coverage ${operation.toLowerCase()} was superseded; coverage remains unverified.`); }
             for (const filePath of new Set([
                 ...this.fileSnapshots.keys(), ...this.opaqueBaselineFiles.keys(), ...this.largeFileReminders.keys(), ...this.unresolvedBaselineFiles.keys()
             ])) {
                 if (!selected(filePath)) { continue; }
                 if (targets && preparationBudget.remainingEntries-- <= 0) { throw new Error('Operation coverage reconciliation budget exceeded'); }
-                if (!current()) { return conflict('Observation coverage recheck was superseded; coverage remains unverified.'); }
+                if (!current()) { return conflict(`Observation coverage ${operation.toLowerCase()} was superseded; coverage remains unverified.`); }
                 await this.readFileAndUpdate(filePath, vscode.Uri.file(filePath), current);
             }
             const recoverableControls: Array<[string, CoverageGapEvidence]> = [];
@@ -2017,7 +2058,7 @@ export class DiffTracker {
                 recoverableControls.push([target, evidence]);
             }
             if (!ownerCoverageCurrent() || handoffs.some(handoff => !handoff.stillCurrent())) {
-                return { status: 'limited', reason: 'Files, settings or watcher ownership changed during Recheck. Coverage remains unverified; retry after activity settles.' };
+                return { status: 'limited', reason: `Files, settings or watcher ownership changed during ${operation}. Coverage remains unverified; retry after activity settles.` };
             }
 
             // Only retirement is transactional. Discovery must not run inside
@@ -2040,7 +2081,7 @@ export class DiffTracker {
                 for (const [target, evidence] of importedDirectoryGaps) {
                     const owner = owners.get(target)?.owner;
                     const folder = this.owningWorkspaceFolderForTraversal(target);
-                    // Only this explicit, completed Recheck proves an old import
+                    // Only this explicit, completed coverage operation proves an old import
                     // interval. Reuse its exact owner/identity/event snapshot and
                     // durable transaction, not the general supplemental predicate.
                     if (this.coverageGaps.get(target)?.subtree !== evidence || !owner || !folder ||
@@ -2101,14 +2142,14 @@ export class DiffTracker {
             // bytes as a baseline. A missing before-image remains Unknown and
             // can only be abandoned by a separate, explicit Reset.
             for (const target of new Set([...removedFiles.keys(),...[...removed.keys()].filter(target=>deferredTargets.get(target)?.identity.isFile())])) {
-                if (!current()) { return conflict('Recheck was superseded after coverage repair; original baselines are unchanged.'); }
+                if (!current()) { return conflict(`${operation} was superseded after coverage repair; original baselines are unchanged.`); }
                 this.pendingScopeSuspendedPaths.delete(target);
                 await this.readFileAndUpdate(target, vscode.Uri.file(target), current);
-                if (!current()) { return conflict('Recheck was superseded after coverage repair; original baselines are unchanged.'); }
+                if (!current()) { return conflict(`${operation} was superseded after coverage repair; original baselines are unchanged.`); }
             }
             for (const target of removed.keys()) { this.pendingScopeSuspendedPaths.delete(target); }
             return (targets ? this.getScopeOperationCoverageGaps(targets).related.length > 0 : this.getCoverageGaps().length > 0 || this.getSubtreeCoverageGaps().length > 0)
-                ? { status: 'limited', reason: 'Recheck completed against the original baselines, but some coverage remains unverified. See Monitoring Scope diagnostics.' }
+                ? { status: 'limited', reason: `${operation} completed against the original baselines, but some coverage remains unverified. See Monitoring Scope diagnostics.` }
                 : { status: 'rechecked' };
         } catch (error) {
             return { status: 'failed', reason: `Observation coverage remains unverified: ${String(error)}` };
@@ -2122,7 +2163,7 @@ export class DiffTracker {
                         for (const root of this.coverageRecheckOverflowRoots) {
                             if (this.coverageGaps.get(root)?.subtree) { continue; }
                             const evidence:CoverageGapEvidence={targetKind:'subtree',reasonCode:'coverage-recheck-incomplete',
-                                reason:'Observation notifications exceeded the bounded Recheck replay; original baselines are preserved and this subtree remains unverified.'};
+                                reason:`Observation notifications exceeded the bounded ${operation} replay; original baselines are preserved and this subtree remains unverified.`};
                             uncertainty.set(`subtree\0${root}`,{path:root,evidence});
                         }
                         for(const target of overflowTargets){
@@ -2138,7 +2179,7 @@ export class DiffTracker {
                             if(evidence.targetKind==='file'){this.markFileUnavailable(path,evidence.reason);}
                         }
                     } catch(error) {
-                        completion.failureReason=`Recheck overflow uncertainty could not be retained: ${String(error)}`;
+                        completion.failureReason=`${operation} overflow uncertainty could not be retained: ${String(error)}`;
                         await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                     }
                 }
@@ -2202,7 +2243,7 @@ export class DiffTracker {
                             if (evidence.targetKind==='file') { this.markFileUnavailable(target,evidence.reason); }
                         }
                     } catch (error) {
-                        completion.failureReason=`Deferred Recheck uncertainty could not be retained: ${String(error)}`;
+                        completion.failureReason=`Deferred ${operation} uncertainty could not be retained: ${String(error)}`;
                         await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                     }
                 }
@@ -2212,12 +2253,12 @@ export class DiffTracker {
                         // deletions belongs to this regional recovery retry.
                         this.annotateScopeOperationRecovery([...deletedTargets], scope.scopeRevision);
                     } catch (error) {
-                        completion.failureReason = `Recheck deletion uncertainty could not be retained: ${String(error)}`;
+                        completion.failureReason = `${operation} deletion uncertainty could not be retained: ${String(error)}`;
                         await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                     }
                 }
                 if (this.isCurrentEpoch(epoch) && !await this.flushPendingPersistence() && this.isCurrentEpoch(epoch)) {
-                    completion.failureReason = 'Observation coverage recheck results could not be saved; recording is paused with original review preserved.';
+                    completion.failureReason = `Observation coverage ${operation.toLowerCase()} results could not be saved; recording is paused with original review preserved.`;
                     await this.pauseRecordingForUnpersistableCoverage(completion.failureReason);
                 }
                 if (this.isCurrentEpoch(epoch)) { this.emitTrackChangesEvent({ fullRefresh: true }); }
@@ -13606,8 +13647,8 @@ export class DiffTracker {
         if (invalid) { return this.actionResult(filePath, 'conflict', invalid); }
         if (this.hasUnknownResetCoverageGap(filePath)) {
             return this.actionResult(filePath, 'conflict', this.pendingMonitoringScope
-                ? 'Monitoring coverage is incomplete. Apply or restore the pending monitoring scope, then run Recheck Observation Coverage before Reset. Original review is preserved.'
-                : 'Monitoring coverage is incomplete. Run Recheck Observation Coverage before resetting this baseline. Original review is preserved.');
+                ? 'Monitoring coverage is incomplete. Apply or restore the pending monitoring scope, then run Check Observation Coverage before Reset. Original review is preserved.'
+                : 'Monitoring coverage is incomplete. Run Check Observation Coverage before resetting this baseline. Original review is preserved.');
         }
         if (this.hasDirtyDocument(filePath)) {
             return this.actionResult(filePath, 'conflict', 'Save or discard unsaved editor changes before resetting this baseline');

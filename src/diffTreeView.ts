@@ -129,7 +129,7 @@ export class DiffTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, 
             child.description = diagnostic.reasonCode;
             const recovery = recheckBlocker
                 ? `${recheckBlocker}\nOpen Manage Monitoring Scope to review this requirement.`
-                : 'To keep monitoring, use Recheck Observation Coverage in the inline actions or right-click menu. Original review baselines are preserved.';
+                : 'To check existing observation owners, use Check Observation Coverage. To force a clean watcher-owner handoff and bounded replay, use Rebuild Observation Coverage. Neither operation replaces original review baselines or pending diffs.';
             child.tooltip = `${diagnostic.targetPath}\n${diagnostic.reason}\n${recovery}\nTo stop monitoring, right-click or use the inline action to save and apply a narrow exclusion. Affected pending reviews require confirmation.`;
             child.command = {
                 command: 'diffTracker.manageMonitoringScope',

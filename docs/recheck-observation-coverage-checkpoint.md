@@ -4,7 +4,9 @@
 
 ## 命令与保留语义
 
-`diffTracker.recheckObservationCoverage` 从命令面板与 Settings → Tools 进入，经 Scope Controller 调用 tracker。它不调用 Reset、Clear Diffs、Start 或持久化重新加载。文本内容、存在性、opaque 指纹、未解决基线与现有待审记录留在同一会话中；当前核对不会被写成新的 `scanCoverage`，未知的过去内容不会被接受为当前内容。
+`diffTracker.recheckObservationCoverage` 从命令面板与 Settings → Tools 进入，经 Scope Controller 调用 tracker。它在 UI 上标为 **Check Observation Coverage**：核对现有 owner 和 bounded replay，不调用 Reset、Clear Diffs、Start 或持久化重新加载来替换 review。文本内容、存在性、opaque 指纹、未解决基线与现有待审记录留在同一会话中；当前核对不会被写成新的 `scanCoverage`，未知的过去内容不会被接受为当前内容。
+
+同组的 `diffTracker.rebuildObservationCoverage` 是显式的 **Rebuild Observation Coverage** 入口。它复用本 checkpoint 的全部安全 guards 和持久化事务，但会先清洁交接 host/supplemental observer owners，再进行同一有界核对；因此不是把 Clear Diffs 或基线重建隐藏在 coverage 操作里。成功后仍保留原基线、pending diffs、unknown before-images 和 Undo；普通 `.gitignore` 也不会因此自动成为显式 exclude。
 
 有效范围保持不变。正常成功时继续录制；停止状态下直接拒绝，绝不隐式开始录制。基线构建、范围申请/准备、恢复阻塞、Git 暂停、未保存编辑器内容或其他 Recheck 进行中时，也明确拒绝。
 

@@ -134,6 +134,27 @@ export function registerRecheckObservationCoverage(h, fixture) {
         await waitUntil(() => tracker.getTrackedChanges().some(change => change.filePath === target && change.currentContent === 'pending'));
         return target;
     }
+    test('REBUILD observation coverage forces a clean owner handoff without replacing review state', () => fixture(async context => {
+        const { tracker } = context;
+        const target = await seed(context);
+        const original = tracker.getOriginalContent(target);
+        const token = tracker.getReviewToken(target);
+        const history = structuredClone(tracker.revertHistory);
+        const disposeWatchers = tracker.disposeFileWatchers.bind(tracker);
+        let disposed = 0;
+        tracker.disposeFileWatchers = () => { disposed++; return disposeWatchers(); };
+        const result = await tracker.rebuildObservationCoverage();
+        assert.equal(result.status, 'rechecked', JSON.stringify(result));
+        assert.equal(disposed, 1, 'Rebuild must perform an explicit clean observer handoff');
+        assert.equal(tracker.getOriginalContent(target), original);
+        assert.deepEqual(tracker.getReviewToken(target), token);
+        assert.equal(tracker.getTrackedChange(target)?.currentContent, 'pending');
+        assert.deepEqual(tracker.revertHistory, history);
+        tracker.stopRecording();
+        const blocked = await tracker.rebuildObservationCoverage();
+        assert.equal(blocked.status, 'conflict', JSON.stringify(blocked));
+        assert.match(blocked.reason ?? '', /active|recording/i);
+    }));
     async function atEnumeration(dir, run) {
         const original = fs.promises.opendir;
         let enter, release, used = false;

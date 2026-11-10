@@ -284,11 +284,13 @@ Acknowledge 不写入、删除或恢复工作区文件，不创建非文本 Undo
 
 批量 Revert 只修改具有可靠文本 before-image 的资源。Opaque 项不提供单文件 Revert，也不在批量 Revert 中修改文件或推进基线；它们继续待审，并报告为“仍待确认”，不计为成功、失败或普通跳过。
 
-### 11.4 Clear Diffs
+### 11.4 Clear Pending Diffs
 
-保留 `Clear Diffs` 名称和命令 ID，通过 Hover、命令说明和模态确认解释实际影响。
+命令 ID 仍为 `diffTracker.clearDiffs`；标题使用 `Clear Pending Diffs`，并通过图标、Hover、命令说明和模态确认解释其只丢弃 pending diffs/review history 的影响。
 
-录制中，Clear Diffs 对整个有效范围原子重建基线并清除待审和恢复历史。停止录制时，Clear Diffs 清除保存的基线、待审和恢复历史，并保持停止。两种情况都不修改工作区文件，也不保证安全擦除历史副本。
+录制中，Clear Pending Diffs 对整个有效范围原子重建基线并清除 pending diffs、待审和恢复历史。停止录制时，它清除保存的基线、pending diffs 和恢复历史，并保持停止。两种情况都不修改工作区文件、监控范围或 observation coverage，也不保证安全擦除历史副本。
+
+`Check Observation Coverage`（兼容命令 ID `diffTracker.recheckObservationCoverage`）只核对现有 owner 和原始基线，不重建基线。`Rebuild Observation Coverage` 是显式的 observer recovery：在相同 recording、scope、recovery、Git、持久化和 dirty-editor 前置条件下，先清洁交接 host/supplemental owners，再进行一次有界核对。两者都保留 pending diffs、unknown before-images 和 Undo；普通 `.gitignore` 仍按 scope policy 处理，不自动转成 exclude。
 
 ## 12. Session V4
 
@@ -342,10 +344,11 @@ V3 恢复后进入范围兼容模式，继续使用旧 Global `watchExclude` 的
 
 - `Apply Pending Scope`
 - `Retry Scope Preparation`
-- `Recheck Observation Coverage`
+- `Check Observation Coverage`
+- `Rebuild Observation Coverage`
 - `Restore Effective Scope Configuration`
 - `Migrate Legacy Watch Rules`
-- `Clear Diffs`
+- `Clear Pending Diffs`
 
 ## 15. 发布验收
 

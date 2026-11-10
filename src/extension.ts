@@ -1133,13 +1133,13 @@ export async function activate(context: vscode.ExtensionContext) {
             const wasRecording = diffTracker.getIsRecording();
             const answer = await vscode.window.showWarningMessage(
                 wasRecording
-                    ? 'Clear Diffs by rebuilding the review baseline from the current workspace state?'
-                    : 'Clear the saved review baseline, pending review, and recovery history while keeping recording stopped?',
+                    ? 'Clear pending diffs by rebuilding the review baseline from the current workspace state?'
+                    : 'Clear the saved review baseline, pending diffs and review recovery history while keeping recording stopped?',
                 {
                     modal: true,
                     detail: wasRecording
-                        ? 'The operation does not modify workspace files. It succeeds only after the replacement baseline is persisted; pending review and recovery history are then cleared.'
-                        : 'Workspace files are not modified. Recording remains stopped. This does not guarantee secure erasure of prior backup or filesystem remnants.'
+                        ? 'This discards pending diffs, review evidence and Undo/recovery history only after the replacement baseline is durably saved. Workspace files and observation coverage are unchanged.'
+                        : 'This only discards saved pending diffs and review history. Workspace files and monitoring scope are unchanged; recording remains stopped. This does not guarantee secure erasure of prior backup or filesystem remnants.'
                 },
                 'Clear Diffs',
                 'Cancel'
@@ -1445,7 +1445,17 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('diffTracker.recheckObservationCoverage', async () => {
             const outcome = await monitoringScopeController.recheckObservationCoverage();
             if (outcome.status === 'rechecked') {
-                void vscode.window.showInformationMessage('Code Diff Tracker: Observation coverage rechecked. Original review baselines are unchanged.');
+                void vscode.window.showInformationMessage('Code Diff Tracker: Observation coverage checked. Original review baselines, pending diffs and Undo are unchanged.');
+            } else {
+                void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`);
+            }
+            settingsTreeDataProvider.refresh();
+            return outcome;
+        }),
+        vscode.commands.registerCommand('diffTracker.rebuildObservationCoverage', async () => {
+            const outcome = await monitoringScopeController.rebuildObservationCoverage();
+            if (outcome.status === 'rechecked') {
+                void vscode.window.showInformationMessage('Code Diff Tracker: Observation coverage rebuilt. Original review baselines, pending diffs and Undo are unchanged.');
             } else {
                 void vscode.window.showWarningMessage(`Code Diff Tracker: ${outcome.reason ?? outcome.status}`);
             }

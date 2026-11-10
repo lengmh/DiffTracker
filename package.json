@@ -314,8 +314,9 @@
       },
       {
         "command": "diffTracker.clearDiffs",
-        "title": "Clear Diffs",
-        "category": "Code Diff Tracker"
+        "title": "Clear Pending Diffs",
+        "category": "Code Diff Tracker",
+        "icon": "$(clear-all)"
       },
       {
         "command": "diffTracker.revertAllChanges",
@@ -515,9 +516,15 @@
       },
       {
         "command": "diffTracker.recheckObservationCoverage",
-        "title": "Recheck Observation Coverage",
+        "title": "Check Observation Coverage",
         "category": "Code Diff Tracker",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "diffTracker.rebuildObservationCoverage",
+        "title": "Rebuild Observation Coverage",
+        "category": "Code Diff Tracker",
+        "icon": "$(sync)"
       },
       {
         "command": "diffTracker.migrateLegacyWatchRules",
@@ -590,14 +597,19 @@
           "group": "1_actions@0"
         },
         {
-          "command": "diffTracker.excludeCoverageSubtree",
+          "command": "diffTracker.rebuildObservationCoverage",
           "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
-          "group": "inline@2"
+          "group": "1_actions@1"
         },
         {
           "command": "diffTracker.excludeCoverageSubtree",
           "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
-          "group": "1_actions@1"
+          "group": "inline@3"
+        },
+        {
+          "command": "diffTracker.excludeCoverageSubtree",
+          "when": "view == diffTracker.changesView && viewItem == coverageDiagnosticSubtreeRecheck",
+          "group": "1_actions@2"
         },
         {
           "command": "diffTracker.excludeCoverageSubtree",
@@ -751,6 +763,11 @@
         {
           "command": "diffTracker.rebuildGitBaseline",
           "when": "view == diffTracker.changesView",
+          "group": "navigation"
+        },
+        {
+          "command": "diffTracker.rebuildObservationCoverage",
+          "when": "view == diffTracker.changesView && diffTracker.isRecording",
           "group": "navigation"
         },
         {
