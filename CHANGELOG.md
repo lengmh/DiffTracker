@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.16
+
+- Add explicit Check and Rebuild Observation Coverage actions so users can verify or reinstall watcher ownership without replacing review baselines, pending diffs, Unknown evidence or Undo history.
+- Preserve ignored-path baseline reset cleanup and host workspace-churn safety across the new coverage recovery flow.
+
 ## 0.8.15
 
 - Fix baseline reset cleanup so ignored paths with stale unknown evidence are retired only after a successful, policy-consistent reset; failed or racing resets preserve unresolved state for retry.
