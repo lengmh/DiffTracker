@@ -69,6 +69,36 @@ module.exports = async function runExtensionHostScenario() {
         assert.ok(extension, 'development extension is installed');
         await extension.activate();
         await until('Ready baseline', async () => (await state())?.baselineState === 'ready');
+
+        // VS Code can publish a transient remove/add pair for the folders in a
+        // freshly opened multi-root workspace. DiffTracker must pause for a
+        // real membership change, so do not weaken that production guard here.
+        // Instead, let the startup churn settle before the scope-transaction
+        // assertions below. If the transient pair paused the initial session,
+        // use the same test-only Start path the user would use to establish a
+        // fresh baseline after the roots are stable.
+        const sameWorkspaceFolders = () => JSON.stringify(folderNames(vscode.workspace.workspaceFolders ?? [])) ===
+            JSON.stringify(initialWorkspaceFolders);
+        const startupSettled = Date.now() + 10_000;
+        let quietSince = Date.now();
+        let observedContextEvents = workspaceContextEvents.length;
+        while (Date.now() < startupSettled && Date.now() - quietSince < 1_500) {
+            const eventCount = workspaceContextEvents.length;
+            if (eventCount !== observedContextEvents || !sameWorkspaceFolders()) {
+                observedContextEvents = eventCount;
+                quietSince = Date.now();
+            }
+            await delay(100);
+        }
+        assert.ok(sameWorkspaceFolders(),
+            `startup workspace folders did not settle: ${JSON.stringify({initialWorkspaceFolders, workspaceContextEvents})}`);
+        const startupState = await state();
+        if (!startupState.isRecording) {
+            assert.equal(await vscode.commands.executeCommand('diffTracker._testStartRecordingAfterPrechecks'), true,
+                `startup workspace churn must leave a recoverable session: ${JSON.stringify(startupState)}`);
+            await until('Ready baseline after startup workspace stabilization', async () =>
+                (await state())?.baselineState === 'ready');
+        }
         assert.equal((await state()).isRecording, true);
 
         // S3: a fresh workspace with no legacy Global watch rules adopts the
