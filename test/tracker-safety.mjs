@@ -6152,6 +6152,159 @@ test('CONVENIENCE initial scan and open binary document stay unrecorded while ba
     assert.equal(tracker.getOriginalContent(text),'baseline');
 });
 
+async function withRealTextSettingToggle(run) {
+    const getConfiguration = vscode.workspace.getConfiguration;
+    const warning = vscode.window.showWarningMessage;
+    const error = vscode.window.showErrorMessage;
+    const relativePath = vscode.workspace.asRelativePath;
+    Module._load = function(id,...args) { return id==='vscode' ? vscode : originalLoad.call(this,id,...args); };
+    let provider;
+    try {
+        vscode.TreeItem ??= class {};
+        const { SettingsTreeDataProvider } = require('../out/settingsTreeView.js');
+        provider = new SettingsTreeDataProvider(tracker);
+        const reports = [], prompts=[];
+        const writes = [];
+        let choose;
+        vscode.workspace.getConfiguration = (...args) => ({
+            ...getConfiguration(...args),
+            inspect: key => ({globalValue:vscodeExcludes[key]}),
+            update: async (key,value,target) => { writes.push(target); vscodeExcludes[key]=value; }
+        });
+        vscode.workspace.asRelativePath = target => path.relative(root,target.fsPath);
+        vscode.window.showWarningMessage = async (...args) => {
+            if (!args[1]?.modal) { reports.push(args[0]); return; }
+            prompts.push(args);
+            return choose?.(...args);
+        };
+        vscode.window.showInformationMessage = message => reports.push(message);
+        vscode.window.showErrorMessage = message => reports.push(message);
+        await run({toggle:()=>provider.toggleSetting('onlyRecordReviewableText'), reports, prompts, writes,
+            choose: choice => { choose=choice; }});
+    } finally {
+        provider?.dispose();
+        Module._load = originalLoad;
+        vscode.workspace.getConfiguration=getConfiguration;
+        vscode.workspace.asRelativePath=relativePath;
+        vscode.window.showWarningMessage=warning;
+        vscode.window.showErrorMessage=error;
+        delete vscode.window.showInformationMessage;
+    }
+}
+
+test('ISSUE-66 sidebar confirms once, clears existing opaque and stable Unknown, and preserves other review and Undo',async()=>{
+    await tracker.dispose();
+    const storage=Uri.file(file('text-cleanup-storage'));
+    const initial=file('initial.txt'); fs.writeFileSync(initial,'initial'); listedFiles=[Uri.file(initial)];
+    tracker=new DiffTracker(storage); assert.equal(tracker.startRecording(),true);
+    await waitUntil(()=>tracker.getBaselineState()==='ready',5000);
+    const binary=file('opaque.bin'); fs.writeFileSync(binary,Buffer.from([0,1]));
+    await tracker.onExternalFileCreated(Uri.file(binary));
+    assert.equal(pending(binary)?.reviewKind,'opaque');
+    const unknown=file('unknown.pdf'); fs.writeFileSync(unknown,Buffer.from([0,2]));
+    tracker.markFileUnavailable(unknown, 'File changed while being read; refresh before review');
+    assert.equal(pending(unknown)?.reviewKind,'unknown');
+    const uncertain=file('unresolved.txt'); fs.writeFileSync(uncertain,'unclassified');
+    faults.set(uncertain,{ read:error('NoPermissions') });
+    await scan(uncertain); assert.equal(pending(uncertain)?.reviewKind,'unknown');
+
+    const text=file('pending.txt'); seed(text,'before','after');await scan(text);
+    const undo=file('undo.txt'); seed(undo,'before','after'); await scan(undo);
+    assert.ok(succeeded(await tracker.revertFile(undo)));
+    const history=tracker.revertHistory;
+    await withRealTextSettingToggle(async ({toggle,choose,prompts,reports})=>{
+        choose((title,options,retire)=>retire);
+        await toggle();
+        assert.equal(prompts.length,1);assert.match(prompts[0][1].detail,/opaque\.bin/);
+        assert.match(prompts[0][1].detail,/unknown\.pdf/);assert.doesNotMatch(prompts[0][1].detail,/unresolved\.txt/);
+        assert.equal(vscodeExcludes.onlyRecordReviewableText,true);
+        assert.ok(reports.some(message=>/Stopped tracking 2 item/.test(message)),reports.join('\n'));
+    });
+    assert.equal(pending(binary),undefined); assert.equal(pending(unknown),undefined);
+    assert.equal(pending(uncertain)?.reviewKind,'unknown');
+    assert.equal(pending(text)?.reviewKind,'text'); assert.deepEqual(tracker.revertHistory,history);
+    assert.deepEqual(fs.readFileSync(binary),Buffer.from([0,1]));
+    fs.writeFileSync(binary,Buffer.from([0,3]));await scan(binary); assert.equal(pending(binary),undefined);
+    assert.equal(await tracker.flushPendingPersistence(),true);await tracker.dispose();
+    listedFiles=[Uri.file(binary),Uri.file(unknown),Uri.file(text),Uri.file(undo),Uri.file(uncertain)];
+    tracker=new DiffTracker(storage);assert.equal(await tracker.restorePersistedState(),'restored',tracker.persistenceIssue);
+    assert.equal(pending(binary),undefined);assert.equal(pending(unknown),undefined);
+    fs.writeFileSync(binary,'became reviewable'); await scan(binary);
+    assert.equal(pending(binary)?.reviewKind,'unknown'); assert.equal(tracker.getOriginalContent(binary),undefined);
+});
+
+for (const decision of ['cancel','keep','changed','setting changed']) {
+    test(`ISSUE-66 sidebar safely handles ${decision} while confirming`,async()=>{
+        const p=file('prior-review'); fs.writeFileSync(p,Buffer.from([0,1]));
+        await tracker.onExternalFileCreated(Uri.file(p)); assert.equal(pending(p)?.reviewKind,'opaque');
+        await withRealTextSettingToggle(async ({toggle,choose,prompts,reports,writes})=>{
+            choose((title,options,retire,keep)=>{
+                if (decision==='changed') fs.writeFileSync(p,'now text');
+                if (decision==='setting changed') vscodeExcludes.onlyRecordReviewableText=true;
+                if (decision==='cancel') return undefined;
+                return decision==='keep'?keep:retire;
+            });
+            await toggle();
+            assert.equal(prompts.length,1);
+            assert.equal(writes.length,['cancel','setting changed'].includes(decision)?0:1);
+            assert.equal(vscodeExcludes.onlyRecordReviewableText,decision==='cancel'?undefined:true);
+            assert.equal(pending(p)?.reviewKind,'opaque');
+            if (decision==='changed') assert.ok(reports.some(message=>/Stopped tracking 0 item/.test(message)));
+        });
+    });
+}
+
+test('ISSUE-66 no eligible sidebar cleanup does not ask for confirmation',async()=>{
+    const p=file('reviewable'); seed(p,'old','new'); await scan(p);
+    await withRealTextSettingToggle(async ({toggle,prompts,writes})=>{
+        await toggle();assert.equal(prompts.length,0);assert.equal(writes.length,1);
+    });
+    assert.equal(pending(p)?.reviewKind,'text');
+});
+
+test('ISSUE-66 sidebar persistence failure preserves approved previous review',async()=>{
+    await tracker.dispose();
+    const storage=Uri.file(file('text-cleanup-failure'));
+    tracker=new DiffTracker(storage);tracker.isRecording=true;tracker.externalWatcherEnabled=true;tracker.snapshotInitialized=true;
+    const p=file('review'); fs.writeFileSync(p,Buffer.from([0,2]));
+    await tracker.onExternalFileCreated(Uri.file(p)); assert.equal(pending(p)?.reviewKind,'opaque');
+    assert.equal(await tracker.flushPendingPersistence(),true);
+    faults.set(path.join(storage.fsPath,'session-state.tmp.json'),{write:error('NoPermissions')});
+    await withRealTextSettingToggle(async ({toggle,choose,reports})=>{
+        choose((title,options,retire)=>retire);
+        await toggle();assert.ok(reports.some(message=>/Stopped tracking 0 item/.test(message)),reports.join('\n'));
+    });
+    assert.equal(pending(p)?.reviewKind,'opaque');
+    assert.equal(tracker.mayHaveSuppressedResource(p),false,'failed cleanup never marks the old review as skipped');
+    assert.deepEqual(fs.readFileSync(p),Buffer.from([0,2]));
+});
+
+test('ISSUE-66 text filter reclassifies a newly created file after its initial read race',async()=>{
+    vscodeExcludes={onlyRecordReviewableText:true};
+    const p=file('producer-output'); fs.writeFileSync(p,Buffer.from([0,1]));
+    const read=pause(p,'read');
+    const created=tracker.onExternalFileCreated(Uri.file(p));
+    await read.entered;
+    fs.writeFileSync(p,Buffer.from([0,2,3])); read.release();
+    await created;
+    assert.equal(pending(p),undefined);
+    assert.equal(tracker.unresolvedBaselineFiles.has(p),false);
+    assert.equal(tracker.fileSnapshots.has(p),false);
+    assert.equal(tracker.mayHaveSuppressedResource(p),true);
+});
+
+test('ISSUE-66 text filter preserves historical and dirty Unknown evidence',async()=>{
+    const historical=file('historical'); fs.writeFileSync(historical,Buffer.from([0,2]));
+    tracker.markFileUnavailable(historical,'File changed while being read; refresh before review');
+    vscodeExcludes={onlyRecordReviewableText:true};
+    const dirty=file('dirty-race'); fs.writeFileSync(dirty,'data'); const doc=document(dirty);doc.isDirty=true;
+    tracker.markFileUnavailable(dirty,'File changed while being read; refresh before review');
+    fs.writeFileSync(dirty,Buffer.from([0,3])); doc.isDirty=false;
+    await scan(historical); await scan(dirty);
+    assert.equal(pending(historical)?.reviewKind,'unknown');
+    assert.equal(pending(dirty)?.reviewKind,'unknown');
+});
+
 if(process.env.DT_TEST_FILTER) {const selected=tests.filter(t=>t.name.includes(process.env.DT_TEST_FILTER));tests.splice(0,tests.length,...selected);}
 if(process.env.DT_EXPECT_LEGACY_REJECTION==='1') { const selected=tests.filter(t=>t.name.startsWith('SCHEMA-DOWNGRADE '));tests.splice(0,tests.length,...selected); }
 if(process.env.DT_PARENT_ONLY==='1') { const selected=tests.filter(t=>t.name.startsWith('PARENT '));tests.splice(0,tests.length,...selected); }

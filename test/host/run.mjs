@@ -177,6 +177,23 @@ try {
             DIFF_TRACKER_HOST_PHASE:'scope-settings'}
     });
 
+    // Use VS Code's rendered confirmation so this fixture can choose the
+    // same options as a user without depending on OS-native dialog controls.
+    const textOnlyWorkspace = path.join(tempRoot, 'text-only-workspace');
+    const textOnlyUserData = path.join(tempRoot, 'text-only-user-data');
+    mkdirSync(textOnlyWorkspace, { recursive: true });
+    mkdirSync(path.join(textOnlyUserData, 'User'), { recursive: true });
+    writeFileSync(path.join(textOnlyUserData, 'User', 'settings.json'), JSON.stringify({
+        'window.dialogStyle': 'custom'
+    }));
+    await runTests({
+        ...hostOptions,
+        launchArgs: hostOptions.launchArgs.map((argument, index) => index === 0 ? textOnlyWorkspace :
+            argument.startsWith('--user-data-dir=') ? `--user-data-dir=${textOnlyUserData}` : argument),
+        extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_WORKSPACE: textOnlyWorkspace,
+            DIFF_TRACKER_HOST_PHASE: 'reviewable-text' }
+    });
+
     const lifecycleWorkspace=path.join(tempRoot,'lifecycle-workspace');
     mkdirSync(path.join(lifecycleWorkspace,'.vscode'),{recursive:true});
     writeFileSync(path.join(lifecycleWorkspace,'ProbeName'),'synthetic case identity');

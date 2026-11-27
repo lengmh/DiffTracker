@@ -5,6 +5,7 @@ import { DiffTracker, MonitoringLifecycleStatus, ObservationCoverageRecheckResul
 import { detectLocalPathCaseSensitivity } from './utils/pathIdentity';
 import {
     CanonicalMonitoringScope,
+    CanonicalWorkspaceRootIdentity,
     configuredScopeExplicitlyExcludesSubtree,
     evaluateConfiguredScope,
     createLegacySourceFingerprint,
@@ -12,6 +13,7 @@ import {
     createScopeMigrationRecord,
     detectScopeExpansion,
     EffectiveMonitoringScope,
+    MonitoringExcludeRule,
     MonitoringScopeRequest,
     previewLegacyWatchExcludeMigration,
     scopeConsentMatches,
@@ -82,6 +84,15 @@ export interface MonitoringScopeConfirmation {
     scopeRevision: string;
     expansionReasons: readonly string[];
     affectedReviewPaths: readonly string[];
+}
+
+export interface QuickExclusionProposal {
+    current: CanonicalMonitoringScope;
+    scope: CanonicalMonitoringScope;
+    rule: MonitoringExcludeRule;
+    owner: CanonicalWorkspaceRootIdentity;
+    relative: string;
+    directory: boolean;
 }
 
 export type MonitoringScopeActionOutcome = MonitoringScopeApplyOutcome | ObservationCoverageRecheckResult |
@@ -606,52 +617,57 @@ export class MonitoringScopeController implements vscode.Disposable {
     }
 
     public excludeCoverageSubtree(
-        targetPath: string, confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>,
-        stillCurrent: () => boolean = () => true
+        targetPath: string, confirm: (affectedReviewPaths: readonly string[], draftConflict?: string) => Promise<boolean>,
+        stillCurrent: () => boolean = () => true, describeDraft?: (proposal: QuickExclusionProposal) => string | undefined
     ): ReturnType<MonitoringScopeController['excludeResource']> {
-        return this.excludeResource(targetPath, true, confirm, true, stillCurrent);
+        return this.excludeResource(targetPath, true, confirm, true, stillCurrent, describeDraft);
     }
 
     /** Confirm a quick exclusion before saving settings or pausing any reads. */
     public excludeResource(
-        targetPath:string,directory:boolean,confirm:(affectedReviewPaths:readonly string[])=>Promise<boolean>,
-        requireCoverage=false,stillCurrent:()=>boolean=()=>true
+        targetPath:string,directory:boolean,confirm:(affectedReviewPaths:readonly string[], draftConflict?:string)=>Promise<boolean>,
+        requireCoverage=false,stillCurrent:()=>boolean=()=>true,
+        describeDraft?:(proposal:QuickExclusionProposal)=>string|undefined
     ):Promise<MonitoringScopeApplyOutcome|{status:'cancelled'|'alreadyExcluded'|'blocked';reason?:string}> {
-        return this.recordScopeOperation(()=>this.excludeResourceNow(targetPath,directory,confirm,requireCoverage,stillCurrent),result=>result);
+        return this.recordScopeOperation(()=>this.excludeResourceNow(targetPath,directory,confirm,requireCoverage,stillCurrent,describeDraft),result=>result);
     }
 
     private async excludeResourceNow(
         targetPath: string,
         directory: boolean,
-        confirm: (affectedReviewPaths: readonly string[]) => Promise<boolean>,
+        confirm: (affectedReviewPaths: readonly string[], draftConflict?: string) => Promise<boolean>,
         requireCoverage = false,
-        stillCurrent: () => boolean = () => true
+        stillCurrent: () => boolean = () => true,
+        describeDraft?: (proposal: QuickExclusionProposal) => string | undefined
     ): Promise<MonitoringScopeApplyOutcome | { status: 'cancelled' | 'alreadyExcluded' | 'blocked'; reason?: string }> {
         const conflict = (reason: string): MonitoringScopeApplyOutcome => ({ status: 'conflict', reason });
         if (this.hasActiveScopeAction() || !stillCurrent()) {
             return conflict('Another monitoring-scope action is in progress; retry after it finishes.');
         }
         const initial = this.getStatus();
+        const initialRequestVersion = this.getRequestVersion();
         let observationBefore: ScopeOperationObservation | undefined;
         let settingsOwnershipLost = false;
         if (!initial.requested.ok || !initial.requested.scope || initial.effective.kind !== 'configured' ||
             initial.requested.scope.scopeRevision !== initial.effective.scopeRevision) {
             return conflict('Apply or restore the existing monitoring-scope request in Manage Monitoring Scope before using a quick exclusion.');
         }
-        const proposal = this.prepareResourceExclusion(targetPath, requireCoverage, directory);
+        const proposal = this.prepareResourceExclusion(targetPath, requireCoverage, directory, true);
         if (proposal.status !== 'ready') { return proposal; }
         const scope = proposal.scope;
+        const draftConflict = describeDraft?.(proposal);
         const affectedReviewPaths = this.tracker.getExplicitlyExcludedPendingReviewPaths(scope);
         const approvedReviewRevision = this.tracker.getExplicitlyExcludedReviewRevision(scope);
         const rawExcludes = this.inspectWorkspaceValue<unknown>('watchExclude');
         const previousExcludes = rawExcludes === undefined ? undefined : JSON.parse(JSON.stringify(rawExcludes));
         this.scopeActionInProgress = true;
         try {
-            if (affectedReviewPaths.length > 0 && !await confirm(affectedReviewPaths)) { return { status: 'cancelled' }; }
+            if ((affectedReviewPaths.length > 0 || draftConflict) && !await confirm(affectedReviewPaths, draftConflict)) { return { status: 'cancelled' }; }
             return await this.enqueueScopeSettingsWrite(async () => {
                 const latest = this.getStatus();
-                const fresh = this.prepareResourceExclusion(targetPath, requireCoverage, directory);
-                if (this.disposed || !stillCurrent() || latest.effective.kind !== 'configured' || latest.effective.scopeRevision !== initial.effective.scopeRevision ||
+                const fresh = this.prepareResourceExclusion(targetPath, requireCoverage, directory, true);
+                if (this.disposed || !stillCurrent() || this.getRequestVersion() !== initialRequestVersion ||
+                    latest.effective.kind !== 'configured' || latest.effective.scopeRevision !== initial.effective.scopeRevision ||
                     latest.requested.scope?.scopeRevision !== proposal.current.scopeRevision ||
                     fresh.status !== 'ready' || fresh.scope.scopeRevision !== scope.scopeRevision ||
                     this.tracker.getExplicitlyExcludedReviewRevision(scope) !== approvedReviewRevision) {
@@ -717,7 +733,7 @@ export class MonitoringScopeController implements vscode.Disposable {
         }
     }
 
-    private prepareResourceExclusion(targetPath: string, requireCoverage: boolean, directory: boolean) {
+    private prepareResourceExclusion(targetPath: string, requireCoverage: boolean, directory: boolean, committedShortcut = false) {
         const blocked = (reason: string) => ({ status: 'blocked' as const, reason });
         if (typeof targetPath !== 'string' || !path.isAbsolute(targetPath)) {
             return blocked('Choose a valid absolute monitored directory.');
@@ -735,9 +751,6 @@ export class MonitoringScopeController implements vscode.Disposable {
                 }
                 // Deleted review paths remain valid literal scope targets.
             }
-        }
-        if (requireCoverage && !this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
-            return blocked('The coverage warning no longer exists. Refresh Change Recording.');
         }
         const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(canonicalPath));
         if (!folder || folder.uri.scheme !== 'file') {
@@ -764,15 +777,18 @@ export class MonitoringScopeController implements vscode.Disposable {
         if (roots.filter(root => root.name === folder.name).length !== 1) {
             return blocked('Workspace folder names are ambiguous; rename the roots before creating a folder-scoped exclusion.');
         }
-        const identity = roots.find(root => root.uri === folder.uri.toString() && root.name === folder.name);
-        if (!identity) { return blocked('The owning workspace folder changed. Refresh the scope manager.'); }
         const current = status.requested.scope;
+        const identity = current.roots.find(root => root.uri === folder.uri.toString() && root.name === folder.name);
+        if (!identity) { return blocked('The owning workspace folder changed. Refresh the scope manager.'); }
         const excludesTarget = (scope: CanonicalMonitoringScope): boolean => directory
             ? configuredScopeExplicitlyExcludesSubtree(scope, identity, relative)
             : evaluateConfiguredScope(scope, identity, relative, false, false).source === 'explicitExclude';
-        if (excludesTarget(current)) {
-            return { status: 'alreadyExcluded' as const };
+        const excluded = excludesTarget(current);
+        if (requireCoverage && !(committedShortcut && excluded) &&
+            !this.tracker.getSubtreeCoverageGaps().some(gap => path.resolve(gap.targetPath) === canonicalPath)) {
+            return blocked('The coverage warning no longer exists. Refresh Change Recording.');
         }
+        if (excluded) { return { status: 'alreadyExcluded' as const }; }
         const rule = roots.length === 1
             ? { scope: 'all' as const, pattern: `/${relative}${directory ? '/' : ''}` }
             : { scope: 'folder' as const, folder: folder.name, pattern: `/${relative}${directory ? '/' : ''}` };
@@ -785,7 +801,8 @@ export class MonitoringScopeController implements vscode.Disposable {
             !excludesTarget(checked.scope)) {
             return blocked('The exact directory exclusion cannot be validated for this workspace.');
         }
-        return { status: 'ready' as const, canonicalPath, folder, current, scope: checked.scope, baseStatus: status };
+        return { status: 'ready' as const, canonicalPath, folder, current, scope: checked.scope, baseStatus: status,
+            owner: identity, relative, directory, rule };
     }
 
     private async saveCoverageSubtreeExclusion(targetPath: string, requireCoverage = true, directory = true): Promise<{ status: 'saved' | 'alreadyExcluded' | 'blocked'; reason?: string; settingsOwnershipLost?: boolean }> {

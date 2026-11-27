@@ -335,6 +335,7 @@ interface BaselineTransaction {
     readyPrepared?: boolean;
     baselineRecovery?: { payload: Uint8Array; digest: string; prepared: boolean };
     durablyCommitted?: boolean;
+    suppressedResourcePath?: string;
     rollback: () => void;
     done: Promise<void>;
     finish: () => void;
@@ -536,6 +537,17 @@ type CurrentFileState =
     | { kind: 'text'; content: string; mode?: number }
     | { kind: 'missing' }
     | { kind: 'unavailable'; reason: string; reasonCode?: string; targetKind?: 'file' | 'directory'; size?: number; mtime?: number; fingerprint?: string };
+
+const readRaceReason = 'File changed while being read; refresh before review';
+const textFilterReadRaceReason = readRaceReason + ' (text-only recording)';
+
+interface UnsupportedReviewCandidate {
+    filePath: string;
+    review: FileDiff;
+    state: CurrentFileState;
+    identity: fs.BigIntStats;
+    epoch: number;
+}
 
 type CandidateBaselinePlan =
     | { kind: 'text'; content: string; mode?: number; baselineExists: boolean }
@@ -4634,10 +4646,16 @@ export class DiffTracker {
             return undefined;
         }
 
+        const suppressionOnCommit = this.baselineTransaction?.suppressedResourcePath;
+        const suppressedResourceBloom = suppressionOnCommit
+            ? Buffer.from(this.suppressedResourceBloom) : this.suppressedResourceBloom;
+        if (suppressionOnCommit) {
+            this.addSuppressedResourceBits(suppressionOnCommit, suppressedResourceBloom);
+        }
         const state: PersistedTrackerState = {
             version: 5,
-            suppressedResourceBloom: this.suppressedResourceBloom.some(byte => byte !== 0)
-                ? this.suppressedResourceBloom.toString('hex') : undefined,
+            suppressedResourceBloom: suppressedResourceBloom.some(byte => byte !== 0)
+                ? suppressedResourceBloom.toString('hex') : undefined,
             stoppedReviews: this.isRecording ? undefined : this.captureStoppedReviews(),
             isRecording: this.isRecording,
             baselineState: this.baselineBuilding || !this.snapshotInitialized ? 'building' : 'ready',
@@ -5522,7 +5540,7 @@ export class DiffTracker {
         return resolvedPath;
     }
 
-    private releaseScopeBaselineData(filePath: string): void {
+    private releaseScopeBaselineData(filePath: string, preserveCoverage = false): void {
         this.largeFileReminders.delete(filePath);
         this.fileSnapshots.delete(filePath);
         this.fileModes.delete(filePath);
@@ -5531,7 +5549,7 @@ export class DiffTracker {
         this.opaqueBaselineFiles.delete(filePath);
         this.postBaselineUnknownFiles.delete(filePath);
         this.retainedReviewPaths.delete(filePath);
-        this.clearCoverageGap(filePath, 'file', false);
+        if (!preserveCoverage) { this.clearCoverageGap(filePath, 'file', false); }
         this.revertHistory = this.revertHistory
             .map(record => ({ ...record, items: record.items.filter(item => item.filePath !== filePath) }))
             .filter(record => record.items.length > 0);
@@ -10298,7 +10316,7 @@ export class DiffTracker {
                 const afterStat = await vscode.workspace.fs.stat(uri);
                 if (afterStat.size > this.maxFullContentBytes) { return this.largeFileState(afterStat.size); }
                 if (stat.size !== afterStat.size || stat.mtime !== afterStat.mtime || stat.type !== afterStat.type) {
-                    return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
+                    return { kind: 'unavailable', reason: readRaceReason };
                 }
                 return {
                     kind: 'unavailable',
@@ -10314,7 +10332,7 @@ export class DiffTracker {
                 return this.largeFileState(afterStat.size);
             }
             if (content.byteLength !== afterStat.size || stat.size !== afterStat.size || stat.mtime !== afterStat.mtime || stat.type !== afterStat.type) {
-                return { kind: 'unavailable', reason: 'File changed while being read; refresh before review' };
+                return { kind: 'unavailable', reason: readRaceReason };
             }
             if (content.length > 5 * 1024 * 1024) {
                 return { kind: 'unavailable', reason: 'File exceeds the 5 MiB limit', size: stat.size, mtime: stat.mtime, fingerprint: createHash('sha256').update(content).digest('hex') };
@@ -10356,8 +10374,16 @@ export class DiffTracker {
 
     private markFileUnavailable(filePath: string, reason: string): void {
         filePath = this.canonicalTrackingPath(filePath);
+        if (reason === readRaceReason && this.onlyRecordReviewableText() &&
+            !this.hasCapturedBaseline(filePath) && !this.trackedChanges.has(filePath) &&
+            !this.largeFileReminders.has(filePath) && !this.hasDirtyDocument(filePath) &&
+            !this.hasScanUncertainty(filePath) && this.isRecording && this.snapshotInitialized &&
+            !this.baselineBuilding && this.restoringEpoch === undefined) {
+            reason = textFilterReadRaceReason;
+        }
         const existingUnresolvedReason = this.unresolvedBaselineFiles.get(filePath);
         const preservedUncertaintyReason = existingUnresolvedReason &&
+            (existingUnresolvedReason !== textFilterReadRaceReason || reason === readRaceReason || reason === textFilterReadRaceReason) &&
             !this.isStableUnsupportedBaselineReason(existingUnresolvedReason) &&
             !this.isBinaryUnavailableReason(existingUnresolvedReason)
             ? existingUnresolvedReason
@@ -10402,23 +10428,174 @@ export class DiffTracker {
     }
 
     private mayHaveSuppressedResource(filePath: string): boolean {
-        return this.suppressedResourcePositions(filePath).every(bit =>
-            (this.suppressedResourceBloom[bit >>> 3] & (1 << (bit & 7))) !== 0);
+        return this.baselineTransaction?.suppressedResourcePath === filePath ||
+            this.suppressedResourcePositions(filePath).every(bit =>
+                (this.suppressedResourceBloom[bit >>> 3] & (1 << (bit & 7))) !== 0);
+    }
+
+    private onlyRecordReviewableText(): boolean {
+        return vscode.workspace.getConfiguration('diffTracker').get<boolean>('onlyRecordReviewableText', false);
     }
 
     private suppressUnsupportedResource(filePath: string, state: CurrentFileState): boolean {
-        if (!vscode.workspace.getConfiguration('diffTracker').get<boolean>('onlyRecordReviewableText', false) ||
+        if (!this.onlyRecordReviewableText() ||
             (!this.isLargeFileState(state) && !this.isStableUnsupportedState(state)) ||
-            this.hasCapturedBaseline(filePath) || this.unresolvedBaselineFiles.has(filePath) ||
-            this.largeFileReminders.has(filePath) || this.trackedChanges.has(filePath) ||
-            this.hasDirtyDocument(filePath) || this.hasScanUncertainty(filePath)) { return false; }
-        if (!this.mayHaveSuppressedResource(filePath)) {
-            for (const bit of this.suppressedResourcePositions(filePath)) {
-                this.suppressedResourceBloom[bit >>> 3] |= 1 << (bit & 7);
-            }
+            this.fileSnapshots.has(filePath) || this.opaqueBaselineFiles.has(filePath) ||
+            this.largeFileReminders.has(filePath) || this.hasDirtyDocument(filePath) ||
+            this.hasScanUncertainty(filePath)) { return false; }
+        const transient = this.isRecording && !this.baselineBuilding && this.restoringEpoch === undefined &&
+            !this.baselineTransaction && !this.retainedReviewPaths.has(filePath) &&
+            this.unresolvedBaselineFiles.get(filePath) === textFilterReadRaceReason &&
+            (!this.trackedChanges.has(filePath) || this.trackedChanges.get(filePath)?.unavailableReason === textFilterReadRaceReason);
+        if (!transient && (this.unresolvedBaselineFiles.has(filePath) || this.trackedChanges.has(filePath))) { return false; }
+        this.noteSuppressedResource(filePath);
+        if (transient) {
+            this.unresolvedBaselineFiles.delete(filePath);
+            this.postBaselineUnknownFiles.delete(filePath);
+            this.clearFileReview(filePath);
             this.schedulePersistState();
         }
         return true;
+    }
+
+    private addSuppressedResourceBits(filePath: string, bloom: Buffer): void {
+        for (const bit of this.suppressedResourcePositions(filePath)) {
+            bloom[bit >>> 3] |= 1 << (bit & 7);
+        }
+    }
+
+    private noteSuppressedResource(filePath: string): void {
+        if (!this.mayHaveSuppressedResource(filePath)) {
+            this.addSuppressedResourceBits(filePath, this.suppressedResourceBloom);
+            this.schedulePersistState();
+        }
+    }
+
+    private canRetireUnsupportedReview(filePath: string): boolean {
+        return !this.validateLiveGitTarget(filePath) && !this.validateSnapshotTarget(filePath) &&
+            !this.hasDirtyDocument(filePath) && !this.hasScanUncertainty(filePath) &&
+            !this.isPathIgnored(vscode.Uri.file(filePath));
+    }
+
+    /** Preview only; no review or workspace state is changed here. */
+    public async previewUnsupportedReviewCleanup(): Promise<{
+        candidates: UnsupportedReviewCandidate[]; unverified: number;
+    }> {
+        const candidates: UnsupportedReviewCandidate[] = [];
+        const epoch = this.sessionEpoch;
+        let unverified = 0;
+        let inspected = 0;
+        let remainingBytes = 128 * 1024 * 1024;
+        for (const [filePath, review] of this.trackedChanges) {
+            if (review.reviewKind === 'text') { continue; }
+            if (++inspected > 100 || this.validateActionReadiness() || this.baselineTransaction ||
+                !this.isCurrentEpoch(epoch) || !this.canRetireUnsupportedReview(filePath)) {
+                unverified++;
+                continue;
+            }
+            // Use an aggregate read budget as well as an entry limit. Very
+            // large files already use the existing metadata-only classifier.
+            let identity: fs.BigIntStats;
+            try { identity = fs.statSync(filePath, { bigint: true }); }
+            catch { unverified++; continue; }
+            const size = Number(identity.size);
+            const cost = size > this.maxFullContentBytes ? 0 : size;
+            if (cost > remainingBytes) { unverified++; continue; }
+            remainingBytes -= cost;
+            const state = await this.readCurrentFileState(filePath);
+            if (!this.isCurrentEpoch(epoch) || this.trackedChanges.get(filePath) !== review) {
+                unverified++;
+                continue;
+            }
+            if (this.isLargeFileState(state) || (this.isStableUnsupportedState(state) && state.fingerprint)) {
+                if (!this.unsupportedReviewStatMatches(filePath, identity)) { unverified++; continue; }
+                candidates.push({ filePath, review, state, identity, epoch });
+            } else if (state.kind === 'unavailable') { unverified++; }
+        }
+        return { candidates, unverified };
+    }
+
+    private unsupportedReviewStatMatches(filePath: string, expected: fs.BigIntStats): boolean {
+        try {
+            const stat = fs.statSync(filePath, { bigint: true });
+            return stat.isFile() && stat.dev === expected.dev && stat.ino === expected.ino &&
+                stat.mtimeNs === expected.mtimeNs && stat.ctimeNs === expected.ctimeNs && stat.size === expected.size;
+        } catch { return false; }
+    }
+
+    public async retireUnsupportedReviews(candidates: UnsupportedReviewCandidate[]): Promise<BatchActionResult> {
+        const results: ActionResult[] = [];
+        for (const candidate of candidates) {
+            try {
+                results.push(await this.queueRecoveryAction(() => this.retireUnsupportedReview(candidate)));
+            } catch {
+                results.push(this.actionResult(candidate.filePath, 'failed', 'Could not save review cleanup'));
+            }
+        }
+        const succeeded = results.filter(result => result.status === 'success').length;
+        return { results, succeeded, failed: results.length - succeeded };
+    }
+
+    private async retireUnsupportedReview({ filePath, review, state, identity, epoch }: UnsupportedReviewCandidate): Promise<ActionResult> {
+        const targetCurrent = () => this.isCurrentEpoch(epoch) && this.onlyRecordReviewableText() &&
+            this.canRetireUnsupportedReview(filePath);
+        const identityCurrent = () => this.unsupportedReviewStatMatches(filePath, identity) &&
+            (this.isLargeFileState(state) || this.acknowledgedIdentityStillCurrent(filePath, state));
+        if (this.baselineTransaction || this.validateActionReadiness() || !targetCurrent() ||
+            this.trackedChanges.get(filePath) !== review || !identityCurrent() || !targetCurrent()) {
+            return this.actionResult(filePath, 'conflict', 'Review or file changed; the prior review was preserved');
+        }
+        const recovery = this.captureBaselineAcceptanceRecovery(!!this.storageUri);
+        const snapshot = this.fileSnapshots.get(filePath);
+        const mode = this.fileModes.get(filePath);
+        const existed = this.baselineExistingFiles.has(filePath);
+        const opaque = this.opaqueBaselineFiles.get(filePath);
+        const unknown = this.unresolvedBaselineFiles.get(filePath);
+        const reminder = this.largeFileReminders.get(filePath);
+        const runtimeUnknown = this.postBaselineUnknownFiles.has(filePath);
+        const retained = this.retainedReviewPaths.has(filePath);
+        const history = this.revertHistory;
+        const building = this.baselineBuilding;
+        const initialized = this.snapshotInitialized;
+        const transaction = this.beginBaselineTransaction(() => {
+            if (snapshot !== undefined) { this.fileSnapshots.set(filePath, snapshot); }
+            if (mode !== undefined) { this.fileModes.set(filePath, mode); }
+            if (existed) { this.baselineExistingFiles.add(filePath); }
+            if (opaque) { this.opaqueBaselineFiles.set(filePath, opaque); }
+            if (unknown !== undefined) { this.unresolvedBaselineFiles.set(filePath, unknown); }
+            if (reminder) { this.largeFileReminders.set(filePath, reminder); }
+            if (runtimeUnknown) { this.postBaselineUnknownFiles.add(filePath); }
+            if (retained) { this.retainedReviewPaths.add(filePath); }
+            this.revertHistory = history;
+            this.baselineBuilding = building;
+            this.snapshotInitialized = initialized;
+            this.restoreFrozenActionReview(filePath, review);
+        });
+        transaction.baselineRecovery = recovery;
+        transaction.valid = () => targetCurrent() && !this.trackedChanges.has(filePath) &&
+            !this.unresolvedBaselineFiles.has(filePath) && !this.hasCapturedBaseline(filePath) && !this.largeFileReminders.has(filePath);
+        transaction.commitValid = identityCurrent;
+        // Do not retire observation diagnostics or alter the workspace. A
+        // bounded persisted marker protects against inventing an empty baseline
+        // if the skipped file later becomes text (or the setting is disabled).
+        transaction.suppressedResourcePath = filePath;
+        this.releaseScopeBaselineData(filePath, true);
+        this.restoreFrozenActionReview(filePath, undefined);
+        let committed = false;
+        try {
+            if (await this.prepareBaselineAcceptancePersistence(transaction)) {
+                committed = await this.completeBaseline(epoch, transaction) || !!transaction.durablyCommitted;
+            }
+        } catch (error) {
+            if (this.isCurrentEpoch(epoch)) { this.reportPersistenceIssue('Non-reviewable review cleanup failed.', error); }
+        } finally {
+            const invalidTarget = !committed && this.isCurrentEpoch(epoch) && !transaction.valid();
+            if (committed) { this.addSuppressedResourceBits(filePath, this.suppressedResourceBloom); }
+            this.endBaselineTransaction(transaction, committed);
+            if (!committed) { await this.rollbackBaselineAcceptancePersistence(transaction, epoch, invalidTarget); }
+        }
+        return this.actionResult(filePath, committed ? 'success' : 'failed',
+            committed ? undefined : 'Cleanup was not saved; the prior review was preserved');
     }
 
     private isStableUnsupportedBaselineReason(reason: string): boolean {
@@ -11824,6 +12001,14 @@ export class DiffTracker {
             if (!creationIsCurrent()) { return; }
             if (creationIsUnproven()) { retainUnprovenCreation(); return; }
             if (this.suppressUnsupportedResource(filePath, state)) { return; }
+            if (this.onlyRecordReviewableText() && !this.hasCapturedBaseline(filePath) &&
+                state.kind === 'unavailable' && state.reason === readRaceReason) {
+                // Do not invent a reviewable before-image for a resource whose
+                // first classification raced its writer. Recheck once now.
+                this.markFileUnavailable(filePath, state.reason);
+                if (creationIsCurrent()) { await this.readFileAndUpdate(filePath, uri, creationIsCurrent); }
+                return;
+            }
             if (!this.hasCapturedBaseline(filePath) && this.mayHaveSuppressedResource(filePath)) {
                 this.recordUnresolvedBaseline(filePath, 'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review');
                 return;
@@ -11870,7 +12055,7 @@ export class DiffTracker {
                     : await this.completeRuntimeBaseline(epoch, observeStopped))) {
                     return;
                 } else if (state.kind === 'unavailable' &&
-                    state.reason === 'File changed while being read; refresh before review') {
+                    state.reason === readRaceReason) {
                     // Creation proved the absent before-image, but its first
                     // snapshot raced the writer. Reconcile once at the durable
                     // release boundary, as for a stable text snapshot below.

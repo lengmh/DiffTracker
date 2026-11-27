@@ -112,6 +112,8 @@ Code Diff Tracker 是一个 VS Code 扩展，用来记录本地工作区文件�
 
 录制期间，新建、移入和重命名目录会自动完成有界的观察核验。文件或文件夹排除、**Save and Apply**、**Restore Effective Scope Configuration** 各发起一次操作即可接续必要核验；需要确认时合并为一次提示。取消保留草稿和审阅。若设置已提交而核验未完成，保留有效排除并明确显示部分完成；无关的覆盖问题单独列出。已停止的会话保持停止。
 
+Change Recording 的眼睛按钮只应用当前文件或目录的排除。可合并的范围草稿改动保留为未提交；如果草稿有冲突或会丢弃待审项，快捷操作会说明影响，一次确认后继续。
+
 文本基线会把内容保存在工作区级扩展存储中。不透明资源（如二进制、不支持的编码或超大文本）保存存在性和有界的身份依据，不新增文件内容副本。**Acknowledge Read-only Change** 重新核验已审阅身份，并在持久化成功后推进基线；它不修改文件、不备份原始内容，也不创建非文本 Undo/Revert 能力。不可读文件或未知 before-image 不能通过普通确认伪装成已核验基线。目录覆盖诊断与文件审阅分开展示。
 
 恢复入口各有用途：
@@ -237,7 +239,7 @@ code --install-extension lengmh.code-diff-tracker
 | `diffTracker.webviewExpandUnchanged` | `false` | 新建 WebView 面板时是否展开全部未改动的上下文行 |
 | `diffTracker.openWebviewBeside` | `false` | 是否将 WebView Diff 打开到旁边的编辑器分组 |
 | `diffTracker.watchExclude` | `[]` | 不支持 `!` 否定的结构化显式排除；旧字符串规则在迁移前保留兼容语义 |
-| `diffTracker.onlyRecordReviewableText` | `false` | 按安全内容分类跳过新的不支持资源，保留既有待审内容和 Undo |
+| `diffTracker.onlyRecordReviewableText` | `false` | 按内容分类跳过新的不支持资源，可从扩展设置侧栏停止跟踪已验证的待审项 |
 | `diffTracker.autoOpenNextPendingFile` | `false` | 单文件审阅成功且无剩余待审内容后，自动打开下一个待审文件 |
 | `diffTracker.enableSourceTracking` | `false` | 为 Vibe Coding Only 开启实验性来源提示；关闭时仍保留基线未知和观察覆盖警告 |
 | `diffTracker.onlyTrackAutomatedChanges` | `false` | 记录外部及显式自动化改动；来源不明的编辑保留待审，不自动接受 |
@@ -261,7 +263,7 @@ WebView 显示默认值也可从 **Settings → Display** 中的 **WebView defau
 
 ## 仅跟踪自动化改动
 
-Recording 设置组提供「Only record reviewable text」和「Auto-open next pending file」开关。文本资格沿用现有 UTF-8、二进制内容和大小检查，无后缀文件也可记录。开启文本筛选不会清空已有待审内容或 Undo；未保存编辑、读取失败和覆盖缺口仍保留为未解决状态。此前跳过的资源变为文本后，需要通过「Reset Unknown Baseline (Current Disk State)」明确建立新基线；关闭筛选不会补造遗漏期间的历史。固定大小的保守标记会跨重启保留这一限制，也可能要求其他尚未追踪的路径重设基线。停止后继续冻结已保存的审阅内容。
+Recording 设置组提供「Only record reviewable text」和「Auto-open next pending file」开关。文本资格沿用现有 UTF-8、二进制内容和大小检查，无后缀文件也可记录。从扩展设置侧栏开启时，可以保留已有待审，或确认停止跟踪已验证为不可审阅的待审项。后一种选择只移除所列待审及其 Undo，不改动工作区文件。直接编辑 VS Code 设置不会移除已有待审。未保存编辑、读取失败和覆盖缺口继续保留。此前跳过的资源变为文本后，需要通过「Reset Unknown Baseline (Current Disk State)」明确建立新基线；关闭筛选不会补造遗漏期间的历史。固定大小的保守标记会跨重启保留这一限制，也可能要求其他尚未追踪的路径重设基线。停止后继续冻结已保存的审阅内容。
 
 Explorer 和待审文件／目录右键菜单中的「Stop Recording This File or Folder」只排除所选精确路径。有待审修改时，先列出实际待审项并请求确认，确认前不修改设置或审阅状态；取消后原范围与审阅保持不变。确认后只移除该路径的活动审阅、基线和 Undo 条目，不修改工作区文件，也不重建整个工作区基线；没有待审修改时无需丢弃确认。已有待应用范围或旧规则迁移须先在 **Manage Monitoring Scope** 处理，并关闭未保存的范围编辑窗口。确认期间范围或审阅发生变化时须重新确认；失败时仅恢复仍属于本次快捷操作的请求，不覆盖较新的用户设置。工作区根、名称有歧义的目录，以及无法用受限排除语法精确表示的路径，会被拒绝且不修改设置。
 

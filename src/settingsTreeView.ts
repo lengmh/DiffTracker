@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { DiffTracker } from './diffTracker';
 
 /**
  * Tree item for a setting toggle
@@ -108,7 +109,9 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
         }
     ];
 
-    constructor() {
+    private changingTextFilter = false;
+
+    constructor(private readonly tracker: DiffTracker) {
         // Refresh when settings change
         this.configurationChangeDisposable = vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('diffTracker')) {
@@ -204,6 +207,10 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
      * Toggle a setting
      */
     public async toggleSetting(settingKey: string): Promise<void> {
+        if (settingKey === 'onlyRecordReviewableText') {
+            await this.toggleReviewableText();
+            return;
+        }
         const config = vscode.workspace.getConfiguration('diffTracker');
         const setting = this.settings.flatMap(group => group.items).find(item => item.key === settingKey);
         const currentValue = config.get<boolean>(settingKey, setting?.defaultValue ?? true);
@@ -212,6 +219,76 @@ export class SettingsTreeDataProvider implements vscode.TreeDataProvider<Setting
             ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
         await config.update(settingKey, !currentValue, target);
         this.refresh();
+    }
+
+    private async toggleReviewableText(): Promise<void> {
+        if (this.changingTextFilter) { return; }
+        this.changingTextFilter = true;
+        try {
+            const key = 'onlyRecordReviewableText';
+            const config = () => vscode.workspace.getConfiguration('diffTracker');
+            const initial = config();
+            const enabled = initial.get<boolean>(key, false);
+            const layers = (value: vscode.WorkspaceConfiguration) => {
+                const inspected = value.inspect<boolean>(key);
+                return JSON.stringify([inspected?.globalValue, inspected?.workspaceValue, inspected?.workspaceFolderValue]);
+            };
+            const initialLayers = layers(initial);
+            const target = initial.inspect(key)?.workspaceValue !== undefined
+                ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+            const preview = enabled ? undefined : await this.tracker.previewUnsupportedReviewCleanup();
+            let retire = false;
+            if (preview?.candidates.length) {
+                const cleanup = 'Enable and Stop Tracking Listed Items';
+                const keep = 'Enable and Keep Existing Reviews';
+                const listed = preview.candidates
+                    .map(({ filePath }) => vscode.workspace.asRelativePath(vscode.Uri.file(filePath), true))
+                    .join('\n');
+                const decision = await vscode.window.showWarningMessage(
+                    `Reviewable text only: ${preview.candidates.length} existing item(s) can stop being tracked`,
+                    { modal: true, detail: 'Stopping tracking discards the listed reviews and their Undo history, not workspace files. Other reviews stay pending.\n\n' + listed },
+                    cleanup, keep
+                );
+                if (decision !== cleanup && decision !== keep) { return; }
+                retire = decision === cleanup;
+            }
+            const current = config();
+            if (current.get<boolean>(key, false) !== enabled || layers(current) !== initialLayers) {
+                void vscode.window.showWarningMessage('The text-only setting changed while awaiting confirmation. No review was removed.');
+                return;
+            }
+            await current.update(key, !enabled, target);
+            if (enabled) { return; }
+            if (!config().get<boolean>(key, false)) {
+                void vscode.window.showWarningMessage('Text-only recording is not effective. No review was removed.');
+                return;
+            }
+            if (retire && preview) {
+                const result = await this.tracker.retireUnsupportedReviews(preview.candidates);
+                const summary = `Text-only recording is on. Stopped tracking ${result.succeeded} item(s).`;
+                if (result.failed || preview.unverified) {
+                    const failed = result.results.filter(item => item.status !== 'success').slice(0, 5).map(item => {
+                        const path = vscode.workspace.asRelativePath(vscode.Uri.file(item.filePath), true);
+                        return item.reason ? `${path}: ${item.reason}` : path;
+                    });
+                    void vscode.window.showWarningMessage(
+                        `${summary} Retained ${result.failed} approved item(s) and ${preview.unverified} unverified item(s).` +
+                        (failed.length ? ` ${failed.join('; ')}` : '')
+                    );
+                } else {
+                    void vscode.window.showInformationMessage(summary);
+                }
+            } else if (preview?.unverified && !preview.candidates.length) {
+                void vscode.window.showInformationMessage(
+                    `Text-only recording is on. Kept ${preview.unverified} existing item(s) that could not be verified.`
+                );
+            }
+        } catch {
+            void vscode.window.showErrorMessage('Could not complete the text-only recording change. Check the setting and pending reviews before retrying.');
+        } finally {
+            this.changingTextFilter = false;
+            this.refresh();
+        }
     }
 
     public dispose(): void {
