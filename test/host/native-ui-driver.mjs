@@ -10,7 +10,7 @@ const ACTION = 'Open Native Review Snapshot';
 const TIMEOUT = 20_000;
 const OPERATIONS = new Set([
     'quick-diff-state', 'click-quick-diff', 'multi-diff-state', 'focus-multi-diff', 'pick-native-file',
-    'click-native-action', 'text-filter-dialog'
+    'click-native-action'
 ]);
 const NATIVE_ACTIONS = new Set([
     'Keep Selected Whole Block', 'Revert Selected Whole Block', 'Keep Reviewed File', 'Revert Reviewed File'
@@ -414,31 +414,6 @@ export async function runNativeUiDriver(portText, operation, argument) {
             await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point,
                 button: 'left', buttons: 0, clickCount: 1 });
         };
-        if (operation === 'text-filter-dialog') {
-            if (!['Enable and Stop Tracking Listed Items', 'Enable and Keep Existing Reviews'].includes(argument)) {
-                throw new Error('Use a specific text-filter modal action');
-            }
-            const before = await until('the text-only recording confirmation', async () => {
-                const response = await cdp.send('Runtime.evaluate', {
-                    expression: `(() => {
-                        const dialogs = [...document.querySelectorAll('.monaco-dialog-box')];
-                        const dlg = dialogs.find(d => d.textContent.includes('Reviewable text only:'));
-                        if (!dlg) return;
-                        const buttons = [...dlg.querySelectorAll('.monaco-button,[role="button"],button')];
-                        const button = buttons.find(b => b.textContent.trim() === ${JSON.stringify(argument)});
-                        if (!button || button.getAttribute('aria-disabled') === 'true') return;
-                        const {left,top,width,height} = button.getBoundingClientRect();
-                        const x = left + width/2, y = top + height/2;
-                        if (!width || !height || !button.contains(document.elementFromPoint(x,y))) return;
-                        return {point:{x,y}, text:dlg.textContent};
-                    })()`,
-                    returnByValue: true
-                });
-                return response.result?.value;
-            });
-            await click(before.point);
-            return { operation, clicked: true, text: before.text };
-        }
         if (operation === 'quick-diff-state' || operation === 'multi-diff-state') {
             return { operation, state: await inspect('state') };
         }

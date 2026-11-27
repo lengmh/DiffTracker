@@ -3,7 +3,6 @@ import { runTests } from '@vscode/test-electron';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 const selected = process.argv[2];
@@ -28,22 +27,6 @@ fs.writeFileSync(path.join(workspace, '.vscode', 'settings.json'), JSON.stringif
     } : {}),
     ...(selected === 'restore-recreate' ? {'files.watcherExclude':{'restored-recreate-host/**':true}} : {})
 }));
-const profile = path.join(temporary, 'profile');
-const renderer = { args: [], env: {} };
-if (selected === 'reviewable-text') {
-    fs.mkdirSync(path.join(profile, 'User'), { recursive:true });
-    fs.writeFileSync(path.join(profile, 'User', 'settings.json'), JSON.stringify({ 'window.dialogStyle': 'custom' }));
-    const port = await new Promise((resolve, reject) => {
-        const server = createServer();
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
-            const address = server.address();
-            server.close(error => error ? reject(error) : resolve(address.port));
-        });
-    });
-    renderer.args = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${port}`];
-    renderer.env = { DIFF_TRACKER_HOST_NODE: process.execPath, DIFF_TRACKER_HOST_CDP_PORT: String(port) };
-}
 try {
     console.log('HOST-LIFECYCLE isolated launch:', JSON.stringify({ scenario: selected, version: process.env.DIFF_TRACKER_VSCODE_VERSION || 'stable' }));
     await runTests({
@@ -52,8 +35,8 @@ try {
         extensionDevelopmentPath: repository,
         extensionTestsPath: path.join(repository, 'test/host/suite/index.cjs'),
         extensionTestsEnv: { DIFF_TRACKER_HOST_WORKSPACE: workspace, DIFF_TRACKER_HOST_PHASE: selected,
-            DIFF_TRACKER_HOST_DIAGNOSTIC: 'isolated', ...renderer.env },
-        launchArgs: [workspace, `--user-data-dir=${profile}`,
-            `--extensions-dir=${path.join(temporary, 'extensions')}`, '--locale=en', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes', ...renderer.args]
+            DIFF_TRACKER_HOST_DIAGNOSTIC: 'isolated' },
+        launchArgs: [workspace, `--user-data-dir=${path.join(temporary, 'profile')}`,
+            `--extensions-dir=${path.join(temporary, 'extensions')}`, '--locale=en', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes']
     });
 } finally { fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }

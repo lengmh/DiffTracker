@@ -196,6 +196,11 @@ test('S4 settings are seeded after Native exits and restores its files, before t
                 assert.equal(fs.existsSync(path.join(workspace,'native-a.txt')),false,
                     'scope configuration work must not share Native or restart fixture files');
                 assert.equal(fs.readFileSync(path.join(workspace,'watched.txt'),'utf8'),'baseline\\n');
+            } else if (phase === 'reviewable-text') {
+                assert.equal(path.resolve(options.launchArgs[0]), path.resolve(workspace));
+                assert.deepEqual(fs.readdirSync(workspace), [], 'text-only confirmation needs an isolated workspace');
+                assert.ok(options.launchArgs.some(value=>value.includes('text-only-user-data')),
+                    'text-only confirmation needs a fresh host profile');
             } else if (phase === 'lifecycle-diagnostics') {
                 assert.equal(path.resolve(options.launchArgs[0]),path.resolve(workspace));
                 assert.deepEqual(JSON.parse(fs.readFileSync(settings,'utf8')),{
@@ -251,6 +256,6 @@ test('S4 settings are seeded after Native exits and restores its files, before t
     });
     assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
     assert.deepEqual(result.stdout.match(/FIXTURE-PHASE [\w-]+/g), [
-        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE lifecycle-diagnostics', 'FIXTURE-PHASE restore-recreate', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
+        'FIXTURE-PHASE native', 'FIXTURE-PHASE scope-settings', 'FIXTURE-PHASE reviewable-text', 'FIXTURE-PHASE lifecycle-diagnostics', 'FIXTURE-PHASE restore-recreate', 'FIXTURE-PHASE prepare', 'FIXTURE-PHASE restore'
     ]);
 });

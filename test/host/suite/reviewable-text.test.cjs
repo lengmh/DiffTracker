@@ -1,8 +1,6 @@
 const assert = require('node:assert/strict');
-const { execFile } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { promisify } = require('node:util');
 const vscode = require('vscode');
 
 module.exports = async function reviewableTextHost() {
@@ -24,12 +22,19 @@ module.exports = async function reviewableTextHost() {
     const config = () => vscode.workspace.getConfiguration('diffTracker');
     const key = 'onlyRecordReviewableText';
     const previous = config().inspect(key)?.globalValue;
-    const driver = path.join(__dirname, '..', 'native-ui-driver.mjs');
-    const decide = async (label) => {
-        const { stdout } = await promisify(execFile)(process.env.DIFF_TRACKER_HOST_NODE,
-            [driver, process.env.DIFF_TRACKER_HOST_CDP_PORT, 'text-filter-dialog', label],
-            { timeout: 25_000 });
-        return JSON.parse(stdout);
+    const originalWarning = vscode.window.showWarningMessage;
+    const prompts = [];
+    let choice;
+    // VS Code's DialogService rejects prompts when running with
+    // --extensionTestsPath, before it selects the native or browser renderer.
+    // Stub only this modal's answer, not the command, file watcher, settings,
+    // classification, or history. Ordinary notifications retain their real API.
+    vscode.window.showWarningMessage = async function(message, ...args) {
+        if (!message.startsWith('Reviewable text only:') || !args[0]?.modal) {
+            return originalWarning.call(this, message, ...args);
+        }
+        prompts.push({ message, options: args[0], buttons: args.slice(1) });
+        return choice;
     };
     const writeBinary = bytes => fs.writeFileSync(binary, Buffer.from(bytes));
     try {
@@ -48,17 +53,20 @@ module.exports = async function reviewableTextHost() {
                 changes.some(c => c.filePath === textPath && c.reviewKind === 'text');
         });
 
-        for (const choice of ['Enable and Keep Existing Reviews', 'Enable and Stop Tracking Listed Items']) {
+        for (const decision of ['Enable and Keep Existing Reviews', 'Enable and Stop Tracking Listed Items']) {
             if (config().get(key)) { await vscode.commands.executeCommand('diffTracker.toggleSetting', key); }
-            const action = vscode.commands.executeCommand('diffTracker.toggleSetting', key);
-            const response = await decide(choice);
-            assert.equal(response.clicked, true);
-            assert.match(response.text, /reviewable-text-host\.pdf/);
-            assert.doesNotMatch(response.text, /reviewable-text-host\.txt/);
-            await action;
+            choice = decision;
+            const count = prompts.length;
+            await vscode.commands.executeCommand('diffTracker.toggleSetting', key);
+            assert.equal(prompts.length, count + 1, 'one confirmation for this setting change');
+            const prompt = prompts.at(-1);
+            assert.match(prompt.message, /1 existing item/);
+            assert.match(prompt.options.detail, /reviewable-text-host\.pdf/);
+            assert.doesNotMatch(prompt.options.detail, /reviewable-text-host\.txt/);
+            assert.deepEqual(prompt.buttons, ['Enable and Stop Tracking Listed Items', 'Enable and Keep Existing Reviews']);
             assert.equal(config().get(key), true);
             const changes = (await readState()).trackedChanges;
-            assert.equal(changes.some(c => c.filePath === binaryPath), choice === 'Enable and Keep Existing Reviews');
+            assert.equal(changes.some(c => c.filePath === binaryPath), decision === 'Enable and Keep Existing Reviews');
             assert.ok(changes.some(c => c.filePath === textPath && c.reviewKind === 'text'));
         }
         assert.deepEqual(fs.readFileSync(binary), Buffer.from([0, 2, 3]));
@@ -67,8 +75,9 @@ module.exports = async function reviewableTextHost() {
         await until('later external recording', async () => (await readState()).trackedChanges.some(
             c => c.filePath === textPath && c.currentContent === 'observe later text\n'));
         assert.ok(!(await readState()).trackedChanges.some(c => c.filePath === binaryPath));
-        console.log('PASS HOST REVIEWABLE TEXT setting command offers a real confirmation and removes only approved unsupported reviews');
+        console.log('PASS HOST REVIEWABLE TEXT setting command requests one confirmation and removes only approved unsupported reviews');
     } finally {
+        vscode.window.showWarningMessage = originalWarning;
         await vscode.commands.executeCommand('diffTracker.stopRecording');
         await config().update(key, previous, vscode.ConfigurationTarget.Global);
         fs.rmSync(binary, { force: true });
