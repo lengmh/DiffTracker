@@ -6,7 +6,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const selected = process.argv[2];
-if (!['scope-settings', 'workspace-edit', 'deleted-coverage', 'lifecycle-diagnostics', 'restore-recreate'].includes(selected)) { throw new Error('Select scope-settings, workspace-edit, deleted-coverage, lifecycle-diagnostics or restore-recreate'); }
+if (!['scope-settings', 'workspace-edit', 'deleted-coverage', 'lifecycle-diagnostics', 'restore-recreate', 'reviewable-text'].includes(selected)) {
+    throw new Error('Select scope-settings, workspace-edit, deleted-coverage, lifecycle-diagnostics, restore-recreate, or reviewable-text');
+}
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'difftracker-host-isolation-'));
 const workspace = path.join(temporary, 'workspace');

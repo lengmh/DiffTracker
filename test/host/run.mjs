@@ -177,6 +177,18 @@ try {
             DIFF_TRACKER_HOST_PHASE:'scope-settings'}
     });
 
+    // Keep the confirmation scenario isolated from other recording sessions.
+    const textOnlyWorkspace = path.join(tempRoot, 'text-only-workspace');
+    const textOnlyUserData = path.join(tempRoot, 'text-only-user-data');
+    mkdirSync(textOnlyWorkspace, { recursive: true });
+    await runTests({
+        ...hostOptions,
+        launchArgs: hostOptions.launchArgs.map((argument, index) => index === 0 ? textOnlyWorkspace :
+            argument.startsWith('--user-data-dir=') ? `--user-data-dir=${textOnlyUserData}` : argument),
+        extensionTestsEnv: { ...hostOptions.extensionTestsEnv, DIFF_TRACKER_HOST_WORKSPACE: textOnlyWorkspace,
+            DIFF_TRACKER_HOST_PHASE: 'reviewable-text' }
+    });
+
     const lifecycleWorkspace=path.join(tempRoot,'lifecycle-workspace');
     mkdirSync(path.join(lifecycleWorkspace,'.vscode'),{recursive:true});
     writeFileSync(path.join(lifecycleWorkspace,'ProbeName'),'synthetic case identity');

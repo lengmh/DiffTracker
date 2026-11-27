@@ -11,6 +11,10 @@
   let initialized = dirty;
   let draftRevision = saved?.draftRevision || 0;
   let baseVersion = saved?.baseVersion;
+  let draftBase = saved?.draftBase;
+  let baseRoots = saved?.baseRoots;
+  let currentRaw;
+  let currentRoots;
   let currentVersion;
   let actionId = saved?.actionId || 0;
   let activeAction;
@@ -38,7 +42,7 @@
     includes.value = saved.includes;
     excludes.value = saved.excludes;
   }
-  const persist = () => vscode.setState?.({dirty,draftRevision,baseVersion,actionId,
+  const persist = () => vscode.setState?.({dirty,draftRevision,baseVersion,draftBase,baseRoots,actionId,
     mode:mode.value,includes:includes.value,excludes:excludes.value});
   const publishDraft = () => {
     persist();
@@ -100,15 +104,29 @@
   window.addEventListener('message', event => {
     const message = event.data;
     if (message.command === 'lockDraft') {
-      const clean = !busy && !dirty;
-      if (clean) {leaseId=message.leaseId;setBusy(true);}
-      vscode.postMessage({command:'draftLockAck',leaseId:message.leaseId,dirty:!clean,draftRevision,baseVersion});
+      const ready = !busy && initialized;
+      if (ready) {leaseId=message.leaseId;setBusy(true);}
+      vscode.postMessage({command:'draftLockAck',leaseId:message.leaseId,ready,dirty,draftRevision,
+        snapshot:ready?{mode:mode.value,includes:includes.value,excludes:excludes.value,base:draftBase,baseRoots,baseVersion}:undefined});
     }
     if (message.command === 'unlockDraft' && leaseId === message.leaseId) {
-      leaseId=undefined;setBusy(false);
+      const update=message.update;
+      if (update?.draftRevision === draftRevision) {
+        mode.value=update.request.mode;
+        includes.value=JSON.stringify(update.request.includes,null,2);
+        excludes.value=JSON.stringify(update.request.excludes,null,2);
+        dirty=update.dirty;
+        baseVersion=update.baseVersion;
+        draftBase=update.base;
+        baseRoots=update.baseRoots;
+        draftRevision++;
+      }
+      leaseId=undefined;setBusy(false);publishDraft();
     }
     if (message.command === 'scopeStatus') {
       currentVersion=message.requestVersion;
+      currentRaw=message.rawRequested;
+      currentRoots=message.requestRoots;
       lifecycle=message.lifecycle;
       document.getElementById('lifecycle-status').textContent=lifecycle?.blocker?.reason ||
         (lifecycle?.settingsWritePending?'A scope settings write is still pending. Wait for it to finish.':lifecycle?.scopeActionPending?'A monitoring scope action is in progress. Wait for it to finish.':lifecycle?.controllerDisposed?'This Monitoring Scope controller is closed. Reopen it after reloading the window.':'No lifecycle blocker.');
@@ -119,6 +137,8 @@
         includes.value = JSON.stringify(message.rawRequested?.includes || [], null, 2);
         excludes.value = JSON.stringify(message.rawRequested?.excludes || [], null, 2);
         baseVersion = message.requestVersion;
+        draftBase = message.rawRequested;
+        baseRoots = message.requestRoots;
         initialized = true;
       }
       publishDraft();
@@ -142,7 +162,10 @@
       }, null, 2);
     }
     if (message.command === 'draftBaseAccepted' && activeAction===message.actionId && draftRevision===message.draftRevision) {
-      baseVersion=message.baseVersion;draftRevision++;publishDraft();
+      baseVersion=message.baseVersion;
+      draftBase=currentVersion===baseVersion?currentRaw:undefined;
+      baseRoots=currentVersion===baseVersion?currentRoots:undefined;
+      draftRevision++;publishDraft();
     }
     if (message.command === 'scopeOperation' && activeAction !== undefined && message.actionId === activeAction) {
       if (message.acceptDraft && message.draftRevision === draftRevision) {dirty=false;}

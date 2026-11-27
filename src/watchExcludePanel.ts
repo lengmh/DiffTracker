@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { DiffTracker } from './diffTracker';
-import { MonitoringScopeApplyOutcome, MonitoringScopeConfirmation, MonitoringScopeController, ScopeOperationReportToken } from './monitoringScopeController';
+import { MonitoringScopeApplyOutcome, MonitoringScopeConfirmation, MonitoringScopeController, QuickExclusionProposal, ScopeOperationReportToken } from './monitoringScopeController';
 import { MonitoringScopeRequest } from './monitoringScope';
+import { planQuickExclusionDraft, QuickExclusionDraftPlan, QuickExclusionDraftSnapshot } from './quickExclusionDraft';
 
 type ScopeMessage = {
     command: string;
@@ -14,6 +15,8 @@ type ScopeMessage = {
     actionId?: number;
     dirty?: boolean;
     leaseId?: number;
+    ready?: boolean;
+    snapshot?: QuickExclusionDraftSnapshot;
 };
 
 export class WatchExcludePanel {
@@ -29,7 +32,7 @@ export class WatchExcludePanel {
     private activeActionId?: number;
     private disposed = false;
     private nextLease = 0;
-    private editorLease?: {id:number;resolve:(clean:boolean)=>void;timer:ReturnType<typeof setTimeout>};
+    private editorLease?: {id:number;resolve:(ack?:ScopeMessage)=>void;timer:ReturnType<typeof setTimeout>};
 
     private constructor(
         panel: vscode.WebviewPanel,
@@ -85,7 +88,7 @@ export class WatchExcludePanel {
                     this.draftKnown = true;
                 }
                 clearTimeout(lease.timer);
-                lease.resolve(current && !this.draftDirty);
+                lease.resolve(current && message.ready === true ? message : undefined);
             }
             return;
         }
@@ -325,43 +328,80 @@ export class WatchExcludePanel {
         }
     }
 
-    public reveal(): void {
-        try { if (!this.disposed) {this.panel.reveal();} }
-        catch { /* The webview may close before its disposal notification arrives. */ }
-    }
-
-    /** One bounded editor handshake; a clean draft stays locked through the quick action. */
-    public async acquireQuickExclusion(): Promise<{current:()=>boolean;release:()=>Promise<void>} | undefined> {
-        if (this.disposed || this.actionInProgress || !this.draftKnown || this.draftDirty) { return undefined; }
+    /** Freeze the editor, including an unsaved draft, for one quick exclusion. */
+    public async acquireQuickExclusion(allowHiddenWake = true): Promise<{
+        current: () => boolean;
+        prepare: (proposal: QuickExclusionProposal) => string | undefined;
+        release: (committed?: boolean) => Promise<void>;
+    } | undefined> {
+        if (this.disposed || this.actionInProgress) { return undefined; }
         const id = ++this.nextLease;
         this.actionInProgress = true;
-        const clean = await new Promise<boolean>(resolve => {
-            const timer = setTimeout(()=>resolve(false),2000);
-            this.editorLease = {id,resolve,timer};
+        const ack = await new Promise<ScopeMessage | undefined>(resolve => {
+            const timer = setTimeout(() => resolve(undefined), 2000);
+            this.editorLease = { id, resolve, timer };
             try {
+                // A newly opened editor may not have sent its initial reload yet.
+                if (!this.draftKnown) { void this.postStatus().catch(() => undefined); }
                 Promise.resolve(this.panel.webview.postMessage({command:'lockDraft',leaseId:id}))
-                    .then(sent=>{if(sent===false)resolve(false);},()=>resolve(false));
-            }catch{resolve(false);}
+                    .then(sent => { if (sent === false) { resolve(undefined); } }, () => resolve(undefined));
+            } catch { resolve(undefined); }
         });
-        if (!clean || this.disposed) { await this.releaseQuickExclusion(id);return undefined; }
-        const revision = this.draftRevision;
-        return {current:()=>!this.disposed && this.editorLease?.id === id && this.draftRevision === revision && !this.draftDirty,
-            release:()=>this.releaseQuickExclusion(id)};
+        if (!ack || this.disposed || this.draftRevision !== ack.draftRevision) {
+            await this.releaseQuickExclusion(id);
+            if (!ack && allowHiddenWake && !this.disposed && this.panel.visible === false) {
+                // On hosts that suspend a retained background renderer, wake
+                // it once without stealing focus and keep the same command.
+                try { this.panel.reveal(undefined, true); }
+                catch { return undefined; }
+                return this.acquireQuickExclusion(false);
+            }
+            return undefined;
+        }
+        const revision = ack.draftRevision;
+        const snapshot = ack.snapshot;
+        let plan: QuickExclusionDraftPlan | undefined;
+        let expectedScopeRevision: string | undefined;
+        const current = () => !this.disposed && this.editorLease?.id === id && this.draftRevision === revision;
+        return {
+            current,
+            prepare: proposal => {
+                expectedScopeRevision = proposal.scope.scopeRevision;
+                plan = ack.dirty === false ? undefined : snapshot
+                    ? planQuickExclusionDraft(snapshot, proposal, this.scopeController.getRequestVersion())
+                    : { conflict: 'The unsaved scope editor draft could not be read safely.' };
+                return plan && 'conflict' in plan ? plan.conflict : undefined;
+            },
+            release: committed => {
+                let update;
+                try {
+                    if (committed && current() && plan && 'request' in plan) {
+                        const saved = this.scopeController.getRequestedScope().scope;
+                        if (saved && saved.scopeRevision === expectedScopeRevision) {
+                            update = { ...plan, base: this.scopeController.getRequestedRawScope(),
+                                baseRoots: saved.roots, baseVersion: this.scopeController.getRequestVersion(),
+                                draftRevision: revision };
+                        }
+                    }
+                } catch { /* No reliable saved base is available; preserve the draft. */ }
+                return this.releaseQuickExclusion(id, update);
+            }
+        };
     }
 
-    private async releaseQuickExclusion(id: number): Promise<void> {
+    private async releaseQuickExclusion(id: number, update?: object): Promise<void> {
         const lease = this.editorLease;
         if (!lease || lease.id !== id) { return; }
         clearTimeout(lease.timer);
-        lease.resolve(false);
+        lease.resolve();
         this.editorLease = undefined;
-        this.actionInProgress = false;
-        if (!this.disposed) {
-            try {
-                await this.panel.webview.postMessage({command:'unlockDraft',leaseId:id});
+        try {
+            if (!this.disposed) {
+                await this.panel.webview.postMessage({command:'unlockDraft',leaseId:id,update});
                 await this.postStatus();
-            }catch{ /* Ownership is released even if the editor transport has closed. */ }
-        }
+            }
+        } catch { /* Ownership is released even if the editor transport has closed. */ }
+        finally { this.actionInProgress = false; }
     }
 
     private async finishEditorAction(message: ScopeMessage,outcome: MonitoringScopeApplyOutcome,acceptDraft=false,reportToken?:ScopeOperationReportToken): Promise<void> {
@@ -425,6 +465,7 @@ export class WatchExcludePanel {
             lifecycle: status.lifecycle,
             migration: status.migration,
             rawRequested: status.rawRequested,
+            requestRoots: status.requested.scope?.roots,
             requested: {
                 ok: status.requested.ok,
                 errors: status.requested.errors,

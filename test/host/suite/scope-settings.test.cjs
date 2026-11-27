@@ -143,6 +143,16 @@ module.exports = async function scopeSettingsCheckpoint() {
         assert.equal(after.requested.scope.scopeRevision,after.effective.scopeRevision);
         assert.ok(after.effective.excludes.some(rule=>rule.pattern==='/.vscode/'),'real active Apply retains the excluded settings directory');
         stage='active-shortcut';
+        const {WatchExcludePanel}=require('../../../out/watchExcludePanel.js');
+        await vscode.commands.executeCommand('diffTracker.manageMonitoringScope');
+        const editor=await until('real scope renderer initialized',()=> {
+            const panel=WatchExcludePanel.currentPanel;
+            return panel?.draftKnown && panel;
+        });
+        // Change Recording can issue the command while the scope tab is in
+        // the background. Use the actual retained renderer and message path.
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri('watched.txt')),vscode.ViewColumn.One);
+        await until('scope renderer hidden',()=>!editor.panel.visible);
         const shortcut=await vscode.commands.executeCommand('diffTracker.excludeResource',uri('quick-cache'));
         assert.equal(shortcut.status,'applied',JSON.stringify({shortcut,trace}));
         assert.equal(shortcut.scopeCommitted,true);
@@ -151,6 +161,10 @@ module.exports = async function scopeSettingsCheckpoint() {
             'the actual quick command result remains available in scope diagnostics');
         assert.equal(quickStatus.requested.scope.scopeRevision,quickStatus.effective.scopeRevision);
         assert.ok(quickStatus.effective.excludes.some(rule=>rule.pattern==='/quick-cache/'));
+
+        assert.equal(WatchExcludePanel.currentPanel,editor,'the quick action must not reopen or replace the scope panel');
+        assert.equal((await vscode.commands.executeCommand('diffTracker.excludeResource',uri('quick-cache'))).status,'alreadyExcluded');
+        editor.dispose();
 
         stage='apply-saved-request';
         const savedExcludes=[...quickStatus.effective.excludes,{scope:'all',pattern:'/saved-cache/'}];

@@ -268,7 +268,7 @@
           "type": "boolean",
           "default": false,
           "scope": "window",
-          "description": "Record only safely reviewable text for new resources. Existing reviews and Undo are preserved. Previously skipped content requires an explicit new baseline before text review."
+          "description": "Record only safely reviewable text for new resources. Use the Diff Tracker settings sidebar to remove verified non-reviewable pending items when enabling. Previously skipped content requires an explicit new baseline before text review."
         },
         "diffTracker.autoOpenNextPendingFile": {
           "type": "boolean",
