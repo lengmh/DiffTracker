@@ -587,21 +587,89 @@ function coverageExclusionHarness(){
 function scopeEditorScriptHarness(onPost = () => undefined, savedState) {
     const elements = new Map(), sent = [], listeners = {};
     let persisted = savedState;
+    const createElement = () => ({value:'',textContent:'',disabled:false,checked:false,children:[],listeners:{},
+        replaceChildren(){this.children=[];},append(child){this.children.push(child);},
+        addEventListener(event,handler){this.listeners[event]=handler;}});
     const element = id => {
-        if (!elements.has(id)) { elements.set(id,{value:'',textContent:'',disabled:false,listeners:{},
-            addEventListener(event,handler){this.listeners[event]=handler;}}); }
+        if (!elements.has(id)) { elements.set(id,createElement()); }
         return elements.get(id);
     };
     const receive = message => listeners.message({data:message});
     vm.runInNewContext(fs.readFileSync('webview/watchExcludePanel.js','utf8'),{
-        document:{getElementById:element},window:{addEventListener:(event,handler)=>{listeners[event]=handler;}},
+        document:{getElementById:element,createElement},window:{addEventListener:(event,handler)=>{listeners[event]=handler;}},
         acquireVsCodeApi:()=>({postMessage:message=>{sent.push(message);return onPost(message);},
             getState:()=>persisted,setState:value=>{persisted=structuredClone(value);}})
     });
     return {elements,sent,receive,state:()=>persisted,
         input:(id,value)=>{const e=element(id);e.value=value;e.listeners.input?.();e.listeners.change?.();},
-        click:id=>element(id).listeners.click()};
+        click:id=>element(id).listeners.click(),
+        toggle:(id,checked)=>{const e=element(id);e.checked=checked;e.listeners.change();}};
 }
+
+await test('suffix exclusion controls preserve scoped and arbitrary rules and apply only through the draft', () => {
+    const ui=scopeEditorScriptHarness();
+    const unrelated=[
+        {scope:'all',pattern:'/cache/'},
+        {scope:'folder',folder:'another',pattern:'**/*.md'},
+        {scope:'all',pattern:'*.md'},
+        {scope:'all',pattern:'**/*.[tT][xX][tT]'}
+    ];
+    const md={scope:'all',pattern:'**/*.md'};
+    ui.receive({command:'scopeStatus',requestVersion:'base',rawRequested:{
+        includes:[{scope:'all',path:'example.txt'}],excludes:[...unrelated,md,md]
+    }});
+    assert.equal(ui.elements.get('suffix-md').checked,true);
+    assert.equal(ui.elements.get('suffix-txt').checked,false);
+    ui.toggle('suffix-md',false);
+    ui.toggle('suffix-txt',true);
+    ui.input('suffix-input',' .tar.gz ');
+    ui.click('suffix-add');
+    ui.input('suffix-input','tar.gz');
+    const previous=ui.state().draftRevision;
+    ui.click('suffix-add');
+    assert.equal(ui.state().draftRevision,previous,'re-adding is a no-op');
+    assert.ok(ui.sent.every(m=>m.command==='draftChanged'||m.command==='reload'));
+    const draft=JSON.parse(ui.elements.get('excludes').value);
+    assert.deepEqual(draft,[...unrelated,{scope:'all',pattern:'**/*.txt'},{scope:'all',pattern:'**/*.tar.gz'}]);
+
+    ui.click('save-apply');
+    const action=ui.sent.at(-1);
+    assert.equal(action.command,'saveAndApply');
+    assert.equal(action.baseVersion,'base');
+    assert.deepEqual(structuredClone(action.excludes),draft);
+    ui.input('suffix-input','csv');
+    ui.click('suffix-add');
+    assert.equal(ui.elements.get('suffix-add').disabled,true);
+    assert.deepEqual(JSON.parse(ui.elements.get('excludes').value),draft,'cannot mutate a submitted draft');
+    ui.receive({command:'scopeOperation',actionId:action.actionId,draftRevision:action.draftRevision,
+        acceptDraft:false,outcome:{status:'cancelled'}});
+    const restored=scopeEditorScriptHarness(()=>undefined,ui.state());
+    restored.receive({command:'scopeStatus',requestVersion:'changed',rawRequested:{excludes:[]}});
+    assert.deepEqual(JSON.parse(restored.elements.get('excludes').value),draft);
+    assert.deepEqual(restored.elements.get('suffix-custom').children.map(option=>option.textContent),['.tar.gz']);
+    restored.click('suffix-remove');
+    assert.deepEqual(JSON.parse(restored.elements.get('excludes').value),draft.slice(0,-1));
+});
+
+await test('invalid suffix and raw excludes cannot replace a monitoring scope draft', () => {
+    const ui=scopeEditorScriptHarness();
+    ui.receive({command:'scopeStatus',requestVersion:'base',rawRequested:{excludes:[]}});
+    const prior=ui.state().draftRevision;
+    for(const invalid of ['**/*.json','../json','.json,.txt','.[xy]','a/b','..csv','csv.','a'.repeat(65)]){
+        ui.input('suffix-input',invalid);
+        ui.click('suffix-add');
+        assert.match(ui.elements.get('suffix-status').textContent,/one file extension/);
+        assert.equal(ui.state().draftRevision,prior);
+    }
+    ui.input('excludes','[{ unfinished');
+    assert.equal(ui.elements.get('suffix-add').disabled,true);
+    ui.input('suffix-input','csv');
+    ui.click('suffix-add');
+    assert.equal(ui.elements.get('excludes').value,'[{ unfinished');
+    ui.input('excludes','[{"scope":"all","pattern":"**/*.json"}]');
+    assert.equal(ui.elements.get('suffix-json').checked,true);
+    assert.equal(ui.elements.get('suffix-add').disabled,false);
+});
 
 await test('scope editor retains raw invalid JSON when newer scope status arrives', () => {
     const ui=scopeEditorScriptHarness();

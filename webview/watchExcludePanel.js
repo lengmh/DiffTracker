@@ -3,6 +3,12 @@
   const mode = document.getElementById('mode');
   const includes = document.getElementById('includes');
   const excludes = document.getElementById('excludes');
+  const presets = ['md', 'txt', 'json', 'log'].map(suffix => [suffix, document.getElementById('suffix-' + suffix)]);
+  const suffixInput = document.getElementById('suffix-input');
+  const suffixAdd = document.getElementById('suffix-add');
+  const suffixCustom = document.getElementById('suffix-custom');
+  const suffixRemove = document.getElementById('suffix-remove');
+  const suffixStatus = document.getElementById('suffix-status');
   const status = document.getElementById('status');
   const testInput = document.getElementById('test-path');
   const testResult = document.getElementById('test-result');
@@ -36,7 +42,7 @@
       : conflict?'Workspace settings changed. Your draft is preserved. Review Settings Conflict to keep it, or explicitly discard it and reload.'
         : dirty?'Unsaved draft. Save and Apply completes the scope change; Save Request Only leaves it pending.':'Editor matches the saved monitoring request.';
   };
-  const setBusy = value => {busy=value;for(const control of controls)control.disabled=value;updateDraftNotice();updateLifecycleControls();};
+  const setBusy = value => {busy=value;for(const control of controls)control.disabled=value;updateDraftNotice();updateLifecycleControls();syncSuffixControls();};
   if (dirty) {
     mode.value = saved.mode;
     includes.value = saved.includes;
@@ -49,16 +55,94 @@
     updateDraftNotice();
     vscode.postMessage({command:'draftChanged',dirty,draftRevision,baseVersion});
   };
-  for (const field of [mode,includes,excludes]) {
-    field.addEventListener('input', () => {dirty=true;draftRevision++;publishDraft();});
-    field.addEventListener('change', () => {dirty=true;draftRevision++;publishDraft();});
-  }
+  const markDraftChanged = () => {dirty=true;draftRevision++;publishDraft();};
 
   const parseArray = (value, label) => {
     const parsed = JSON.parse(value || '[]');
     if (!Array.isArray(parsed)) throw new Error(label + ' must be a JSON array');
     return parsed;
   };
+
+  // Only project the exact all-root rule shape we can round trip without
+  // changing the meaning of hand-written patterns or root-specific exclusions.
+  const isExtension = value => value.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*$/.test(value);
+  const patternFor = suffix => '**/*.' + suffix;
+  const ruleExtension = rule => {
+    if (rule?.scope !== 'all' || Object.keys(rule).length !== 2 || typeof rule.pattern !== 'string' ||
+        !rule.pattern.startsWith('**/*.')) return undefined;
+    const suffix = rule.pattern.slice(5);
+    return isExtension(suffix) ? suffix : undefined;
+  };
+
+  const syncSuffixControls = () => {
+    let extensions;
+    try {
+      extensions = new Set(parseArray(excludes.value,'Excludes').map(ruleExtension).filter(Boolean));
+      suffixStatus.textContent = '';
+    } catch {
+      suffixStatus.textContent = 'Fix the Explicit excludes JSON to use these controls. Your draft is unchanged.';
+    }
+    const blocked = busy || !initialized || !extensions;
+    for (const [suffix, field] of presets) {
+      field.checked = extensions?.has(suffix) ?? false;
+      field.disabled = blocked;
+    }
+    const previous = suffixCustom.value;
+    suffixCustom.replaceChildren();
+    const custom = [...(extensions ?? [])].filter(suffix => !presets.some(([preset]) => preset === suffix)).sort();
+    for (const suffix of custom) {
+      const option = document.createElement('option');
+      option.value = suffix;
+      option.textContent = '.' + suffix;
+      suffixCustom.append(option);
+    }
+    suffixCustom.value = custom.includes(previous) ? previous : custom[0] ?? '';
+    suffixInput.disabled = suffixAdd.disabled = blocked;
+    suffixCustom.disabled = suffixRemove.disabled = blocked || custom.length === 0;
+  };
+
+  const editSuffix = (suffix, exclude) => {
+    if (busy || !initialized) return false;
+    if (!isExtension(suffix)) {
+      suffixStatus.textContent = 'Enter one file extension, such as .csv or .tar.gz. Do not enter paths or wildcards.';
+      return false;
+    }
+    try {
+      const rules = parseArray(excludes.value,'Excludes');
+      if (rules.some(rule => ruleExtension(rule) === suffix) !== exclude) {
+        const updated = exclude ? [...rules, {scope:'all',pattern:patternFor(suffix)}]
+          : rules.filter(rule => ruleExtension(rule) !== suffix);
+        excludes.value = JSON.stringify(updated, null, 2);
+        markDraftChanged();
+      }
+      syncSuffixControls();
+      return true;
+    } catch {
+      syncSuffixControls();
+      return false;
+    }
+  };
+
+  const addCustomSuffix = () => {
+    if (editSuffix(suffixInput.value.trim().replace(/^\./, ''),true)) suffixInput.value = '';
+  };
+  for (const [suffix, field] of presets) {
+    field.addEventListener('change', () => editSuffix(suffix, field.checked));
+  }
+  suffixAdd.addEventListener('click', addCustomSuffix);
+  suffixInput.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {event.preventDefault();addCustomSuffix();}
+  });
+  suffixRemove.addEventListener('click', () => editSuffix(suffixCustom.value,false));
+  for (const field of [mode,includes,excludes]) {
+    const changed = () => {
+      markDraftChanged();
+      if (field === excludes) syncSuffixControls();
+    };
+    field.addEventListener('input', changed);
+    field.addEventListener('change', changed);
+  }
+  syncSuffixControls();
 
   const submitDraft = command => {
     if (busy) return;
@@ -141,6 +225,7 @@
         baseRoots = message.requestRoots;
         initialized = true;
       }
+      syncSuffixControls();
       publishDraft();
       status.textContent = JSON.stringify({
         lifecycle: message.lifecycle,
