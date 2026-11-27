@@ -54,6 +54,29 @@ function valid(overrides = {}) {
     assert.equal(result.warnings.length, 1);
 }
 
+// The suffix shortcut produces these ordinary all-root rules, not a
+// separate suffix allowlist or a second policy.
+for (const mode of ['rules', 'wholeWorkspace']) {
+    const result = validateAndCanonicalizeScope(valid({
+        mode,
+        includes: [{ scope: 'all', path: 'docs/README.md' }],
+        excludes: [
+            { scope: 'all', pattern: '**/*.md' },
+            { scope: 'all', pattern: '**/*.tar.gz' }
+        ]
+    }), roots, 'linux');
+    assert.equal(result.ok, true);
+    for (const root of roots) {
+        for (const relativePath of ['README.md', 'docs/README.md', 'archive/a.tar.gz', 'folder.md/nested.ts']) {
+            assert.deepEqual(evaluateConfiguredScope(result.scope, root, relativePath, false),
+                { monitored: false, source: 'explicitExclude' }, relativePath);
+        }
+        for (const relativePath of ['src/main.ts', 'docs/README.md.txt', 'archive/a.gz', 'LICENSE']) {
+            assert.equal(evaluateConfiguredScope(result.scope, root, relativePath, false).monitored, true, relativePath);
+        }
+    }
+}
+
 {
     const malformed = [
         { mode: 'invalid', includes: [], excludes: [] },

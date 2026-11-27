@@ -463,6 +463,14 @@ p,.hint{color:var(--vscode-descriptionForeground);font-size:12px}
 label{display:block;font-size:12px;margin:8px 0 4px}
 select,textarea,input{width:100%;box-sizing:border-box;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);padding:7px;font-family:var(--vscode-editor-font-family)}
 textarea{min-height:120px;resize:vertical}
+fieldset{margin:12px 0;padding:8px 12px;border:1px solid var(--vscode-panel-border);min-width:0}
+.suffix-presets{display:flex;gap:12px;flex-wrap:wrap}
+.suffix-presets label{display:flex;align-items:center;gap:5px}
+.suffix-presets input{width:auto}
+.suffix-entry{display:flex;gap:8px;margin-top:6px}
+.suffix-entry input,.suffix-entry select{flex:1;min-width:0}
+.suffix-entry button{flex-shrink:0}
+#suffix-status{color:var(--vscode-errorForeground)}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 button{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:0;padding:6px 10px;cursor:pointer;border-radius:2px}
 button.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
@@ -477,6 +485,21 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeB
 <select id="mode"><option value="rules">Rules</option><option value="wholeWorkspace">Whole Workspace</option></select>
 <label for="includes">Explicit includes (JSON array)</label>
 <textarea id="includes" spellcheck="false"></textarea>
+<fieldset>
+<legend>Exclude by extension</legend>
+<p class="hint">Checked extensions are excluded across all workspace roots. These draft controls use the same rules as Explicit excludes: a matching folder name also excludes its contents. Apply the draft to change recording.</p>
+<div class="suffix-presets">
+<label><input id="suffix-md" type="checkbox" disabled> .md</label>
+<label><input id="suffix-txt" type="checkbox" disabled> .txt</label>
+<label><input id="suffix-json" type="checkbox" disabled> .json</label>
+<label><input id="suffix-log" type="checkbox" disabled> .log</label>
+</div>
+<label for="suffix-input">Custom extension</label>
+<div class="suffix-entry"><input id="suffix-input" placeholder="e.g. .csv or .tar.gz" maxlength="65" disabled aria-describedby="suffix-status"><button id="suffix-add" class="secondary" disabled>Add</button></div>
+<label for="suffix-custom">Custom extensions in this draft</label>
+<div class="suffix-entry"><select id="suffix-custom" disabled></select><button id="suffix-remove" class="secondary" disabled>Remove</button></div>
+<p id="suffix-status" role="status"></p>
+</fieldset>
 <label for="excludes">Explicit excludes (JSON array)</label>
 <textarea id="excludes" spellcheck="false"></textarea>
 <div class="actions">
