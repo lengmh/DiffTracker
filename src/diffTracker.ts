@@ -11997,18 +11997,23 @@ export class DiffTracker {
                 }
             };
             if (creationIsUnproven()) { retainUnprovenCreation(); return; }
-            const state = await this.readFileSnapshot(uri);
+            let state = await this.readFileSnapshot(uri);
             if (!creationIsCurrent()) { return; }
             if (creationIsUnproven()) { retainUnprovenCreation(); return; }
-            if (this.suppressUnsupportedResource(filePath, state)) { return; }
             if (this.onlyRecordReviewableText() && !this.hasCapturedBaseline(filePath) &&
                 state.kind === 'unavailable' && state.reason === readRaceReason) {
-                // Do not invent a reviewable before-image for a resource whose
-                // first classification raced its writer. Recheck once now.
-                this.markFileUnavailable(filePath, state.reason);
-                if (creationIsCurrent()) { await this.readFileAndUpdate(filePath, uri, creationIsCurrent); }
-                return;
+                // A second bounded read preserves the normal creation proof for
+                // genuinely reviewable text without committing an absence
+                // baseline to a file that only appears unsupported later.
+                state = await this.readFileSnapshot(uri);
+                if (!creationIsCurrent()) { return; }
+                if (creationIsUnproven()) { retainUnprovenCreation(); return; }
+                if (state.kind === 'unavailable' && state.reason === readRaceReason) {
+                    this.markFileUnavailable(filePath, state.reason);
+                    return;
+                }
             }
+            if (this.suppressUnsupportedResource(filePath, state)) { return; }
             if (!this.hasCapturedBaseline(filePath) && this.mayHaveSuppressedResource(filePath)) {
                 this.recordUnresolvedBaseline(filePath, 'Earlier content was not recorded; explicitly reset the baseline to current disk state before text review');
                 return;

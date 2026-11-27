@@ -791,6 +791,26 @@ for (const approve of [false, true]) {
     });
 }
 
+await test('ISSUE-67 a suspended renderer is woken once without losing the quick exclusion', async () => {
+    const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
+    const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
+    const hostPanel=h.state.createdPanels.at(-1),send=hostPanel.webview.postMessage;
+    hostPanel.visible=false;
+    let revealed=0;
+    hostPanel.reveal=(_column,preserveFocus)=> {
+        assert.equal(preserveFocus,true);
+        hostPanel.visible=true;
+        revealed++;
+    };
+    hostPanel.webview.postMessage=message=>message.command==='lockDraft'&&!hostPanel.visible?false:send(message);
+    ui.input('mode','rules');
+    assert.equal((await h.run('excludeCoverageSubtree',h.targets[0])).status,'applied');
+    assert.equal(revealed,1);
+    assert.equal(ui.state().dirty,true);
+    assert.equal(h.state.updates.length,1);
+    panel.dispose();
+});
+
 await test('a queued draft change during quick settings save invalidates the editor lease and preserves the input', async () => {
     const h=monitoringScopeCommandHarness();await h.run('manageMonitoringScope');
     const panel=h.WatchExcludePanel.currentPanel,ui=connectScopeEditor(h);
@@ -2759,7 +2779,7 @@ for (const overlap of [false, true]) {
         const includes = [{scope:'all',path:'docs/development.md'},{scope:'all',path:'test'}];
         ui.input('includes', JSON.stringify(includes));
         const external = overlap ? '/docs/' : '/external/';
-        h.state.workspaceConfiguration.watchExclude.push({scope:'all',pattern:external});
+        h.state.workspaceConfiguration.watchExclude = [...h.state.workspaceConfiguration.watchExclude, {scope:'all',pattern:external}];
         await h.tracker.applyConfiguredMonitoringScope(h.controller.getRequestedScope().scope,false,()=>true);
         h.controller.reconcileRequestedScope();
         let confirmations = 0;

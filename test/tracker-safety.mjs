@@ -6293,6 +6293,36 @@ test('ISSUE-66 text filter reclassifies a newly created file after its initial r
     assert.equal(tracker.mayHaveSuppressedResource(p),true);
 });
 
+test('ISSUE-66 a first read race does not hide a proven new text change',async()=>{
+    vscodeExcludes={onlyRecordReviewableText:true};
+    const p=file('producer-text'); fs.writeFileSync(p,'write in progress');
+    const read=pause(p,'read');
+    const created=tracker.onExternalFileCreated(Uri.file(p));
+    await read.entered;
+    fs.writeFileSync(p,'stable reviewable text'); read.release();
+    await created;
+    assert.equal(pending(p)?.reviewKind,'text');
+    assert.equal(tracker.getOriginalContent(p),'');
+    assert.equal(tracker.mayHaveSuppressedResource(p),false);
+});
+
+test('ISSUE-66 persistent temporary races resolve only after stable unsupported classification',async()=>{
+    vscodeExcludes={onlyRecordReviewableText:true};
+    const p=file('race-then-binary'); fs.writeFileSync(p,Buffer.from([0,1]));
+    const first=pause(p,'read');
+    const created=tracker.onExternalFileCreated(Uri.file(p));
+    await first.entered;
+    fs.writeFileSync(p,Buffer.from([0,2,3]));
+    const second=pause(p,'read'); first.release();
+    await second.entered;
+    fs.writeFileSync(p,Buffer.from([0,3,4,5])); second.release();
+    await created;
+    assert.equal(pending(p)?.reviewKind,'unknown');
+    await scan(p);
+    assert.equal(pending(p),undefined);
+    assert.equal(tracker.mayHaveSuppressedResource(p),true);
+});
+
 test('ISSUE-66 text filter preserves historical and dirty Unknown evidence',async()=>{
     const historical=file('historical'); fs.writeFileSync(historical,Buffer.from([0,2]));
     tracker.markFileUnavailable(historical,'File changed while being read; refresh before review');
