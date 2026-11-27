@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.17
+
+- Add **Exclude by extension** in Manage Monitoring Scope. Select common extensions or enter a custom suffix, then use Save and Apply. Existing rules are preserved; matching folder names also exclude their contents.
+- When enabling **Only record reviewable text**, choose whether to retain existing reviews or stop tracking verified non-reviewable items. Unverified reviews and unrelated Undo entries are preserved.
+- Make the eye-button exclusion apply only the selected file or folder. Preserve compatible unsaved scope edits and combine any required draft or pending-review confirmation into one prompt.
+
 ## 0.8.16
 
 - Add explicit Check and Rebuild Observation Coverage actions so users can verify or reinstall watcher ownership without replacing review baselines, pending diffs, Unknown evidence or Undo history.
